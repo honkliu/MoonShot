@@ -1,16 +1,20 @@
 #include "MatchService.h"
 
+using namespace Service;
+
 MatchService::MatchService()
 {
 
 }
-MatchService::~MatchService();
+
+MatchService::~MatchService()
 {
 
 }
 
-MatchService::Init()
+bool MatchService::Init()
 {
+    return true;
 
 }
 
