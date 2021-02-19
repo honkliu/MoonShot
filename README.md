@@ -50,4 +50,22 @@ To https://github.com/honkliu/MoonShot.git
 C:\gitroot\MoonShot>git branch
 * main
 
+C:\gitroot\test\MoonShot\ThirdParty\mimalloc>git submodule init
+Submodule 'ThirdParty/mimalloc' (https://github.com/microsoft/mimalloc.git) registered for path './'
+
+C:\gitroot\test\MoonShot\ThirdParty\mimalloc>dir
+ Volume in drive C is OSDisk
+ Volume Serial Number is CE63-1B08
+
+ Directory of C:\gitroot\test\MoonShot\ThirdParty\mimalloc
+
+02/18/2021  11:20 PM    <DIR>          .
+02/18/2021  11:20 PM    <DIR>          ..
+               0 File(s)              0 bytes
+               2 Dir(s)  272,321,204,224 bytes free
+
+C:\gitroot\test\MoonShot\ThirdParty\mimalloc>git submodule update
+Cloning into 'C:/gitroot/test/MoonShot/ThirdParty/mimalloc'...
+Submodule path './': checked out '15220c684331d1c486550d7a6b1736e0a1773816'
+
 
