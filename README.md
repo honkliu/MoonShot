@@ -69,3 +69,22 @@ Cloning into 'C:/gitroot/test/MoonShot/ThirdParty/mimalloc'...
 Submodule path './': checked out '15220c684331d1c486550d7a6b1736e0a1773816'
 
 
+# Install boost library
+
+# sudo apt-get install libboost-dev
+# Examples
+#include <iostream>
+#include<boost/version.hpp>
+#include<boost/config.hpp>
+
+using namespace std;
+
+int main() {
+    cout << BOOST_VERSION << endl;
+    cout << BOOST_LIB_VERSION << endl;
+    cout << BOOST_PLATFORM << endl;
+    cout << BOOST_COMPILER << endl;
+    cout << BOOST_STDLIB << endl;
+
+  return 0;
+}
