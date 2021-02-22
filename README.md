@@ -88,3 +88,17 @@ int main() {
 
   return 0;
 }
+
+#GRPC
+
+ $ sudo apt-get install build-essential autoconf libtool pkg-config
+  $ [sudo] apt-get install clang-5.0 libc++-dev
+
+ $ git clone -b RELEASE_TAG_HERE https://github.com/grpc/grpc
+ $ cd grpc
+ $ git submodule update --init
+
+ $ mkdir -p cmake/build
+ $ cd cmake/build
+ $ cmake ../..
+ $ make
