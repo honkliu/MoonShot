@@ -21,6 +21,7 @@ namespace Service
         void ExecuteQuery();
 
     private:
-        boost::shared_ptr<boost::priority_queue<int>> m_queue; 
+        //boost::shared_ptr<boost::priority_queue<int>> m_queue; 
+        bool IsCapable();
     };
 }
