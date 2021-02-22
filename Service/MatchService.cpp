@@ -24,23 +24,37 @@ bool MatchService::Init()
     * 3. OnQueryExecuted()
     */
 
-    m_QueueThreads.reset(new boost::asio::thread_pool(m_NumberOfQueueThreads));
-    m_QueryThreads.reset(new boost::asio::thread_pool(m_NumberOfQueryThreads));
-    m_DataThreads.reset(new boost::asio::thread_pool(m_NumberOfQueueThreads));
-    
-    for (int i = 0; )
-    m_QueueThreads.get(),  
+    //QueueThreads.Start();
+    //QueryThreads.Start();
+    //DataThreads.Start();
 
+    std::string server_address = "0.0.0.0:60060";
+    ShenNongImp service();
+
+    ServerBuilder builder;
+
+    builder.AddListeningPort(server_address, grpc::InsecureServerlCredetials());
+    buileer.RegisterService(&service);
+
+    std::unique_ptr<Server> server(builder.BuilderAndStart());
+
+    server->Wait();
+
+    return true;
+}
+
+bool IsCapable()
+{
     return true;
 }
 
 void OnQueryReceived()
 {
-    if (isCapable())
+    if (IsCapable())
     {
-        SmartTokenize();
-        CreateQueryPlans()
-        m_queue.Enqueue(queryJob)
+        //SmartTokenize();
+        //CreateQueryPlans()
+        //m_queue.Enqueue(queryJob)
     }
 }
 

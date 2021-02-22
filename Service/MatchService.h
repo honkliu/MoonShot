@@ -1,9 +1,9 @@
 
-/*
+
 #include <boost/make_shared.hpp>
 #include <boost/shared_ptr.hpp>
 #include <boost/asio/thread_pool.hpp>
-*/
+
 #include <queue>
 #include <stdlib.h>
 
@@ -29,6 +29,7 @@ namespace Service
         std::unique_ptr<boost::asio:thread_pool> m_QueryThreads;
         std::unique_ptr<boost::asio:thread_pool> m_DataThreads;
 
-//        boost::shared_ptr<prioirty_queue<int>> m_queue; 
+        //boost::shared_ptr<boost::priority_queue<int>> m_queue; 
+        bool IsCapable();
     };
 }

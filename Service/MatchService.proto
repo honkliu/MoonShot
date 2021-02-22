@@ -1,0 +1,17 @@
+service ShenNong {
+    rpc Query121(Question) returns (Answers) {}
+    rpc Query129(Question) returns(stream Answers) {}
+    rpc Query921(stream Question) returns (Answers) {}
+    rpc Query929(stream question) returns(stream Answers) {}
+}
+
+message Question {
+    int32 QuestionID = 1;
+    string Question = 2;
+    string Option = 3;
+}
+
+message Answers {
+    int32 AnswersID = 1;
+    string Answers = 2; 
+}
