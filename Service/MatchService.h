@@ -21,6 +21,14 @@ namespace Service
         void ExecuteQuery();
 
     private:
+        int m_NumberOfQueueThreads;
+        int m_NumberOfQueryThreads;
+        int m_NumberOfDataThreads;
+
+        std::unique_ptr<boost::asio:thread_pool> m_QueueThreads;
+        std::unique_ptr<boost::asio:thread_pool> m_QueryThreads;
+        std::unique_ptr<boost::asio:thread_pool> m_DataThreads;
+
 //        boost::shared_ptr<prioirty_queue<int>> m_queue; 
     };
 }

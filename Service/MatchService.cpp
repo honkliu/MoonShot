@@ -1,3 +1,5 @@
+#include <boost/asio.h>
+
 #include "MatchService.h"
 
 using namespace Service;
@@ -22,10 +24,13 @@ bool MatchService::Init()
     * 3. OnQueryExecuted()
     */
 
-    QueueThreads.Start();
-    QueryThreads.Start();
-    DataThreads.Start();
+    m_QueueThreads.reset(new boost::asio::thread_pool(m_NumberOfQueueThreads));
+    m_QueryThreads.reset(new boost::asio::thread_pool(m_NumberOfQueryThreads));
+    m_DataThreads.reset(new boost::asio::thread_pool(m_NumberOfQueueThreads));
     
+    for (int i = 0; )
+    m_QueueThreads.get(),  
+
     return true;
 }
 
