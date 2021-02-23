@@ -1,4 +1,4 @@
-#include <boost/asio.h>
+#include <boost/asio.hpp>
 
 #include "MatchService.h"
 
@@ -74,5 +74,5 @@ int MatchService::SetState(int state)
 
 void MatchService::ExecuteQuery()
 {
-    OnQueryReceived()
+    OnQueryReceived();
 }
