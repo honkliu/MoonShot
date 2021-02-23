@@ -1,6 +1,3 @@
 [submodule "ThirdParty/mimalloc"]
 	path = ThirdParty/mimalloc
 	url = https://github.com/microsoft/mimalloc.git
-[submodule "ThirdParty/grpc"]
-	path = ThirdParty/grpc
-	url = https://github.com/grpc/grpc.git
