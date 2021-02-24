@@ -61,7 +61,34 @@ aux_source_directory(. SOURCEFILES)
 
 message(Status, GRPC_SRCS, "--${PROTO_FILES}, ${PROTO_SRCS}, ${GRPC_SRCS}, ${CMAKE_CURRENT_BINARY_DIR}")
 
-add_executable(MoonShot ${PROTO_SRCS} ${GRPC_SRCS})
+include_directories(
+    PUBLIC
+    "${CMAKE_CURRENT_LIST_DIR}/../ThirdParty/include"
+    "${CMAKE_CURRENT_LIST_DIR}/../Executor"
+    "${CMAKE_CURRENT_LIST_DIR}"
+    "${CMAKE_CURRENT_BINARY_DIR}"
+)
+
+set(MOONSHOT MoonShot)
+foreach(_target
+    MoonShot
+)
+    add_executable(${_target} 
+        ${SOURCEFILES}
+        ${GRPC_SRCS}
+        ${PROTO_SRCS})
+    target_link_libraries(${_target}
+        ${_REFLECTION}
+        ${_GRPC_GRPCPP}
+        ${_PROTOBUF_LIBPROTOBUF})
+endforeach()
+
+##add_executable(${MoonShot} ${PROTO_SRCS} ${GRPC_SRCS})
+#target_link_libraries(${MOONSHOT}
+#    ${_REFLECTION}
+##    ${_GRPC_GRPCPP}
+#    ${_PROTOBUF_LIBPROTOBUF}
+#)
 #add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../Executor)
 
 #include_directories(
@@ -78,7 +105,7 @@ add_executable(MoonShot ${PROTO_SRCS} ${GRPC_SRCS})
 
 #add_executable(MoonShot ${SOURCEFILES})
 
-#target_link_libraries(MoonShot Executor)
+target_link_libraries(MoonShot grpc++)
 
 #add_executable()
 # Generated sources
