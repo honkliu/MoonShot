@@ -1,8 +1,10 @@
+syntax = "proto3";
+
 service ShenNong {
     rpc Query121(Question) returns (Answers) {}
     rpc Query129(Question) returns(stream Answers) {}
     rpc Query921(stream Question) returns (Answers) {}
-    rpc Query929(stream question) returns(stream Answers) {}
+    rpc Query929(stream Question) returns(stream Answers) {}
 }
 
 message Question {
@@ -12,6 +14,8 @@ message Question {
 }
 
 message Answers {
-    int32 AnswersID = 1;
-    string Answers = 2; 
+    int64 DocID = 1; 
+    int32 AnswersID = 2;
+    float AnswerScore = 3;
+    string Answers = 4; 
 }
