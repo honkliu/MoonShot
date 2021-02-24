@@ -20,7 +20,6 @@ set(CMAKE_CXX_STANDARD 11)
 # configure time. This makes gRPC's source code available to your project,
 # similar to a git submodule.
 message(STATUS "Using gRPC via add_subdirectory (FetchContent).")
-message(${CMAKE_CXX_FLAGS})
 include(FetchContent)
 FetchContent_Declare(
   gRPC
@@ -65,17 +64,17 @@ message(Status, GRPC_SRCS, "--${PROTO_FILES}, ${PROTO_SRCS}, ${GRPC_SRCS}, ${CMA
 add_executable(MoonShot ${PROTO_SRCS} ${GRPC_SRCS})
 #add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../Executor)
 
-include_directories(
-    PUBLIC
-    "${CMAKE_CURRENT_LIST_DIR}/../ThirdParty/include"
-    "${CMAKE_CURRENT_LIST_DIR}/../Executor"
-    "${CMAKE_CURRENT_LIST_DIR}"
-    "${CMAKE_CURRENT_BINARY_DIR}"
-)
-target_include_directories(MoonShot
-    PUBLIC
-    ${CMAKE_CURRENT_BINARY_DIR}
-)
+#include_directories(
+#    PUBLIC
+#    "${CMAKE_CURRENT_LIST_DIR}/../ThirdParty/include"
+#    "${CMAKE_CURRENT_LIST_DIR}/../Executor"
+#    "${CMAKE_CURRENT_LIST_DIR}"
+#    "${CMAKE_CURRENT_BINARY_DIR}"
+#)
+#target_include_directories(MoonShot
+#    PUBLIC
+#    ${CMAKE_CURRENT_BINARY_DIR}
+#)
 
 #add_executable(MoonShot ${SOURCEFILES})
 
