@@ -1,6 +1,8 @@
 syntax = "proto3";
 
-service ShenNong {
+package ShenNong;
+
+service Greeter {
     rpc Query121(Question) returns (Answers) {}
     rpc Query129(Question) returns(stream Answers) {}
     rpc Query921(stream Question) returns (Answers) {}

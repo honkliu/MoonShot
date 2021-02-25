@@ -1,9 +1,19 @@
+#include <grpcpp/grpcpp.h>
 
-Status ShenNongImp::Query121(ServerContext * context, const Question * question, Answers *answers) override 
+#include "ShenNongImp.h"
+
+using grpc::ServerContext;
+using grpc::Status;
+using ShenNong::Greeter;
+using ShenNong::Question;
+using ShenNong::Answers;
+
+Status ShenNongImp::Query121(ServerContext * context, const Question * question, Answers *answers)
 {
     return Status::OK;
 }
 
+/*
 Status ShenNongImp::Query129(ServerContext * context, const Question * question, ServerWriter<Answers>* writer) override 
 {
     return Status::OK;
@@ -13,11 +23,11 @@ Status ShenNongImp::Query129(ServerContext * context, const Question * question,
 Status ShenNongImp::Query129(ServerContext * context, ServerReader<Question>* reader, Answers* answers) override 
 {
 
-/*
+
     while (reader->Read() {
         writer->Write()
     })
-*/
+
     return Status::OK;
 }
 
@@ -27,3 +37,4 @@ Status ShenNongImp::Query929(ServerContext* context, ServerReader<Question>* rea
     return Status::OK;
 
 }
+*/
