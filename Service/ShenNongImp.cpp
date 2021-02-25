@@ -13,28 +13,27 @@ Status ShenNongImp::Query121(ServerContext * context, const Question * question,
     return Status::OK;
 }
 
-/*
-Status ShenNongImp::Query129(ServerContext * context, const Question * question, ServerWriter<Answers>* writer) override 
+
+Status ShenNongImp::Query129(ServerContext * context, const Question * question, ServerWriter<Answers>* writer)  
 {
     return Status::OK;
 }
 
 
-Status ShenNongImp::Query129(ServerContext * context, ServerReader<Question>* reader, Answers* answers) override 
+Status ShenNongImp::Query921(ServerContext * context, ServerReader<Question>* reader, Answers* answers)  
 {
 
-
+/*
     while (reader->Read() {
         writer->Write()
     })
-
+*/
     return Status::OK;
 }
 
-Status ShenNongImp::Query929(ServerContext* context, ServerReader<Question>* reader, ServerWriter<Answers>* writer) override 
+Status ShenNongImp::Query929(ServerContext* context, ServerReader<Question>* reader, ServerWriter<Answers>* writer)  
 {
 
     return Status::OK;
 
 }
-*/

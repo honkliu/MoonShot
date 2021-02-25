@@ -9,7 +9,7 @@ else()
 endif()
 
 find_package(Threads REQUIRED)
-find_package(Boost REQUIRED COMPONENTS system)
+#find_package(Boost REQUIRED COMPONENTS system)
 
 include(../cmake/grpc.cmake)
 include(GNUInstallDirs)
@@ -63,8 +63,7 @@ aux_source_directory(. SOURCEFILES)
 
 include_directories(
     PUBLIC
-    ${Boost_INCLUDE_DIRS}
-    "${CMAKE_CURRENT_LIST_DIR}/../ThirdParty/include"
+    "${CMAKE_CURRENT_LIST_DIR}/../thirdParty/boost_1_75_0"
     "${CMAKE_CURRENT_LIST_DIR}/../Executor"
     "${CMAKE_CURRENT_LIST_DIR}"
     "${CMAKE_CURRENT_BINARY_DIR}"
@@ -81,7 +80,6 @@ foreach(_target
     target_link_libraries(${_target}
         ${_REFLECTION}
         ${_GRPC_GRPCPP}
-        ${Boost_LIBRARIES}
         ${_PROTOBUF_LIBPROTOBUF})
 endforeach()
 
