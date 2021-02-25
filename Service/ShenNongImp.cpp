@@ -4,9 +4,9 @@
 
 using grpc::ServerContext;
 using grpc::Status;
-using ShenNong::Greeter;
-using ShenNong::Question;
-using ShenNong::Answers;
+using Wenda::ShenNong;
+using Wenda::Question;
+using Wenda::Answers;
 
 Status ShenNongImp::Query121(ServerContext * context, const Question * question, Answers *answers)
 {

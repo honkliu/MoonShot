@@ -9,6 +9,7 @@ else()
 endif()
 
 find_package(Threads REQUIRED)
+find_package(Boost REQUIRED COMPONENTS system)
 
 include(../cmake/grpc.cmake)
 include(GNUInstallDirs)
@@ -41,6 +42,8 @@ else()
     set(_GRPC_CPP_PLUGIN_EXECUTABLE $<TARGET_FILE:grpc_cpp_plugin>)
 endif()
 
+message (BOOST, ${Boost_INCLUDE_DIRS} ${Boost_LIBRARIES})
+
 # Proto file
 #get_filename_component(PROTO_FILES "MatchService.proto" ABSOLUTE)
 
@@ -49,7 +52,6 @@ list(APPEND PROTO_FILES
     )
 
     set(CMAKE_CXX_STANDARD 11)
-message(Status, GRPC_SRCS, "--${PROTO_FILES}, ${PROTO_SRCS}, ${GRPC_SRCS}, ${CMAKE_CURRENT_BINARY_DIR}")
 
 GRPC_GENERATE_CPP(
     PROTO_SRCS
@@ -59,10 +61,9 @@ GRPC_GENERATE_CPP(
 )
 aux_source_directory(. SOURCEFILES)
 
-message(Status, GRPC_SRCS, "--${PROTO_FILES}, ${PROTO_SRCS}, ${GRPC_SRCS}, ${CMAKE_CURRENT_BINARY_DIR}")
-
 include_directories(
     PUBLIC
+    ${Boost_INCLUDE_DIRS}
     "${CMAKE_CURRENT_LIST_DIR}/../ThirdParty/include"
     "${CMAKE_CURRENT_LIST_DIR}/../Executor"
     "${CMAKE_CURRENT_LIST_DIR}"
@@ -80,6 +81,7 @@ foreach(_target
     target_link_libraries(${_target}
         ${_REFLECTION}
         ${_GRPC_GRPCPP}
+        ${Boost_LIBRARIES}
         ${_PROTOBUF_LIBPROTOBUF})
 endforeach()
 

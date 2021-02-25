@@ -62,9 +62,9 @@ function(GRPC_GENERATE_CPP
 
         add_custom_command(
             OUTPUT
-                "${DEST}/${FIL_WE}.pb.cc"
+                "${DEST}/${FIL_WE}.pb.cpp"
                 "${DEST}/${FIL_WE}.pb.h" 
-                "${DEST}/${FIL_WE}.grpc.pb.cc"
+                "${DEST}/${FIL_WE}.grpc.pb.cpp"
                 "${DEST}/${FIL_WE}.grpc.pb.h"
             COMMAND 
                 ${_PROTOBUF_PROTOC}

@@ -8,12 +8,13 @@
 #include <grpcpp/grpcpp.h>
 
 #include "MatchService.grpc.pb.h"
+#include "MatchService.pb.h"
 
 using grpc::ServerContext;
 using grpc::Status;
-using ShenNong::Greeter;
-using ShenNong::Question;
-using ShenNong::Answers;
+using Wenda::ShenNong;
+using Wenda::Question;
+using Wenda::Answers;
 
 class ShenNongImp final: public ShenNong::Service {
     Status Query121(ServerContext * context, const Question * question, Answers *answers);
