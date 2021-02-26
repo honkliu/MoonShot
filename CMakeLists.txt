@@ -11,6 +11,7 @@ project(MoonShot)
 #FetchContent_MakeAvailable(gRPC)
 
 add_subdirectory(Executor)
+add_subdirectory(IndexAccess)
 add_subdirectory(Service)
 
 include_directories(
