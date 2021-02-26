@@ -7,6 +7,14 @@ AdvancedIndexReader::AdvancedIndexReader()
 
 void AdvancedIndexReader::GoNext()
 {
+    uint64_t m_Decoder.GoNext(0);
+    
+    if (!m_Decoder.IsEnd()) {
+        int page = pageReader->GetNextPage();
+        m_Decoder.SetPage(page)
+
+    }
+
     
 }
 
