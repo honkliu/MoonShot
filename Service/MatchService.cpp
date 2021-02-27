@@ -68,6 +68,9 @@ void OnQueryReceived()
         //SmartTokenize();
         //CreateQueryPlans()
         //m_queue.Enqueue(queryJob)
+        m_Tokenizer.Execute();
+        m_QueryPlanGenerator.Execute();
+        m_Queue.
     }
 }
 
