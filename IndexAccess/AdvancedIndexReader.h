@@ -22,8 +22,7 @@ class AdvancedIndexReader : IndexReader
         virtual uint64_t GetDocumentID();
     private:
         boost::shared_ptr<struct IndexBlock> m_IndexBlock;
-        boost::shared_ptr<IndexBlockTable> m_IndexBlockTable;
-
+        boost::shared_ptr<IndexContext> m_IndexContext;
         uint32_t m_BlockSeqNumber;
         unsigned char * m_EncodedData;
 

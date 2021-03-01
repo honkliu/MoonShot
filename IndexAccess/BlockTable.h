@@ -11,7 +11,7 @@ struct IndexBlock
 class IndexBlockTable
 {
     public:
-        BlockTable()
+        IndexBlockTable()
         {
             m_FileManager.reset()
         }
