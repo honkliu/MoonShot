@@ -18,7 +18,9 @@ class IndexContext
         * differnt tokens, which would be a tree for combinations such as:
         * "Innovative" 
         */
-        IndexReader * GetReader()
+        IndexReader * GetReader(EvalTree);
+
+        IndexSearchExecutor * GetExecutor();
     private:
         boost::shared_ptr<IndexBlockTable> m_IndexBlockTable;
 };
