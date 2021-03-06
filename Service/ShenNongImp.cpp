@@ -31,7 +31,7 @@ Status ShenNongImp::Query921(ServerContext * context, ServerReader<Question>* re
     return Status::OK;
 }
 
-Status ShenNongImp::Query929(ServerContext* context, ServerReader<Question>* reader, ServerWriter<Answers>* writer)   
+Status ShenNongImp::Query929(ServerContext* context, ServerReaderWriter<Answers, Question>* readerwriter)   
 {
 
     return Status::OK;
