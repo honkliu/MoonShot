@@ -12,6 +12,7 @@ class IndexReader: boost::noncopyable
         virtual void GoUntil(uint64_t target, uint64_t limit) = 0;
         virtual bool IsEnd() = 0;
         virtual uint64_t GetDocumentID() = 0;
+        virtual void Close() = 0;
 };
 
 #endif
