@@ -1,7 +1,6 @@
 #ifndef BLOCKTABLE_H__
 #define BLOCKTABLE_H__
 
-#include <boost/scoped_ptr.hpp>
 #include "FileBlockManager.h"
 
 const int BlockSize = 0x400000;
@@ -32,7 +31,7 @@ class IndexBlockTable
         }
         
     private:
-        boost::scoped_ptr<FileBlockManager> m_FileManager;
+        std::shared_ptr<FileBlockManager> m_FileManager;
 };
 
 #endif

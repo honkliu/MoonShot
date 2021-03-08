@@ -3,8 +3,6 @@
 
 #include <stdint.h>
 
-#include <boost/shared_ptr.hpp>
-
 #include "BlockTable.h"
 #include "IndexReader.h"
 
@@ -24,8 +22,8 @@ class AdvancedIndexReader : public IndexReader
         virtual uint64_t GetDocumentID();
         virtual void Close();
     private:
-        boost::shared_ptr<struct IndexBlock> m_IndexBlock;
-        boost::shared_ptr<IndexContext> m_IndexContext;
+        std::shared_ptr<struct IndexBlock> m_IndexBlock;
+        std::shared_ptr<IndexContext> m_IndexContext;
         uint32_t m_BlockSeqNumber;
         unsigned char * m_EncodedData;
 

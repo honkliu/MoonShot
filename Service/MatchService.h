@@ -29,7 +29,7 @@ namespace Service
         std::unique_ptr<boost::asio::thread_pool> m_QueryThreads;
         std::unique_ptr<boost::asio::thread_pool> m_DataThreads;
 
-        //boost::shared_ptr<boost::priority_queue<int>> m_queue; 
+        //std::shared_ptr<boost::priority_queue<int>> m_queue; 
         bool IsCapable();
     };
 }

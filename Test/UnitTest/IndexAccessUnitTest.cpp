@@ -33,7 +33,7 @@ namespace IndexAccessTests
 
     void TestCompositeRead()
     {
-        //boost::shared_ptr<IndexSearchCompiler> is_compiler(new IndexSearchCompiler());
+        //std::shared_ptr<IndexSearchCompiler> is_compiler(new IndexSearchCompiler());
 
         auto is_compiler = new IndexSearchCompiler();
 
