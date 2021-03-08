@@ -23,6 +23,9 @@ namespace IndexAccessTests
         IndexReader * index_reader3 = index_context->GetReader("Conf2021");
 
         index_reader1->GoNext();
+        index_reader2->GoNext();
+        index_reader3->GoNext();
+
         index_reader1->Close();
         index_reader2->Close();
         index_reader3->Close();      

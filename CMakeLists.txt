@@ -13,10 +13,10 @@ project(MoonShot)
 add_subdirectory(Executor)
 add_subdirectory(IndexAccess)
 add_subdirectory(Service)
+add_subdirectory(Test/UnitTest)
 
 include_directories(
     "${CMAKE_CURRENT_LIST_DIR}/../ThirdParty/include"
     "${CMAKE_CURRENT_LIST_DIR}/../Executor"
     "${CMAKE_CURRENT_LIST_DIR}"
-
 )
