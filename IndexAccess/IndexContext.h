@@ -2,6 +2,7 @@
 #define INDDEXCONTEXT_H__
 
 #include <boost/shared_ptr.hpp>
+#include <boost/make_shared.hpp>
 
 #include "AdvancedIndexReader.h"
 #include "EvalExpression.h"
@@ -25,7 +26,8 @@ class IndexContext
         */
         IndexReader * GetReader(const char * p_token)
         {
-            boost::shared_ptr<AdvancedIndexReader> index_reader(new AdvancedIndexReader());
+            //boost::shared_ptr<AdvancedIndexReader> index_reader(new AdvancedIndexReader());
+            auto index_reader = boost::make_shared<AdvancedIndexReader>();
 
             return static_cast<IndexReader *>(index_reader.get());
         }
@@ -38,9 +40,15 @@ class IndexContext
         IndexReader * GetReader(EvalTree *);
 
         IndexSearchExecutor * GetExecutor();
+    
+        /*
+        * Load the index into memory
+        */
+        void LoadIndex();
     private:
         boost::shared_ptr<IndexBlockTable> m_IndexBlockTable;
         boost::shared_ptr<ConfigParameters> m_Parameters;
+        boost::shared_ptr<struct IndexFile> m_IndexFile;
 };
 
 #endif

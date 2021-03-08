@@ -18,9 +18,9 @@ namespace IndexAccessTests
 
     void TestSingleRead()
     {        
-        IndexReader * index_reader1 = index_context->GetReader("Innovative");
-        IndexReader * index_reader2 = index_context->GetReader("Ideas");
-        IndexReader * index_reader3 = index_context->GetReader("Conf2021");
+        auto index_reader1 = index_context->GetReader("Innovative");
+        auto index_reader2 = index_context->GetReader("Ideas");
+        auto index_reader3 = index_context->GetReader("Conf2021");
 
         index_reader1->GoNext();
         index_reader2->GoNext();
@@ -37,11 +37,11 @@ namespace IndexAccessTests
 
         auto is_compiler = new IndexSearchCompiler();
 
-        EvalTree * eval_tree = is_compiler->Compile("Innative ids in Conf 2021");
+        auto eval_tree = is_compiler->Compile("Innative ids in Conf 2021");
         
-        IndexReader * index_reader = index_context->GetReader(eval_tree);
+        auto index_reader = index_context->GetReader(eval_tree);
 
-        IndexSearchExecutor * executor = index_context->GetExecutor();
+        auto executor = index_context->GetExecutor();
         executor->Execute(eval_tree);
 
         index_reader->GoNext();

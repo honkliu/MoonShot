@@ -11,6 +11,9 @@
 inline uint64_t Decode(unsigned char *) {
     return 0;
 }
+
+class IndexContext;
+
 class AdvancedIndexReader : public IndexReader 
 {
     public:
@@ -22,7 +25,7 @@ class AdvancedIndexReader : public IndexReader
         virtual void Close();
     private:
         boost::shared_ptr<struct IndexBlock> m_IndexBlock;
-        //boost::shared_ptr<IndexContext> m_IndexContext;
+        boost::shared_ptr<IndexContext> m_IndexContext;
         uint32_t m_BlockSeqNumber;
         unsigned char * m_EncodedData;
 
