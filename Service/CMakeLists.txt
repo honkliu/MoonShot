@@ -51,7 +51,7 @@ list(APPEND PROTO_FILES
         MatchService.proto
     )
 
-    set(CMAKE_CXX_STANDARD 11)
+set(CMAKE_CXX_STANDARD 11)
 
 GRPC_GENERATE_CPP(
     PROTO_SRCS
