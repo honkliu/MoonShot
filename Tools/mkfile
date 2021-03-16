@@ -1,0 +1,30 @@
+NAME=$1
+HEADER_FILE=$1.h
+CPP_FILE=$1.cpp
+echo "$CPP_FILE $HEADER_FILE" 
+
+DATE=`date`
+cat << EOF > $HEADER_FILE
+/*
+* All files are used for internal only
+*
+* Author: honkliu@hotmail.com
+*/
+#ifndef ${NAME^^}_H__
+#define ${NAME^^}_H__
+
+#endif
+
+EOF
+
+cat << EOT > $CPP_FILE
+/*
+* All files are used for internal only
+*
+* Author: honkliu@hotmail.com
+*/
+
+#include <$HEADER_FILE>
+
+EOT
+

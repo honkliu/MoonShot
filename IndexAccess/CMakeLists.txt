@@ -4,6 +4,8 @@ aux_source_directory(. SOURCEFILES)
 
 add_library(IndexAccess ${SOURCEFILES})
 
+set(CMAKE_CXX_STANDARD 11)
+
 include_directories(
     PUBLIC
     "${CMAKE_CURRENT_LIST_DIR}/../thirdParty/boost_1_75_0"

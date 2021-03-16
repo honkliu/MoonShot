@@ -1,6 +1,7 @@
 #ifndef BLOCKTABLE_H__
 #define BLOCKTABLE_H__
 
+#include <memory>
 #include "FileBlockManager.h"
 
 const int BlockSize = 0x400000;
