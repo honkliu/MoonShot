@@ -15,7 +15,7 @@ class IndexContext;
 class AdvancedIndexReader : public IndexReader 
 {
     public:
-        AdvancedIndexReader();
+        AdvancedIndexReader() = default;
         virtual void GoNext();
         virtual void GoUntil(uint64_t target = 0, uint64_t limit = 0);
         virtual bool IsEnd();
