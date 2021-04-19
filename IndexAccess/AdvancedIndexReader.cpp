@@ -1,10 +1,5 @@
 #include "AdvancedIndexReader.h"
 
-AdvancedIndexReader::AdvancedIndexReader()
-{
-
-}
-
 /* 
 * Here need to define the relationship
 *
