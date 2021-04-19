@@ -6,15 +6,17 @@
 
 #include <stdlib.h>
 #include <stdint.h>
-
 #include <sys/mman.h>
 #include <sys/time.h>
 #include <sys/resource.h>
 
+#include <map>
+
 #include "MemOperation.h"
 
+static std::map<void *, uint64_t> gPointerMap;  
 
-void * MemOperation::PinedMemAlloc(uint64_t size)
+void * PinedMemAlloc(uint64_t size)
 {
     /*
     * 0: Set resources
@@ -49,16 +51,18 @@ void * MemOperation::PinedMemAlloc(uint64_t size)
     /*
     * 2. Commit
     * 
-    * VirtualAlloc(memory, size, MEM_COMMIT, PAGE_READWRITE);
+    * ::VirtualAlloc(memory, size, MEM_COMMIT, PAGE_READWRITE);
     */
     auto ret = mprotect(memAddress, size, PROT_READ | PROT_WRITE);
 
     /*
     * 3. Lock
     * 
-    * in Windows: VirtualLock(memAddress, size)
+    * in Windows: ::VirtualLock(memAddress, size)
     */
     mlock(memAddress, size);
+
+    gPointerMap.insert(std::make_pair(memAddress, size));
 
     return memAddress; 
 }
@@ -66,4 +70,14 @@ void * MemOperation::PinedMemAlloc(uint64_t size)
 void PinedMemFree(void *ptr)
 {
 
+    auto pointer_pair = gPointerMap.find(ptr);
+
+    /*
+    * In windows, we should use
+    * 
+    * ::VirtualFree(ptr, pointer_pair->second, MEM_RELEASE); 
+    */
+    munmap(ptr, pointer_pair->second);
+
+    gPointerMap.erase(pointer_pair);
 }

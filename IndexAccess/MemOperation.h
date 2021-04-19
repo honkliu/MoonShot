@@ -8,11 +8,8 @@
 
 #include <stdio.h>
 
-class MemOperation
-{
-    static void * PinedMemAlloc(uint64_t size);
-    static void PinedMemFree(void *ptr);
-};
+void * PinedMemAlloc(uint64_t size);
+static void PinedMemFree(void *ptr);
 
 #endif
 
