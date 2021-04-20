@@ -1,0 +1,26 @@
+
+/*
+* All files are used for internal only
+*
+* Author: honkliu@hotmail.com
+*/
+#ifndef ELEMENTFILTER_H__
+#define ELEMENTFILTER_H__
+
+
+/*
+*	Here you could use different filters such as BloomFilter, CookFilter, XorFilter 
+*	and so on. From the description, xor filter outperform others. 
+*/
+class ElementFilter {
+	public:
+		ElementFilter() = default;
+		void AddElement(unsigned char *elt);
+		bool Contains(unsigned char *elt);
+	private:
+		int m_size; 
+		unsigned char * m_FilterSpace;	
+};
+ 
+#endif
+
