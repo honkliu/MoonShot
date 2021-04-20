@@ -4,7 +4,20 @@ CPP_FILE=$1.cpp
 echo "$CPP_FILE $HEADER_FILE" 
 
 DATE=`date`
+
+FUNCS=""
+FUNCF=""
+while read line
+do
+    linep=`echo -ne "${line/;/}"`
+    linef=`echo -ne "${linep/ / $1::}"`
+	FUNCS=$FUNCS$linep";+++"
+	FUNCF=$FUNCF''$linef'{}'
+	echo "${line}"
+done
+
 cat << EOF > $HEADER_FILE
+
 /*
 * All files are used for internal only
 *
@@ -13,6 +26,12 @@ cat << EOF > $HEADER_FILE
 #ifndef ${NAME^^}_H__
 #define ${NAME^^}_H__
 
+class $1 {
+	public:
+		$1() = default;
+		$FUNCS
+};
+ 
 #endif
 
 EOF
@@ -24,7 +43,15 @@ cat << EOT > $CPP_FILE
 * Author: honkliu@hotmail.com
 */
 
-#include <$HEADER_FILE>
+#include "$HEADER_FILE"
+$FUNCF
 
 EOT
 
+sed -e "s/+++/\n\t\t/g" $HEADER_FILE > $HEADER_FILE.tmp
+sed -e "s/{/\n{/g" $CPP_FILE |sed  "s/}/\n}\n/g" > $CPP_FILE.tmp
+
+rm $HEADER_FILE
+rm $CPP_FILE
+mv $HEADER_FILE.tmp $HEADER_FILE
+mv $CPP_FILE.tmp $CPP_FILE
