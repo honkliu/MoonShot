@@ -7,6 +7,10 @@
 * readv() -- Linux
 * WriteFileScatter() -- Windows
 * writev() -- Linux
+* 
+* DirectStorage on windows
+* ReadFilesWithIoRing()
+* io_uring() for IO operation.
 */
 class FileBlockManager
 {
