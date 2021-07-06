@@ -4,6 +4,7 @@
 #include <string>
 
 #include "EvalExpression.h"
+#include "Embeddings.h"
 
 class IndexSearchCompiler
 {
@@ -16,6 +17,12 @@ class IndexSearchCompiler
         EvalTree * Compile(const std::string& query_string)
         {
             return NULL; 
+        }
+
+        template<typename T>
+        Embeddings<T> CompileToVector(const char * query_string)
+        {
+            return NULL;
         }
 };
 #endif

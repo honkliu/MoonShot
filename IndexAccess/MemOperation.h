@@ -9,7 +9,7 @@
 #include <stdio.h>
 
 void * PinedMemAlloc(uint64_t size);
-static void PinedMemFree(void *ptr);
+void PinedMemFree(void *ptr);
 
 #endif
 

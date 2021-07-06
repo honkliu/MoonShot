@@ -37,7 +37,7 @@ namespace IndexAccessTests
 
         auto is_compiler = new IndexSearchCompiler();
 
-        auto eval_tree = is_compiler->Compile("Innative ids in Conf 2021");
+        auto eval_tree = is_compiler->Compile("Innovative ids in Conf 2021");
         
         auto index_reader = index_context->GetReader(eval_tree);
 
@@ -47,6 +47,23 @@ namespace IndexAccessTests
         index_reader->GoNext();
 
         index_reader->Close();
+    }
+
+    void TestVectorRead()
+    {
+        auto is_compiler = new IndexSearchCompiler();
+
+        /*
+        * The call here must specify the return type
+        */
+        auto embedding = is_compiler->CompileToVector<float>("Innovitve ideas in Conf 2021");
+
+        /*
+        * or use index_context->GetReader<float>(embedding);
+        */
+        auto index_reader = index_context->GetReader(embedding)
+
+        index_reader->GoNext();
     }
 }
 

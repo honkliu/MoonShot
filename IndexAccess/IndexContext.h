@@ -5,6 +5,7 @@
 #include "EvalExpression.h"
 #include "IndexSearchExecutor.h"
 #include "ConfigParameters.h"
+#include "Embeddings.h"
 
 class IndexContext
 {
@@ -35,6 +36,17 @@ class IndexContext
         * "Innovative" 
         */
         IndexReader * GetReader(EvalTree *);
+
+        /*
+        * Make a member so the call would be
+        * index_context->GetReader<float>() or we could ask compiler to 
+        * index_context->GetReader(Embeeding<float> embeddings)
+        */
+        template<typename T>
+        IndexReader * GetReader(Embeddings<T> embedding)
+        {
+            return nullptr;
+        }
 
         IndexSearchExecutor * GetExecutor();
     

@@ -9,12 +9,13 @@
 
 
 /*
-*	Here you could use different filters such as BloomFilter, CookFilter, XorFilter 
+*	Here you could use different filters such as BloomFilter, CuckookFilter, XorFilter 
 *	and so on. From the description, xor filter outperform others. 
 */
 class ElementFilter {
 	public:
-		ElementFilter() = default;
+		ElementFilter(int size = 24, void * memory = NULL);
+		~ElementFilter();
 		void AddElement(unsigned char *elt);
 		bool Contains(unsigned char *elt);
 	private:

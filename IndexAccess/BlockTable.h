@@ -4,11 +4,16 @@
 #include <memory>
 #include "FileBlockManager.h"
 
-const int BlockSize = 0x400000;
-
+/*
+* 4K size, which is the size of 
+* a page.
+*/
+const int BlockSize = 0x1000;
+const int NUMBLOCKS = 50; 
 struct IndexBlock {
     uint64_t            IB_Header;
-    unsigned char       IB_data[BlockSize];
+    uint32_t            IB_Skip[NUMBLOCKS];
+    uint64_t            IB_Data[BlockSize-26];
 };
 
 struct IndexFile {
