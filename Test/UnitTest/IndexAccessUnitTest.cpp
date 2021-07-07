@@ -6,6 +6,7 @@
 #include "IndexSearchCompiler.h"
 #include "ConfigParameters.h"
 
+#include <boost::asio
 namespace IndexAccessTests
 {
     IndexContext* index_context = nullptr;
@@ -42,11 +43,18 @@ namespace IndexAccessTests
         auto index_reader = index_context->GetReader(eval_tree);
 
         auto executor = index_context->GetExecutor();
-        executor->Execute(eval_tree);
+        
+        executor->Execute(index_reader);
 
         index_reader->GoNext();
 
         index_reader->Close();
+
+        boost:asio:thread_pool thread_pool(4);
+        //boost::asio::post(thread_pool, boost::bind(&IndexSearchExecutor::Execute,  ))
+        boost::asio::post(thread_pool, [] {
+            executor->Execute(index_reader);
+        });
     }
 
     void TestVectorRead()
@@ -61,10 +69,11 @@ namespace IndexAccessTests
         /*
         * or use index_context->GetReader<float>(embedding);
         */
-        auto index_reader = index_context->GetReader(embedding)
+        auto index_reader = index_context->GetReader(embedding);
 
         index_reader->GoNext();
     }
+
 }
 
  

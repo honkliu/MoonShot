@@ -13,6 +13,8 @@ include_directories(
     "${CMAKE_CURRENT_LIST_DIR}/../Executor"
     "${CMAKE_CURRENT_LIST_DIR}/../Compiler"
     "${CMAKE_CURRENT_LIST_DIR}/../Tokenizer"
+    "${CMAKE_CURRENT_LIST_DIR}/../Utils"
+    "${CMAKE_CURRENT_LIST_DIR}/../Embeddings"
     "${CMAKE_CURRENT_LIST_DIR}/../Configuration"
     "${CMAKE_CURRENT_LIST_DIR}"
     "${CMAKE_CURRENT_BINARY_DIR}"

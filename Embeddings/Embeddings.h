@@ -7,7 +7,10 @@
 #ifndef EMBEDDINGS_H__
 #define EMBEDDINGS_H__
 
+#include <stdio.h>
+
 template <typename T>
+
 class Embeddings {
 	int m_bytes;
 	T* m_data;
@@ -17,9 +20,9 @@ class Embeddings {
 		Embeddings(int size)
 		{
 			m_bytes = sizeof(T) * size;
-			m_data = new T[size]
+			m_data = new T[size]();
 
-			memset(m_data, 0, m_bytes)
+			memset(m_data, 0, m_bytes);
 		}
 		~Embeddings() 
 		{

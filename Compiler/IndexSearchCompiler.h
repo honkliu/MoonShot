@@ -20,7 +20,7 @@ class IndexSearchCompiler
         }
 
         template<typename T>
-        Embeddings<T> CompileToVector(const char * query_string)
+        Embeddings<T> * CompileToVector(const char * query_string)
         {
             return NULL;
         }

@@ -17,13 +17,13 @@ ElementFilter::ElementFilter(int size, void * memory)
     if (memory == NULL) {
         
         auto pages = size/Constants::PAGE_SIZE;
-        auto extr = (size % Constants::PAGE_SIZE) > 0? 1 : 0;
+        auto extra = (size % Constants::PAGE_SIZE) > 0? 1 : 0;
 
         pages += extra;
 
         m_FilterSpace = (unsigned char *)PinedMemAlloc(pages * Constants::PAGE_SIZE);
     } else {
-        m_FilterSpace = memory;
+        m_FilterSpace = (unsigned char *)memory;
     }
 }
 
