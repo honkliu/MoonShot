@@ -6,7 +6,7 @@
 #include "IndexSearchCompiler.h"
 #include "ConfigParameters.h"
 
-#include <boost::asio
+#include <future>
 namespace IndexAccessTests
 {
     IndexContext* index_context = nullptr;
@@ -45,18 +45,58 @@ namespace IndexAccessTests
         auto executor = index_context->GetExecutor();
         
         executor->Execute(index_reader);
-
+        //auto result = std::async(std::launch::async, [executor] { return executor->Execute(index_reader)});
+        //result.wait();
         index_reader->GoNext();
 
         index_reader->Close();
-
+/*
         boost:asio:thread_pool thread_pool(4);
         //boost::asio::post(thread_pool, boost::bind(&IndexSearchExecutor::Execute,  ))
         boost::asio::post(thread_pool, [] {
             executor->Execute(index_reader);
         });
-    }
 
+
+        auto a1 = std::async(static_cast<void (*)(Reader)>(&IndexSearchExecutor::Executor), executor, index_reader);
+        a1.wait();
+        a1.get();
+
+         or
+         auto function = static_cast<void(*)(Reader)>(Exextue);
+         audo call = std::async(funciton, reader, ...)
+         call.wait
+
+         or
+         auto a = std::async([](Reader reader) {
+                                    exector->execute(reader);
+                                    },
+                                reader
+         )
+
+         std::async(std::launch::async, [executor] { return executor->Execute(index_reader)})
+
+         or use:
+
+class A
+{
+public:
+    int foo(int a, int b);
+    int foo(int a, double b);
+};
+         std::function<int(int,double)> func = std::bind((int(A::*)(int,double))&A::foo,&a,std::placeholders::_1,std::placeholders::_2);
+auto f = std::async(std::launch::async, func, 2, 3.5);
+    
+*/
+
+    std::bind(
+            (
+            int(A::*)(int,double)
+            )&A::foo,
+            &a,
+            std::placeholders::_1,
+            std::placeholders::_2);
+    }
     void TestVectorRead()
     {
         auto is_compiler = new IndexSearchCompiler();
