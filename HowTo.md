@@ -1,11 +1,11 @@
 # Index Format
-## How index is stored 
-## index in disk
-## index in memory
+### How index is stored 
+### index in disk
+### index in memory
 
 # How to acces the index
-## Prepare the cache
-## Read the index into memory
+### Prepare the cache
+### Read the index into memory
  
 
 # Received a query
