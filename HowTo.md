@@ -1,7 +1,7 @@
-1. Index Format
-2. How index is stored. 
-2.1 index in disk
-2.2 index in memory
+# Index Format
+* How index is stored. 
+* index in disk
+*index in memory
 
 3. How to acces the index
 3.1 Prepare the cache
