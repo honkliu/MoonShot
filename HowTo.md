@@ -1,12 +1,31 @@
 # Index Format
+
+There are considerations whether the posting should be stored as a key/value pair using levelDB, Redis, RocksDB and so on.but on the other hand, from current compression requirements, such as Roaring, bitmap, VBC and so on, the postings is still should be organized in a different way for search engine So the index is
+
+* Each [IndexBlock] has 4096 bytes, which is the same as a physical page. 
+* Each [IndexFile] is composed of multiple [IndexBlock], it is stored in physical page because it is more efficient. 
+* Each [IndexPosting] is a list of documents. A term may have several consecutive IndexPosting across pages.  
+
+IndexBlock
 ### How index is stored 
 ### index in disk
 ### index in memory
 
 # How to acces the index
 ### Prepare the cache
+
 ### Read the index into memory
- 
+
+    [IndexBlockTable] is organized in the way, it means that a term could cross Page. A read to a term (posting) generally should load multiple pages at the same time. If we limit the posting length, then the number of pages read a time should be limit to a fixed length, might be 4 at most. 
+    
+    {Term1, pageStart, pageEnd}
+    {Term1, pageStart, pageEnd}
+    {Term2, pageStart, pageEnd}
+    ....
+
+    
+    When a term is looked up in the {Term, pageStart, pageEnd}, Call [IndexBlockTable]._GetIndexBlock(block_seq, number)_ to load the pages into memory if they are not there.
+
 
 # Received a query
 ### 1. Tokenize [SmartTokenizer] or Vectorize 
@@ -32,6 +51,9 @@ An [AdvancedIndexReader] is composed within the [IndexContext], it is passed wit
 In order to assign the postings to the reader, it need to. 
 * Check [ElementFilter] to conclude whether the posting exists in the index. 
 * If the index exist, Look up the [TermToTable] to find the corresponding [page].
+
+
+
 * Load the [Page] into [BlockTable] for further use. 
 * Return a reference to [Page], so [AdvancedIndexReader] could iterate.   
 
@@ -46,6 +68,6 @@ In order to assign the postings to the reader, it need to.
 [AdvancedIndexReader]: IndexAccess/AdvancedIndexReader.h
 [ElementFilter]: IndexAccess/ElementFilter.h
 [IndexContext]: IndexAccess/IndexContext.h
-
+[IndexBlockTable]:IndexAccess/BlockTable.h
 
 
