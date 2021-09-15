@@ -248,6 +248,7 @@ void MurmurHash3_x86_128 ( const void * key, const int len,
   ((uint32_t*)out)[3] = h4;
 }
 
+
 //-----------------------------------------------------------------------------
 
 void MurmurHash3_x64_128 ( const void * key, const int len,

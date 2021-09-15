@@ -10,6 +10,8 @@
 void 
 AdvancedIndexReader::GoNext()
 {
+
+    
     //TODO: uint64_t m_Decoder.GoNext(0);
     
     if (m_EncodedData!= 0) {
@@ -31,6 +33,12 @@ bool
 AdvancedIndexReader::IsEnd()
 {
     return true;
+}
+
+void 
+AdvancedIndexReader::Open(char * word)
+{
+    if (m_IndexBlock = IndexBlockTable.get(word))
 }
 
 void 

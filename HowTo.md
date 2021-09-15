@@ -14,17 +14,35 @@ IndexBlock
 # How to acces the index
 ### Prepare the cache
 
+[IndexBlockTable] is initialized with a number of buffer. it is in the following way. 
+
+A term is hashed to an integer. And there is a list of postings in the table. Look into the IndexBlockTable to access the postings. it means that an iteration is needed to find the table in the memory. 
+
+
 ### Read the index into memory
 
-    [IndexBlockTable] is organized in the way, it means that a term could cross Page. A read to a term (posting) generally should load multiple pages at the same time. If we limit the posting length, then the number of pages read a time should be limit to a fixed length, might be 4 at most. 
+[IndexBlockTable] is organized in the way, it means that a term could cross Page. A read to a term (posting) generally should load multiple pages at the same time. If we limit the posting length, then the number of pages read a time should be limit to a fixed length, might be 4 at most. 
     
     {Term1, pageStart, pageEnd}
     {Term1, pageStart, pageEnd}
     {Term2, pageStart, pageEnd}
     ....
 
-    
-    When a term is looked up in the {Term, pageStart, pageEnd}, Call [IndexBlockTable]._GetIndexBlock(block_seq, number)_ to load the pages into memory if they are not there.
+When a term is looked up in the {Term, pageStart, pageEnd}, Call [IndexBlockTable]._GetIndexBlock(block_seq, number)_ to load the pages into memory if they are not there.
+
+* block_seq is the sequence of the page in the index (memory or ssd), it is the integer, such as: 345, which means that its page number is 345. 
+ 
+### Look up in the index
+The order: 
+    Term
+    -->[ElementFilter] (in Memory, Judge whether the index in existing in the index) 
+    -->[TermToBlock](in Memory, find out the physical number of the block in the index)
+    -->[IndexBlockTable] (In memory)
+        -->If [IndexBlockTable] Contains the [IndexBlock], return the Seriel Number
+        -->If [IndexBlockTable] does not contain the [IndexBlock], Do IO, Read the [IndexBlock] from [IndexFile]->[IF_Data]
+    -->[BlockHeader] Decoding from the [IndexBlock]
+    -->[SkipList] decoding from the [IndexBlock]
+    -->Get the [Posting] for further use. 
 
 
 # Received a query
@@ -50,11 +68,11 @@ An [AdvancedIndexReader] is composed within the [IndexContext], it is passed wit
 ### 2. Assign the postings to  [AdvancedIndexReader]
 In order to assign the postings to the reader, it need to. 
 * Check [ElementFilter] to conclude whether the posting exists in the index. 
-* If the index exist, Look up the [TermToTable] to find the corresponding [page].
+* If the index exist, Look up the [TermToBlock] to find the corresponding [IndexBlock] Num.
 
 
 
-* Load the [Page] into [BlockTable] for further use. 
+* Load the [Page] into [IndexBlockTable] for further use. 
 * Return a reference to [Page], so [AdvancedIndexReader] could iterate.   
 
 
