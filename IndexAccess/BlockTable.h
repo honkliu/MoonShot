@@ -68,22 +68,59 @@ class RWSpinLock {
 
 };
 
-struct CacheSlot {
+class ReaderSpinLock {
 
+    public:
+        ReaderSpinLock(RWSpinLock &p_lock): m_lock(p_lock)
+        {
+            m_lock.ReadLock();
+        }
+
+        ~ReaderSpinLock()
+        {
+            m_lock.ReadUnlock();
+        }
+
+    private:
+        RWSpinLock& m_lock;
+};
+
+class WriterSpinLock {
+
+    public:
+        WriterSpinLock(RWSpinLock &p_lock): m_lock(p_lock)
+        {
+            m_lock.WriteLock();
+        }
+
+        ~WriterSpinLock()
+        {
+            m_lock.WriteUnlock();
+        }
+
+    private:
+        RWSpinLock& m_lock;
+};
+
+struct CacheSlot {
+    RWSpinLock CS_lock;
+    uint32_t CS_BlockNum;
 };
 
 class BlockCache {
     public:
         BlockCache(uint32_t slot_count):
-        m_CacheSlots(new CacheSlot[slot_count])
+            m_CacheSlots(new CacheSlot[slot_count])
         {
         }
         ~BlockCache();
         
     
-        bool DataLoaded(int block_seq)
+        bool DataLoaded(int block_seq, void * address)
         {
             m_CacheSlots[block_seq % Table]
+
+            address = 
             return false;
         }
         
@@ -91,6 +128,7 @@ class BlockCache {
         std::unique_ptr<CacheSlot[]> m_CacheSlots;
 };
 
+class 
 class IndexBlockTable
 {
     public:
