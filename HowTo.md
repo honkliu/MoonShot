@@ -75,7 +75,7 @@ In order to assign the postings to the reader, it need to.
 * Load the [Page] into [IndexBlockTable] for further use. 
 * Return a reference to [Page], so [AdvancedIndexReader] could iterate.   
 
-
+Adding more
 ### 3. 
 
 [SmartTokenizer]: Tokenizer/SmartTokenizer.cpp
