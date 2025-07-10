@@ -63,15 +63,17 @@ The order:
         auto index_writer2 = index_context->GetWriter("U");
         auto index_writer3 = index_context->GetWriter("B", tokenizer);
 
-        index_writer1->Write(tokenizer->Tokenize("Innovative ids in Conf 2021"));
-        index_writer2->Write(tokenizer->Tokenize("Conf 2021"));
-        index_writer3->Write("Innovative ids in Conf 2021");
+        auto documentid = index_context->CreateDocumentID("Innovative ids is Conf 2021");
+
+        index_writer1->Write(documentid, tokenizer->Tokenize("Innovative ids in Conf 2021"));
+        index_writer2->Write(documentid, tokenizer->Tokenize("Conf 2021"));
+        index_writer3->Write(documentid, "Innovative ids in Conf 2021");
 
         auto index_ebwriter1 = index_context->GetEBWriter("HNSW");
         auto index_ebwriter2 = index_content->GetEBWriter("IVF");
 
-        index_ebwriter1->Write(tokenizer->Tokenize("Innovative ids in Conf 2021"));
-        index_ebwriter2->Write(tokenizer->Tokenize("Innovative ids in Conf 2021"));
+        index_ebwriter1->Write(documentid, tokenizer->Tokenize("Innovative ids in Conf 2021"));
+        index_ebwriter2->Write(documentid, tokenizer->Tokenize("Innovative ids in Conf 2021"));
 
         auto is_compiler = new IndexSearchCompiler("AUTBV");
 
