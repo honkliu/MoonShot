@@ -51,8 +51,43 @@ The order:
 * Into an [EvalTree], [IndexSearchCompiler].Compile(string)
 * Into an [Embeddings], [IndexSearchCompiler].CompileToVector(string)
 ### 3. Use [IndexContext] to get [AdvancedIndexReader] with [EvalTree] or [Embeddings]
-```c 
-    auto reader = indexContext.GetReader(EvalTree * eval_tree);
+```c
+      
+    void TrySearch()
+    {
+        auto context = new IndexContext("Tenant ABC");
+
+        auto tokenizer = new Tokenizer("Unigram, Bigram");
+        
+        auto index_writer1 = index_context->GetWriter("A");
+        auto index_writer2 = index_context->GetWriter("U");
+        auto index_writer3 = index_context->GetWriter("B", tokenizer);
+
+        index_writer1->Write(tokenizer->Tokenize("Innovative ids in Conf 2021"));
+        index_writer2->Write(tokenizer->Tokenize("Conf 2021"));
+        index_writer3->Write("Innovative ids in Conf 2021");
+
+        auto index_ebwriter1 = index_context->GetEBWriter("HNSW");
+        auto index_ebwriter2 = index_content->GetEBWriter("IVF");
+
+        index_ebwriter1->Write(tokenizer->Tokenize("Innovative ids in Conf 2021"));
+        index_ebwriter2->Write(tokenizer->Tokenize("Innovative ids in Conf 2021"));
+
+        auto is_compiler = new IndexSearchCompiler("AUTBV");
+
+        auto eval_tree = is_compiler->Compile("Innovative ids in Conf 2021", "");
+        
+        auto index_reader = index_context->GetReader(eval_tree);
+
+        while (true) {
+            index_reader->GoNext();
+            auto documentId = index_reader->GetDocumentID();
+
+            if (documentId == 0)
+                break;
+        }
+
+    }
 ```
 ### 4. Iterate document candidate with _GoNext()_ of [AdvancedIndexReader]  
 ---
