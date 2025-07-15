@@ -109,3 +109,10 @@ int main() {
 #cd thirdparty
 # tar -xzf boost_1_75_0.tar.gz
  
+# on windows: 
+
+$ Install G++ (MSYS2, Cmake)
+
+$ cmake ..\.. -G "MinGW Makefiles" 
+
+$ ingw32-make

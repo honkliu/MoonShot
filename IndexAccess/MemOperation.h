@@ -7,6 +7,7 @@
 #define MEMOPERATION_H__
 
 #include <stdio.h>
+#include <stdint.h>
 
 void * PinedMemAlloc(uint64_t size);
 void PinedMemFree(void *ptr);
