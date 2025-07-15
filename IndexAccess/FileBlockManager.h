@@ -1,65 +1,60 @@
 #ifndef FILEBLOCKMANAGER_H__
 #define FILEBLOCKMANAGER_H__
 
+#include "../Utils/FileAccess.h"
+#include <cstdint>
+#include <memory>
+
 /*
-* Use CreateFileA()
-* ReadFileScatter() -- Windows 
-* readv() -- Linux
-* WriteFileScatter() -- Windows
-* writev() -- Linux
+* FileBlockManager - Manages block-based file I/O operations
+* Uses the FileAccess class for actual file operations
 * 
-* DirectStorage on windows
-* ReadFilesWithIoRing()
-* io_uring() for IO operation.
-*
-signed main(){
-    int listenfd = socket(AF_INET,SOCK_STREAM,0);
-    struct sockaddr_in server,client;
-    socklen_t addrlen;
-    server.sin_family = AF_INET;
-    server.sin_port = htons(port);
-    server.sin_addr.s_addr = htonl(INADDR_ANY);
-    bind(listenfd,(struct sockaddr*)&server,sizeof(server));
-    listen(listenfd,6);
-
-    struct io_uring ring;
-	struct io_uring_cqe *cqe;
-    struct io_uring_sqe *sqe;
-    int ret = io_uring_queue_init(QD,&ring,0);
-    assert(ret>=0);
-
-    sqe = io_uring_get_sqe(&ring);
-    io_uring_prep_poll_add(sqe,listenfd,POLLIN);
-    sqe->user_data = LISTENFD;
-    io_uring_submit(&ring);
-
-    char buffer[4100];
-    buffer[0] = '\0';
-    while(1){
-        io_uring_wait_cqe(&ring,&cqe);
-        if(cqe->user_data == LISTENFD){
-            int connectfd = accept(listenfd,(struct sockaddr*)&client,&addrlen);
-            sqe = io_uring_get_sqe(&ring);
-            io_uring_prep_read(sqe,connectfd,buffer,1000,0);
-            sqe->user_data = SOCKETIN;
-        }
-        else if(cqe->user_data == SOCKETIN){
-            printf("%s\n",buffer);
-        }
-        io_uring_cqe_seen(&ring, cqe);
-        io_uring_submit(&ring);
-    }
-    
-    return 0;
-}
-————————————————
-版权声明：本文为CSDN博主「FawkesLi」的原创文章，遵循CC 4.0 BY-SA版权协议，转载请附上原文出处链接及本声明。
-原文链接：https://blog.csdn.net/Fawkess/article/details/114418795
+* This class provides an interface for reading/writing fixed-size blocks
+* from/to index files, supporting efficient random access patterns
+* required for search index operations.
 */
+
 class FileBlockManager
 {
+public:
+    FileBlockManager() : m_BlockSize(4096) {}
+    explicit FileBlockManager(size_t block_size) : m_BlockSize(block_size) {}
+    ~FileBlockManager() = default;
     
+    // Initialize with a file
+    bool open(const char* filename) {
+        m_FileAccess = std::make_unique<FileAccess>(filename);
+        return m_FileAccess && m_FileAccess->Init();
+    }
+    
+    void close() {
+        m_FileAccess.reset();
+    }
+    
+    // Read a block by sequence number
+    bool read(uint32_t block_seq, void* buffer) {
+        if (!m_FileAccess) {
+            return false;
+        }
+        return m_FileAccess->ReadBlock(block_seq, buffer, m_BlockSize);
+    }
+    
+    // Write a block by sequence number  
+    bool write(uint32_t block_seq, const void* buffer) {
+        // TODO: Implement write functionality in FileAccess
+        // For now, return false to indicate not implemented
+        return false;
+    }
+    
+    // Get block size
+    size_t getBlockSize() const { return m_BlockSize; }
+    
+    // Set block size (should be done before opening file)
+    void setBlockSize(size_t block_size) { m_BlockSize = block_size; }
 
+private:
+    std::unique_ptr<FileAccess> m_FileAccess;
+    size_t m_BlockSize;
 };
 
 #endif
