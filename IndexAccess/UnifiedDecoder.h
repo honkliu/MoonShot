@@ -4,10 +4,8 @@
 #include <stdint.h>
 #include <cstdint>
 
-#include "BlockTable.h"
-
-constexpr uint64_t MAX_DOCID = UINT64_MAX;
-constexpr uint32_t MAX_BLOCK_SIZE = 4096;
+// Forward declaration to avoid circular dependency
+struct IndexBlock;
 
 class UnifiedDecoder {
 public:

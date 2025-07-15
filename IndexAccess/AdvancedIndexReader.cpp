@@ -10,48 +10,58 @@
 void 
 AdvancedIndexReader::GoNext()
 {
-
     //TODO: uint64_t m_Decoder.GoNext(0);
 
-    if (m_EncodedData!= 0) {
-        int IndexBlock = m_IndexBlockTable->GetIndexBlock();
+    if (m_EncodedData != nullptr) {
+        auto& table = GetIndexBlockTable();
+        m_IndexBlock = std::shared_ptr<IndexBlock>(table.GetIndexBlock(m_Word), [](IndexBlock*){});
 
-        m_EncodedData = (u_int8_t *)m_IndexBlock;
+        m_EncodedData = (uint8_t *)m_IndexBlock.get();
     }
 
     m_Decoder.GoNext();
-
 }
 void 
 AdvancedIndexReader::GoUntil(uint64_t target, uint64_t limit)
 {
-
+    m_Decoder.GoUntil(target);
 }
 
 bool 
 AdvancedIndexReader::IsEnd()
 {
-    return true;
+    return m_Decoder.IsEnd();
 }
 
 void 
 AdvancedIndexReader::Open(char * word)
 {
+    m_Word = word;
     auto& table = GetIndexBlockTable();
-    m_IndexBlock = table.get(word);
+    IndexBlock* block = table.GetIndexBlock(word);
+    m_IndexBlock = std::shared_ptr<IndexBlock>(block, [](IndexBlock*){});
 
-    m_Decoder.Open(m_IndexBlock[0], 0)
+    if (m_IndexBlock) {
+        m_Decoder.Open(m_IndexBlock.get(), 0);
+    }
     GoNext();
+}
+
+void 
+AdvancedIndexReader::Open()
+{
+    // Default implementation - could be used for initialization without a specific word
 }
 
 void 
 AdvancedIndexReader::Close()
 {
-
+    m_IndexBlock.reset();
+    m_EncodedData = nullptr;
+    m_Word = nullptr;
 }
 
 uint64_t AdvancedIndexReader::GetDocumentID()
 {
     return m_Decoder.GetDocumentID();
-    return 0;
 }

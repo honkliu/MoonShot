@@ -24,6 +24,7 @@ class AdvancedIndexReader : public IndexReader
         virtual uint64_t GetDocumentID();
         virtual void Close();
         virtual void Open();
+        virtual void Open(char* word);  // Add overload for word parameter
     private:
         std::shared_ptr<struct IndexBlock> m_IndexBlock;
         std::shared_ptr<IndexContext> m_IndexContext;
