@@ -7,7 +7,18 @@
 #ifndef FILEACCESS_H__
 #define FILEACCESS_H__
 
+#ifdef _WIN32
 #include <windows.h>
+#else
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <errno.h>
+#include <cstring>
+#endif
+
+#include <stdio.h>
+#include <stdint.h>
 
 class FileAccess {
 	public:
@@ -22,7 +33,11 @@ class FileAccess {
 		bool SetPosition(uint64_t position);
 		
 	private:
+#ifdef _WIN32
 		HANDLE m_FileHandle = INVALID_HANDLE_VALUE;
+#else
+		int m_FileHandle = -1;
+#endif
 		char * m_FileName = nullptr;	
 };
  
