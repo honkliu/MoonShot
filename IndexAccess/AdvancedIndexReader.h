@@ -5,6 +5,7 @@
 
 #include "BlockTable.h"
 #include "IndexReader.h"
+#include "UnifiedDecoder.h"
 
 inline uint64_t Decode(unsigned char *) {
     return 0;
@@ -29,6 +30,7 @@ class AdvancedIndexReader : public IndexReader
         char * m_Word; 
         uint32_t m_BlockSeqNumber;
         unsigned char * m_EncodedData;
+        UnifiedDecoder m_Decoder;
 
 };
 
