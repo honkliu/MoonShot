@@ -10,9 +10,10 @@ macro(FETCH_GRPC)
     FetchContent_Declare(
         gRPC
         GIT_REPOSITORY https://github.com/grpc/grpc
-        GIT_TAG        v1.35.0
+        GIT_TAG        v1.50.0
     )
     set(FETCHCONTENT_QUIET OFF)
+    set(FETCHCONTENT_UPDATES_DISCONNECTED OFF)
     FetchContent_MakeAvailable(gRPC)
 
     # Since FetchContent uses add_subdirectory under the hood, we can use

@@ -53,7 +53,7 @@ namespace IndexAccessTests
         index_writer3->Write("Innovative ids in Conf 2021");
 
         auto index_ebwriter1 = index_context->GetEBWriter("HNSW");
-        auto index_ebwriter2 = index_content->GetEBWriter("IVF");
+        auto index_ebwriter2 = index_context->GetEBWriter("IVF");
 
         index_ebwriter1->Write(tokenizer->Tokenize("Innovative ids in Conf 2021"));
         index_ebwriter2->Write(tokenizer->Tokenize("Innovative ids in Conf 2021"));

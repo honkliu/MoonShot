@@ -11,5 +11,5 @@ class SmartTokenizer : Tokenizer
 {
     public:
         void Tokenize();
-}
+};
 #endif
