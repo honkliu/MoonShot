@@ -2,10 +2,17 @@
 #define INDDEXCONTEXT_H__
 
 #include "AdvancedIndexReader.h"
+#include "AdvancedIndexWriter.h"
 #include "EvalExpression.h"
 #include "IndexSearchExecutor.h"
 #include "ConfigParameters.h"
 #include "Embeddings.h"
+#include <memory>
+#include <string>
+
+using std::shared_ptr;
+using std::make_shared;
+using std::string;
 
 class IndexContext
 {
@@ -22,10 +29,10 @@ class IndexContext
         /*
         * we could get an IndexReader by a token
         */
-        std::shared_ptr<IndexReader> GetReader(const char * p_token)
+        shared_ptr<IndexReader> GetReader(const char * p_token)
         {
             //std::shared_ptr<AdvancedIndexReader> index_reader(new AdvancedIndexReader());
-            auto index_reader = std::make_shared<AdvancedIndexReader>();
+            auto index_reader = make_shared<AdvancedIndexReader>();
 
             return index_reader;
 
@@ -37,22 +44,42 @@ class IndexContext
         * differnt tokens, which would be a tree for combinations such as:
         * "Innovative" 
         */
-        std::shared_ptr<IndexReader> GetReader(EvalTree *)
+        shared_ptr<IndexReader> GetReader(EvalTree *)
         {
             return nullptr;
         }
 
+        
         /*
         * Make a member so the call would be
         * index_context->GetReader<float>() or we could ask compiler to 
         * index_context->GetReader(Embeeding<float> embeddings)
         */
         template<typename T>
-        std::shared_ptr<IndexReader> GetReader(Embeddings<T> * embedding)
+        shared_ptr<IndexReader> GetReader(Embeddings<T> * embedding)
         {
             return nullptr;
         }
 
+        shared_ptr<IndexWriter> GetWriter()
+        {
+            //std::shared_ptr<IndexWriter> index_writer(new IndexWriter());
+            auto index_writer = make_shared<AdvancedIndexWriter>();
+
+            return index_writer;
+
+            //return static_cast<IndexWriter *>(index_writer.get());
+        }
+        /*
+        shared_ptr<IndexEBWriter> GetEBWriter(const char * p_token)
+        {
+            //std::shared_ptr<IndexEBWriter> index_ebwriter(new IndexEBWriter());
+            auto index_ebwriter = make_shared<IndexEBWriter>();
+
+            return index_ebwriter;
+
+            //return static_cast<IndexEBWriter *>(index_ebwriter.get());
+        }*/
         IndexSearchExecutor * GetExecutor()
         {
             return NULL;
@@ -63,9 +90,9 @@ class IndexContext
         */
         void LoadIndex();
     private:
-        std::shared_ptr<IndexBlockTable> m_IndexBlockTable;
-        std::shared_ptr<ConfigParameters> m_Parameters;
-        std::shared_ptr<struct IndexFile> m_IndexFile;
+        shared_ptr<IndexBlockTable> m_IndexBlockTable;
+        shared_ptr<ConfigParameters> m_Parameters;
+        shared_ptr<struct IndexFile> m_IndexFile;
 };
 
 #endif

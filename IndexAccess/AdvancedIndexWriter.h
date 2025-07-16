@@ -1,0 +1,16 @@
+#ifndef ADVANCEDINDEXWRITER_H__
+#define ADVANCEDINDEXWRITER_H__
+
+#include "IndexWriter.h"
+#include <vector>
+#include <string>
+#include <cstdint>
+
+class AdvancedIndexWriter : public IndexWriter {
+public:
+    AdvancedIndexWriter() = default;
+    virtual ~AdvancedIndexWriter() = default;
+    void Write(const std::vector<std::string>& words, uint64_t documentId, PostingType posting);
+};
+
+#endif // ADVANCEDINDEXWRITER_H__

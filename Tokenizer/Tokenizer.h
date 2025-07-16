@@ -1,15 +1,18 @@
 #ifndef TOKENIZER_H__
 #define TOKENIZER_H__
 
+#include <vector>
+#include <string>
+
 class Tokenizer
 {
     public:
-        virtual void Tokenize(); 
+        virtual std::vector<std::string> Tokenize(const char * text); 
 };
 
-class SmartTokenizer : Tokenizer
+class SmartTokenizer : public Tokenizer
 {
     public:
-        void Tokenize();
+        std::vector<std::string> Tokenize(const char * text) override;
 };
 #endif

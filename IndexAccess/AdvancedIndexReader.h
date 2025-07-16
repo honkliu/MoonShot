@@ -2,6 +2,8 @@
 #define ADVANCEDINDEXREADER_H__
 
 #include <stdint.h>
+#include <string>
+#include <memory>
 
 #include "BlockTable.h"
 #include "IndexReader.h"
@@ -34,5 +36,20 @@ class AdvancedIndexReader : public IndexReader
         UnifiedDecoder m_Decoder;
 
 };
+
+// class AdvancedIndexEBWriter : public IndexWriter {
+//     public:
+//         AdvancedIndexEBWriter() = default;
+
+//         virtual void Open();
+//         virtual void Open(const std::string& word);
+//         virtual void Write(const std::string& data);
+//         virtual void Close();   
+//     private:
+//         std::shared_ptr<IndexBlock> m_IndexBlock;   
+//         std::shared_ptr<IndexContext> m_IndexContext;
+//         std::string m_Word;
+//         uint32_t m_BlockSeqNumber;
+// };
 
 #endif
