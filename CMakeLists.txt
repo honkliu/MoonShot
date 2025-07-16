@@ -12,6 +12,8 @@ project(MoonShot)
 
 add_subdirectory(Executor)
 add_subdirectory(IndexAccess)
+add_subdirectory(Tokenizer)
+add_subdirectory(Utils)
 # add_subdirectory(Service)  # Commented out - uses gRPC
 add_subdirectory(Test/UnitTest)  # Commented out - has compilation errors
 

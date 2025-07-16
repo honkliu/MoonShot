@@ -337,6 +337,7 @@ int Hash1(unsigned char *, int size)
 }
 int Hash2(unsigned char *, int size)
 {
+  return 0;
 }
 int HashMurmur3(unsigned char * key, int len, int seed)
 {

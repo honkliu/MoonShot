@@ -1,6 +1,6 @@
 #include "Tokenizer.h"
 
-vector<string> SmartTokenizer::Tokenize(const char * text)
+std::vector<std::string> SmartTokenizer::Tokenize(const char * text)
 {
-    return vector<string>{};
+    return std::vector<std::string>{};
 }

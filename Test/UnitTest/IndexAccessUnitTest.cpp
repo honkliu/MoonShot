@@ -10,6 +10,9 @@
 #include "BlockTable.h"
 
 #include <future>
+#include <map>
+#include <iostream>
+
 namespace IndexAccessTests
 {
     IndexContext* index_context = nullptr;
@@ -17,7 +20,7 @@ namespace IndexAccessTests
     void SetupIndex(const char * filename, IndexBlockTable * table, ConfigParameters * config_paramter)
     {
         index_context = new IndexContext(config_paramter);
-        index_context->SetupContext(filename, table);
+        index_context -> SetupContext(filename, table);
     }
 
     void TestSingleRead()
@@ -43,14 +46,10 @@ namespace IndexAccessTests
 
     void TestingEndToEnd()
     {
-        // IndexContext expects ConfigParameters*, not a string
-        auto config = new ConfigParameters();
-        auto context = new IndexContext(config);
-
         // SmartTokenizer expects no arguments
         auto tokenizer = new SmartTokenizer();
         // Use context for writer, not index_context
-        auto index_writer = context->GetWriter();
+        auto index_writer = index_context->GetWriter();
         // Remove GetNewDocumentID (not implemented), use a dummy id
         uint64_t documentId = 1;
         index_writer->Write(tokenizer->Tokenize("Innovative ids in Conf 2021"), documentId, PostingType::Body);
@@ -163,4 +162,58 @@ auto f = std::async(std::launch::async, func, 2, 3.5);
 
         index_reader->GoNext();
     }
+}
+std::map<std::string, std::function<void()>> testRegistry = {
+    {"TestSingleRead", IndexAccessTests::TestSingleRead},
+    {"TestingEndToEnd", IndexAccessTests::TestingEndToEnd},
+    {"TestCompositeRead", IndexAccessTests::TestCompositeRead},
+    {"TestVectorRead", IndexAccessTests::TestVectorRead}
+};
+
+int main(int argc, char* argv[]) {
+    using namespace IndexAccessTests;
+    
+    // 初始化配置
+    ConfigParameters config;
+    IndexBlockTable table;
+    SetupIndex("test_index", &table, &config);
+
+    try {
+        // 无参数时显示帮助
+        if (argc < 2) {
+            std::cout << "Available tests:\n";
+            for (const auto& [name, _] : testRegistry) {
+                std::cout << "  " << name << "\n";
+            }
+            std::cout << "\nUsage: " << argv[0] << " <test_name> [test_name2 ...]\n";
+            return 1;
+        }
+
+        // 运行所有指定的测试
+        for (int i = 1; i < argc; ++i) {
+            std::string testName = argv[i];
+            if (auto it = testRegistry.find(testName); it != testRegistry.end()) {
+                std::cout << "===== Running test: " << testName << " =====\n";
+                it->second(); // 执行测试函数
+                std::cout << "+++++ Test passed: " << testName << " +++++\n\n";
+            } else {
+                std::cerr << "!!!!! Unknown test: " << testName << " !!!!!\n";
+                std::cerr << "Valid tests:";
+                for (const auto& [name, _] : testRegistry) {
+                    std::cerr << " " << name;
+                }
+                std::cerr << "\n";
+                return 2;
+            }
+        }
+    } catch (const std::exception& e) {
+        std::cerr << "!!!!! Test execution failed: " << e.what() << " !!!!!\n";
+        return 3;
+    }
+
+    // 清理资源
+    delete index_context;
+    index_context = nullptr;
+    
+    return 0;
 }

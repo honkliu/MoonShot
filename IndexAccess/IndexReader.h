@@ -2,6 +2,7 @@
 #define INDEXREADER_H__
 
 #include <stdio.h>
+#include <cstdint>
 
 class IndexReader
 {

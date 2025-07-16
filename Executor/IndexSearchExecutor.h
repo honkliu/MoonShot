@@ -2,6 +2,9 @@
 #define INDEXSEARCHEXECUTOR_H__
 
 #include "EvalExpression.h"
+#include "IndexReader.h"
+#include <memory>
+
 class IndexSearchExecutor
 {
     public: 

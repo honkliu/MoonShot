@@ -116,7 +116,7 @@ class BlockCache {
             m_CacheSlots(new CacheSlot[slot_count])
         {
         }
-        ~BlockCache();
+        ~BlockCache() = default;
         
     
         bool DataLoaded(int block_seq, void** address)
