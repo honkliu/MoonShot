@@ -15,6 +15,7 @@
 
 namespace IndexAccessTests
 {
+
     IndexContext* index_context = nullptr;
 
     void SetupIndex(const char * filename, IndexBlockTable * table, ConfigParameters * config_paramter)
@@ -99,52 +100,7 @@ namespace IndexAccessTests
         index_reader->GoNext();
 
         index_reader->Close();
-/*
-        boost:asio:thread_pool thread_pool(4);
-        //boost::asio::post(thread_pool, boost::bind(&IndexSearchExecutor::Execute,  ))
-        boost::asio::post(thread_pool, [] {
-            executor->Execute(index_reader);
-        });
 
-
-        auto a1 = std::async(static_cast<void (*)(Reader)>(&IndexSearchExecutor::Executor), executor, index_reader);
-        a1.wait();
-        a1.get();
-
-         or
-         auto function = static_cast<void(*)(Reader)>(Exextue);
-         audo call = std::async(funciton, reader, ...)
-         call.wait
-
-         or
-         auto a = std::async([](Reader reader) {
-                                    exector->execute(reader);
-                                    },
-                                reader
-         )
-
-         std::async(std::launch::async, [executor] { return executor->Execute(index_reader)})
-
-         or use:
-
-class A
-{
-public:
-    int foo(int a, int b);
-    int foo(int a, double b);
-};
-         std::function<int(int,double)> func = std::bind((int(A::*)(int,double))&A::foo,&a,std::placeholders::_1,std::placeholders::_2);
-auto f = std::async(std::launch::async, func, 2, 3.5);
-    
-    std::bind(
-            (
-            int(A::*)(int,double)
-            )&A::foo,
-            &a,
-            std::placeholders::_1,
-            std::placeholders::_2);
-    }
-            */
     }
     void TestVectorRead()
     {
@@ -162,58 +118,12 @@ auto f = std::async(std::launch::async, func, 2, 3.5);
 
         index_reader->GoNext();
     }
+
 }
+
 std::map<std::string, std::function<void()>> testRegistry = {
     {"TestSingleRead", IndexAccessTests::TestSingleRead},
     {"TestingEndToEnd", IndexAccessTests::TestingEndToEnd},
     {"TestCompositeRead", IndexAccessTests::TestCompositeRead},
     {"TestVectorRead", IndexAccessTests::TestVectorRead}
 };
-
-int main(int argc, char* argv[]) {
-    using namespace IndexAccessTests;
-    
-    // 初始化配置
-    ConfigParameters config;
-    IndexBlockTable table;
-    SetupIndex("test_index", &table, &config);
-
-    try {
-        // 无参数时显示帮助
-        if (argc < 2) {
-            std::cout << "Available tests:\n";
-            for (const auto& [name, _] : testRegistry) {
-                std::cout << "  " << name << "\n";
-            }
-            std::cout << "\nUsage: " << argv[0] << " <test_name> [test_name2 ...]\n";
-            return 1;
-        }
-
-        // 运行所有指定的测试
-        for (int i = 1; i < argc; ++i) {
-            std::string testName = argv[i];
-            if (auto it = testRegistry.find(testName); it != testRegistry.end()) {
-                std::cout << "===== Running test: " << testName << " =====\n";
-                it->second(); // 执行测试函数
-                std::cout << "+++++ Test passed: " << testName << " +++++\n\n";
-            } else {
-                std::cerr << "!!!!! Unknown test: " << testName << " !!!!!\n";
-                std::cerr << "Valid tests:";
-                for (const auto& [name, _] : testRegistry) {
-                    std::cerr << " " << name;
-                }
-                std::cerr << "\n";
-                return 2;
-            }
-        }
-    } catch (const std::exception& e) {
-        std::cerr << "!!!!! Test execution failed: " << e.what() << " !!!!!\n";
-        return 3;
-    }
-
-    // 清理资源
-    delete index_context;
-    index_context = nullptr;
-    
-    return 0;
-}

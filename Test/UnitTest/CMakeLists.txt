@@ -11,7 +11,7 @@ file(GLOB SOURCEFILES
 )
 # 显式过滤掉 Search.cpp
 list(FILTER SOURCEFILES EXCLUDE REGEX ".*/Search\.cpp$")
-list(FILTER SOURCEFILES EXCLUDE REGEX ".*/UnitTestMain\.cpp$")
+#list(FILTER SOURCEFILES EXCLUDE REGEX ".*/UnitTestMain\.cpp$")
 
 #add_library(UnitTest ${SOURCEFILES})
 
