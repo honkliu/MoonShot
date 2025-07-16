@@ -32,7 +32,7 @@ class IndexWriter
     public:
         IndexWriter(const IndexWriter&) = delete;
 
-        virtual void Write(const std::vector<std::string>& words, uint64_t documentId, PostingType posting) {}
+        virtual void Write(std::vector<std::string>&&words, uint64_t documentId, PostingType posting) {}
         //virtual void Write(const std::vector<std::string>& tokens) {};
         //virtual void Close() = {};
         //virtual void Flush() = {};

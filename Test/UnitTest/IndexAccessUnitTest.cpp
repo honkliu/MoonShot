@@ -53,7 +53,7 @@ namespace IndexAccessTests
         auto index_writer = index_context->GetWriter();
         // Remove GetNewDocumentID (not implemented), use a dummy id
         uint64_t documentId = 1;
-        index_writer->Write(tokenizer->Tokenize("Innovative ids in Conf 2021"), documentId, PostingType::Body);
+        index_writer->Write(tokenizer->Tokenize("The QUICK Brown Fox jumps over the lazy DOG! Привет, МИР! Hello, WORLD! こんにちは这是一个人的世界! I'm testing apostrophes: don't, can't, won't"), documentId, PostingType::Body);
         index_writer->Write(tokenizer->Tokenize("Conf 2021"), documentId, PostingType::Title);
        
         /*
