@@ -14,6 +14,7 @@ class IndexReader
         virtual bool IsEnd() = 0;
         virtual uint64_t GetDocumentID() = 0;
         virtual void Close() = 0;
+        virtual void Open(const char* word) = 0;
     protected:
         IndexReader() = default;
 };

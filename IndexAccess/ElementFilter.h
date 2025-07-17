@@ -16,8 +16,8 @@ class ElementFilter {
 	public:
 		ElementFilter(int size = 24, void * memory = NULL);
 		~ElementFilter();
-		void AddElement(unsigned char *elt);
-		bool Contains(unsigned char *elt);
+		void AddElement(const char *elt);
+		bool Contains(const char *elt);
 	private:
 		int m_size; 
 		unsigned char * m_FilterSpace;	

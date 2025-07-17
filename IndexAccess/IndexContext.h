@@ -6,6 +6,7 @@
 #include "EvalExpression.h"
 #include "IndexSearchExecutor.h"
 #include "ConfigParameters.h"
+#include "Tokenizer.h"
 #include "Embeddings.h"
 #include <memory>
 #include <string>
@@ -17,15 +18,13 @@ using std::string;
 class IndexContext
 {
     public:
-        IndexContext(ConfigParameters * parameters)
+        IndexContext(const char * config_file, const char * index_file)
         {
-            m_Parameters.reset(parameters);
+            m_Parameters = make_shared<ConfigParameters>();
+            m_IndexBlockTable = make_shared<IndexBlockTable>();
 
         }
-        void SetupContext(const char* file_name, IndexBlockTable * p_blockTable)
-        {
-            m_IndexBlockTable.reset(p_blockTable);
-        }
+
         /*
         * we could get an IndexReader by a token
         */

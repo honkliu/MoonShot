@@ -34,7 +34,7 @@ include_directories(
     "${CMAKE_CURRENT_BINARY_DIR}"
 )
 
-target_link_libraries(UnitTestRunner PRIVATE
+set(common_libs
     Tokenizer           # 确保在 Tokenizer/CMakeLists.txt 中有定义
     IndexAccess         # 确保在 IndexAccess/CMakeLists.txt 中有定义
     Executor            # 确保在 Executor/CMakeLists.txt 中有定义
@@ -42,4 +42,6 @@ target_link_libraries(UnitTestRunner PRIVATE
     stdc++fs            # 文件系统库 (GCC)
 )
 
+target_link_libraries(Search PRIVATE ${common_libs})
+target_link_libraries(UnitTestRunner PRIVATE ${common_libs})
 

@@ -1,5 +1,9 @@
 #include "AdvancedIndexReader.h"
 
+#include <cstring>
+#include <iostream>
+
+using namespace std;
 /* 
 * Here need to define the relationship
 *
@@ -19,6 +23,7 @@ AdvancedIndexReader::GoNext()
         m_EncodedData = (uint8_t *)m_IndexBlock.get();
     }
 
+    cout << "Go Next" << endl;
     m_Decoder.GoNext();
 }
 void 
@@ -34,23 +39,21 @@ AdvancedIndexReader::IsEnd()
 }
 
 void 
-AdvancedIndexReader::Open(char * word)
+AdvancedIndexReader::Open(const char * word)
 {
-    m_Word = word;
+    m_Word = new char[std::strlen(word) + 1];
+
+    std::strcpy(m_Word, word);
+
     auto& table = GetIndexBlockTable();
     IndexBlock* block = table.GetIndexBlock(word);
     m_IndexBlock = std::shared_ptr<IndexBlock>(block, [](IndexBlock*){});
 
+    cout << "Opened posting: " << word << endl;
     if (m_IndexBlock) {
         m_Decoder.Open(m_IndexBlock.get(), 0);
     }
     GoNext();
-}
-
-void 
-AdvancedIndexReader::Open()
-{
-    // Default implementation - could be used for initialization without a specific word
 }
 
 void 

@@ -139,7 +139,7 @@ class BlockCache {
 // Forward declarations
 class TermToBlock {
 public:
-    uint32_t Contains(char* word) { 
+    uint32_t Contains(const char* word) { 
         // TODO: Implement proper term-to-block mapping
         return 0; 
     }
@@ -158,12 +158,12 @@ class IndexBlockTable
             return nullptr;
         }
         
-        IndexBlock* GetIndexBlock(char *word)
+        IndexBlock* GetIndexBlock(const char *word)
         {
             /*
             * Firstly, do element bloom filter
             */
-            if (m_ElementFilter && m_ElementFilter->Contains(reinterpret_cast<unsigned char*>(word))) {
+            if (m_ElementFilter && m_ElementFilter->Contains(word)) {
                 return nullptr;
             }
 

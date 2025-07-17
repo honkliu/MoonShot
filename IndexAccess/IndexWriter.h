@@ -18,21 +18,12 @@
 * Then in the future, we could use the IndexReader to read the data, match find the doc
 */
 
-enum class PostingType
-{
-    Anchor = 0,
-    URL = 1,
-    Title = 2,  
-    Body = 3,
-    Click = 4,
-}; 
-
 class IndexWriter
 {
     public:
         IndexWriter(const IndexWriter&) = delete;
 
-        virtual void Write(std::vector<std::string>&&words, uint64_t documentId, PostingType posting) {}
+        virtual void Write(std::vector<std::string>&&words, uint64_t documentId, const char * postingType) {}
         //virtual void Write(const std::vector<std::string>& tokens) {};
         //virtual void Close() = {};
         //virtual void Flush() = {};

@@ -18,10 +18,9 @@ namespace IndexAccessTests
 
     IndexContext* index_context = nullptr;
 
-    void SetupIndex(const char * filename, IndexBlockTable * table, ConfigParameters * config_paramter)
+    void SetupIndex(const char * config_file, const char * index_file)
     {
-        index_context = new IndexContext(config_paramter);
-        index_context -> SetupContext(filename, table);
+        index_context = new IndexContext(config_file, index_file);
     }
 
     void TestSingleRead()
@@ -47,14 +46,15 @@ namespace IndexAccessTests
 
     void TestingEndToEnd()
     {
+        SetupIndex("", "");
         // SmartTokenizer expects no arguments
         auto tokenizer = new SmartTokenizer();
         // Use context for writer, not index_context
         auto index_writer = index_context->GetWriter();
         // Remove GetNewDocumentID (not implemented), use a dummy id
         uint64_t documentId = 1;
-        index_writer->Write(tokenizer->Tokenize("The QUICK Brown Fox jumps over the lazy DOG! Привет, МИР! Hello, WORLD! こんにちは这是一个人的世界! I'm testing apostrophes: don't, can't, won't"), documentId, PostingType::Body);
-        index_writer->Write(tokenizer->Tokenize("Conf 2021"), documentId, PostingType::Title);
+        index_writer->Write(tokenizer->Tokenize("The QUICK Brown Fox jumps over the lazy DOG! Привет, МИР! Hello, WORLD! こんにちは这是一个人的世界! I'm testing apostrophes: don't, can't, won't"), documentId, "Body");
+        index_writer->Write(tokenizer->Tokenize("Conf 2021"), documentId, "Title");
        
         /*
         * For the Embeddings, no need to do it now, 

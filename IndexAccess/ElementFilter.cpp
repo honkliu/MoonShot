@@ -32,15 +32,16 @@ ElementFilter::~ElementFilter()
     PinedMemFree((void *)m_FilterSpace);
 }
 
-void ElementFilter::AddElement(unsigned char *elt)
+void ElementFilter::AddElement(const char *elt)
 {
-    std::hash<unsigned char *> h_funciton;
+    std::string_view str_view(elt);
+    std::hash<std::string_view> h_funciton;
 
-    auto n = h_funciton(elt);
+    auto n = h_funciton(str_view);
 
     m_FilterSpace[n%m_size] = 1;
 }
-bool ElementFilter::Contains(unsigned char *elt)
+bool ElementFilter::Contains(const char *elt)
 {
     return true;
 }
