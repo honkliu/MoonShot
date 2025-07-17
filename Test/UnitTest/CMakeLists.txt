@@ -20,6 +20,8 @@ add_executable(Search Search.cpp)
 
 add_executable(UnitTestRunner ${SOURCEFILES})
 
+find_package(ICU REQUIRED COMPONENTS uc i18n)
+
 include_directories(
     PUBLIC
     "${CMAKE_CURRENT_LIST_DIR}/../../thirdParty/boost_1_75_0"
@@ -43,5 +45,5 @@ set(common_libs
 )
 
 target_link_libraries(Search PRIVATE ${common_libs})
-target_link_libraries(UnitTestRunner PRIVATE ${common_libs})
 
+target_link_libraries(UnitTestRunner PRIVATE ${common_libs})

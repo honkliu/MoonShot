@@ -109,10 +109,20 @@ int main() {
 #cd thirdparty
 # tar -xzf boost_1_75_0.tar.gz
  
-# on windows: 
+# on windows: Install ICU
+
+
 
 $ Install G++ (MSYS2, Cmake)
+Find prebuilt MinGW ICU binaries
+
+Some third-party package managers (like MSYS2) provide MinGW builds:
+Open MSYS2 MinGW64 shell.
+Run: pacman -S mingw-w64-x86_64-icu
+The libraries will be installed in /mingw64/lib (e.g., libicuin.a, libicuuc.a, libicudt.a).
+
+$ set ICU_ROOT=C:\msys64\mingw64
 
 $ cmake ..\.. -G "MinGW Makefiles" 
 
-$ ingw32-make
+$ mingw32-make
