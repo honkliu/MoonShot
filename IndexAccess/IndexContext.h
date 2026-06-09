@@ -3,11 +3,14 @@
 
 #include "AdvancedIndexReader.h"
 #include "AdvancedIndexWriter.h"
+#include "IsrImpl.h"
+#include "PostingStore.h"
 #include "EvalExpression.h"
 #include "IndexSearchExecutor.h"
 #include "ConfigParameters.h"
 #include "Tokenizer.h"
 #include "Embeddings.h"
+
 #include <memory>
 #include <string>
 
@@ -15,83 +18,126 @@ using std::shared_ptr;
 using std::make_shared;
 using std::string;
 
+/*
+* Central factory: owns the PostingStore and creates writers, readers,
+* and executors on demand.
+*
+* GetReader(word)      — single-term ISR across AUT streams
+* GetReader(EvalTree*) — ISR tree built from a compiled EvalTree
+* GetWriter()          — AdvancedIndexWriter backed by the store
+* GetExecutor()        — IndexSearchExecutor
+*/
 class IndexContext
 {
-    public:
-        IndexContext(const char * config_file, const char * index_file)
-        {
-            m_Parameters = make_shared<ConfigParameters>();
-            m_IndexBlockTable = make_shared<IndexBlockTable>();
+public:
+    explicit IndexContext(const char* /*config_file*/ = "",
+                         const char* /*index_file*/   = "")
+        : store_(make_shared<PostingStore>())
+        , params_(make_shared<ConfigParameters>())
+    {}
 
+    shared_ptr<IndexWriter> GetWriter()
+    {
+        return make_shared<AdvancedIndexWriter>(store_);
+    }
+
+    /*
+    * Open a single-term ISR across the default AUT streams.
+    */
+    shared_ptr<IndexReader> GetReader(const char* term)
+    {
+        std::string s(term);
+        std::vector<shared_ptr<IndexReader>> isrs;
+        for (const char* abbrev : {"A", "U", "T"}) {
+            auto* pl = store_->GetPostingList(s + abbrev);
+            if (pl) isrs.push_back(make_shared<TermIsr>(pl));
+        }
+        if (isrs.empty()) return make_shared<TermIsr>(nullptr);
+        if (isrs.size() == 1) return isrs[0];
+        return make_shared<OrIsr>(std::move(isrs));
+    }
+
+    /*
+    * Build an ISR tree from a compiled EvalTree.
+    */
+    shared_ptr<IndexReader> GetReader(EvalTree* eval_tree)
+    {
+        if (!eval_tree || eval_tree->IsEmpty())
+            return make_shared<TermIsr>(nullptr);
+        return BuildIsr(eval_tree->root);
+    }
+
+    template<typename T>
+    shared_ptr<IndexReader> GetReader(Embeddings<T>* /*embedding*/)
+    {
+        return nullptr;
+    }
+
+    IndexSearchExecutor* GetExecutor()
+    {
+        return new IndexSearchExecutor(store_);
+    }
+
+    PostingStore* GetStore() { return store_.get(); }
+
+    void LoadIndex() {}
+
+private:
+    shared_ptr<PostingStore>      store_;
+    shared_ptr<ConfigParameters>  params_;
+
+    /*
+    * Recursively convert an EvalNode to the matching ISR type.
+    */
+    shared_ptr<IndexReader> BuildIsr(const shared_ptr<EvalNode>& node)
+    {
+        if (!node) return make_shared<TermIsr>(nullptr);
+
+        switch (node->GetType()) {
+
+        case NodeType::Term: {
+            auto* tn = static_cast<TermNode*>(node.get());
+            auto* pl = store_->GetPostingList(tn->stream_key);
+            return make_shared<TermIsr>(pl);
         }
 
-        /*
-        * we could get an IndexReader by a token
-        */
-        shared_ptr<IndexReader> GetReader(const char * p_token)
-        {
-            //std::shared_ptr<AdvancedIndexReader> index_reader(new AdvancedIndexReader());
-            auto index_reader = make_shared<AdvancedIndexReader>();
-
-            return index_reader;
-
-            //return static_cast<IndexReader *>(index_reader.get());
-        }
-        
-        /*
-        * Or we could get an composite Reader which specify
-        * differnt tokens, which would be a tree for combinations such as:
-        * "Innovative" 
-        */
-        shared_ptr<IndexReader> GetReader(EvalTree *)
-        {
-            return nullptr;
+        case NodeType::And: {
+            auto* an = static_cast<AndNode*>(node.get());
+            std::vector<shared_ptr<IndexReader>> kids;
+            for (auto& c : an->children) {
+                auto kid = BuildIsr(c);
+                if (kid) kids.push_back(kid);
+            }
+            if (kids.empty())   return make_shared<TermIsr>(nullptr);
+            if (kids.size()==1) return kids[0];
+            return make_shared<AndIsr>(std::move(kids));
         }
 
-        
-        /*
-        * Make a member so the call would be
-        * index_context->GetReader<float>() or we could ask compiler to 
-        * index_context->GetReader(Embeeding<float> embeddings)
-        */
-        template<typename T>
-        shared_ptr<IndexReader> GetReader(Embeddings<T> * embedding)
-        {
-            return nullptr;
+        case NodeType::Or: {
+            auto* on = static_cast<OrNode*>(node.get());
+            std::vector<shared_ptr<IndexReader>> kids;
+            for (auto& c : on->children) {
+                auto kid = BuildIsr(c);
+                if (kid) kids.push_back(kid);
+            }
+            if (kids.empty())   return make_shared<TermIsr>(nullptr);
+            if (kids.size()==1) return kids[0];
+            return make_shared<OrIsr>(std::move(kids));
         }
 
-        shared_ptr<IndexWriter> GetWriter()
-        {
-            //std::shared_ptr<IndexWriter> index_writer(new IndexWriter());
-            auto index_writer = make_shared<AdvancedIndexWriter>();
-
-            return index_writer;
-
-            //return static_cast<IndexWriter *>(index_writer.get());
+        case NodeType::Not: {
+            auto* nn = static_cast<NotNode*>(node.get());
+            auto base    = BuildIsr(nn->base);
+            auto exclude = BuildIsr(nn->exclude);
+            if (!base)    return make_shared<TermIsr>(nullptr);
+            if (!exclude) return base;
+            return make_shared<NotIsr>(base, exclude);
         }
-        /*
-        shared_ptr<IndexEBWriter> GetEBWriter(const char * p_token)
-        {
-            //std::shared_ptr<IndexEBWriter> index_ebwriter(new IndexEBWriter());
-            auto index_ebwriter = make_shared<IndexEBWriter>();
 
-            return index_ebwriter;
-
-            //return static_cast<IndexEBWriter *>(index_ebwriter.get());
-        }*/
-        IndexSearchExecutor * GetExecutor()
-        {
-            return NULL;
+        default:
+            return make_shared<TermIsr>(nullptr);
         }
-    
-        /*
-        * Load the index into memory
-        */
-        void LoadIndex();
-    private:
-        shared_ptr<IndexBlockTable> m_IndexBlockTable;
-        shared_ptr<ConfigParameters> m_Parameters;
-        shared_ptr<struct IndexFile> m_IndexFile;
+    }
 };
 
 #endif

@@ -1,0 +1,22 @@
+[package]
+name = "rustblade"
+version = "0.1.0"
+edition = "2021"
+description = "High-performance hybrid search engine — inverted index + HNSW vector index"
+
+[dependencies]
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror  = "1"
+rand       = "0.8"
+
+[dev-dependencies]
+tempfile = "3"
+
+[[example]]
+name = "search"
+path = "examples/search.rs"
+
+[[example]]
+name = "morning_vietnam"
+path = "examples/morning_vietnam.rs"

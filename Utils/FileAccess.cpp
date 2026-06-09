@@ -19,7 +19,7 @@ FileAccess::FileAccess(const char * fileName)
 bool FileAccess::Init()
 {
 #ifdef _WIN32
-    m_FileHandle = CreateFileA(m_FileName, 
+    m_FileHandle = CreateFileA(m_FileName,
                             GENERIC_READ,
                             FILE_SHARE_READ,
                             NULL,
@@ -33,13 +33,30 @@ bool FileAccess::Init()
 #endif
 }
 
+bool FileAccess::InitWrite()
+{
+#ifdef _WIN32
+    m_FileHandle = CreateFileA(m_FileName,
+                            GENERIC_READ | GENERIC_WRITE,
+                            0,
+                            NULL,
+                            OPEN_ALWAYS,
+                            FILE_ATTRIBUTE_NORMAL,
+                            NULL);
+    return m_FileHandle != INVALID_HANDLE_VALUE;
+#else
+    m_FileHandle = open(m_FileName, O_RDWR | O_CREAT, 0644);
+    return m_FileHandle != -1;
+#endif
+}
+
 int FileAccess::GetData(void * buffer, int numBytes)
 {
 #ifdef _WIN32
     if (m_FileHandle == INVALID_HANDLE_VALUE) {
         return -1;
     }
-    
+
     DWORD bytesRead = 0;
     if (ReadFile(m_FileHandle, buffer, numBytes, &bytesRead, NULL)) {
         return static_cast<int>(bytesRead);
@@ -49,7 +66,7 @@ int FileAccess::GetData(void * buffer, int numBytes)
     if (m_FileHandle == -1) {
         return -1;
     }
-    
+
     ssize_t bytesRead = read(m_FileHandle, buffer, numBytes);
     return static_cast<int>(bytesRead);
 #endif
@@ -61,41 +78,73 @@ bool FileAccess::ReadBlock(uint32_t block_seq, void* buffer, size_t block_size)
     if (m_FileHandle == INVALID_HANDLE_VALUE) {
         return false;
     }
-    
-    // Calculate file position for this block
+
     uint64_t position = static_cast<uint64_t>(block_seq) * block_size;
-    
-    // Set file pointer to the block position
+
     LARGE_INTEGER liPosition;
     liPosition.QuadPart = position;
-    
+
     if (!SetFilePointerEx(m_FileHandle, liPosition, NULL, FILE_BEGIN)) {
         return false;
     }
-    
-    // Read the block
+
     DWORD bytesRead = 0;
     if (ReadFile(m_FileHandle, buffer, static_cast<DWORD>(block_size), &bytesRead, NULL)) {
         return bytesRead == block_size;
     }
-    
+
     return false;
 #else
     if (m_FileHandle == -1) {
         return false;
     }
-    
-    // Calculate file position for this block
+
     off_t position = static_cast<off_t>(block_seq) * block_size;
-    
-    // Seek to the block position
+
     if (lseek(m_FileHandle, position, SEEK_SET) == -1) {
         return false;
     }
-    
-    // Read the block
+
     ssize_t bytesRead = read(m_FileHandle, buffer, block_size);
     return bytesRead == static_cast<ssize_t>(block_size);
+#endif
+}
+
+bool FileAccess::WriteBlock(uint32_t block_seq, const void* buffer, size_t block_size)
+{
+#ifdef _WIN32
+    if (m_FileHandle == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+
+    uint64_t position = static_cast<uint64_t>(block_seq) * block_size;
+
+    LARGE_INTEGER liPosition;
+    liPosition.QuadPart = position;
+
+    if (!SetFilePointerEx(m_FileHandle, liPosition, NULL, FILE_BEGIN)) {
+        return false;
+    }
+
+    DWORD written = 0;
+    if (WriteFile(m_FileHandle, buffer, static_cast<DWORD>(block_size), &written, NULL)) {
+        return written == static_cast<DWORD>(block_size);
+    }
+
+    return false;
+#else
+    if (m_FileHandle == -1) {
+        return false;
+    }
+
+    off_t position = static_cast<off_t>(block_seq) * block_size;
+
+    if (lseek(m_FileHandle, position, SEEK_SET) == -1) {
+        return false;
+    }
+
+    ssize_t written = write(m_FileHandle, buffer, block_size);
+    return written == static_cast<ssize_t>(block_size);
 #endif
 }
 
@@ -105,16 +154,16 @@ bool FileAccess::SetPosition(uint64_t position)
     if (m_FileHandle == INVALID_HANDLE_VALUE) {
         return false;
     }
-    
+
     LARGE_INTEGER liPosition;
     liPosition.QuadPart = position;
-    
+
     return SetFilePointerEx(m_FileHandle, liPosition, NULL, FILE_BEGIN) != 0;
 #else
     if (m_FileHandle == -1) {
         return false;
     }
-    
+
     return lseek(m_FileHandle, static_cast<off_t>(position), SEEK_SET) != -1;
 #endif
 }
@@ -131,5 +180,3 @@ FileAccess::~FileAccess()
     }
 #endif
 }
-
-

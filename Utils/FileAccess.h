@@ -26,20 +26,20 @@ class FileAccess {
 		FileAccess(const char * fileName);
 		~FileAccess();
 		bool Init();
+		bool InitWrite();
 		int GetData(void * buffer, int numBytes);
-		
-		// Additional methods for block-based access
+
 		bool ReadBlock(uint32_t block_seq, void* buffer, size_t block_size);
+		bool WriteBlock(uint32_t block_seq, const void* buffer, size_t block_size);
 		bool SetPosition(uint64_t position);
-		
+
 	private:
 #ifdef _WIN32
 		HANDLE m_FileHandle = INVALID_HANDLE_VALUE;
 #else
 		int m_FileHandle = -1;
 #endif
-		char * m_FileName = nullptr;	
+		char * m_FileName = nullptr;
 };
- 
-#endif
 
+#endif

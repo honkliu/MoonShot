@@ -9,7 +9,6 @@ else()
 endif()
 
 find_package(Threads REQUIRED)
-#find_package(Boost REQUIRED COMPONENTS system)
 
 include(../cmake/grpc.cmake)
 include(GNUInstallDirs)
@@ -30,8 +29,6 @@ FetchContent_Declare(
 set(FETCHCONTENT_QUIET OFF)
 FetchContent_MakeAvailable(gRPC)
 
-# Since FetchContent uses add_subdirectory under the hood, we can use
-# the grpc targets directly from this build.
 set(_PROTOBUF_LIBPROTOBUF libprotobuf)
 set(_REFLECTION grpc++_reflection)
 set(_PROTOBUF_PROTOC $<TARGET_FILE:protoc>)
@@ -41,8 +38,6 @@ if(CMAKE_CROSSCOMPILING)
 else()
     set(_GRPC_CPP_PLUGIN_EXECUTABLE $<TARGET_FILE:grpc_cpp_plugin>)
 endif()
-
-message (BOOST, ${Boost_INCLUDE_DIRS} ${Boost_LIBRARIES})
 
 # Proto file
 #get_filename_component(PROTO_FILES "MatchService.proto" ABSOLUTE)
@@ -63,8 +58,6 @@ aux_source_directory(. SOURCEFILES)
 
 include_directories(
     PUBLIC
-    "${CMAKE_CURRENT_LIST_DIR}/../thirdParty/boost_1_75_0"
-    "${CMAKE_CURRENT_LIST_DIR}/../ThirdParty/boost_1_75_0"
     "${CMAKE_CURRENT_LIST_DIR}/../Executor"
     "${CMAKE_CURRENT_LIST_DIR}"
     "${CMAKE_CURRENT_BINARY_DIR}"

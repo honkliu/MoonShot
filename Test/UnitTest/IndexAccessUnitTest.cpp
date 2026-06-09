@@ -1,129 +1,454 @@
 #include "IndexContext.h"
 #include "EvalExpression.h"
 #include "IndexReader.h"
-#include "AdvancedIndexReader.h"
-#include "AdvancedIndexWriter.h"
 #include "IndexSearchExecutor.h"
 #include "IndexSearchCompiler.h"
-#include "ConfigParameters.h"
 #include "Tokenizer.h"
-#include "BlockTable.h"
+#include "SearchResult.h"
 
-#include <future>
-#include <map>
+#include <functional>
+#include <memory>
 #include <iostream>
+#include <map>
+#include <cassert>
+#include <cstring>
+#include <sstream>
 
-namespace IndexAccessTests
+static SmartTokenizer g_tokenizer;
+
+static void PrintResults(const std::vector<SearchResult>& results,
+                         const char* label = "")
 {
-
-    IndexContext* index_context = nullptr;
-
-    void SetupIndex(const char * config_file, const char * index_file)
-    {
-        index_context = new IndexContext(config_file, index_file);
-    }
-
-    void TestSingleRead()
-    {        
-        auto index_reader1 = index_context->GetReader("Innovative");
-        auto index_reader2 = index_context->GetReader("Ideas");
-        auto index_reader3 = index_context->GetReader("Conf2021");
-
-        index_reader1->GoNext();
-        index_reader2->GoNext();
-        index_reader3->GoNext();
-        
-        auto documentId = index_reader1->GetDocumentID();
-
-        if (documentId != 0) {
-            //Find the document. Do something
-        }
-
-        index_reader1->Close();
-        index_reader2->Close();
-        index_reader3->Close();      
-    }
-
-    void TestingEndToEnd()
-    {
-        SetupIndex("", "");
-        // SmartTokenizer expects no arguments
-        auto tokenizer = new SmartTokenizer();
-        // Use context for writer, not index_context
-        auto index_writer = index_context->GetWriter();
-        // Remove GetNewDocumentID (not implemented), use a dummy id
-        uint64_t documentId = 1;
-        index_writer->Write(tokenizer->Tokenize("The QUICK Brown Fox jumps over the lazy DOG! Привет, МИР! Hello, WORLD! こんにちは这是一个人的世界! I'm testing apostrophes: don't, can't, won't"), documentId, "Body");
-        index_writer->Write(tokenizer->Tokenize("Conf 2021"), documentId, "Title");
-       
-        /*
-        * For the Embeddings, no need to do it now, 
-        * let me implement it later
-        * 
-        auto index_ebwriter1 = index_context->GetEBWriter("HNSW");
-        auto index_ebwriter2 = index_context->GetEBWriter("IVF");
-
-        index_ebwriter1->Write(tokenizer->Tokenize("Innovative ids in Conf 2021"), documentId, PostingType::Anchor);
-        index_ebwriter2->Write(tokenizer->Tokenize("Innovative ids in Conf 2021"));
-        */
-       /*
-        auto is_compiler = new IndexSearchCompiler("AUTBV");
-
-        auto eval_tree = is_compiler->Compile("Innovative ids in Conf 2021", "");
-        
-        auto index_reader = index_context->GetReader(eval_tree);
-
-        while (true) {
-            index_reader->GoNext();
-            auto documentId = index_reader->GetDocumentID();
-
-            if (documentId == 0)
-                break;
-        }
-    */
-    }
-    void TestCompositeRead()
-    {
-        //std::shared_ptr<IndexSearchCompiler> is_compiler(new IndexSearchCompiler());
-
-        auto is_compiler = new IndexSearchCompiler();
-
-        auto eval_tree = is_compiler->Compile("Innovative ids in Conf 2021");
-        
-        auto index_reader = index_context->GetReader(eval_tree);
-
-        auto executor = index_context->GetExecutor();
-        
-        executor->Execute(index_reader);
-        //auto result = std::async(std::launch::async, [executor] { return executor->Execute(index_reader)});
-        //result.wait();
-        index_reader->GoNext();
-
-        index_reader->Close();
-
-    }
-    void TestVectorRead()
-    {
-        auto is_compiler = new IndexSearchCompiler();
-
-        /*
-        * The call here must specify the return type
-        */
-        auto embedding = is_compiler->CompileToVector<float>("Innovitve ideas in Conf 2021");
-
-        /*
-        * or use index_context->GetReader<float>(embedding);
-        */
-        auto index_reader = index_context->GetReader(embedding);
-
-        index_reader->GoNext();
-    }
-
+    std::cout << "  [" << label << "] " << results.size() << " result(s):\n";
+    for (auto& r : results)
+        std::cout << "    doc=" << r.doc_id << "  score=" << r.score << "\n";
 }
 
+static float AssertContains(const std::vector<SearchResult>& r,
+                             uint64_t doc_id,
+                             const char* ctx = "")
+{
+    for (auto& x : r)
+        if (x.doc_id == doc_id) return x.score;
+    std::cerr << "FAIL: doc " << doc_id << " not found [" << ctx << "]\n";
+    assert(false);
+    return 0.0f;
+}
+
+static void AssertNotContains(const std::vector<SearchResult>& r,
+                               uint64_t doc_id,
+                               const char* ctx = "")
+{
+    for (auto& x : r) {
+        if (x.doc_id == doc_id) {
+            std::cerr << "FAIL: doc " << doc_id << " should not be in results [" << ctx << "]\n";
+            assert(false);
+        }
+    }
+}
+
+/*
+* Shared corpus of 5 movie documents (Title + Body, two streams each).
+* DocIDs are ordered by descending importance (1 is most important).
+*/
+static IndexContext* g_ctx = nullptr;
+
+static void BuildSharedIndex()
+{
+    if (g_ctx) return;
+    g_ctx = new IndexContext();
+
+    auto writer = g_ctx->GetWriter();
+    auto cast = dynamic_cast<AdvancedIndexWriter*>(writer.get());
+
+    struct Doc { uint64_t id; const char* title; const char* body; float importance; };
+    static const Doc docs[] = {
+        {1, "Good Morning Vietnam",
+            "Robin Williams plays a radio DJ stationed in Vietnam during the brutal war",
+            0.9f},
+        {2, "Apocalypse Now",
+            "A soldier journeys through Vietnam and Cambodia on a mission to find a rogue colonel seeking power",
+            0.8f},
+        {3, "Platoon",
+            "A young soldier in Vietnam faces moral conflict between two rival sergeants during a savage war",
+            0.7f},
+        {4, "Good Will Hunting",
+            "A janitor at MIT hides his extraordinary mathematical genius until a therapist helps him",
+            0.6f},
+        {5, "The Deer Hunter",
+            "Pennsylvania steelworkers go to Vietnam and face the trauma of captivity and Russian roulette",
+            0.5f},
+    };
+
+    for (auto& d : docs) {
+        writer->Write(g_tokenizer.Tokenize(d.title), d.id, "Title");
+        writer->Write(g_tokenizer.Tokenize(d.body),  d.id, "Body");
+        if (cast) cast->SetDocImportance(d.id, d.importance);
+    }
+
+    std::cout << "Index built: "
+              << g_ctx->GetStore()->TotalDocs() << " docs, avg_len="
+              << g_ctx->GetStore()->AvgDocLen()  << "\n\n";
+}
+
+namespace IndexAccessTests {
+
+/*
+* Verify posting lists are present after indexing.
+*/
+void TestBuildIndex()
+{
+    BuildSharedIndex();
+    auto* store = g_ctx->GetStore();
+
+    assert(store->GetPostingList("vietnamT") != nullptr);
+    assert(store->GetPostingList("vietnamB") != nullptr);
+
+    auto* pl = store->GetPostingList("vietnamT");
+    assert(pl->doc_freq() >= 3);
+
+    pl = store->GetPostingList("goodT");
+    assert(pl->doc_freq() >= 2);
+
+    std::cout << "  'vietnamT' doc_freq = " << store->GetPostingList("vietnamT")->doc_freq() << "\n";
+    std::cout << "  'goodT'    doc_freq = " << store->GetPostingList("goodT")->doc_freq()    << "\n";
+    std::cout << "  avg_doc_len         = " << store->AvgDocLen()                             << "\n";
+}
+
+/*
+* Single-term BM25 search on AUT streams.
+*/
+void TestSingleTermSearch()
+{
+    BuildSharedIndex();
+
+    auto compiler = new IndexSearchCompiler();
+    auto tree     = compiler->Compile("vietnam", "AUT");
+    auto reader   = g_ctx->GetReader(tree);
+    auto executor = g_ctx->GetExecutor();
+    auto results  = executor->Execute(reader, 10);
+
+    PrintResults(results, "vietnam/AUT");
+
+    AssertContains(results, 1, "vietnam AUT");
+    AssertContains(results, 2, "vietnam AUT");
+    AssertContains(results, 3, "vietnam AUT");
+    AssertNotContains(results, 4, "vietnam AUT");
+    assert(!results.empty());
+
+    delete compiler; delete tree; delete executor;
+}
+
+/*
+* AND query — both terms must appear in the same document.
+*/
+void TestAndSearch()
+{
+    BuildSharedIndex();
+
+    auto compiler = new IndexSearchCompiler();
+    auto tree     = compiler->Compile("good morning", "AUT");
+    auto reader   = g_ctx->GetReader(tree);
+    auto executor = g_ctx->GetExecutor();
+    auto results  = executor->Execute(reader, 10);
+
+    PrintResults(results, "good morning/AUT");
+
+    AssertContains(results, 1, "good morning");
+    AssertNotContains(results, 4, "good morning AND");
+
+    delete compiler; delete tree; delete executor;
+}
+
+/*
+* OR query — union of posting lists.
+*/
+void TestOrSearch()
+{
+    BuildSharedIndex();
+
+    auto compiler = new IndexSearchCompiler();
+    auto tree     = compiler->Compile("morning OR apocalypse", "AUT");
+    auto reader   = g_ctx->GetReader(tree);
+    auto executor = g_ctx->GetExecutor();
+    auto results  = executor->Execute(reader, 10);
+
+    PrintResults(results, "morning OR apocalypse");
+
+    AssertContains(results, 1, "OR morning");
+    AssertContains(results, 2, "OR apocalypse");
+
+    delete compiler; delete tree; delete executor;
+}
+
+/*
+* NOT query — exclude documents that match the exclusion ISR.
+*/
+void TestNotSearch()
+{
+    BuildSharedIndex();
+
+    auto compiler = new IndexSearchCompiler();
+    auto tree     = compiler->Compile("good NOT hunting", "AUTB");
+    auto reader   = g_ctx->GetReader(tree);
+    auto executor = g_ctx->GetExecutor();
+    auto results  = executor->Execute(reader, 10);
+
+    PrintResults(results, "good NOT hunting");
+
+    AssertContains   (results, 1, "NOT: doc1 present");
+    AssertNotContains(results, 4, "NOT: doc4 excluded");
+
+    delete compiler; delete tree; delete executor;
+}
+
+/*
+* Field-constraint prefix pins the query to a specific MetaStream.
+*/
+void TestFieldConstraint()
+{
+    BuildSharedIndex();
+    auto* store = g_ctx->GetStore();
+    auto executor_raw = g_ctx->GetExecutor();
+
+    {
+        auto compiler = new IndexSearchCompiler();
+        auto tree     = compiler->Compile("title:vietnam", "AUTB");
+        auto reader   = g_ctx->GetReader(tree);
+        auto results  = executor_raw->Execute(reader, 10);
+        PrintResults(results, "title:vietnam");
+
+        for (auto& r : results) {
+            auto* pl = store->GetPostingList("vietnamT");
+            bool in_title = false;
+            if (pl) for (auto& e : pl->entries)
+                if (e.doc_id == r.doc_id) { in_title = true; break; }
+            assert(in_title && "title:vietnam matched a doc not in vietnamT");
+        }
+        delete compiler; delete tree;
+    }
+
+    {
+        auto compiler = new IndexSearchCompiler();
+        auto tree     = compiler->Compile("body:vietnam", "AUTB");
+        auto reader   = g_ctx->GetReader(tree);
+        auto results  = executor_raw->Execute(reader, 10);
+        PrintResults(results, "body:vietnam");
+        AssertContains(results, 5, "body:vietnam doc5");
+        delete compiler; delete tree;
+    }
+
+    delete executor_raw;
+}
+
+/*
+* Inspect EvalTree node types produced by the compiler.
+*/
+void TestEvalTree()
+{
+    auto compiler = new IndexSearchCompiler();
+
+    {
+        auto tree = compiler->Compile("fox", "T");
+        assert(tree && !tree->IsEmpty());
+        assert(tree->root->GetType() == NodeType::Term);
+        auto* tn = static_cast<TermNode*>(tree->root.get());
+        assert(tn->stream_key == "foxT");
+        std::cout << "  Compile('fox','T') → TermNode('" << tn->stream_key << "')\n";
+        delete tree;
+    }
+
+    {
+        auto tree = compiler->Compile("fox quick", "T");
+        assert(tree && !tree->IsEmpty());
+        assert(tree->root->GetType() == NodeType::And);
+        auto* an = static_cast<AndNode*>(tree->root.get());
+        assert(an->children.size() == 2);
+        std::cout << "  Compile('fox quick','T') → AndNode with "
+                  << an->children.size() << " children\n";
+        delete tree;
+    }
+
+    {
+        auto tree = compiler->Compile("fox OR lazy", "T");
+        assert(tree && !tree->IsEmpty());
+        assert(tree->root->GetType() == NodeType::Or);
+        auto* on = static_cast<OrNode*>(tree->root.get());
+        assert(on->children.size() == 2);
+        std::cout << "  Compile('fox OR lazy','T') → OrNode with "
+                  << on->children.size() << " children\n";
+        delete tree;
+    }
+
+    {
+        /*
+        * A single term on AUT expands to OrNode( foxA, foxU, foxT ).
+        */
+        auto tree = compiler->Compile("fox", "AUT");
+        assert(tree && !tree->IsEmpty());
+        assert(tree->root->GetType() == NodeType::Or);
+        auto* on = static_cast<OrNode*>(tree->root.get());
+        assert(on->children.size() == 3);
+        for (auto& c : on->children) {
+            assert(c->GetType() == NodeType::Term);
+            auto* tn = static_cast<TermNode*>(c.get());
+            std::cout << "    stream_key: " << tn->stream_key << "\n";
+        }
+        delete tree;
+    }
+
+    {
+        auto tree = compiler->Compile("good NOT hunting", "T");
+        assert(tree && !tree->IsEmpty());
+        assert(tree->root->GetType() == NodeType::Not);
+        std::cout << "  Compile('good NOT hunting','T') → NotNode\n";
+        delete tree;
+    }
+
+    delete compiler;
+}
+
+/*
+* Multi-phase: Phase 1 (AUT) finds nothing; ExecutePhased escalates to AUTB.
+*/
+void TestMultiPhase()
+{
+    BuildSharedIndex();
+
+    /*
+    * "roulette" only appears in doc 5's body, not in any title.
+    */
+    auto compiler = new IndexSearchCompiler();
+    auto executor = g_ctx->GetExecutor();
+
+    auto tree1  = compiler->Compile("roulette", "AUT");
+    auto rdr1   = g_ctx->GetReader(tree1);
+    auto phase1 = executor->Execute(rdr1, 10);
+    std::cout << "  Phase 1 (AUT)  'roulette': " << phase1.size() << " results\n";
+
+    auto tree2  = compiler->Compile("roulette", "AUTB");
+    auto rdr2   = g_ctx->GetReader(tree2);
+    auto phase2 = executor->Execute(rdr2, 10);
+    std::cout << "  Phase 2 (AUTB) 'roulette': " << phase2.size() << " results\n";
+    AssertContains(phase2, 5, "roulette body phase2");
+
+    auto tree_p1 = compiler->Compile("roulette", "AUT");
+    auto tree_p2 = compiler->Compile("roulette", "AUTB");
+    auto rdr_p1  = g_ctx->GetReader(tree_p1);
+    auto rdr_p2  = g_ctx->GetReader(tree_p2);
+    auto phased  = executor->ExecutePhased(rdr_p1, rdr_p2, 10, 1);
+    PrintResults(phased, "ExecutePhased 'roulette'");
+    AssertContains(phased, 5, "roulette phased");
+
+    delete compiler;
+    delete tree1; delete tree2; delete tree_p1; delete tree_p2;
+    delete executor;
+}
+
+/*
+* Doc importance is added to BM25 score and breaks ties.
+*/
+void TestDocImportance()
+{
+    auto ctx    = new IndexContext();
+    auto writer = ctx->GetWriter();
+    auto adv    = dynamic_cast<AdvancedIndexWriter*>(writer.get());
+
+    const char* same_text = "identical body content with fox and quick terms";
+    writer->Write(g_tokenizer.Tokenize(same_text), 99,  "Body");
+    writer->Write(g_tokenizer.Tokenize(same_text), 100, "Body");
+    if (adv) {
+        adv->SetDocImportance(99,  2.0f);
+        adv->SetDocImportance(100, 0.1f);
+    }
+
+    auto compiler = new IndexSearchCompiler();
+    auto tree     = compiler->Compile("fox", "B");
+    auto reader   = ctx->GetReader(tree);
+    auto executor = ctx->GetExecutor();
+    auto results  = executor->Execute(reader, 10);
+
+    PrintResults(results, "importance tiebreak");
+    assert(results.size() == 2);
+    assert(results[0].doc_id == 99 && "doc 99 must rank first");
+
+    delete ctx; delete compiler; delete tree; delete executor;
+}
+
+/*
+* End-to-end: mirrors the original IndexAccessUnitTest API shape.
+*/
+void TestEndToEnd()
+{
+    IndexContext* index_context = new IndexContext("", "");
+    auto tokenizer    = new SmartTokenizer();
+    auto index_writer = index_context->GetWriter();
+
+    uint64_t documentId = 1;
+    index_writer->Write(
+        tokenizer->Tokenize(
+            "The QUICK Brown Fox jumps over the lazy DOG! "
+            "Привет, МИР! Hello, WORLD! こんにちは这是一个人的世界! "
+            "I'm testing apostrophes: don't, can't, won't"),
+        documentId, "Body");
+    index_writer->Write(
+        tokenizer->Tokenize("Conf 2021"),
+        documentId, "Title");
+
+    index_writer->Write(
+        tokenizer->Tokenize("The lazy fox slept all morning"),
+        2u, "Body");
+    index_writer->Write(
+        tokenizer->Tokenize("Morning Fox 2021"),
+        2u, "Title");
+
+    {
+        auto rdr = index_context->GetReader("fox");
+        rdr->GoNext();
+        std::cout << "  single 'fox': first doc_id = " << rdr->GetDocumentID() << "\n";
+        rdr->Close();
+    }
+
+    {
+        auto is_compiler = new IndexSearchCompiler();
+        auto eval_tree   = is_compiler->Compile("fox lazy", "AUTB");
+        auto reader      = index_context->GetReader(eval_tree);
+        auto executor    = index_context->GetExecutor();
+        auto results     = executor->Execute(reader, 10);
+
+        PrintResults(results, "fox AND lazy / AUTB");
+        assert(!results.empty());
+
+        delete is_compiler; delete eval_tree; delete executor;
+    }
+
+    {
+        /*
+        * Vector search is not yet implemented; CompileToVector returns null.
+        */
+        auto is_compiler = new IndexSearchCompiler();
+        auto embedding   = is_compiler->CompileToVector<float>("Innovative ideas in Conf 2021");
+        auto reader = index_context->GetReader(embedding);
+        std::cout << "  CompileToVector: "
+                  << (embedding ? "non-null" : "null (not implemented)") << "\n";
+        delete is_compiler;
+    }
+
+    delete index_context;
+    delete tokenizer;
+}
+
+} // namespace IndexAccessTests
+
 std::map<std::string, std::function<void()>> testRegistry = {
-    {"TestSingleRead", IndexAccessTests::TestSingleRead},
-    {"TestingEndToEnd", IndexAccessTests::TestingEndToEnd},
-    {"TestCompositeRead", IndexAccessTests::TestCompositeRead},
-    {"TestVectorRead", IndexAccessTests::TestVectorRead}
+    {"TestBuildIndex",       IndexAccessTests::TestBuildIndex},
+    {"TestSingleTermSearch", IndexAccessTests::TestSingleTermSearch},
+    {"TestAndSearch",        IndexAccessTests::TestAndSearch},
+    {"TestOrSearch",         IndexAccessTests::TestOrSearch},
+    {"TestNotSearch",        IndexAccessTests::TestNotSearch},
+    {"TestFieldConstraint",  IndexAccessTests::TestFieldConstraint},
+    {"TestEvalTree",         IndexAccessTests::TestEvalTree},
+    {"TestMultiPhase",       IndexAccessTests::TestMultiPhase},
+    {"TestDocImportance",    IndexAccessTests::TestDocImportance},
+    {"TestEndToEnd",         IndexAccessTests::TestEndToEnd},
 };

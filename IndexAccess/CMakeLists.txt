@@ -8,8 +8,6 @@ set(CMAKE_CXX_STANDARD 11)
 
 include_directories(
     PUBLIC
-    "${CMAKE_CURRENT_LIST_DIR}/../thirdParty/boost_1_75_0"
-    "${CMAKE_CURRENT_LIST_DIR}/../ThirdParty/boost_1_75_0"
     "${CMAKE_CURRENT_LIST_DIR}/../Executor"
     "${CMAKE_CURRENT_LIST_DIR}/../Compiler"
     "${CMAKE_CURRENT_LIST_DIR}/../Tokenizer"
