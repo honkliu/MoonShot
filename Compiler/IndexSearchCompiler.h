@@ -39,13 +39,18 @@ static inline std::vector<std::string> SplitOn(const std::string& s,
 * Field-prefix syntax:
 *   title:fox   → TermNode("foxT")
 *   body:fox    → TermNode("foxB")
-*   anchor:fox  → TermNode("foxA")
 *
 * Boolean syntax:
-*   "fox quick"      → AND(fox, quick)
-*   "fox OR quick"   → OR(fox, quick)
-*   "fox NOT unsafe" → NOT(base=fox, exclude=unsafe)
-*   "-unsafe fox"    → NOT(base=fox, exclude=unsafe)
+*   "fox quick"      → AND + bigram variant
+*   "fox OR quick"   → OR
+*   "fox NOT unsafe" → NOT
+*   "-unsafe fox"    → NOT (minus prefix)
+*
+* Bigram support:
+*   Multi-token queries automatically include a bigram alternative.
+*   "good morning" → Or( And(good_morningT,...),        ← bigram arm
+*                        And(Or(goodT,...), Or(morningT,...)) )  ← unigram arm
+*   Documents matching bigrams score higher than unigram-only matches.
 */
 class IndexSearchCompiler {
 public:
@@ -99,6 +104,10 @@ private:
         return streams;
     }
 
+    /*
+    * Build an Or/Term group for one term across all streams.
+    * "fox" on "AUT" → OrNode(TermNode("foxA"), TermNode("foxU"), TermNode("foxT"))
+    */
     std::shared_ptr<EvalNode> MakeTermGroup(
             const std::string&              term,
             const std::vector<std::string>& streams)
@@ -112,6 +121,65 @@ private:
             orNode->children.push_back(std::make_shared<TermNode>(term + stream));
 
         return orNode;
+    }
+
+    /*
+    * Build an AND of bigram term groups for adjacent token pairs.
+    *
+    * "good morning vietnam" →
+    *   And( Or(good_morningA,...,good_morningT),
+    *        Or(morning_vietnamA,...,morning_vietnamT) )
+    *
+    * Returns nullptr when fewer than 2 canonical terms are present.
+    */
+    std::shared_ptr<EvalNode> BuildBigramQuery(
+            const std::vector<std::string>& terms,
+            const std::vector<std::string>& streams)
+    {
+        if (terms.size() < 2)
+            return nullptr;
+
+        std::vector<std::shared_ptr<EvalNode>> bigramGroups;
+
+        for (size_t i = 0; i + 1 < terms.size(); ++i) {
+            if (terms[i].empty() || terms[i + 1].empty())
+                continue;
+
+            std::string bigramKey = terms[i] + "_" + terms[i + 1];
+            bigramGroups.push_back(MakeTermGroup(bigramKey, streams));
+        }
+
+        if (bigramGroups.empty())
+            return nullptr;
+
+        if (bigramGroups.size() == 1)
+            return bigramGroups[0];
+
+        auto andNode      = std::make_shared<AndNode>();
+        andNode->children = std::move(bigramGroups);
+        return andNode;
+    }
+
+    /*
+    * Extract canonical token strings from a raw query token for bigram use.
+    * Field-prefixed tokens (title:foo) and negated tokens (-foo) are skipped —
+    * bigrams do not span field boundaries or cross negation boundaries.
+    */
+    void ExtractCanonicalTerms(const std::string&       rawToken,
+                               std::vector<std::string>& outTerms)
+    {
+        if (rawToken.empty() || rawToken[0] == '-')
+            return;
+
+        std::string termText;
+
+        if (!DetectFieldPrefix(rawToken, termText).empty())
+            return;
+
+        auto tokens = tokenizer_->Tokenize(rawToken.c_str());
+
+        for (auto& t : tokens)
+            outTerms.push_back(t);
     }
 
     /*
@@ -234,8 +302,10 @@ private:
 
         std::istringstream               iss(cleaned);
         std::string                      tok;
-        std::vector<std::shared_ptr<EvalNode>> positiveNodes;
+        std::vector<std::shared_ptr<EvalNode>> freeNodes;
+        std::vector<std::shared_ptr<EvalNode>> fieldNodes;
         std::vector<std::shared_ptr<EvalNode>> negatedNodes;
+        std::vector<std::string>               canonicalTerms;
 
         while (iss >> tok) {
             auto [node, negated] = TokenToNode(tok, streams);
@@ -243,23 +313,70 @@ private:
             if (!node)
                 continue;
 
-            if (negated)
+            if (negated) {
                 negatedNodes.push_back(node);
-            else
-                positiveNodes.push_back(node);
+            } else {
+                std::string dummy;
+                bool isField = !DetectFieldPrefix(tok, dummy).empty();
+
+                if (isField)
+                    fieldNodes.push_back(node);
+                else
+                    freeNodes.push_back(node);
+
+                ExtractCanonicalTerms(tok, canonicalTerms);
+            }
         }
 
-        if (positiveNodes.empty())
+        if (freeNodes.empty() && fieldNodes.empty())
             return nullptr;
+
+        /*
+        * Build the unigram AND from free (non-field) terms only.
+        */
+        std::shared_ptr<EvalNode> unigramBase;
+
+        if (!freeNodes.empty()) {
+            if (freeNodes.size() == 1) {
+                unigramBase = freeNodes[0];
+            } else {
+                auto andNode      = std::make_shared<AndNode>();
+                andNode->children = std::move(freeNodes);
+                unigramBase       = andNode;
+            }
+        }
+
+        /*
+        * Combine with bigram arm when possible.
+        */
+        auto bigramQuery = BuildBigramQuery(canonicalTerms, streams);
 
         std::shared_ptr<EvalNode> base;
 
-        if (positiveNodes.size() == 1) {
-            base = positiveNodes[0];
-        } else {
-            auto andNode      = std::make_shared<AndNode>();
-            andNode->children = std::move(positiveNodes);
-            base              = andNode;
+        if (unigramBase && bigramQuery) {
+            auto orNode = std::make_shared<OrNode>();
+            orNode->children.push_back(bigramQuery);
+            orNode->children.push_back(unigramBase);
+            base = orNode;
+        } else if (unigramBase) {
+            base = unigramBase;
+        } else if (bigramQuery) {
+            base = bigramQuery;
+        }
+
+        /*
+        * AND field-constrained nodes (site:, title:, body:, ...) around the
+        * entire expression so they apply to both the bigram and unigram arms.
+        */
+        for (auto& f : fieldNodes) {
+            if (!base) {
+                base = f;
+            } else {
+                auto andNode = std::make_shared<AndNode>();
+                andNode->children.push_back(base);
+                andNode->children.push_back(f);
+                base = andNode;
+            }
         }
 
         for (auto& excl : negatedNodes) {

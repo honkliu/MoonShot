@@ -16,23 +16,32 @@ class IndexReader
         virtual bool IsEnd() = 0;
         virtual uint64_t GetDocumentID() = 0;
 
-        /*
-        * Term frequency for the current document.
-        */
         virtual uint32_t GetTermFreq() { return 1u; }
 
-        /*
-        * BM25 contribution of this node for the current document.
-        * doc_len is the total token count for the current document.
-        */
         virtual float GetBM25Score(const Bm25Scorer& /*scorer*/,
                                    uint32_t          /*doc_len*/) { return 0.0f; }
 
         virtual void Close() = 0;
         virtual void Open(const char* word) = 0;
 
+        /*
+        * Enable debug tracing.  label appears in every printed line so the
+        * caller can identify which reader produced each output.
+        * Composite readers propagate the flag to all children.
+        */
+        virtual void SetDebug(const char* label, int depth = 0)
+        {
+            m_debug      = true;
+            m_debugDepth = depth;
+            if (label) m_debugLabel = label;
+        }
+
     protected:
         IndexReader() = default;
+
+        bool        m_debug      = false;
+        int         m_debugDepth = 0;
+        const char* m_debugLabel = "";
 };
 
 #endif

@@ -17,11 +17,58 @@ struct PostingEntry {
 
 /*
 * Sorted array of entries for one (term+stream) key, e.g. "foxT".
+*
+* entries  — decoded form; used by the writer to accumulate postings.
+* bytes    — VarByte-delta-encoded form; used by TermIndexReader via
+*             UnifiedDecoder::OpenRaw().  Computed lazily on first call to
+*             GetBytes() so encoding only runs once per posting list.
 */
 struct PostingList {
-    std::vector<PostingEntry> entries;
+    std::vector<PostingEntry>    entries;
+    mutable std::vector<uint8_t> bytes;
 
     uint32_t doc_freq() const { return static_cast<uint32_t>(entries.size()); }
+
+    /*
+    * Return the VarByte-encoded representation, encoding lazily on first call.
+    */
+    const std::vector<uint8_t>& GetBytes() const
+    {
+        if (bytes.empty() && !entries.empty())
+            Encode();
+        return bytes;
+    }
+
+    /*
+    * Invalidate the byte cache when entries are modified.
+    */
+    void InvalidateBytes()
+    {
+        bytes.clear();
+    }
+
+private:
+    static void vb_write(uint64_t v, std::vector<uint8_t>& out)
+    {
+        while (v >= 0x80u) {
+            out.push_back(static_cast<uint8_t>((v & 0x7Fu) | 0x80u));
+            v >>= 7;
+        }
+        out.push_back(static_cast<uint8_t>(v));
+    }
+
+    void Encode() const
+    {
+        bytes.clear();
+        bytes.reserve(entries.size() * 3);
+
+        uint64_t prev = 0;
+        for (const auto& e : entries) {
+            vb_write(e.doc_id - prev, bytes);
+            vb_write(e.tf,            bytes);
+            prev = e.doc_id;
+        }
+    }
 };
 
 /*
@@ -50,6 +97,12 @@ public:
         } else {
             pl.entries.insert(it, PostingEntry{doc_id, tf});
         }
+
+        /*
+        * Byte cache is now stale — clear it so the next GetBytes() call
+        * re-encodes the updated entries list.
+        */
+        pl.InvalidateBytes();
     }
 
     void AddDocTokens(uint64_t doc_id, uint32_t count)

@@ -560,6 +560,112 @@ void TestDiskPersistence()
 
 } // namespace IndexAccessTests
 
+// ============================================================
+// Test 12: bigram indexing and query
+// ============================================================
+namespace IndexAccessTests {
+
+void TestBigram()
+{
+    IndexContext   engine;
+    SmartTokenizer tok;
+    auto           writer = engine.GetWriter();
+
+    /*
+    * Doc 1: "good morning vietnam" — bigrams: good_morning, morning_vietnam
+    * Doc 2: "bad morning london"   — bigrams: bad_morning,  morning_london
+    * Doc 3: "good night vietnam"   — bigrams: good_night,   night_vietnam
+    */
+    writer->Write(tok.Tokenize("good morning vietnam"), 1, "Title");
+    writer->SetDocImportance(1, 0.9f);
+
+    writer->Write(tok.Tokenize("bad morning london"),   2, "Title");
+    writer->SetDocImportance(2, 0.7f);
+
+    writer->Write(tok.Tokenize("good night vietnam"),   3, "Title");
+    writer->SetDocImportance(3, 0.6f);
+
+    auto* store = engine.GetStore();
+
+    /*
+    * Verify bigrams were written into the Title stream posting store.
+    */
+    assert(store->GetPostingList("good_morningT")    != nullptr);
+    assert(store->GetPostingList("morning_vietnamT") != nullptr);
+    assert(store->GetPostingList("bad_morningT")     != nullptr);
+    assert(store->GetPostingList("good_nightT")      != nullptr);
+
+    std::cout << "  good_morningT    doc_freq="
+              << store->GetPostingList("good_morningT")->doc_freq() << "\n";
+    std::cout << "  morning_vietnamT doc_freq="
+              << store->GetPostingList("morning_vietnamT")->doc_freq() << "\n";
+
+    IndexSearchCompiler compiler;
+    auto exec = std::unique_ptr<IndexSearchExecutor>(engine.GetExecutor());
+
+    /*
+    * "good morning" on Title.
+    * Doc 1 matches bigram good_morningT → scored by both OR arms → highest score.
+    * Doc 2 has "morning" but not "good" → excluded by AND arm.
+    * Doc 3 has "good" but not "morning" → excluded by AND arm.
+    */
+    {
+        auto tree    = std::unique_ptr<EvalTree>(compiler.Compile("good morning", "T"));
+        auto results = exec->Execute(engine.GetReader(tree.get()), 5);
+
+        std::cout << "  search('good morning', T):\n";
+        for (auto& r : results)
+            std::cout << "    doc=" << r.doc_id << "  score=" << r.score << "\n";
+
+        AssertContains   (results, 1, "bigram: doc1 matches good morning");
+        AssertNotContains(results, 2, "bigram: doc2 has no good");
+        AssertNotContains(results, 3, "bigram: doc3 has no morning");
+    }
+
+    /*
+    * "morning vietnam" on Title.
+    * Doc 1 matches bigram morning_vietnamT → highest score.
+    */
+    {
+        auto tree    = std::unique_ptr<EvalTree>(compiler.Compile("morning vietnam", "T"));
+        auto results = exec->Execute(engine.GetReader(tree.get()), 5);
+
+        std::cout << "  search('morning vietnam', T):\n";
+        for (auto& r : results)
+            std::cout << "    doc=" << r.doc_id << "  score=" << r.score << "\n";
+
+        AssertContains   (results, 1, "bigram: doc1 matches morning vietnam");
+        AssertNotContains(results, 2, "bigram: doc2 has no vietnam");
+        AssertNotContains(results, 3, "bigram: doc3 has no morning");
+    }
+
+    /*
+    * Verify the compiled EvalTree structure for "good morning" on stream T.
+    * Expected:
+    *   Or( TermNode("good_morningT"),          ← bigram arm
+    *       And( TermNode("goodT"),              ← unigram arm
+    *            TermNode("morningT") ) )
+    */
+    {
+        auto tree = std::unique_ptr<EvalTree>(compiler.Compile("good morning", "T"));
+        assert(tree && !tree->IsEmpty());
+        assert(tree->root->GetType() == NodeType::Or);
+
+        auto* orNode = static_cast<OrNode*>(tree->root.get());
+        assert(orNode->children.size() == 2);
+
+        assert(orNode->children[0]->GetType() == NodeType::Term);
+        auto* bigramNode = static_cast<TermNode*>(orNode->children[0].get());
+        assert(bigramNode->stream_key == "good_morningT");
+        std::cout << "  bigram arm key: " << bigramNode->stream_key << "\n";
+
+        assert(orNode->children[1]->GetType() == NodeType::And);
+        std::cout << "  unigram arm: AndNode verified\n";
+    }
+}
+
+} // namespace IndexAccessTests
+
 std::map<std::string, std::function<void()>> testRegistry = {
     {"TestBuildIndex",       IndexAccessTests::TestBuildIndex},
     {"TestSingleTermSearch", IndexAccessTests::TestSingleTermSearch},
@@ -572,4 +678,5 @@ std::map<std::string, std::function<void()>> testRegistry = {
     {"TestDocImportance",    IndexAccessTests::TestDocImportance},
     {"TestEndToEnd",         IndexAccessTests::TestEndToEnd},
     {"TestDiskPersistence",  IndexAccessTests::TestDiskPersistence},
+    {"TestBigram",           IndexAccessTests::TestBigram},
 };

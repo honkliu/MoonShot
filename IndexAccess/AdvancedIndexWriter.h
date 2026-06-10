@@ -32,14 +32,33 @@ public:
 
         const std::string abbrev = StreamAbbrev(postingType);
 
-        std::unordered_map<std::string, uint32_t> tf_map;
+        /*
+        * Index unigrams: count TF per distinct term.
+        */
+        std::unordered_map<std::string, uint32_t> unigramTf;
         for (auto& word : words) {
             if (!word.empty())
-                ++tf_map[word];
+                ++unigramTf[word];
         }
 
-        for (auto& [term, tf] : tf_map)
+        for (auto& [term, tf] : unigramTf)
             store_->AddPosting(term + abbrev, documentId, tf);
+
+        /*
+        * Index bigrams: adjacent pairs joined by '_'.
+        * Key format: "good_morning" + abbrev  →  "good_morningT"
+        * TF counts repeated occurrences of the same adjacent pair.
+        */
+        std::unordered_map<std::string, uint32_t> bigramTf;
+        for (size_t i = 0; i + 1 < words.size(); ++i) {
+            if (!words[i].empty() && !words[i + 1].empty()) {
+                std::string bigram = words[i] + "_" + words[i + 1];
+                ++bigramTf[bigram];
+            }
+        }
+
+        for (auto& [bigram, tf] : bigramTf)
+            store_->AddPosting(bigram + abbrev, documentId, tf);
 
         store_->AddDocTokens(documentId,
                              static_cast<uint32_t>(words.size()));
