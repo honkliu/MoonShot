@@ -106,12 +106,12 @@ void TestBuildIndex()
     assert(store->GetPostingList("vietnamT") != nullptr);
     assert(store->GetPostingList("vietnamB") != nullptr);
 
-    auto* pl = store->GetPostingList("vietnamT");
-    assert(pl != nullptr);
-    assert(pl->doc_freq() >= 1);   // only "Good Morning Vietnam" has vietnam in title
+    auto* postingList = store->GetPostingList("vietnamT");
+    assert(postingList != nullptr);
+    assert(postingList->doc_freq() >= 1);
 
-    pl = store->GetPostingList("goodT");
-    assert(pl->doc_freq() >= 2);   // "Good Morning Vietnam" and "Good Will Hunting"
+    postingList = store->GetPostingList("goodT");
+    assert(postingList->doc_freq() >= 2);
 
     std::cout << "  'vietnamT' doc_freq = " << store->GetPostingList("vietnamT")->doc_freq() << "\n";
     std::cout << "  'goodT'    doc_freq = " << store->GetPostingList("goodT")->doc_freq()    << "\n";
@@ -223,12 +223,13 @@ void TestFieldConstraint()
         auto results  = executor_raw->Execute(reader, 10);
         PrintResults(results, "title:vietnam");
 
-        for (auto& r : results) {
-            auto* pl = store->GetPostingList("vietnamT");
-            bool in_title = false;
-            if (pl) for (auto& e : pl->entries)
-                if (e.doc_id == r.doc_id) { in_title = true; break; }
-            assert(in_title && "title:vietnam matched a doc not in vietnamT");
+        for (auto& result : results) {
+            const PostingList* postingList = store->GetPostingList("vietnamT");
+            bool inTitle = false;
+            if (postingList)
+                for (auto& entry : postingList->entries)
+                    if (entry.doc_id == result.doc_id) { inTitle = true; break; }
+            assert(inTitle && "title:vietnam matched a doc not in vietnamT");
         }
         delete compiler; delete tree;
     }
@@ -257,9 +258,9 @@ void TestEvalTree()
         auto tree = compiler->Compile("fox", "T");
         assert(tree && !tree->IsEmpty());
         assert(tree->root->GetType() == NodeType::Term);
-        auto* tn = static_cast<TermNode*>(tree->root.get());
-        assert(tn->stream_key == "foxT");
-        std::cout << "  Compile('fox','T') → TermNode('" << tn->stream_key << "')\n";
+        auto* termNode = static_cast<TermNode*>(tree->root.get());
+        assert(termNode->stream_key == "foxT");
+        std::cout << "  Compile('fox','T') → TermNode('" << termNode->stream_key << "')\n";
         delete tree;
     }
 
@@ -267,10 +268,10 @@ void TestEvalTree()
         auto tree = compiler->Compile("fox quick", "T");
         assert(tree && !tree->IsEmpty());
         assert(tree->root->GetType() == NodeType::And);
-        auto* an = static_cast<AndNode*>(tree->root.get());
-        assert(an->children.size() == 2);
+        auto* andNode = static_cast<AndNode*>(tree->root.get());
+        assert(andNode->children.size() == 2);
         std::cout << "  Compile('fox quick','T') → AndNode with "
-                  << an->children.size() << " children\n";
+                  << andNode->children.size() << " children\n";
         delete tree;
     }
 
@@ -278,10 +279,10 @@ void TestEvalTree()
         auto tree = compiler->Compile("fox OR lazy", "T");
         assert(tree && !tree->IsEmpty());
         assert(tree->root->GetType() == NodeType::Or);
-        auto* on = static_cast<OrNode*>(tree->root.get());
-        assert(on->children.size() == 2);
+        auto* orNode = static_cast<OrNode*>(tree->root.get());
+        assert(orNode->children.size() == 2);
         std::cout << "  Compile('fox OR lazy','T') → OrNode with "
-                  << on->children.size() << " children\n";
+                  << orNode->children.size() << " children\n";
         delete tree;
     }
 
@@ -292,12 +293,12 @@ void TestEvalTree()
         auto tree = compiler->Compile("fox", "AUT");
         assert(tree && !tree->IsEmpty());
         assert(tree->root->GetType() == NodeType::Or);
-        auto* on = static_cast<OrNode*>(tree->root.get());
-        assert(on->children.size() == 3);
-        for (auto& c : on->children) {
-            assert(c->GetType() == NodeType::Term);
-            auto* tn = static_cast<TermNode*>(c.get());
-            std::cout << "    stream_key: " << tn->stream_key << "\n";
+        auto* orNode = static_cast<OrNode*>(tree->root.get());
+        assert(orNode->children.size() == 3);
+        for (auto& child : orNode->children) {
+            assert(child->GetType() == NodeType::Term);
+            auto* termNode = static_cast<TermNode*>(child.get());
+            std::cout << "    stream_key: " << termNode->stream_key << "\n";
         }
         delete tree;
     }
@@ -406,7 +407,7 @@ void TestEndToEnd()
 
     {
         /*
-        * GetReader returns an ISR starting at the first matching document.
+        * GetReader returns an IndexReader starting at the first matching document.
         * Read the current doc_id directly — no GoNext needed.
         */
         auto rdr   = index_context->GetReader("fox");

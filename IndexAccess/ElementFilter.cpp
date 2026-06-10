@@ -27,13 +27,14 @@ ElementFilter::~ElementFilter()
 
 void ElementFilter::AddElement(const char *elt)
 {
-    if (!m_FilterSpace || m_size <= 0) return;
+    if (!m_FilterSpace || m_size <= 0)
+        return;
 
     std::string_view sv(elt);
     std::hash<std::string_view> h;
 
     auto n1 = h(sv);
-    auto n2 = n1 ^ (n1 >> 17);    // second probe using bit rotation
+    auto n2 = n1 ^ (n1 >> 17);
 
     m_FilterSpace[n1 % m_size] = 1;
     m_FilterSpace[n2 % m_size] = 1;
@@ -41,7 +42,8 @@ void ElementFilter::AddElement(const char *elt)
 
 bool ElementFilter::Contains(const char *elt)
 {
-    if (!m_FilterSpace || m_size <= 0) return true;
+    if (!m_FilterSpace || m_size <= 0)
+        return true;
 
     std::string_view sv(elt);
     std::hash<std::string_view> h;

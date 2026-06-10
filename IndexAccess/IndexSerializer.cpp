@@ -103,7 +103,8 @@ static float    read_f32(FILE* f) { float    v; fread(&v, 4, 1, f); return v; }
  * ============================================================ */
 bool IndexSerializer::Save(const PostingStore& store, const char* path)
 {
-    if (!path || !*path) return false;
+    if (!path || !*path)
+        return false;
 
     /* 1. Collect terms sorted alphabetically. */
     struct TermEntry {
@@ -115,8 +116,10 @@ bool IndexSerializer::Save(const PostingStore& store, const char* path)
 
     std::vector<TermEntry> terms;
     terms.reserve(store.AllPostings().size());
+
     for (const auto& [k, pl] : store.AllPostings())
         terms.push_back({k, &pl, 0u, 0u});
+
     std::sort(terms.begin(), terms.end(),
         [](const TermEntry& a, const TermEntry& b){ return a.key < b.key; });
 
@@ -128,15 +131,17 @@ bool IndexSerializer::Save(const PostingStore& store, const char* path)
     for (auto& te : terms) {
         te.data_offset = static_cast<uint64_t>(posting_buf.size());
         uint64_t prev  = 0;
+
         for (const auto& e : te.list->entries) {
             vb_encode(e.doc_id - prev, posting_buf);
             vb_encode(e.tf,            posting_buf);
             prev = e.doc_id;
         }
+
         te.data_len = static_cast<uint32_t>(posting_buf.size() - te.data_offset);
     }
 
-    /* 3. Compute term-dict byte size (needed for offset calculation). */
+    /* 3. Compute term-dict byte size. */
     uint64_t termdict_bytes = 0;
     for (const auto& te : terms)
         termdict_bytes += 2u + te.key.size() + 4u + 8u + 4u;
@@ -161,7 +166,9 @@ bool IndexSerializer::Save(const PostingStore& store, const char* path)
 
     /* 5. Write file. */
     FILE* f = fopen(path, "wb");
-    if (!f) return false;
+
+    if (!f)
+        return false;
 
     fwrite(&hdr, sizeof(hdr), 1, f);
 
@@ -191,33 +198,50 @@ bool IndexSerializer::Save(const PostingStore& store, const char* path)
     return true;
 }
 
-/* ============================================================
- * Load
- * ============================================================ */
 bool IndexSerializer::Load(PostingStore& store, const char* path)
 {
-    if (!path || !*path) return false;
+    if (!path || !*path)
+        return false;
 
     FILE* f = fopen(path, "rb");
-    if (!f) return false;
+
+    if (!f)
+        return false;
 
     /* Read and validate header. */
     FileHeader hdr;
-    if (fread(&hdr, sizeof(hdr), 1, f) != 1) { fclose(f); return false; }
-    if (memcmp(hdr.magic, MAGIC, 8) != 0)     { fclose(f); return false; }
-    if (hdr.version != FORMAT_VERSION)         { fclose(f); return false; }
+
+    if (fread(&hdr, sizeof(hdr), 1, f) != 1) {
+        fclose(f);
+        return false;
+    }
+
+    if (memcmp(hdr.magic, MAGIC, 8) != 0) {
+        fclose(f);
+        return false;
+    }
+
+    if (hdr.version != FORMAT_VERSION) {
+        fclose(f);
+        return false;
+    }
 
     /* DocData section. */
     fseek(f, static_cast<long>(hdr.docdata_offset), SEEK_SET);
+
     for (uint64_t i = 0; i < hdr.num_documents; ++i) {
         DocDataRecord rec;
-        if (fread(&rec, sizeof(rec), 1, f) != 1) break;
+
+        if (fread(&rec, sizeof(rec), 1, f) != 1)
+            break;
+
         store.AddDocTokens(rec.doc_id, rec.doc_len);
         store.SetDocImportance(rec.doc_id, rec.importance);
     }
 
     /* Read entire postings data into a buffer for random access. */
     std::vector<uint8_t> post_buf(static_cast<size_t>(hdr.postings_size));
+
     if (hdr.postings_size > 0) {
         fseek(f, static_cast<long>(hdr.postings_offset), SEEK_SET);
         fread(post_buf.data(), 1, post_buf.size(), f);
@@ -225,13 +249,14 @@ bool IndexSerializer::Load(PostingStore& store, const char* path)
 
     /* TermDict section. */
     fseek(f, static_cast<long>(hdr.termdict_offset), SEEK_SET);
+
     for (uint64_t i = 0; i < hdr.num_terms; ++i) {
-        uint16_t key_len = read_u16(f);
+        uint16_t    key_len  = read_u16(f);
         std::string key(key_len, '\0');
         fread(&key[0], 1, key_len, f);
-        uint32_t doc_freq   = read_u32(f);
-        uint64_t data_off   = read_u64(f);
-        uint32_t data_len   = read_u32(f);
+        uint32_t doc_freq = read_u32(f);
+        uint64_t data_off = read_u64(f);
+        uint32_t data_len = read_u32(f);
 
         /* Decode the posting list from the buffer. */
         size_t   pos  = static_cast<size_t>(data_off);
@@ -245,23 +270,26 @@ bool IndexSerializer::Load(PostingStore& store, const char* path)
             store.AddPosting(key, prev, static_cast<uint32_t>(tf));
         }
 
-        (void)doc_freq;   // doc_freq is implicitly correct from the entries
+        (void)doc_freq;
     }
 
     fclose(f);
     return true;
 }
 
-/* ============================================================
- * IsValidIndex
- * ============================================================ */
 bool IndexSerializer::IsValidIndex(const char* path)
 {
-    if (!path || !*path) return false;
+    if (!path || !*path)
+        return false;
+
     FILE* f = fopen(path, "rb");
-    if (!f) return false;
+
+    if (!f)
+        return false;
+
     uint8_t magic[8] = {};
     fread(magic, 1, 8, f);
     fclose(f);
+
     return memcmp(magic, MAGIC, 8) == 0;
 }

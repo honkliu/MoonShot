@@ -83,6 +83,7 @@ install(FILES
     IndexAccess/IndexWriter.h
     IndexAccess/AdvancedIndexWriter.h
     IndexAccess/AdvancedIndexReader.h
+    IndexAccess/IndexReaderImpl.h
     IndexAccess/IsrImpl.h
     IndexAccess/BlockTable.h
     IndexAccess/FileBlockManager.h

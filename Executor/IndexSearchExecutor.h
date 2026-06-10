@@ -12,8 +12,8 @@
 #include <algorithm>
 
 /*
-* Traverses an ISR tree in doc_id order, scores each matched document
-* with BM25 + doc importance, and returns a top-K result list.
+* Traverses an IndexReader tree in ascending doc_id order, scores each
+* matched document with BM25 + doc importance, and returns a top-K list.
 */
 class IndexSearchExecutor
 {
@@ -23,102 +23,113 @@ public:
     {}
 
     std::vector<SearchResult> Execute(std::shared_ptr<IndexReader> reader,
-                                      int top_k = 10)
+                                      int topK = 10)
     {
-        if (!reader || reader->IsEnd()) return {};
+        if (!reader || reader->IsEnd())
+            return {};
 
         Bm25Scorer scorer(store_->TotalDocs(), store_->AvgDocLen());
         std::vector<SearchResult> results;
 
         while (!reader->IsEnd()) {
-            uint64_t doc_id  = reader->GetDocumentID();
-            uint32_t doc_len = store_->GetDocLen(doc_id);
-            float    score   = reader->GetBM25Score(scorer, doc_len)
-                             + store_->GetDocImportance(doc_id);
-            results.push_back({doc_id, score, ""});
+            uint64_t docId     = reader->GetDocumentID();
+            uint32_t docLength = store_->GetDocLen(docId);
+            float    score     = reader->GetBM25Score(scorer, docLength)
+                               + store_->GetDocImportance(docId);
+
+            results.push_back({docId, score, ""});
             reader->GoNext();
         }
 
-        SortAndTruncate(results, top_k);
+        SortAndTruncate(results, topK);
         return results;
     }
 
-    std::vector<SearchResult> Execute(IndexReader* reader, int top_k = 10)
+    std::vector<SearchResult> Execute(IndexReader* reader, int topK = 10)
     {
         return Execute(std::shared_ptr<IndexReader>(reader,
-                       [](IndexReader*){}), top_k);
+                       [](IndexReader*){}), topK);
     }
 
     /*
-    * Two-phase search: run phase1 first; if fewer than min_results
+    * Two-phase search: run phase1 first; if fewer than minResultsForPhase1
     * are found, run phase2 and merge the result sets.
     */
     std::vector<SearchResult> ExecutePhased(
-            std::shared_ptr<IndexReader> phase1_reader,
-            std::shared_ptr<IndexReader> phase2_reader,
-            int top_k = 10,
-            int min_results_phase1 = 3)
+            std::shared_ptr<IndexReader> phase1Reader,
+            std::shared_ptr<IndexReader> phase2Reader,
+            int topK                = 10,
+            int minResultsForPhase1 = 3)
     {
         Bm25Scorer scorer(store_->TotalDocs(), store_->AvgDocLen());
 
-        auto results = CollectResults(phase1_reader, scorer);
+        auto results = CollectResults(phase1Reader, scorer);
 
-        if ((int)results.size() < min_results_phase1 && phase2_reader) {
-            auto r2 = CollectResults(phase2_reader, scorer);
-            MergeResults(results, r2);
+        if ((int)results.size() < minResultsForPhase1 && phase2Reader) {
+            auto phase2Results = CollectResults(phase2Reader, scorer);
+            MergeResults(results, phase2Results);
         }
 
-        SortAndTruncate(results, top_k);
+        SortAndTruncate(results, topK);
         return results;
     }
 
-    // kept for backward compat
+    // Kept for backward compat.
     void Execute() {}
-    void Execute(EvalTree* /*eval_tree*/) {}
+    void Execute(EvalTree* /*evalTree*/) {}
 
 private:
     std::shared_ptr<PostingStore> store_;
 
     std::vector<SearchResult> CollectResults(
             std::shared_ptr<IndexReader>& reader,
-            const Bm25Scorer& scorer)
+            const Bm25Scorer&             scorer)
     {
-        std::vector<SearchResult> out;
-        if (!reader) return out;
+        std::vector<SearchResult> results;
+
+        if (!reader)
+            return results;
+
         while (!reader->IsEnd()) {
-            uint64_t doc_id  = reader->GetDocumentID();
-            uint32_t doc_len = store_->GetDocLen(doc_id);
-            float    score   = reader->GetBM25Score(scorer, doc_len)
-                             + store_->GetDocImportance(doc_id);
-            out.push_back({doc_id, score, ""});
+            uint64_t docId     = reader->GetDocumentID();
+            uint32_t docLength = store_->GetDocLen(docId);
+            float    score     = reader->GetBM25Score(scorer, docLength)
+                               + store_->GetDocImportance(docId);
+
+            results.push_back({docId, score, ""});
             reader->GoNext();
         }
-        return out;
+
+        return results;
     }
 
-    static void SortAndTruncate(std::vector<SearchResult>& v, int top_k)
+    static void SortAndTruncate(std::vector<SearchResult>& results, int topK)
     {
-        std::sort(v.begin(), v.end(),
+        std::sort(results.begin(), results.end(),
             [](const SearchResult& a, const SearchResult& b){
                 return a.score > b.score;
             });
-        if (top_k > 0 && (int)v.size() > top_k)
-            v.resize(static_cast<size_t>(top_k));
+
+        if (topK > 0 && (int)results.size() > topK)
+            results.resize(static_cast<size_t>(topK));
     }
 
-    static void MergeResults(std::vector<SearchResult>& base,
+    static void MergeResults(std::vector<SearchResult>&       base,
                               const std::vector<SearchResult>& additional)
     {
-        for (auto& r : additional) {
-            bool dup = false;
-            for (auto& b : base) {
-                if (b.doc_id == r.doc_id) {
-                    b.score = std::max(b.score, r.score);
-                    dup = true;
+        for (auto& result : additional) {
+            bool isDuplicate = false;
+
+            for (auto& existing : base) {
+                if (existing.doc_id == result.doc_id) {
+                    existing.score = std::max(existing.score, result.score);
+                    isDuplicate    = true;
                     break;
                 }
             }
-            if (!dup) base.push_back(r);
+
+            if (!isDuplicate)
+                base.push_back(result);
         }
     }
 };

@@ -27,18 +27,19 @@ public:
                uint64_t                    documentId,
                const char*                 postingType) override
     {
-        if (!store_ || words.empty()) return;
+        if (!store_ || words.empty())
+            return;
 
         const std::string abbrev = StreamAbbrev(postingType);
 
         std::unordered_map<std::string, uint32_t> tf_map;
-        for (auto& w : words) {
-            if (!w.empty()) ++tf_map[w];
+        for (auto& word : words) {
+            if (!word.empty())
+                ++tf_map[word];
         }
 
-        for (auto& [term, tf] : tf_map) {
+        for (auto& [term, tf] : tf_map)
             store_->AddPosting(term + abbrev, documentId, tf);
-        }
 
         store_->AddDocTokens(documentId,
                              static_cast<uint32_t>(words.size()));
@@ -57,7 +58,9 @@ private:
     */
     static std::string StreamAbbrev(const char* stream)
     {
-        if (!stream || !*stream) return "B";
+        if (!stream || !*stream)
+            return "B";
+
         switch (stream[0]) {
             case 'A': case 'a': return "A";
             case 'U': case 'u': return "U";
@@ -66,13 +69,16 @@ private:
             case 'M': case 'm': return "M";
             default: break;
         }
-        std::string s(stream);
-        std::transform(s.begin(), s.end(), s.begin(), ::tolower);
-        if (s == "title")  return "T";
-        if (s == "body")   return "B";
-        if (s == "anchor") return "A";
-        if (s == "url")    return "U";
-        if (s == "meta")   return "M";
+
+        std::string lower(stream);
+        std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+
+        if (lower == "title")  return "T";
+        if (lower == "body")   return "B";
+        if (lower == "anchor") return "A";
+        if (lower == "url")    return "U";
+        if (lower == "meta")   return "M";
+
         return "B";
     }
 };

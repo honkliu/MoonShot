@@ -22,7 +22,7 @@
 #include "AdvancedIndexWriter.h"    /* write tokens into the index          */
 #include "AdvancedIndexReader.h"    /* block-backed ISR (on-disk path)      */
 #include "IndexReader.h"            /* ISR base interface                   */
-#include "IsrImpl.h"                /* TermIsr / AndIsr / OrIsr / NotIsr    */
+#include "IndexReaderImpl.h"        /* TermIndexReader / AndIndexReader / OrIndexReader / NotIndexReader */
 #include "PostingStore.h"           /* in-memory posting store              */
 #include "SearchResult.h"           /* { doc_id, score, snippet }           */
 #include "Bm25Scorer.h"             /* Okapi BM25 scorer                    */

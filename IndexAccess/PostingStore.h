@@ -42,8 +42,9 @@ public:
     void AddPosting(const std::string& stream_key, uint64_t doc_id, uint32_t tf)
     {
         auto& pl = postings_[stream_key];
-        auto it = std::lower_bound(pl.entries.begin(), pl.entries.end(), doc_id,
+        auto  it = std::lower_bound(pl.entries.begin(), pl.entries.end(), doc_id,
             [](const PostingEntry& e, uint64_t d) { return e.doc_id < d; });
+
         if (it != pl.entries.end() && it->doc_id == doc_id) {
             it->tf += tf;
         } else {
@@ -84,7 +85,9 @@ public:
 
     float AvgDocLen() const
     {
-        if (doc_stats_.empty()) return 1.0f;
+        if (doc_stats_.empty())
+            return 1.0f;
+
         return static_cast<float>(total_terms_) /
                static_cast<float>(doc_stats_.size());
     }

@@ -17,10 +17,12 @@ static inline std::vector<std::string> SplitOn(const std::string& s,
 {
     std::vector<std::string> parts;
     size_t start = 0, pos;
+
     while ((pos = s.find(delim, start)) != std::string::npos) {
         parts.push_back(s.substr(start, pos - start));
         start = pos + delim.size();
     }
+
     parts.push_back(s.substr(start));
     return parts;
 }
@@ -29,10 +31,10 @@ static inline std::vector<std::string> SplitOn(const std::string& s,
 * Compiles a query string into an EvalTree.
 *
 * Stream sets:
-*   "AUT"  — Anchor, URL, Title   (phase 1)
-*   "AUTB" — + Body               (phase 2)
-*   "T"    — Title only
-*   "B"    — Body only
+*   "AUT"   — Anchor, URL, Title   (phase 1)
+*   "AUTB"  — + Body               (phase 2)
+*   "T"     — Title only
+*   "B"     — Body only
 *
 * Field-prefix syntax:
 *   title:fox   → TermNode("foxT")
@@ -51,22 +53,24 @@ public:
         : tokenizer_(new SmartTokenizer())
     {}
 
-    EvalTree* Compile(const char* query_string,
-                      const char* stream_set = "AUT")
+    EvalTree* Compile(const char* queryString,
+                      const char* streamSet = "AUT")
     {
-        if (!query_string || !*query_string) return new EvalTree{};
+        if (!queryString || !*queryString)
+            return new EvalTree{};
 
-        std::string q(query_string);
-        std::vector<std::string> streams = ParseStreamSet(stream_set);
+        std::string          query(queryString);
+        std::vector<std::string> streams = ParseStreamSet(streamSet);
 
-        auto root = ParseExpression(q, streams);
-        auto tree = new EvalTree();
+        auto root = ParseExpression(query, streams);
+
+        auto tree  = new EvalTree();
         tree->root = root;
         return tree;
     }
 
     template<typename T>
-    Embeddings<T>* CompileToVector(const char* /*query_string*/)
+    Embeddings<T>* CompileToVector(const char* /*queryString*/)
     {
         return nullptr;
     }
@@ -74,43 +78,48 @@ public:
 private:
     std::unique_ptr<Tokenizer> tokenizer_;
 
-    std::vector<std::string> ParseStreamSet(const char* ss)
+    std::vector<std::string> ParseStreamSet(const char* streamSet)
     {
         std::vector<std::string> streams;
-        for (const char* p = ss; *p; ++p) {
+
+        for (const char* p = streamSet; *p; ++p) {
             switch (*p) {
                 case 'A': streams.emplace_back("A"); break;
                 case 'U': streams.emplace_back("U"); break;
                 case 'T': streams.emplace_back("T"); break;
                 case 'B': streams.emplace_back("B"); break;
                 case 'M': streams.emplace_back("M"); break;
-                default: break;
+                default:  break;
             }
         }
-        if (streams.empty()) streams.emplace_back("T");
+
+        if (streams.empty())
+            streams.emplace_back("T");
+
         return streams;
     }
 
     std::shared_ptr<EvalNode> MakeTermGroup(
-            const std::string& term,
+            const std::string&              term,
             const std::vector<std::string>& streams)
     {
         if (streams.size() == 1)
             return std::make_shared<TermNode>(term + streams[0]);
 
-        auto or_node = std::make_shared<OrNode>();
-        for (auto& s : streams)
-            or_node->children.push_back(
-                std::make_shared<TermNode>(term + s));
-        return or_node;
+        auto orNode = std::make_shared<OrNode>();
+
+        for (auto& stream : streams)
+            orNode->children.push_back(std::make_shared<TermNode>(term + stream));
+
+        return orNode;
     }
 
     /*
     * Return the single-stream abbreviation if a field prefix is detected,
-    * and write the bare term into out_term. Returns "" if no prefix found.
+    * and write the bare term into outTerm. Returns "" if no prefix found.
     */
     std::string DetectFieldPrefix(const std::string& token,
-                                  std::string& out_term)
+                                  std::string&        outTerm)
     {
         static const struct { const char* prefix; const char* abbrev; } fields[] = {
             {"title:",  "T"},
@@ -120,79 +129,99 @@ private:
             {"site:",   "U"},
             {nullptr,  nullptr}
         };
-        std::string low = token;
-        std::transform(low.begin(), low.end(), low.begin(), ::tolower);
+
+        std::string lower = token;
+        std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+
         for (auto* f = fields; f->prefix; ++f) {
-            if (low.rfind(f->prefix, 0) == 0) {
-                out_term = token.substr(strlen(f->prefix));
-                std::transform(out_term.begin(), out_term.end(),
-                               out_term.begin(), ::tolower);
+            if (lower.rfind(f->prefix, 0) == 0) {
+                outTerm = token.substr(strlen(f->prefix));
+                std::transform(outTerm.begin(), outTerm.end(),
+                               outTerm.begin(), ::tolower);
                 return f->abbrev;
             }
         }
+
         return "";
     }
 
     std::pair<std::shared_ptr<EvalNode>, bool>
-    TokenToNode(const std::string& raw_token,
+    TokenToNode(const std::string&              rawToken,
                 const std::vector<std::string>& streams)
     {
-        std::string token = raw_token;
-        bool negated = false;
+        std::string token   = rawToken;
+        bool        negated = false;
 
         if (!token.empty() && token[0] == '-') {
             negated = true;
-            token = token.substr(1);
+            token   = token.substr(1);
         }
-        if (token.empty()) return {nullptr, false};
 
-        std::string term_text;
-        std::string field_abbrev = DetectFieldPrefix(token, term_text);
-        if (!field_abbrev.empty() && !term_text.empty()) {
-            auto node = std::make_shared<TermNode>(term_text + field_abbrev);
+        if (token.empty())
+            return {nullptr, false};
+
+        std::string termText;
+        std::string fieldAbbrev = DetectFieldPrefix(token, termText);
+
+        if (!fieldAbbrev.empty() && !termText.empty()) {
+            auto node = std::make_shared<TermNode>(termText + fieldAbbrev);
             return {node, negated};
         }
 
         auto tokens = tokenizer_->Tokenize(token.c_str());
-        if (tokens.empty()) return {nullptr, false};
+
+        if (tokens.empty())
+            return {nullptr, false};
 
         if (tokens.size() == 1)
             return {MakeTermGroup(tokens[0], streams), negated};
 
-        auto and_node = std::make_shared<AndNode>();
+        auto andNode = std::make_shared<AndNode>();
         for (auto& t : tokens)
-            and_node->children.push_back(MakeTermGroup(t, streams));
-        return {and_node, negated};
+            andNode->children.push_back(MakeTermGroup(t, streams));
+
+        return {andNode, negated};
     }
 
     std::shared_ptr<EvalNode> ParseExpression(
-            const std::string& query,
+            const std::string&              query,
             const std::vector<std::string>& streams)
     {
         if (query.find(" OR ") != std::string::npos) {
-            auto parts = SplitOn(query, " OR ");
-            auto or_node = std::make_shared<OrNode>();
-            for (auto& p : parts) {
-                auto child = ParseExpression(Trim(p), streams);
-                if (child) or_node->children.push_back(child);
+            auto parts  = SplitOn(query, " OR ");
+            auto orNode = std::make_shared<OrNode>();
+
+            for (auto& part : parts) {
+                auto child = ParseExpression(Trim(part), streams);
+                if (child)
+                    orNode->children.push_back(child);
             }
-            if (or_node->children.empty()) return nullptr;
-            if (or_node->children.size() == 1) return or_node->children[0];
-            return or_node;
+
+            if (orNode->children.empty())
+                return nullptr;
+
+            if (orNode->children.size() == 1)
+                return orNode->children[0];
+
+            return orNode;
         }
 
         if (query.find(" NOT ") != std::string::npos) {
             auto parts = SplitOn(query, " NOT ");
+
             if (parts.size() >= 2) {
-                auto base    = ParseExpression(Trim(parts[0]), streams);
-                auto exclude = ParseExpression(Trim(parts[1]), streams);
-                if (base && exclude) {
-                    auto not_node = std::make_shared<NotNode>();
-                    not_node->base    = base;
-                    not_node->exclude = exclude;
-                    return not_node;
+                auto baseExpr    = ParseExpression(Trim(parts[0]), streams);
+                auto excludeExpr = ParseExpression(Trim(parts[1]), streams);
+
+                if (baseExpr && excludeExpr) {
+                    auto notNode     = std::make_shared<NotNode>();
+                    notNode->base    = baseExpr;
+                    notNode->exclude = excludeExpr;
+                    return notNode;
                 }
-                if (base) return base;
+
+                if (baseExpr)
+                    return baseExpr;
             }
         }
 
@@ -203,34 +232,41 @@ private:
                 cleaned.replace(pos, 5, " ");
         }
 
-        std::istringstream iss(cleaned);
-        std::string tok;
-        std::vector<std::shared_ptr<EvalNode>> positive_nodes;
-        std::vector<std::shared_ptr<EvalNode>> negated_nodes;
+        std::istringstream               iss(cleaned);
+        std::string                      tok;
+        std::vector<std::shared_ptr<EvalNode>> positiveNodes;
+        std::vector<std::shared_ptr<EvalNode>> negatedNodes;
 
         while (iss >> tok) {
             auto [node, negated] = TokenToNode(tok, streams);
-            if (!node) continue;
-            if (negated) negated_nodes.push_back(node);
-            else         positive_nodes.push_back(node);
+
+            if (!node)
+                continue;
+
+            if (negated)
+                negatedNodes.push_back(node);
+            else
+                positiveNodes.push_back(node);
         }
 
-        if (positive_nodes.empty()) return nullptr;
+        if (positiveNodes.empty())
+            return nullptr;
 
         std::shared_ptr<EvalNode> base;
-        if (positive_nodes.size() == 1) {
-            base = positive_nodes[0];
+
+        if (positiveNodes.size() == 1) {
+            base = positiveNodes[0];
         } else {
-            auto and_node = std::make_shared<AndNode>();
-            and_node->children = std::move(positive_nodes);
-            base = and_node;
+            auto andNode      = std::make_shared<AndNode>();
+            andNode->children = std::move(positiveNodes);
+            base              = andNode;
         }
 
-        for (auto& excl : negated_nodes) {
-            auto not_node = std::make_shared<NotNode>();
-            not_node->base    = base;
-            not_node->exclude = excl;
-            base = not_node;
+        for (auto& excl : negatedNodes) {
+            auto notNode     = std::make_shared<NotNode>();
+            notNode->base    = base;
+            notNode->exclude = excl;
+            base             = notNode;
         }
 
         return base;
@@ -240,7 +276,10 @@ private:
     {
         size_t l = s.find_first_not_of(" \t");
         size_t r = s.find_last_not_of(" \t");
-        if (l == std::string::npos) return "";
+
+        if (l == std::string::npos)
+            return "";
+
         return s.substr(l, r - l + 1);
     }
 };
