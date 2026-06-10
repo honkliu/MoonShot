@@ -44,7 +44,7 @@ public:
                              static_cast<uint32_t>(words.size()));
     }
 
-    void SetDocImportance(uint64_t doc_id, float score)
+    void SetDocImportance(uint64_t doc_id, float score) override
     {
         store_->SetDocImportance(doc_id, score);
     }

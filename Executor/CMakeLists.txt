@@ -1,11 +1,10 @@
-#project(Executor)
-
 aux_source_directory(. SOURCEFILES)
 
 add_library(Executor ${SOURCEFILES})
 
-include_directories(
-    PUBLIC
-    "${CMAKE_CURRENT_LIST_DIR}/../Compiler"
-    "${CMAKE_CURRENT_LIST_DIR}/../IndexAccess"
+target_include_directories(Executor PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../Compiler"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../IndexAccess"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../Utils"
 )

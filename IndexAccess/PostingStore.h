@@ -100,6 +100,18 @@ public:
         return doc_stats_.find(doc_id) != doc_stats_.end();
     }
 
+    const std::unordered_map<std::string, PostingList>& AllPostings() const
+    {
+        return postings_;
+    }
+
+    const std::unordered_map<uint64_t, DocStats>& AllDocStats() const
+    {
+        return doc_stats_;
+    }
+
+    uint64_t TotalTerms() const { return total_terms_; }
+
 private:
     std::unordered_map<std::string, PostingList> postings_;
     std::unordered_map<uint64_t, DocStats>       doc_stats_;

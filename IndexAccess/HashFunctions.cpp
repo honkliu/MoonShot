@@ -331,20 +331,29 @@ void MurmurHash3_x64_128 ( const void * key, const int len,
 }
 
 
-int Hash1(unsigned char *, int size)
+int Hash1(unsigned char *key, int size)
 {
-	return 0;
+    uint32_t out = 0;
+    MurmurHash3_x86_32(key, size, 1u, &out);
+    return static_cast<int>(out);
 }
-int Hash2(unsigned char *, int size)
+
+int Hash2(unsigned char *key, int size)
 {
-  return 0;
+    uint32_t out = 0;
+    MurmurHash3_x86_32(key, size, 2u, &out);
+    return static_cast<int>(out);
 }
+
 int HashMurmur3(unsigned char * key, int len, int seed)
 {
-	return 0;
+    uint32_t out = 0;
+    MurmurHash3_x86_32(key, len, static_cast<uint32_t>(seed), &out);
+    return static_cast<int>(out);
 }
-int HashCrypto(unsigned char *, int size)
+
+int HashCrypto(unsigned char *, int)
 {
-	return 0;
+    return 0;
 }
 

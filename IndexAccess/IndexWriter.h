@@ -6,30 +6,38 @@
 #include <string>
 #include <cstdint>
 
-/* 
-* An IndexWriter or IndexReader is reprenting a table name
+/*
+* IndexWriter — base interface for writing tokens into the index.
 *
-* After it is initialized, it will be pointing a table or index name. 
-* such that:
-*  "T_word": Doc1, Doc2, Doc3
-*  "A_word": Doc5, Doc7, Doc9
-*  "B_word": Doc1, Doc2, Doc3, Doc4
-*
-* Then in the future, we could use the IndexReader to read the data, match find the doc
+* An IndexWriter or IndexReader represents a table name.
+* After it is initialised it points to a table or index name such that:
+*   "T_word": Doc1, Doc2, Doc3
+*   "A_word": Doc5, Doc7, Doc9
+*   "B_word": Doc1, Doc2, Doc3, Doc4
 */
-
 class IndexWriter
 {
     public:
         IndexWriter(const IndexWriter&) = delete;
 
-        virtual void Write(std::vector<std::string>&&words, uint64_t documentId, const char * postingType) {}
-        //virtual void Write(const std::vector<std::string>& tokens) {};
-        //virtual void Close() = {};
-        //virtual void Flush() = {};
+        /*
+        * Index a list of tokens for documentId under the given stream.
+        * stream: "Title", "Body", "Anchor", "URL", "Meta"
+        *         (or single-char abbreviations T, B, A, U, M)
+        */
+        virtual void Write(std::vector<std::string>&& words,
+                           uint64_t                    documentId,
+                           const char*                 postingType) {}
+
+        /*
+        * Assign a pre-computed quality score to a document.
+        * Higher score lifts the document during BM25 ranking.
+        * Typical source: PageRank, domain authority, or a learned model.
+        */
+        virtual void SetDocImportance(uint64_t /*doc_id*/, float /*score*/) {}
+
     protected:
         IndexWriter() = default;
 };
-
 
 #endif
