@@ -11,4 +11,4 @@ target_include_directories(Tokenizer PUBLIC
     $<BUILD_INTERFACE:${ICU_INCLUDE_DIRS}>
 )
 
-target_link_libraries(Tokenizer PRIVATE ${ICU_LIBRARIES})
+target_link_libraries(Tokenizer PUBLIC ICU::uc ICU::i18n)

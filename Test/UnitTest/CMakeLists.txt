@@ -1,4 +1,7 @@
-cmake_minimum_required(VERSION 3.10)
+cmake_minimum_required(VERSION 3.14)
+
+set(CMAKE_CXX_STANDARD 23)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 enable_testing()
 
@@ -34,3 +37,7 @@ set(common_libs IndexAccess Executor Tokenizer Utils)
 
 target_link_libraries(UnitTestRunner PRIVATE ${common_libs})
 target_link_libraries(Search        PRIVATE ${common_libs})
+
+set_target_properties(UnitTestRunner Search PROPERTIES
+    CXX_STANDARD 23
+    CXX_STANDARD_REQUIRED ON)
