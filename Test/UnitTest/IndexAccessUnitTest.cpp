@@ -141,7 +141,7 @@ void TestSingleTermSearch()
     AssertNotContains(results, 4, "vietnam AUT");
     assert(!results.empty());
 
-    delete compiler; delete tree; delete executor;
+    delete compiler; delete tree;
 }
 
 /*
@@ -162,7 +162,7 @@ void TestAndSearch()
     AssertContains(results, 1, "good morning");
     AssertNotContains(results, 4, "good morning AND");
 
-    delete compiler; delete tree; delete executor;
+    delete compiler; delete tree;
 }
 
 /*
@@ -183,7 +183,7 @@ void TestOrSearch()
     AssertContains(results, 1, "OR morning");
     AssertContains(results, 2, "OR apocalypse");
 
-    delete compiler; delete tree; delete executor;
+    delete compiler; delete tree;
 }
 
 /*
@@ -204,7 +204,7 @@ void TestNotSearch()
     AssertContains   (results, 1, "NOT: doc1 present");
     AssertNotContains(results, 4, "NOT: doc4 excluded");
 
-    delete compiler; delete tree; delete executor;
+    delete compiler; delete tree;
 }
 
 /*
@@ -243,8 +243,6 @@ void TestFieldConstraint()
         AssertContains(results, 5, "body:vietnam doc5");
         delete compiler; delete tree;
     }
-
-    delete executor_raw;
 }
 
 /*
@@ -348,7 +346,6 @@ void TestMultiPhase()
 
     delete compiler;
     delete tree1; delete tree2; delete tree_p1; delete tree_p2;
-    delete executor;
 }
 
 /*
@@ -375,7 +372,7 @@ void TestDocImportance()
     assert(results.size() == 2);
     assert(results[0].doc_id == 99 && "doc 99 must rank first");
 
-    delete ctx; delete compiler; delete tree; delete executor;
+    delete ctx; delete compiler; delete tree;
 }
 
 /*
@@ -493,7 +490,7 @@ void TestDiskPersistence()
         * Run the same queries as the other tests to confirm results match.
         */
         IndexSearchCompiler compiler;
-        auto exec = std::unique_ptr<IndexSearchExecutor>(engine2.GetExecutor());
+        auto exec = engine2.GetExecutor();
 
         // 1. Single term — should find doc 1 ("rust" in title)
         {
@@ -593,7 +590,7 @@ void TestBigram()
               << store->GetPostingList("morning_vietnamT")->doc_freq() << "\n";
 
     IndexSearchCompiler compiler;
-    auto exec = std::unique_ptr<IndexSearchExecutor>(engine.GetExecutor());
+    auto exec = engine.GetExecutor();
 
     /*
     * "good morning" on Title.
