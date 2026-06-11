@@ -42,9 +42,9 @@ public:
     UnifiedDecoder()
         : m_block(nullptr)
         , m_current_ptr(nullptr)
+        , m_block_end(nullptr)
         , m_current_doc(0)
         , m_current_tf(0)
-        , m_block_end(nullptr)
         , m_raw_mode(false)
         , m_has_current(false)
     {}

@@ -275,8 +275,8 @@ class IndexBlockTable
 {
     public:
         explicit IndexBlockTable(uint32_t cache_capacity = 512)
-            : m_BlockCache(cache_capacity)
-            , m_TermToBlock(std::make_shared<TermToBlock>())
+            : m_TermToBlock(std::make_shared<TermToBlock>())
+            , m_BlockCache(cache_capacity)
         {
             m_FileManager.reset();
         }
