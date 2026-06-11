@@ -7,8 +7,8 @@ aux_source_directory(. SOURCEFILES)
 add_library(Tokenizer ${SOURCEFILES})
 
 target_include_directories(Tokenizer PUBLIC
-    "${CMAKE_CURRENT_SOURCE_DIR}"
-    ${ICU_INCLUDE_DIRS}
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
+    $<BUILD_INTERFACE:${ICU_INCLUDE_DIRS}>
 )
 
 target_link_libraries(Tokenizer PRIVATE ${ICU_LIBRARIES})
