@@ -1,47 +1,32 @@
-// ---------------------------------------------------------------------------
-// RustBlade — public API surface
-//
-// Design map:
-//   MoonShot concept       → RustBlade equivalent
-//   ─────────────────────────────────────────────
-//   IndexContext            → Engine
-//   IndexReader / ISR       → isr::Isr trait
-//   AdvancedIndexReader     → isr::InvertedIsr
-//   AndIsr / OrIsr          → isr::{AndIsr, OrIsr, NotIsr}
-//   BlockTable / BlockCache → clock_cache::ClockCache
-//   SimpleISRPool (REF)     → isr_pool::IsrPool
-//   IndexSearchCompiler     → query::{QueryNode, QueryParser}
-//   IndexSearchExecutor     → executor::QueryExecutor
-//   UnifiedDecoder          → codec::{decode, decode_postings}
-//   AdvancedIndexWriter     → inverted_index::InvertedIndexBuilder
-//   Embeddings<T>           → vector_index::VectorIndex (Flat + HNSW)
-//   SmartTokenizer          → tokenizer::SimpleTokenizer
-//   BM25 scorer (missing)   → bm25::Bm25Scorer
-//   RRF fusion (missing)    → fusion::rrf_fusion
-// ---------------------------------------------------------------------------
+use mimalloc::MiMalloc;
+
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
 
 pub mod error;
-pub mod document;
 pub mod tokenizer;
-pub mod codec;
-pub mod postings;
-pub mod dictionary;
-pub mod isr;
-pub mod isr_pool;
-pub mod clock_cache;
+pub mod posting_store;
+pub mod block_table;
+pub mod varbyte_decoder;
+pub mod index_writer;
+pub mod eval_tree;
 pub mod bm25;
-pub mod inverted_index;
-pub mod vector_index;
-pub mod query;
+pub mod index_reader;
+pub mod advanced_reader;
+pub mod composite_readers;
+pub mod compiler;
 pub mod executor;
-pub mod doc_store;
+pub mod serializer;
+pub mod index_context;
+pub mod vector_index;
 pub mod fusion;
-pub mod engine;
 
-// -- Flat re-exports for the happy path ------------------------------------
-pub use engine::{Engine, EngineConfig, VectorFieldConfig, VectorIndexType};
-pub use document::{Document, FieldValue, SearchResult};
-pub use vector_index::Metric;
-pub use query::{QueryNode, QueryParser};
-pub use tokenizer::{SimpleTokenizer, Tokenizer, WhitespaceTokenizer};
-pub use error::{Result, RustBladeError};
+pub use error::{RustBladeError, Result};
+pub use tokenizer::SmartTokenizer;
+pub use index_writer::IndexWriter;
+pub use eval_tree::{EvalTree, EvalNode};
+pub use index_reader::IndexReader;
+pub use executor::SearchResult;
+pub use index_context::IndexContext;
+pub use vector_index::{HnswIndex, VectorMetric};
+pub use fusion::rrf_merge;

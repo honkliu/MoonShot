@@ -1,34 +1,30 @@
-/// Tokenizer trait — converts raw text to a list of lowercase tokens.
-///
-/// Mirrors MoonShot's `Tokenizer` base class and REF's atom extraction logic.
-/// The default implementation splits on Unicode word boundaries without
-/// depending on ICU (Rust's `char::is_alphanumeric` is Unicode-aware).
+use unicode_segmentation::UnicodeSegmentation;
+
 pub trait Tokenizer: Send + Sync {
     fn tokenize(&self, text: &str) -> Vec<String>;
 }
 
-// ---------------------------------------------------------------------------
-// SimpleTokenizer — splits on non-alphanumeric characters, lowercases.
-// ---------------------------------------------------------------------------
-pub struct SimpleTokenizer;
+/*
+* SmartTokenizer — Unicode word segmentation via unicode-segmentation crate.
+* Equivalent to ICU BreakIterator in the C++ MoonShot.
+* CJK ideographs are individual words per UAX#29; bigrams are generated
+* by AdvancedIndexWriter at index time.
+*/
+pub struct SmartTokenizer;
 
-impl Tokenizer for SimpleTokenizer {
-    fn tokenize(&self, text: &str) -> Vec<String> {
-        text.to_lowercase()
-            .split(|c: char| !c.is_alphanumeric())
-            .filter(|s| !s.is_empty() && s.len() <= 64)
-            .map(str::to_string)
-            .collect()
-    }
+impl SmartTokenizer {
+    pub fn new() -> Self { Self }
 }
 
-// ---------------------------------------------------------------------------
-// WhitespaceTokenizer — for code or pre-tokenized inputs.
-// ---------------------------------------------------------------------------
-pub struct WhitespaceTokenizer;
+impl Default for SmartTokenizer {
+    fn default() -> Self { Self::new() }
+}
 
-impl Tokenizer for WhitespaceTokenizer {
+impl Tokenizer for SmartTokenizer {
     fn tokenize(&self, text: &str) -> Vec<String> {
-        text.split_whitespace().map(|s| s.to_lowercase()).collect()
+        text.unicode_words()
+            .map(|w| w.to_lowercase())
+            .filter(|w| !w.is_empty() && w.len() <= 64)
+            .collect()
     }
 }

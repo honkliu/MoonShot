@@ -8,7 +8,10 @@ pub enum RustBladeError {
     #[error("Serialization error: {0}")]
     Serde(#[from] serde_json::Error),
 
-    #[error("Index not built — call engine.build() first")]
+    #[error("Invalid index format")]
+    InvalidFormat,
+
+    #[error("Index not built — call build() first")]
     IndexNotBuilt,
 
     #[error("Document {0} not found")]
@@ -17,11 +20,8 @@ pub enum RustBladeError {
     #[error("Vector dimension mismatch: expected {expected}, got {got}")]
     DimensionMismatch { expected: usize, got: usize },
 
-    #[error("Empty index — add documents before searching")]
+    #[error("Empty index")]
     EmptyIndex,
-
-    #[error("Field '{0}' not found")]
-    FieldNotFound(String),
 
     #[error("Invalid query: {0}")]
     InvalidQuery(String),

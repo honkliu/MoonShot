@@ -1,144 +1,81 @@
-use std::collections::HashMap;
+use crate::index_reader::IndexReader;
 use crate::bm25::Bm25Scorer;
-use crate::document::SearchResult;
-use crate::inverted_index::InvertedIndex;
-use crate::isr::{AndIsr, Isr, NotIsr, OrIsr, DONE};
-use crate::query::QueryNode;
-use crate::vector_index::VectorIndex;
-use crate::fusion::rrf_fusion;
+use crate::posting_store::PostingStore;
 
-// ---------------------------------------------------------------------------
-// QueryExecutor — maps a QueryNode to the correct retrieval path, scores
-// results, and merges them.
-//
-// Mirrors REF's QueryPlanExecutor + RankInstruction chain.
-// ---------------------------------------------------------------------------
-pub struct QueryExecutor<'a> {
-    inv_index:      &'a mut InvertedIndex,
-    vec_indexes:    &'a HashMap<String, VectorIndex>,
+#[derive(Debug, Clone)]
+pub struct SearchResult {
+    pub doc_id: u64,
+    pub score:  f32,
 }
 
-impl<'a> QueryExecutor<'a> {
-    pub fn new(
-        inv_index:   &'a mut InvertedIndex,
-        vec_indexes: &'a HashMap<String, VectorIndex>,
-    ) -> Self {
-        Self { inv_index, vec_indexes }
-    }
+pub struct IndexSearchExecutor<'a> {
+    store: &'a PostingStore,
+}
 
-    /// Execute `query` and return up to `limit` results sorted by score.
-    pub fn execute(&mut self, query: &QueryNode, limit: usize) -> Vec<SearchResult> {
-        self.inv_index.reset_isr_pool();
-        match query {
-            QueryNode::Knn { field, vector, k } => {
-                self.execute_knn(field, vector, *k)
-            }
-            QueryNode::Hybrid { text, vector, field, k, rrf_k } => {
-                self.execute_hybrid(text, vector, field, *k, *rrf_k, limit)
-            }
-            text_query => {
-                self.execute_text(text_query, limit)
-            }
-        }
-    }
+impl<'a> IndexSearchExecutor<'a> {
+    pub fn new(store: &'a PostingStore) -> Self { Self { store } }
 
-    // -- text retrieval (BM25 + ISR tree) -----------------------------------
+    pub fn execute(&self, reader: &mut dyn IndexReader, top_k: usize) -> Vec<SearchResult> {
+        if reader.is_end() { return vec![]; }
+        let scorer  = Bm25Scorer::new(self.store.total_docs(), self.store.avg_doc_len());
+        let mut results = Vec::new();
 
-    fn execute_text(&mut self, query: &QueryNode, limit: usize) -> Vec<SearchResult> {
-        let scorer = Bm25Scorer::new(self.inv_index.doc_count(), self.inv_index.avg_doc_len());
-
-        let Some(mut isr) = self.build_isr(query) else {
-            return vec![];
-        };
-
-        let mut results: Vec<SearchResult> = Vec::new();
-
-        while !isr.is_done() {
-            let doc_id  = isr.current_doc();
-            let doc_len = self.inv_index.doc_len(doc_id);
-            let score   = isr.bm25_score(&scorer, doc_len);
-
-            results.push(SearchResult::new(doc_id, score));
-            isr.advance();
+        while !reader.is_end() {
+            let doc_id  = reader.get_document_id();
+            let doc_len = self.store.get_doc_len(doc_id);
+            let score   = reader.get_bm25_score(&scorer, doc_len)
+                        + self.store.get_doc_importance(doc_id);
+            results.push(SearchResult { doc_id, score });
+            reader.go_next();
         }
 
-        results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
-        results.truncate(limit);
+        sort_and_truncate(&mut results, top_k);
         results
     }
 
-    // -- vector (KNN) retrieval ----------------------------------------------
-
-    fn execute_knn(&self, field: &str, vector: &[f32], k: usize) -> Vec<SearchResult> {
-        let Some(idx) = self.vec_indexes.get(field) else {
-            return vec![];
-        };
-        let ef = (k * 4).max(50);
-        idx.search(vector, k, ef)
-            .into_iter()
-            .map(|(id, score)| SearchResult::new(id, score))
-            .collect()
-    }
-
-    // -- hybrid (text + vector fused with RRF) -------------------------------
-
-    fn execute_hybrid(
-        &mut self,
-        text:    &QueryNode,
-        vector:  &[f32],
-        field:   &str,
-        k:       usize,
-        rrf_k:   f32,
-        limit:   usize,
+    pub fn execute_phased(
+        &self,
+        phase1:     &mut dyn IndexReader,
+        phase2:     &mut dyn IndexReader,
+        top_k:      usize,
+        min_phase1: usize,
     ) -> Vec<SearchResult> {
-        let text_top = limit.max(k) * 4;   // retrieve more than needed for fusion
-        let text_hits = self.execute_text(text, text_top);
-        let vec_hits  = self.execute_knn(field, vector, k * 4);
+        let scorer   = Bm25Scorer::new(self.store.total_docs(), self.store.avg_doc_len());
+        let mut results = collect_results(phase1, &scorer, self.store);
 
-        let text_ranking: Vec<(u64, f32)> = text_hits.iter().map(|r| (r.doc_id, r.score)).collect();
-        let vec_ranking:  Vec<(u64, f32)> = vec_hits.iter().map(|r| (r.doc_id, r.score)).collect();
+        if results.len() < min_phase1 {
+            let more = collect_results(phase2, &scorer, self.store);
+            merge_results(&mut results, more);
+        }
 
-        rrf_fusion(vec![text_ranking, vec_ranking], rrf_k, limit)
-            .into_iter()
-            .map(|(id, score)| SearchResult::new(id, score))
-            .collect()
+        sort_and_truncate(&mut results, top_k);
+        results
     }
+}
 
-    // -- ISR construction ---------------------------------------------------
+fn collect_results(r: &mut dyn IndexReader, s: &Bm25Scorer, store: &PostingStore) -> Vec<SearchResult> {
+    let mut out = Vec::new();
+    while !r.is_end() {
+        let doc_id  = r.get_document_id();
+        let doc_len = store.get_doc_len(doc_id);
+        let score   = r.get_bm25_score(s, doc_len) + store.get_doc_importance(doc_id);
+        out.push(SearchResult { doc_id, score });
+        r.go_next();
+    }
+    out
+}
 
-    /// Recursively build the ISR tree for a text QueryNode.
-    fn build_isr(&mut self, node: &QueryNode) -> Option<Box<dyn Isr>> {
-        match node {
-            QueryNode::Term(term) => {
-                self.inv_index.open_isr(term)
-            }
-            QueryNode::And(children) => {
-                let isrs: Vec<Box<dyn Isr>> = children.iter()
-                    .filter_map(|c| self.build_isr(c))
-                    .collect();
-                match isrs.len() {
-                    0 => None,
-                    1 => Some(isrs.into_iter().next().unwrap()),
-                    _ => Some(Box::new(AndIsr::new(isrs))),
-                }
-            }
-            QueryNode::Or(children) => {
-                let isrs: Vec<Box<dyn Isr>> = children.iter()
-                    .filter_map(|c| self.build_isr(c))
-                    .collect();
-                match isrs.len() {
-                    0 => None,
-                    1 => Some(isrs.into_iter().next().unwrap()),
-                    _ => Some(Box::new(OrIsr::new(isrs))),
-                }
-            }
-            QueryNode::Not { base, exclude } => {
-                let base_isr    = self.build_isr(base)?;
-                let exclude_isr = self.build_isr(exclude)?;
-                Some(Box::new(NotIsr::new(base_isr, exclude_isr)))
-            }
-            // Vector nodes are handled in execute(), not here.
-            _ => None,
+fn sort_and_truncate(v: &mut Vec<SearchResult>, top_k: usize) {
+    v.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    if top_k > 0 && v.len() > top_k { v.truncate(top_k); }
+}
+
+fn merge_results(base: &mut Vec<SearchResult>, extra: Vec<SearchResult>) {
+    for r in extra {
+        if let Some(e) = base.iter_mut().find(|e| e.doc_id == r.doc_id) {
+            e.score = e.score.max(r.score);
+        } else {
+            base.push(r);
         }
     }
 }

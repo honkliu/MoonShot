@@ -2,20 +2,22 @@
 name = "rustblade"
 version = "0.1.0"
 edition = "2021"
-description = "High-performance hybrid search engine — inverted index + HNSW vector index"
+description = "MoonShot search engine — Rust implementation with inverted index + HNSW vector index"
 
 [dependencies]
-serde      = { version = "1", features = ["derive"] }
-serde_json = "1"
-thiserror  = "1"
-rand       = "0.8"
+serde             = { version = "1", features = ["derive"] }
+serde_json        = "1"
+thiserror         = "1"
+rand              = "0.8"
+unicode-segmentation = "1"
+mimalloc          = { version = "0.1", default-features = false }
 
 [dev-dependencies]
 tempfile = "3"
 
 [[example]]
-name = "search"
-path = "examples/search.rs"
+name = "demo"
+path = "examples/demo.rs"
 
 [[example]]
 name = "morning_vietnam"
