@@ -78,6 +78,7 @@ target_include_directories(MoonShot INTERFACE
 # -------------------------------------------------------------------------
 if(CMAKE_PROJECT_NAME STREQUAL PROJECT_NAME)
     add_subdirectory(examples)
+    add_subdirectory(RustBlade)
     # add_subdirectory(Service)   # requires gRPC
     add_subdirectory(Test/UnitTest)
 endif()
