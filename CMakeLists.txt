@@ -25,14 +25,17 @@ if(MSVC)
     # Silence MSVC deprecation warnings on C standard functions.
     add_compile_definitions(NOMINMAX _CRT_SECURE_NO_WARNINGS)
     add_compile_options(/W3 /wd4996)
+elseif(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    add_compile_options(-Wall -Wextra -Wno-unused-parameter)
 endif()
 
 # -------------------------------------------------------------------------
 # mimalloc — mandatory high-performance allocator override.
-# Pass -Dmimalloc_DIR=/path/to/mimalloc/lib/cmake/mimalloc-2.1 at configure.
 # -------------------------------------------------------------------------
 find_package(mimalloc REQUIRED)
 message(STATUS "mimalloc ${mimalloc_VERSION} found")
+
+find_package(Threads REQUIRED)
 
 # -------------------------------------------------------------------------
 # Component libraries
@@ -65,6 +68,8 @@ if(TARGET mimalloc-static)
 else()
     target_link_libraries(MoonShot INTERFACE mimalloc)
 endif()
+
+target_link_libraries(MoonShot INTERFACE Threads::Threads)
 
 target_include_directories(MoonShot INTERFACE
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
