@@ -3,8 +3,8 @@
 
 #include <stdint.h>
 #include <cinttypes>
-#include <string>
 #include <memory>
+#include <string>
 
 #include "BlockTable.h"
 #include "IndexReader.h"
@@ -58,11 +58,11 @@ class AdvancedIndexReader : public IndexReader
         {
             IndexReader::SetDebug(label, depth);
             const char* w = m_Word ? m_Word : "?";
+            auto ind = std::string(depth * 2, ' ');
             if (!m_Decoder.IsEnd())
-                printf("%*s[leaf] %-12s  -%" PRIu64 "-\n",
-                       depth * 2, "", w, m_Decoder.GetDocumentID());
+                std::println("{}[leaf] {:<12}  -{}-", ind, w, m_Decoder.GetDocumentID());
             else
-                printf("%*s[leaf] %-12s  (empty)\n", depth * 2, "", w);
+                std::println("{}[leaf] {:<12}  (empty)", ind, w);
         }
 
         void     GoNext() override;

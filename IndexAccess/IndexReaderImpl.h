@@ -4,9 +4,10 @@
 #include "IndexReader.h"
 #include "Bm25Scorer.h"
 
-#include <algorithm>
 #include <cinttypes>
 #include <memory>
+#include <print>
+#include <string>
 #include <vector>
 
 static constexpr uint64_t NO_MORE_DOCS = UINT64_MAX;
@@ -37,7 +38,7 @@ public:
     void SetDebug(const char* label, int depth = 0) override
     {
         IndexReader::SetDebug(label, depth);
-        printf("%*s[AND]\n", depth * 2, "");
+        std::println("{}[AND]", std::string(depth * 2, ' '));
         for (auto& c : m_Children) c->SetDebug(label, depth + 1);
     }
 
@@ -134,8 +135,8 @@ private:
 
             if (aligned) {
                 if (m_debug)
-                    printf("%*sAND match  doc %" PRIu64 "\n",
-                           m_debugDepth * 2, "", pivot);
+                    std::println("{}AND match  doc {}",
+                                 std::string(m_debugDepth * 2, ' '), pivot);
                 return;
             }
         }
@@ -154,7 +155,7 @@ public:
     void SetDebug(const char* label, int depth = 0) override
     {
         IndexReader::SetDebug(label, depth);
-        printf("%*s[OR]\n", depth * 2, "");
+        std::println("{}[OR]", std::string(depth * 2, ' '));
         for (auto& c : m_Children) c->SetDebug(label, depth + 1);
     }
 
@@ -249,10 +250,10 @@ public:
     void SetDebug(const char* label, int depth = 0) override
     {
         IndexReader::SetDebug(label, depth);
-        printf("%*s[NOT]\n", depth * 2, "");
-        printf("%*s  + base:\n", depth * 2, "");
+        std::println("{}[NOT]", std::string(depth * 2, ' '));
+        std::println("{}  + base:", std::string(depth * 2, ' '));
         m_Base->SetDebug(label, depth + 2);
-        printf("%*s  - excl:\n", depth * 2, "");
+        std::println("{}  - excl:", std::string(depth * 2, ' '));
         m_Exclude->SetDebug(label, depth + 2);
     }
 
@@ -293,8 +294,8 @@ private:
 
             if (!m_Exclude->IsEnd() && m_Exclude->GetDocumentID() == doc) {
                 if (m_debug)
-                    printf("%*sNOT excluded  doc %" PRIu64 "\n",
-                           m_debugDepth * 2, "", doc);
+                    std::println("{}NOT excluded  doc {}",
+                                 std::string(m_debugDepth * 2, ' '), doc);
                 m_Base->GoNext();
             } else {
                 break;

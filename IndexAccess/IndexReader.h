@@ -1,8 +1,9 @@
 #ifndef INDEXREADER_H__
 #define INDEXREADER_H__
 
-#include <stdio.h>
 #include <cstdint>
+#include <print>
+#include <string>
 
 class Bm25Scorer;
 

@@ -1,6 +1,5 @@
 #include "AdvancedIndexReader.h"
 
-#include <cinttypes>
 #include <cstring>
 
 void AdvancedIndexReader::Open(const char*      streamKey,
@@ -42,9 +41,10 @@ void AdvancedIndexReader::GoNext()
     m_Decoder.GoNext();
 
     if (m_debug && !m_Decoder.IsEnd())
-        printf("%*s%-12s  -%" PRIu64 "-\n",
-               m_debugDepth * 2, "", m_Word ? m_Word : "?",
-               m_Decoder.GetDocumentID());
+        std::println("{}{:<12}  -{}-",
+                     std::string(m_debugDepth * 2, ' '),
+                     m_Word ? m_Word : "?",
+                     m_Decoder.GetDocumentID());
 }
 
 void AdvancedIndexReader::GoUntil(uint64_t target, uint64_t /*limit*/)
