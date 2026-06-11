@@ -24,19 +24,19 @@ public:
         if (thread_count == 0)
             throw std::invalid_argument("ThreadPool: thread_count must be > 0");
 
-        workers_.reserve(thread_count);
+        m_Workers.reserve(thread_count);
         for (std::size_t i = 0; i < thread_count; ++i)
-            workers_.emplace_back([this] { WorkerLoop(); });
+            m_Workers.emplace_back([this] { WorkerLoop(); });
     }
 
     ~ThreadPool()
     {
         {
-            std::unique_lock<std::mutex> lock(mutex_);
-            stop_ = true;
+            std::unique_lock<std::mutex> lock(m_Mutex);
+            m_Stop = true;
         }
-        cv_.notify_all();
-        for (auto& t : workers_)
+        m_Cv.notify_all();
+        for (auto& t : m_Workers)
             if (t.joinable()) t.join();
     }
 
@@ -47,23 +47,23 @@ public:
     void post(F&& f)
     {
         {
-            std::unique_lock<std::mutex> lock(mutex_);
-            if (stop_)
+            std::unique_lock<std::mutex> lock(m_Mutex);
+            if (m_Stop)
                 throw std::runtime_error("ThreadPool: post() after shutdown");
-            tasks_.emplace(std::forward<F>(f));
+            m_Tasks.emplace(std::forward<F>(f));
         }
-        cv_.notify_one();
+        m_Cv.notify_one();
     }
 
     void join()
     {
-        std::unique_lock<std::mutex> lock(mutex_);
-        cv_done_.wait(lock, [this] {
-            return tasks_.empty() && active_count_ == 0;
+        std::unique_lock<std::mutex> lock(m_Mutex);
+        m_CvDone.wait(lock, [this] {
+            return m_Tasks.empty() && m_ActiveCount == 0;
         });
     }
 
-    std::size_t thread_count() const { return workers_.size(); }
+    std::size_t thread_count() const { return m_Workers.size(); }
 
 private:
     void WorkerLoop()
@@ -71,31 +71,31 @@ private:
         while (true) {
             std::function<void()> task;
             {
-                std::unique_lock<std::mutex> lock(mutex_);
-                cv_.wait(lock, [this] { return stop_ || !tasks_.empty(); });
-                if (stop_ && tasks_.empty()) return;
-                task = std::move(tasks_.front());
-                tasks_.pop();
-                ++active_count_;
+                std::unique_lock<std::mutex> lock(m_Mutex);
+                m_Cv.wait(lock, [this] { return m_Stop || !m_Tasks.empty(); });
+                if (m_Stop && m_Tasks.empty()) return;
+                task = std::move(m_Tasks.front());
+                m_Tasks.pop();
+                ++m_ActiveCount;
             }
 
             task();
 
             {
-                std::unique_lock<std::mutex> lock(mutex_);
-                --active_count_;
+                std::unique_lock<std::mutex> lock(m_Mutex);
+                --m_ActiveCount;
             }
-            cv_done_.notify_all();
+            m_CvDone.notify_all();
         }
     }
 
-    std::vector<std::thread>           workers_;
-    std::queue<std::function<void()>>  tasks_;
-    std::mutex                         mutex_;
-    std::condition_variable            cv_;
-    std::condition_variable            cv_done_;
-    bool                               stop_         = false;
-    std::size_t                        active_count_ = 0;
+    std::vector<std::thread>           m_Workers;
+    std::queue<std::function<void()>>  m_Tasks;
+    std::mutex                         m_Mutex;
+    std::condition_variable            m_Cv;
+    std::condition_variable            m_CvDone;
+    bool                               m_Stop         = false;
+    std::size_t                        m_ActiveCount = 0;
 };
 
 

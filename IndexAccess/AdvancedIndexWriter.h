@@ -20,14 +20,14 @@
 class AdvancedIndexWriter : public IndexWriter {
 public:
     explicit AdvancedIndexWriter(std::shared_ptr<PostingStore> store)
-        : store_(std::move(store))
+        : m_Store(std::move(store))
     {}
 
     void Write(std::vector<std::string>&& words,
                uint64_t                    documentId,
                const char*                 postingType) override
     {
-        if (!store_ || words.empty())
+        if (!m_Store || words.empty())
             return;
 
         const std::string abbrev = StreamAbbrev(postingType);
@@ -42,7 +42,7 @@ public:
         }
 
         for (auto& [term, tf] : unigramTf)
-            store_->AddPosting(term + abbrev, documentId, tf);
+            m_Store->AddPosting(term + abbrev, documentId, tf);
 
         /*
         * Index bigrams: adjacent pairs joined by '_'.
@@ -58,19 +58,19 @@ public:
         }
 
         for (auto& [bigram, tf] : bigramTf)
-            store_->AddPosting(bigram + abbrev, documentId, tf);
+            m_Store->AddPosting(bigram + abbrev, documentId, tf);
 
-        store_->AddDocTokens(documentId,
+        m_Store->AddDocTokens(documentId,
                              static_cast<uint32_t>(words.size()));
     }
 
     void SetDocImportance(uint64_t doc_id, float score) override
     {
-        store_->SetDocImportance(doc_id, score);
+        m_Store->SetDocImportance(doc_id, score);
     }
 
 private:
-    std::shared_ptr<PostingStore> store_;
+    std::shared_ptr<PostingStore> m_Store;
 
     /*
     * Map a stream name or single-char abbreviation to the canonical letter.

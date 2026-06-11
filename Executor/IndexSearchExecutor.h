@@ -19,7 +19,7 @@ class IndexSearchExecutor
 {
 public:
     explicit IndexSearchExecutor(std::shared_ptr<PostingStore> store)
-        : store_(std::move(store))
+        : m_Store(std::move(store))
     {}
 
     std::vector<SearchResult> Execute(std::shared_ptr<IndexReader> reader,
@@ -28,14 +28,14 @@ public:
         if (!reader || reader->IsEnd())
             return {};
 
-        Bm25Scorer scorer(store_->TotalDocs(), store_->AvgDocLen());
+        Bm25Scorer scorer(m_Store->TotalDocs(), m_Store->AvgDocLen());
         std::vector<SearchResult> results;
 
         while (!reader->IsEnd()) {
             uint64_t docId     = reader->GetDocumentID();
-            uint32_t docLength = store_->GetDocLen(docId);
+            uint32_t docLength = m_Store->GetDocLen(docId);
             float    score     = reader->GetBM25Score(scorer, docLength)
-                               + store_->GetDocImportance(docId);
+                               + m_Store->GetDocImportance(docId);
 
             results.push_back({docId, score, ""});
             reader->GoNext();
@@ -61,7 +61,7 @@ public:
             int topK                = 10,
             int minResultsForPhase1 = 3)
     {
-        Bm25Scorer scorer(store_->TotalDocs(), store_->AvgDocLen());
+        Bm25Scorer scorer(m_Store->TotalDocs(), m_Store->AvgDocLen());
 
         auto results = CollectResults(phase1Reader, scorer);
 
@@ -79,7 +79,7 @@ public:
     void Execute(EvalTree* /*evalTree*/) {}
 
 private:
-    std::shared_ptr<PostingStore> store_;
+    std::shared_ptr<PostingStore> m_Store;
 
     std::vector<SearchResult> CollectResults(
             std::shared_ptr<IndexReader>& reader,
@@ -92,9 +92,9 @@ private:
 
         while (!reader->IsEnd()) {
             uint64_t docId     = reader->GetDocumentID();
-            uint32_t docLength = store_->GetDocLen(docId);
+            uint32_t docLength = m_Store->GetDocLen(docId);
             float    score     = reader->GetBM25Score(scorer, docLength)
-                               + store_->GetDocImportance(docId);
+                               + m_Store->GetDocImportance(docId);
 
             results.push_back({docId, score, ""});
             reader->GoNext();

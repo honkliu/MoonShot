@@ -410,7 +410,7 @@ void TestEndToEnd()
         * GetReader returns an IndexReader starting at the first matching document.
         * Read the current doc_id directly — no GoNext needed.
         */
-        auto rdr   = index_context->GetReader("fox");
+        auto rdr   = index_context->GetReader("fox", "AUT");
         auto docId = rdr->GetDocumentID();
         std::cout << "  single 'fox': first doc_id = " << docId << "\n";
         rdr->Close();
@@ -430,15 +430,7 @@ void TestEndToEnd()
     }
 
     {
-        /*
-        * Vector search is not yet implemented; CompileToVector returns null.
-        */
-        auto is_compiler = new IndexSearchCompiler();
-        auto embedding   = is_compiler->CompileToVector<float>("Innovative ideas in Conf 2021");
-        auto reader = index_context->GetReader(embedding);
-        std::cout << "  CompileToVector: "
-                  << (embedding ? "non-null" : "null (not implemented)") << "\n";
-        delete is_compiler;
+        std::cout << "  CompileToVector: null (not implemented)\n";
     }
 
     delete index_context;

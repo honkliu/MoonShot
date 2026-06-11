@@ -191,7 +191,7 @@ int main()
      * ------------------------------------------------------------------ */
     printf("\n=== Low-level ISR iteration ===\n");
     {
-        auto reader = engine.GetReader("rust");
+        auto reader = engine.GetReader("rust", "AUT");
         Bm25Scorer scorer(engine.GetStore()->TotalDocs(),
                           engine.GetStore()->AvgDocLen());
         printf("  Posting list for \"rust\" (across AUT streams):\n");

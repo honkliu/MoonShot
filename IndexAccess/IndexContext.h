@@ -8,6 +8,7 @@
 #include "IndexSerializer.h"
 #include "EvalExpression.h"
 #include "IndexSearchExecutor.h"
+#include "IndexSearchCompiler.h"
 #include "ConfigParameters.h"
 #include "Tokenizer.h"
 #include "Embeddings.h"
@@ -41,19 +42,21 @@ class IndexContext
 public:
     explicit IndexContext(const char* configFile = "",
                          const char* indexFile   = "")
-        : store_(make_shared<PostingStore>())
-        , params_(make_shared<ConfigParameters>())
-        , blockTable_(512)
-        , indexPath_(indexFile ? indexFile : "")
-        , built_(false)
+        : m_Store(make_shared<PostingStore>())
+        , m_Params(make_shared<ConfigParameters>())
+        , m_BlockTable(512)
+        , m_Compiler(&m_Tokenizer)
+        , m_Executor(m_Store)
+        , m_IndexPath(indexFile ? indexFile : "")
+        , m_Built(false)
     {
-        if (!indexPath_.empty())
+        if (!m_IndexPath.empty())
             LoadIndex();
     }
 
     shared_ptr<IndexWriter> GetWriter()
     {
-        return make_shared<AdvancedIndexWriter>(store_);
+        return make_shared<AdvancedIndexWriter>(m_Store);
     }
 
     /*
@@ -62,13 +65,13 @@ public:
     */
     void Build()
     {
-        if (built_)
+        if (m_Built)
             return;
 
         const size_t blockCapacity = sizeof(IndexBlock::IB_Data) - 1u;
         uint32_t     blockSeq      = 0;
 
-        for (const auto& [streamKey, postingList] : store_->AllPostings()) {
+        for (const auto& [streamKey, postingList] : m_Store->AllPostings()) {
             const auto& bytes = postingList.GetBytes();
 
             if (bytes.empty())
@@ -85,49 +88,17 @@ public:
                 size_t len     = std::min(dataLen - offset, blockCapacity);
                 bool   hasMore = (blk + 1 < numBlocks);
 
-                blockTable_.InsertBlock(blockSeq,
+                m_BlockTable.InsertBlock(blockSeq,
                                         bytes.data() + offset,
                                         len,
                                         hasMore);
                 ++blockSeq;
             }
 
-            blockTable_.AddTermMapping(streamKey, firstSeq);
+            m_BlockTable.AddTermMapping(streamKey, firstSeq);
         }
 
-        built_ = true;
-    }
-
-    /*
-    * Open a single-term reader across the default AUT streams.
-    * Returns OrIndexReader over the non-empty stream readers.
-    */
-    shared_ptr<IndexReader> GetReader(const char* term)
-    {
-        EnsureBuilt();
-
-        std::string termStr(term);
-        std::vector<shared_ptr<IndexReader>> readers;
-
-        for (const char* abbrev : {"A", "U", "T"}) {
-            std::string streamKey = termStr + abbrev;
-            auto reader = make_shared<AdvancedIndexReader>();
-            reader->Open(streamKey.c_str(), &blockTable_,
-                         store_->DocFreq(streamKey));
-
-            if (!reader->IsEnd())
-                readers.push_back(reader);
-        }
-
-        if (readers.empty()) {
-            auto empty = make_shared<AdvancedIndexReader>();
-            return empty;
-        }
-
-        if (readers.size() == 1)
-            return readers[0];
-
-        return make_shared<OrIndexReader>(std::move(readers));
+        m_Built = true;
     }
 
     /*
@@ -145,34 +116,36 @@ public:
         return BuildIndexReader(evalTree->root);
     }
 
+    Tokenizer*           GetTokenizer() { return &m_Tokenizer; }
+    IndexSearchCompiler* GetCompiler()  { return &m_Compiler; }
+    IndexSearchExecutor* GetExecutor()  { return &m_Executor; }
+
+    /* Compile query string and return an ISR tree ready for traversal. */
+    shared_ptr<IndexReader> GetReader(const char* queryString,
+                                      const char* streamSet = "AUT")
+    {
+        auto tree = std::unique_ptr<EvalTree>(
+                        m_Compiler.Compile(queryString, streamSet));
+        return GetReader(tree.get());
+    }
+
     /* Open a reader for one specific stream key (e.g. "raceA", "carT"). */
     shared_ptr<IndexReader> GetStreamReader(const char* streamKey)
     {
         EnsureBuilt();
         auto reader = make_shared<AdvancedIndexReader>();
-        reader->Open(streamKey, &blockTable_, store_->DocFreq(streamKey));
+        reader->Open(streamKey, &m_BlockTable, m_Store->DocFreq(streamKey));
         return reader;
     }
 
-    template<typename T>
-    shared_ptr<IndexReader> GetReader(Embeddings<T>* /*embedding*/)
-    {
-        return nullptr;
-    }
-
-    IndexSearchExecutor* GetExecutor()
-    {
-        return new IndexSearchExecutor(store_);
-    }
-
-    PostingStore* GetStore() { return store_.get(); }
+    PostingStore* GetStore() { return m_Store.get(); }
 
     bool SaveIndex()
     {
-        if (indexPath_.empty())
+        if (m_IndexPath.empty())
             return false;
 
-        return IndexSerializer::Save(*store_, indexPath_.c_str());
+        return IndexSerializer::Save(*m_Store, m_IndexPath.c_str());
     }
 
     bool SaveIndex(const char* path)
@@ -180,16 +153,17 @@ public:
         if (!path || !*path)
             return false;
 
-        indexPath_ = path;
-        return IndexSerializer::Save(*store_, path);
+        m_IndexPath = path;
+        return IndexSerializer::Save(*m_Store, path);
     }
 
     void LoadIndex()
     {
-        if (!indexPath_.empty()) {
-            store_ = make_shared<PostingStore>();
-            IndexSerializer::Load(*store_, indexPath_.c_str());
-            built_ = false;
+        if (!m_IndexPath.empty()) {
+            m_Store = make_shared<PostingStore>();
+            IndexSerializer::Load(*m_Store, m_IndexPath.c_str());
+            m_Executor = IndexSearchExecutor(m_Store);
+            m_Built = false;
         }
     }
 
@@ -198,22 +172,26 @@ public:
         if (!path || !*path)
             return;
 
-        indexPath_ = path;
-        store_     = make_shared<PostingStore>();
-        IndexSerializer::Load(*store_, path);
-        built_ = false;
+        m_IndexPath = path;
+        m_Store     = make_shared<PostingStore>();
+        IndexSerializer::Load(*m_Store, path);
+        m_Executor = IndexSearchExecutor(m_Store);
+        m_Built = false;
     }
 
 private:
-    shared_ptr<PostingStore>     store_;
-    shared_ptr<ConfigParameters> params_;
-    IndexBlockTable              blockTable_;
-    std::string                  indexPath_;
-    bool                         built_;
+    shared_ptr<PostingStore>     m_Store;
+    shared_ptr<ConfigParameters> m_Params;
+    IndexBlockTable              m_BlockTable;
+    SmartTokenizer               m_Tokenizer;
+    IndexSearchCompiler          m_Compiler;
+    IndexSearchExecutor          m_Executor;
+    std::string                  m_IndexPath;
+    bool                         m_Built;
 
     void EnsureBuilt()
     {
-        if (!built_)
+        if (!m_Built)
             Build();
     }
 
@@ -243,8 +221,8 @@ private:
             auto  reader   = make_shared<AdvancedIndexReader>();
 
             reader->Open(termNode->stream_key.c_str(),
-                         &blockTable_,
-                         store_->DocFreq(termNode->stream_key));
+                         &m_BlockTable,
+                         m_Store->DocFreq(termNode->stream_key));
             return reader;
         }
 

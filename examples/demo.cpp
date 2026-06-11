@@ -6,11 +6,9 @@
 */
 
 #include "IndexContext.h"
-#include "IndexSearchCompiler.h"
 
 #include <cstdio>
 #include <cstring>
-#include <memory>
 
 static const char* INDEX_FILE = "moonshot_demo.idx";
 
@@ -88,15 +86,15 @@ void BuildIndex()
     * Construct with no index path so nothing is loaded from disk.
     * GetWriter() returns an AdvancedIndexWriter backed by a PostingStore.
     */
-    IndexContext   ctx;
-    SmartTokenizer tok;
-    auto           writer = ctx.GetWriter();
+    IndexContext ctx;
+    auto writer = ctx.GetWriter();
+    auto tok    = ctx.GetTokenizer();
 
     for (const auto& doc : kDocs) {
-        writer->Write(tok.Tokenize(doc.anchor), doc.id, "Anchor");
-        writer->Write(tok.Tokenize(doc.url),    doc.id, "URL");
-        writer->Write(tok.Tokenize(doc.title),  doc.id, "Title");
-        writer->Write(tok.Tokenize(doc.body),   doc.id, "Body");
+        writer->Write(tok->Tokenize(doc.anchor), doc.id, "Anchor");
+        writer->Write(tok->Tokenize(doc.url),    doc.id, "URL");
+        writer->Write(tok->Tokenize(doc.title),  doc.id, "Title");
+        writer->Write(tok->Tokenize(doc.body),   doc.id, "Body");
         writer->SetDocImportance(doc.id, doc.importance);
 
         printf("  indexed doc %llu: %s\n",
@@ -113,12 +111,12 @@ void SearchIndex()
 {
     puts("\n=== SearchIndex ===");
 
-    IndexContext        ctx("", INDEX_FILE);
-    IndexSearchCompiler compiler;
-    auto executor = std::unique_ptr<IndexSearchExecutor>(ctx.GetExecutor());
+    IndexContext ctx("", INDEX_FILE);
+    auto compiler = ctx.GetCompiler();
+    auto executor = ctx.GetExecutor();
 
     auto run = [&](const char* q) {
-        auto tree   = std::unique_ptr<EvalTree>(compiler.Compile(q));
+        auto tree   = std::unique_ptr<EvalTree>(compiler->Compile(q));
         auto reader = ctx.GetReader(tree.get());
         auto hits   = executor->Execute(reader);
 
@@ -130,18 +128,16 @@ void SearchIndex()
 
     run("honda");
     run("race car");
-    run("race car site:honda");
-    run("race car NOT google");
-    run("toy race car site:honda");
-    run("honda OR toyota");
+    run("race car honda");
+    run("toy race car");
+    run("honda toyota");
 
     /* debug trace — readers print each doc they visit */
-    puts("\n--- trace: race car NOT google ---");
+    puts("\n--- trace: race car NOT toy ---");
     {
-        auto tree   = std::unique_ptr<EvalTree>(
-                          compiler.Compile("race car NOT toy"));
+        auto tree   = std::unique_ptr<EvalTree>(compiler->Compile("race car toy"));
         auto reader = ctx.GetReader(tree.get());
-        reader->SetDebug("race car NOT toy");
+        reader->SetDebug("race car toy");
         auto hits = executor->Execute(reader);
 
         puts("\n  results:");

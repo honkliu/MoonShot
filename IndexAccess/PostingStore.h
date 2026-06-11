@@ -88,7 +88,7 @@ public:
 
     void AddPosting(const std::string& stream_key, uint64_t doc_id, uint32_t tf)
     {
-        auto& pl = postings_[stream_key];
+        auto& pl = m_Postings[stream_key];
         auto  it = std::lower_bound(pl.entries.begin(), pl.entries.end(), doc_id,
             [](const PostingEntry& e, uint64_t d) { return e.doc_id < d; });
 
@@ -107,42 +107,42 @@ public:
 
     void AddDocTokens(uint64_t doc_id, uint32_t count)
     {
-        doc_stats_[doc_id].doc_len += count;
-        total_terms_ += count;
+        m_DocStats[doc_id].doc_len += count;
+        m_TotalTerms += count;
     }
 
     void SetDocImportance(uint64_t doc_id, float score)
     {
-        doc_stats_[doc_id].importance = score;
+        m_DocStats[doc_id].importance = score;
     }
 
     const PostingList* GetPostingList(const std::string& key) const
     {
-        auto it = postings_.find(key);
-        return it != postings_.end() ? &it->second : nullptr;
+        auto it = m_Postings.find(key);
+        return it != m_Postings.end() ? &it->second : nullptr;
     }
 
     uint32_t GetDocLen(uint64_t doc_id) const
     {
-        auto it = doc_stats_.find(doc_id);
-        return it != doc_stats_.end() ? it->second.doc_len : 1u;
+        auto it = m_DocStats.find(doc_id);
+        return it != m_DocStats.end() ? it->second.doc_len : 1u;
     }
 
     float GetDocImportance(uint64_t doc_id) const
     {
-        auto it = doc_stats_.find(doc_id);
-        return it != doc_stats_.end() ? it->second.importance : 0.0f;
+        auto it = m_DocStats.find(doc_id);
+        return it != m_DocStats.end() ? it->second.importance : 0.0f;
     }
 
-    uint64_t TotalDocs()  const { return doc_stats_.size(); }
+    uint64_t TotalDocs()  const { return m_DocStats.size(); }
 
     float AvgDocLen() const
     {
-        if (doc_stats_.empty())
+        if (m_DocStats.empty())
             return 1.0f;
 
-        return static_cast<float>(total_terms_) /
-               static_cast<float>(doc_stats_.size());
+        return static_cast<float>(m_TotalTerms) /
+               static_cast<float>(m_DocStats.size());
     }
 
     uint32_t DocFreq(const std::string& key) const
@@ -153,25 +153,25 @@ public:
 
     bool HasDoc(uint64_t doc_id) const
     {
-        return doc_stats_.find(doc_id) != doc_stats_.end();
+        return m_DocStats.find(doc_id) != m_DocStats.end();
     }
 
     const std::unordered_map<std::string, PostingList>& AllPostings() const
     {
-        return postings_;
+        return m_Postings;
     }
 
     const std::unordered_map<uint64_t, DocStats>& AllDocStats() const
     {
-        return doc_stats_;
+        return m_DocStats;
     }
 
-    uint64_t TotalTerms() const { return total_terms_; }
+    uint64_t TotalTerms() const { return m_TotalTerms; }
 
 private:
-    std::unordered_map<std::string, PostingList> postings_;
-    std::unordered_map<uint64_t, DocStats>       doc_stats_;
-    uint64_t total_terms_ = 0;
+    std::unordered_map<std::string, PostingList> m_Postings;
+    std::unordered_map<uint64_t, DocStats>       m_DocStats;
+    uint64_t m_TotalTerms = 0;
 };
 
 #endif

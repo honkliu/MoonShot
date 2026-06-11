@@ -29,7 +29,7 @@ static constexpr uint64_t NO_MORE_DOCS = UINT64_MAX;
 class AndIndexReader : public IndexReader {
 public:
     explicit AndIndexReader(std::vector<std::shared_ptr<IndexReader>> children)
-        : children_(std::move(children))
+        : m_Children(std::move(children))
     {
         AlignToPivot();
     }
@@ -38,27 +38,27 @@ public:
     {
         IndexReader::SetDebug(label, depth);
         printf("%*s[AND]\n", depth * 2, "");
-        for (auto& c : children_) c->SetDebug(label, depth + 1);
+        for (auto& c : m_Children) c->SetDebug(label, depth + 1);
     }
 
     bool IsEnd() override
     {
-        if (children_.empty())
+        if (m_Children.empty())
             return true;
-        for (auto& c : children_)
+        for (auto& c : m_Children)
             if (c->IsEnd()) return true;
         return false;
     }
 
     uint64_t GetDocumentID() override
     {
-        return IsEnd() ? NO_MORE_DOCS : children_[0]->GetDocumentID();
+        return IsEnd() ? NO_MORE_DOCS : m_Children[0]->GetDocumentID();
     }
 
     uint32_t GetTermFreq() override
     {
         uint32_t total = 0;
-        for (auto& c : children_)
+        for (auto& c : m_Children)
             total += c->GetTermFreq();
         return total;
     }
@@ -66,7 +66,7 @@ public:
     float GetBM25Score(const Bm25Scorer& scorer, uint32_t docLength) override
     {
         float total = 0.0f;
-        for (auto& c : children_)
+        for (auto& c : m_Children)
             total += c->GetBM25Score(scorer, docLength);
         return total;
     }
@@ -78,7 +78,7 @@ public:
 
         uint64_t doc = GetDocumentID();
 
-        for (auto& c : children_) {
+        for (auto& c : m_Children) {
             if (!c->IsEnd() && c->GetDocumentID() == doc)
                 c->GoNext();
         }
@@ -88,17 +88,17 @@ public:
 
     void GoUntil(uint64_t target, uint64_t limit = NO_MORE_DOCS) override
     {
-        for (auto& c : children_)
+        for (auto& c : m_Children)
             c->GoUntil(target, limit);
 
         AlignToPivot();
     }
 
-    void Close() override { for (auto& c : children_) c->Close(); }
+    void Close() override { for (auto& c : m_Children) c->Close(); }
     void Open(const char*) override {}
 
 private:
-    std::vector<std::shared_ptr<IndexReader>> children_;
+    std::vector<std::shared_ptr<IndexReader>> m_Children;
 
     void AlignToPivot()
     {
@@ -108,7 +108,7 @@ private:
 
             uint64_t pivot = 0;
 
-            for (auto& c : children_) {
+            for (auto& c : m_Children) {
                 if (c->IsEnd())
                     return;
 
@@ -117,7 +117,7 @@ private:
 
             bool aligned = true;
 
-            for (auto& c : children_) {
+            for (auto& c : m_Children) {
                 if (c->GetDocumentID() == pivot)
                     continue;
 
@@ -148,19 +148,19 @@ private:
 class OrIndexReader : public IndexReader {
 public:
     explicit OrIndexReader(std::vector<std::shared_ptr<IndexReader>> children)
-        : children_(std::move(children))
+        : m_Children(std::move(children))
     {}
 
     void SetDebug(const char* label, int depth = 0) override
     {
         IndexReader::SetDebug(label, depth);
         printf("%*s[OR]\n", depth * 2, "");
-        for (auto& c : children_) c->SetDebug(label, depth + 1);
+        for (auto& c : m_Children) c->SetDebug(label, depth + 1);
     }
 
     bool IsEnd() override
     {
-        for (auto& c : children_) {
+        for (auto& c : m_Children) {
             if (!c->IsEnd())
                 return false;
         }
@@ -171,7 +171,7 @@ public:
     {
         uint64_t minDoc = NO_MORE_DOCS;
 
-        for (auto& c : children_) {
+        for (auto& c : m_Children) {
             if (!c->IsEnd())
                 minDoc = std::min(minDoc, c->GetDocumentID());
         }
@@ -184,7 +184,7 @@ public:
         uint64_t doc   = GetDocumentID();
         uint32_t total = 0;
 
-        for (auto& c : children_) {
+        for (auto& c : m_Children) {
             if (!c->IsEnd() && c->GetDocumentID() == doc)
                 total += c->GetTermFreq();
         }
@@ -197,7 +197,7 @@ public:
         uint64_t doc   = GetDocumentID();
         float    total = 0.0f;
 
-        for (auto& c : children_) {
+        for (auto& c : m_Children) {
             if (!c->IsEnd() && c->GetDocumentID() == doc)
                 total += c->GetBM25Score(scorer, docLength);
         }
@@ -212,7 +212,7 @@ public:
 
         uint64_t doc = GetDocumentID();
 
-        for (auto& c : children_) {
+        for (auto& c : m_Children) {
             if (!c->IsEnd() && c->GetDocumentID() == doc)
                 c->GoNext();
         }
@@ -220,17 +220,17 @@ public:
 
     void GoUntil(uint64_t target, uint64_t limit = NO_MORE_DOCS) override
     {
-        for (auto& c : children_) {
+        for (auto& c : m_Children) {
             if (!c->IsEnd() && c->GetDocumentID() < target)
                 c->GoUntil(target, limit);
         }
     }
 
-    void Close() override { for (auto& c : children_) c->Close(); }
+    void Close() override { for (auto& c : m_Children) c->Close(); }
     void Open(const char*) override {}
 
 private:
-    std::vector<std::shared_ptr<IndexReader>> children_;
+    std::vector<std::shared_ptr<IndexReader>> m_Children;
 };
 
 /*
@@ -240,8 +240,8 @@ class NotIndexReader : public IndexReader {
 public:
     NotIndexReader(std::shared_ptr<IndexReader> base,
                    std::shared_ptr<IndexReader> exclude)
-        : base_(std::move(base))
-        , exclude_(std::move(exclude))
+        : m_Base(std::move(base))
+        , m_Exclude(std::move(exclude))
     {
         SkipExcluded();
     }
@@ -251,51 +251,51 @@ public:
         IndexReader::SetDebug(label, depth);
         printf("%*s[NOT]\n", depth * 2, "");
         printf("%*s  + base:\n", depth * 2, "");
-        base_->SetDebug(label, depth + 2);
+        m_Base->SetDebug(label, depth + 2);
         printf("%*s  - excl:\n", depth * 2, "");
-        exclude_->SetDebug(label, depth + 2);
+        m_Exclude->SetDebug(label, depth + 2);
     }
 
-    bool     IsEnd()         override { return base_->IsEnd(); }
-    uint64_t GetDocumentID() override { return base_->GetDocumentID(); }
-    uint32_t GetTermFreq()   override { return base_->GetTermFreq(); }
+    bool     IsEnd()         override { return m_Base->IsEnd(); }
+    uint64_t GetDocumentID() override { return m_Base->GetDocumentID(); }
+    uint32_t GetTermFreq()   override { return m_Base->GetTermFreq(); }
 
     float GetBM25Score(const Bm25Scorer& scorer, uint32_t docLength) override
     {
-        return base_->GetBM25Score(scorer, docLength);
+        return m_Base->GetBM25Score(scorer, docLength);
     }
 
     void GoNext() override
     {
-        base_->GoNext();
+        m_Base->GoNext();
         SkipExcluded();
     }
 
     void GoUntil(uint64_t target, uint64_t limit = NO_MORE_DOCS) override
     {
-        base_->GoUntil(target, limit);
+        m_Base->GoUntil(target, limit);
         SkipExcluded();
     }
 
-    void Close() override { base_->Close(); exclude_->Close(); }
+    void Close() override { m_Base->Close(); m_Exclude->Close(); }
     void Open(const char*) override {}
 
 private:
-    std::shared_ptr<IndexReader> base_;
-    std::shared_ptr<IndexReader> exclude_;
+    std::shared_ptr<IndexReader> m_Base;
+    std::shared_ptr<IndexReader> m_Exclude;
 
     void SkipExcluded()
     {
-        while (!base_->IsEnd()) {
-            uint64_t doc = base_->GetDocumentID();
+        while (!m_Base->IsEnd()) {
+            uint64_t doc = m_Base->GetDocumentID();
 
-            exclude_->GoUntil(doc);
+            m_Exclude->GoUntil(doc);
 
-            if (!exclude_->IsEnd() && exclude_->GetDocumentID() == doc) {
+            if (!m_Exclude->IsEnd() && m_Exclude->GetDocumentID() == doc) {
                 if (m_debug)
                     printf("%*sNOT excluded  doc %" PRIu64 "\n",
                            m_debugDepth * 2, "", doc);
-                base_->GoNext();
+                m_Base->GoNext();
             } else {
                 break;
             }

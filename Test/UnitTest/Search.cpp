@@ -19,7 +19,7 @@ int main(int argc, char **argv)
 
     index_writer->Write(tokenizer->Tokenize("Conf 2021"), documentId, "Title");
 
-    auto index_reader = index_context->GetReader("Title");
+    auto index_reader = index_context->GetReader("Title", "T");
 
     index_reader->Open("fox");
 
