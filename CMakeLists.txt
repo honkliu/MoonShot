@@ -23,6 +23,13 @@ if(MSVC)
 endif()
 
 # -------------------------------------------------------------------------
+# mimalloc — mandatory high-performance allocator override.
+# Pass -Dmimalloc_DIR=/path/to/mimalloc/lib/cmake/mimalloc-2.1 at configure.
+# -------------------------------------------------------------------------
+find_package(mimalloc REQUIRED)
+message(STATUS "mimalloc ${mimalloc_VERSION} found")
+
+# -------------------------------------------------------------------------
 # Component libraries
 # -------------------------------------------------------------------------
 add_subdirectory(Utils)
@@ -46,6 +53,7 @@ target_link_libraries(MoonShot INTERFACE
     Executor
     Tokenizer
     Utils
+    mimalloc-static
 )
 
 target_include_directories(MoonShot INTERFACE
