@@ -9,7 +9,7 @@
 use rustblade::{IndexContext, IndexWriter, SmartTokenizer};
 use rustblade::tokenizer::Tokenizer;
 use rustblade::compiler::IndexSearchCompiler;
-use rustblade::executor::{IndexSearchExecutor, SearchResult};
+use rustblade::executor::IndexSearchExecutor;
 
 static INDEX_FILE: &str = "moonshot_demo.idx";
 
