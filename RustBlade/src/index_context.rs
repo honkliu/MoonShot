@@ -1,8 +1,8 @@
 use std::sync::{Arc, Mutex};
 use crate::posting_store::PostingStore;
 use crate::block_table::IndexBlockTable;
-use crate::index_writer::{IndexWriter, AdvancedIndexWriter};
-use crate::eval_tree::{EvalTree, EvalNode, TermNode, AndNode, OrNode, NotNode};
+use crate::index_writer::AdvancedIndexWriter;
+use crate::eval_tree::{EvalTree, EvalNode};
 use crate::advanced_reader::AdvancedIndexReader;
 use crate::composite_readers::{AndIndexReader, OrIndexReader, NotIndexReader};
 use crate::index_reader::IndexReader;

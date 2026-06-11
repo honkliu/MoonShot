@@ -28,5 +28,5 @@ pub use eval_tree::{EvalTree, EvalNode};
 pub use index_reader::IndexReader;
 pub use executor::SearchResult;
 pub use index_context::IndexContext;
-pub use vector_index::{HnswIndex, VectorMetric};
-pub use fusion::rrf_merge;
+pub use vector_index::{HnswIndex, Metric as VectorMetric};
+pub use fusion::rrf_fusion as rrf_merge;

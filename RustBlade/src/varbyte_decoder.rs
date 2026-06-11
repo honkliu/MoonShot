@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use crate::block_table::{IndexBlock, IB_HEADER_HAS_MORE, DATA_SIZE};
+use crate::block_table::{IndexBlock, DATA_SIZE};
 
 /*
 * VarByteDecoder — stateful decoder for VarByte-delta-encoded (docId, tf) pairs.

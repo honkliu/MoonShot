@@ -20,7 +20,7 @@ pub trait IndexReader {
     fn is_end(&self)            -> bool;
     fn get_document_id(&self)   -> u64;
     fn get_term_freq(&self)     -> u32   { 1 }
-    fn get_bm25_score(&self, scorer: &Bm25Scorer, doc_len: u32) -> f32 { 0.0 }
+    fn get_bm25_score(&self, _scorer: &Bm25Scorer, _doc_len: u32) -> f32 { 0.0 }
     fn set_debug(&mut self, _label: &str, _depth: usize) {}
     fn close(&mut self) {}
 }
