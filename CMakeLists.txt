@@ -53,8 +53,13 @@ target_link_libraries(MoonShot INTERFACE
     Executor
     Tokenizer
     Utils
-    mimalloc-static
 )
+
+if(TARGET mimalloc-static)
+    target_link_libraries(MoonShot INTERFACE mimalloc-static)
+else()
+    target_link_libraries(MoonShot INTERFACE mimalloc)
+endif()
 
 target_include_directories(MoonShot INTERFACE
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
