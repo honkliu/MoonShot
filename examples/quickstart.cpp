@@ -8,7 +8,7 @@
  */
 
 #include "moonshot.h"
-#include <cstdio>
+#include <print>
 
 int main()
 {
@@ -37,7 +37,7 @@ int main()
     writer->Write(tok.Tokenize("Go language concurrency"),             3, "Title");
     writer->SetDocImportance(3, 0.6f);
 
-    printf("Indexed %llu documents.\n\n", engine.GetStore()->TotalDocs());
+    std::println("Indexed {} documents.\n", engine.GetStore()->TotalDocs());
 
     /* ------------------------------------------------------------------ *
      * 3.  Search.                                                          *
@@ -45,12 +45,12 @@ int main()
     IndexSearchCompiler compiler;
 
     auto runQuery = [&](const char* q, const char* streams) {
-        printf("search(\"%s\", \"%s\"):\n", q, streams);
+        std::println("search(\"{}\", \"{}\"):", q, streams);
         std::unique_ptr<EvalTree>            tree(compiler.Compile(q, streams));
         std::unique_ptr<IndexSearchExecutor> exec(engine.GetExecutor());
         for (auto& r : exec->Execute(engine.GetReader(tree.get()), 5))
-            printf("  doc=%-3llu  score=%.3f\n", r.doc_id, r.score);
-        printf("\n");
+            std::println("  doc={:<3}  score={:.3f}", r.doc_id, r.score);
+        std::println("");
     };
 
     runQuery("rust",              "AUTB");
@@ -62,17 +62,16 @@ int main()
      * 4.  Persist the index to disk, then reload and search again.         *
      * ------------------------------------------------------------------ */
     if (engine.SaveIndex())
-        printf("Index saved to my_index.bin\n\n");
+        std::println("Index saved to my_index.bin\n");
 
-    IndexContext engine2("", "my_index.bin");   // auto-loads from disk
-    printf("Reloaded %llu documents from disk.\n\n",
-           engine2.GetStore()->TotalDocs());
+    IndexContext engine2("", "my_index.bin");
+    std::println("Reloaded {} documents from disk.\n", engine2.GetStore()->TotalDocs());
 
     std::unique_ptr<EvalTree>            tree(compiler.Compile("rust", "AUTB"));
     std::unique_ptr<IndexSearchExecutor> exec(engine2.GetExecutor());
-    printf("search(\"rust\") after reload:\n");
+    std::println("search(\"rust\") after reload:");
     for (auto& r : exec->Execute(engine2.GetReader(tree.get()), 5))
-        printf("  doc=%-3llu  score=%.3f\n", r.doc_id, r.score);
+        std::println("  doc={:<3}  score={:.3f}", r.doc_id, r.score);
 
     return 0;
 }

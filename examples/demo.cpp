@@ -7,8 +7,8 @@
 
 #include "IndexContext.h"
 
-#include <cstdio>
 #include <cstring>
+#include <print>
 
 static const char* INDEX_FILE = "moonshot_demo.idx";
 
@@ -80,12 +80,8 @@ static const Doc kDocs[] = {
 
 void BuildIndex()
 {
-    puts("\n=== BuildIndex ===");
+    std::println("\n=== BuildIndex ===");
 
-    /*
-    * Construct with no index path so nothing is loaded from disk.
-    * GetWriter() returns an AdvancedIndexWriter backed by a PostingStore.
-    */
     IndexContext ctx;
     auto writer = ctx.GetWriter();
     auto tok    = ctx.GetTokenizer();
@@ -97,19 +93,18 @@ void BuildIndex()
         writer->Write(tok->Tokenize(doc.body),   doc.id, "Body");
         writer->SetDocImportance(doc.id, doc.importance);
 
-        printf("  indexed doc %llu: %s\n",
-               (unsigned long long)doc.id, doc.title);
+        std::println("  indexed doc {}: {}", doc.id, doc.title);
     }
 
     ctx.SaveIndex(INDEX_FILE);
-    printf("  saved → %s\n", INDEX_FILE);
+    std::println("  saved → {}", INDEX_FILE);
 }
 
 /* ------------------------------------------------------------------ */
 
 void SearchIndex()
 {
-    puts("\n=== SearchIndex ===");
+    std::println("\n=== SearchIndex ===");
 
     IndexContext ctx("", INDEX_FILE);
     auto compiler = ctx.GetCompiler();
@@ -120,10 +115,9 @@ void SearchIndex()
         auto reader = ctx.GetReader(tree.get());
         auto hits   = executor->Execute(reader);
 
-        printf("\n[%s]\n", q);
+        std::println("\n[{}]", q);
         for (const auto& h : hits)
-            printf("  doc %llu  score=%.3f\n",
-                   (unsigned long long)h.doc_id, h.score);
+            std::println("  doc {:<3}  score={:.3f}", h.doc_id, h.score);
     };
 
     run("honda");
@@ -133,17 +127,16 @@ void SearchIndex()
     run("honda toyota");
 
     /* debug trace — readers print each doc they visit */
-    puts("\n--- trace: race car NOT toy ---");
+    std::println("\n--- trace: race car toy ---");
     {
         auto tree   = std::unique_ptr<EvalTree>(compiler->Compile("race car toy"));
         auto reader = ctx.GetReader(tree.get());
         reader->SetDebug("race car toy");
         auto hits = executor->Execute(reader);
 
-        puts("\n  results:");
+        std::println("\n  results:");
         for (const auto& h : hits)
-            printf("    doc %llu  score=%.3f\n",
-                   (unsigned long long)h.doc_id, h.score);
+            std::println("    doc {:<3}  score={:.3f}", h.doc_id, h.score);
     }
 }
 
@@ -160,9 +153,9 @@ int main(int argc, char* argv[])
     }
 
     if (!doBuild && !doSearch) {
-        puts("usage: demo -b       build index\n"
-             "            -q       search index\n"
-             "            -b -q    build then search");
+        std::println("usage: demo -b       build index\n"
+                     "            -q       search index\n"
+                     "            -b -q    build then search");
         return 1;
     }
 

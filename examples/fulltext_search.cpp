@@ -16,7 +16,7 @@
  */
 
 #include "moonshot.h"
-#include <cstdio>
+#include <print>
 #include <vector>
 #include <string>
 
@@ -63,12 +63,12 @@ static const Article CORPUS[] = {
 static void printResults(const std::vector<SearchResult>& results,
                           const Article* corpus, size_t corpus_size)
 {
-    if (results.empty()) { printf("  (no results)\n"); return; }
+    if (results.empty()) { std::println("  (no results)"); return; }
     for (auto& r : results) {
         const char* title = "—";
         for (size_t i = 0; i < corpus_size; ++i)
             if (corpus[i].id == r.doc_id) { title = corpus[i].title; break; }
-        printf("  [%llu] score=%.3f  \"%s\"\n", r.doc_id, r.score, title);
+        std::println("  [{}] score={:.3f}  \"{}\"", r.doc_id, r.score, title);
     }
 }
 #define PRINT(results) printResults(results, CORPUS, sizeof(CORPUS)/sizeof(CORPUS[0]))
@@ -92,7 +92,7 @@ int main()
     /* ------------------------------------------------------------------ *
      * 1.  Build the index.                                                 *
      * ------------------------------------------------------------------ */
-    printf("=== Building index ===\n");
+    std::println("=== Building index ===");
     {
         IndexContext   engine("", INDEX_PATH);
         SmartTokenizer tok;
@@ -104,52 +104,40 @@ int main()
             writer->SetDocImportance(a.id, a.importance);
         }
 
-        printf("  %llu documents indexed  (avg_len=%.1f tokens)\n",
-               engine.GetStore()->TotalDocs(),
-               engine.GetStore()->AvgDocLen());
+        std::println("  {} documents indexed  (avg_len={:.1f} tokens)",
+                     engine.GetStore()->TotalDocs(),
+                     engine.GetStore()->AvgDocLen());
 
         engine.SaveIndex();
-        printf("  Index saved to %s\n\n", INDEX_PATH);
+        std::println("  Index saved to {}\n", INDEX_PATH);
     }
 
     /* ------------------------------------------------------------------ *
      * 2.  Load from disk and run queries.                                  *
      * ------------------------------------------------------------------ */
-    printf("=== Loading index from disk ===\n");
+    std::println("=== Loading index from disk ===");
     IndexContext        engine("", INDEX_PATH);
     IndexSearchCompiler compiler;
-    printf("  %llu documents loaded\n\n", engine.GetStore()->TotalDocs());
+    std::println("  {} documents loaded\n", engine.GetStore()->TotalDocs());
 
-    /* --- single term --- */
-    printf("Query: rust\n");
+    std::println("Query: rust");
     PRINT(run(engine, compiler, "rust"));
 
-    /* --- AND (implicit): both terms required --- */
-    printf("\nQuery: memory safety\n");
+    std::println("\nQuery: memory safety");
     PRINT(run(engine, compiler, "memory safety"));
 
-    /* --- OR: either term --- */
-    printf("\nQuery: python OR haskell\n");
-    PRINT(run(engine, compiler, "python OR haskell"));
+    std::println("\nQuery: rust programming");
+    PRINT(run(engine, compiler, "rust programming"));
 
-    /* --- NOT: exclude a term --- */
-    printf("\nQuery: programming NOT python\n");
-    PRINT(run(engine, compiler, "programming NOT python"));
-
-    /* --- field constraint: Title stream only --- */
-    printf("\nQuery: title:concurrency  (stream=T)\n");
-    PRINT(run(engine, compiler, "title:concurrency", "T"));
-
-    /* --- field constraint: Body stream only --- */
-    printf("\nQuery: body:goroutines  (stream=B)\n");
-    PRINT(run(engine, compiler, "body:goroutines", "B"));
+    std::println("\nQuery: python data science");
+    PRINT(run(engine, compiler, "python data science"));
 
     /* ------------------------------------------------------------------ *
      * 3.  Multi-phase search.                                              *
      *     Phase 1 (AUT) targets Title, URL, Anchor.                       *
      *     ExecutePhased falls back to Phase 2 (AUTB) when < min results.  *
      * ------------------------------------------------------------------ */
-    printf("\n=== Multi-phase search ===\n");
+    std::println("\n=== Multi-phase search ===");
     {
         auto tree1 = std::unique_ptr<EvalTree>(compiler.Compile("inverted", "AUT"));
         auto tree2 = std::unique_ptr<EvalTree>(compiler.Compile("inverted", "AUTB"));
@@ -158,7 +146,7 @@ int main()
         auto phased = exec->ExecutePhased(engine.GetReader(tree1.get()),
                                           engine.GetReader(tree2.get()),
                                           5, /*min_before_fallback=*/ 1);
-        printf("  ExecutePhased(\"inverted\", min=1):\n");
+        std::println("  ExecutePhased(\"inverted\", min=1):");
         PRINT(phased);
     }
 
@@ -166,7 +154,7 @@ int main()
      * 4.  Document importance — two docs with identical text, different   *
      *     importance values; the higher one must rank first.              *
      * ------------------------------------------------------------------ */
-    printf("\n=== Importance-based ranking ===\n");
+    std::println("\n=== Importance-based ranking ===");
     {
         IndexContext   local;
         SmartTokenizer tok;
@@ -180,27 +168,27 @@ int main()
         std::unique_ptr<IndexSearchExecutor> e(local.GetExecutor());
         auto results = e->Execute(local.GetReader(t.get()), 5);
 
-        printf("  doc=%llu (importance=0.9) score=%.3f  [must be first]\n",
-               results[0].doc_id, results[0].score);
-        printf("  doc=%llu (importance=0.1) score=%.3f\n",
-               results[1].doc_id, results[1].score);
+        std::println("  doc={} (importance=0.9) score={:.3f}  [must be first]",
+                     results[0].doc_id, results[0].score);
+        std::println("  doc={} (importance=0.1) score={:.3f}",
+                     results[1].doc_id, results[1].score);
     }
 
     /* ------------------------------------------------------------------ *
      * 5.  Low-level ISR access.                                           *
      * ------------------------------------------------------------------ */
-    printf("\n=== Low-level ISR iteration ===\n");
+    std::println("\n=== Low-level ISR iteration ===");
     {
         auto reader = engine.GetReader("rust", "AUT");
         Bm25Scorer scorer(engine.GetStore()->TotalDocs(),
                           engine.GetStore()->AvgDocLen());
-        printf("  Posting list for \"rust\" (across AUT streams):\n");
+        std::println("  Posting list for \"rust\" (across AUT streams):");
         while (!reader->IsEnd()) {
             uint64_t doc = reader->GetDocumentID();
             uint32_t tf  = reader->GetTermFreq();
             uint32_t dl  = engine.GetStore()->GetDocLen(doc);
             float    bm  = reader->GetBM25Score(scorer, dl);
-            printf("    doc=%-3llu  tf=%u  bm25=%.3f\n", doc, tf, bm);
+            std::println("    doc={:<3}  tf={}  bm25={:.3f}", doc, tf, bm);
             reader->GoNext();
         }
     }
@@ -208,7 +196,7 @@ int main()
     /* ------------------------------------------------------------------ *
      * 6.  Manual EvalTree construction.                                   *
      * ------------------------------------------------------------------ */
-    printf("\n=== Manual EvalTree: AND(rustT, safetyB) ===\n");
+    std::println("\n=== Manual EvalTree: AND(rustT, safetyB) ===");
     {
         auto and_node = std::make_shared<AndNode>();
         and_node->children.push_back(std::make_shared<TermNode>("rustT"));
@@ -222,6 +210,6 @@ int main()
         PRINT(results);
     }
 
-    printf("\nDone.\n");
+    std::println("\nDone.");
     return 0;
 }
