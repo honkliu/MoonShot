@@ -96,10 +96,6 @@ static std::string hex8(uint64_t v)
 {
     return std::format("{:016X}", v);
 }
-static std::string hex4(uint32_t v)
-{
-    return std::format("{:08X}", v);
-}
 
 /* hex dump of bytes */
 static std::string hexdump(const uint8_t* d, size_t n, size_t cols=16)
