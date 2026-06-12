@@ -20,6 +20,7 @@
 #include <vector>
 #include <unordered_map>
 #include <algorithm>
+#include <format>
 #include <sstream>
 #include <fstream>
 #include <iostream>
@@ -93,12 +94,11 @@ static std::string esc(const std::string& s)
 
 static std::string hex8(uint64_t v)
 {
-    char buf[20]; snprintf(buf,sizeof(buf),"%016llX",(unsigned long long)v);
-    return buf;
+    return std::format("{:016X}", v);
 }
 static std::string hex4(uint32_t v)
 {
-    char buf[12]; snprintf(buf,sizeof(buf),"%08X",v); return buf;
+    return std::format("{:08X}", v);
 }
 
 /* hex dump of bytes */
@@ -106,10 +106,9 @@ static std::string hexdump(const uint8_t* d, size_t n, size_t cols=16)
 {
     std::ostringstream o;
     for (size_t i=0; i<n; i+=cols) {
-        char addr[12]; snprintf(addr,sizeof(addr),"%04zX  ",i);
-        o << addr;
+        o << std::format("{:04X}  ", i);
         for (size_t j=0; j<cols; ++j) {
-            if (i+j < n) { char h[4]; snprintf(h,sizeof(h),"%02X ",d[i+j]); o<<h; }
+            if (i+j < n) o << std::format("{:02X} ", d[i+j]);
             else o << "   ";
             if (j==7) o << ' ';
         }

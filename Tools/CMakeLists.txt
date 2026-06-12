@@ -3,10 +3,6 @@ cmake_minimum_required(VERSION 3.14)
 # ── moon_inspect ─────────────────────────────────────────────────────────────
 add_executable(moon_inspect moon_inspect.cpp)
 
-set_target_properties(moon_inspect PROPERTIES
-    CXX_STANDARD 17
-    CXX_STANDARD_REQUIRED ON)
-
 if(MSVC)
     target_compile_options(moon_inspect PRIVATE /W3 /wd4996)
 endif()
