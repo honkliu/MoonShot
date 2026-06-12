@@ -17,6 +17,8 @@
 #include <string>
 #include <algorithm>
 
+#include <cstdio>
+
 using std::shared_ptr;
 using std::make_shared;
 using std::string;
@@ -60,43 +62,92 @@ public:
     }
 
     /*
-    * Build() — converts PostingStore entries into IndexBlock pages.
-    * Called lazily on first GetReader().
+    * Build() — packs PostingStore entries into multi-term IndexBlocks,
+    * sorted alphabetically, and populates the SubIndex.
+    * Called lazily on first GetReader() for in-memory indexes.
+    * Not called when the index was loaded from disk (m_Built = true).
     */
     void Build()
     {
         if (m_Built)
             return;
 
-        const size_t blockCapacity = sizeof(IndexBlock::IB_Data) - 1u;
-        uint32_t     blockSeq      = 0;
+        std::vector<std::pair<std::string, const PostingList*>> sorted;
+        sorted.reserve(m_Store->AllPostings().size());
+        for (const auto& [k, pl] : m_Store->AllPostings())
+            sorted.push_back({k, &pl});
+        std::sort(sorted.begin(), sorted.end());
 
-        for (const auto& [streamKey, postingList] : m_Store->AllPostings()) {
-            const auto& bytes = postingList.GetBytes();
+        constexpr size_t   DATA_CAP = sizeof(IndexBlock::IB_Data) - 1u;
+        constexpr uint16_t CONT     = BLOCK_CONTINUATION_MARKER;
 
-            if (bytes.empty())
-                continue;
+        IndexBlock cur = {};
+        uint8_t*   wptr  = cur.IB_Data;
+        uint8_t*   wend  = cur.IB_Data + DATA_CAP;
+        uint32_t   seq   = 0;
+        bool       fresh = true;
 
-            size_t dataLen   = bytes.size();
-            size_t numBlocks = (dataLen + blockCapacity - 1) / blockCapacity;
-            if (numBlocks == 0) numBlocks = 1;
+        auto flush = [&](bool has_more) {
+            cur.IB_Header = static_cast<uint64_t>(seq);
+            if (has_more) cur.IB_Header |= IB_HEADER_HAS_MORE;
+            if (!has_more && wptr + 2 <= wend + 1) {
+                *wptr++ = 0; *wptr = 0;
+            }
+            m_BlockTable.InsertBlock(seq, &cur);
+            ++seq;
+            cur   = {};
+            wptr  = cur.IB_Data;
+            fresh = true;
+        };
 
-            uint32_t firstSeq = blockSeq;
+        for (const auto& [term, pl] : sorted) {
+            const auto& bytes = pl->GetBytes();
+            if (bytes.empty()) continue;
 
-            for (size_t blk = 0; blk < numBlocks; ++blk) {
-                size_t offset  = blk * blockCapacity;
-                size_t len     = std::min(dataLen - offset, blockCapacity);
-                bool   hasMore = (blk + 1 < numBlocks);
+            uint16_t kl       = static_cast<uint16_t>(term.size());
+            uint32_t freq     = pl->doc_freq();
+            size_t   hdr_size = 2u + kl + 4u + 4u;
 
-                m_BlockTable.InsertBlock(blockSeq,
-                                        bytes.data() + offset,
-                                        len,
-                                        hasMore);
-                ++blockSeq;
+            if (static_cast<size_t>(wend - wptr) < hdr_size + 1u)
+                flush(false);
+
+            if (fresh) {
+                m_BlockTable.AddSubIndexEntry(term, seq);
+                fresh = false;
             }
 
-            m_BlockTable.AddTermMapping(streamKey, firstSeq);
+            const uint8_t* src       = bytes.data();
+            size_t         remaining = bytes.size();
+            size_t         data_space = static_cast<size_t>(wend - wptr) - hdr_size;
+            size_t         data_here  = std::min(remaining, data_space);
+            bool           has_more   = (data_here < remaining);
+
+            std::memcpy(wptr, &kl,   2); wptr += 2;
+            std::memcpy(wptr, term.c_str(), kl); wptr += kl;
+            std::memcpy(wptr, &freq, 4); wptr += 4;
+            uint32_t dl = static_cast<uint32_t>(data_here);
+            std::memcpy(wptr, &dl,   4); wptr += 4;
+            std::memcpy(wptr, src,   data_here); wptr += data_here;
+            src       += data_here;
+            remaining -= data_here;
+
+            if (has_more) {
+                flush(true);
+                while (remaining > 0) {
+                    std::memcpy(wptr, &CONT, 2); wptr += 2;
+                    size_t cont_here = std::min(remaining,
+                                                static_cast<size_t>(wend - wptr));
+                    bool   more_cont = (cont_here < remaining);
+                    std::memcpy(wptr, src, cont_here);
+                    wptr      += cont_here;
+                    src       += cont_here;
+                    remaining -= cont_here;
+                    flush(more_cont);
+                }
+            }
         }
+        if (!fresh || wptr != cur.IB_Data)
+            flush(false);
 
         m_Built = true;
     }
@@ -142,41 +193,58 @@ public:
 
     bool SaveIndex()
     {
-        if (m_IndexPath.empty())
-            return false;
-
-        return IndexSerializer::Save(*m_Store, m_IndexPath.c_str());
+        if (m_IndexPath.empty()) return false;
+        return SaveIndex(m_IndexPath.c_str());
     }
 
     bool SaveIndex(const char* path)
     {
-        if (!path || !*path)
-            return false;
-
+        if (!path || !*path) return false;
         m_IndexPath = path;
-        return IndexSerializer::Save(*m_Store, path);
+
+        EnsureBuilt();
+        if (!IndexSerializer::Save(*m_Store, path)) return false;
+
+        // Wire up FileBlockManager so cache misses reload from the .idx file.
+        std::vector<SubIndexEntry> dummy_si;
+        uint64_t blocks_offset = 0;
+        PostingStore tmp;
+        IndexSerializer::Load(tmp, path, &dummy_si, &blocks_offset);
+
+        auto fm = make_shared<FileBlockManager>(sizeof(IndexBlock), blocks_offset);
+        if (fm->open(path))
+            m_BlockTable.SetFileManager(std::move(fm));
+
+        return true;
     }
 
     void LoadIndex()
     {
-        if (!m_IndexPath.empty()) {
-            m_Store = make_shared<PostingStore>();
-            IndexSerializer::Load(*m_Store, m_IndexPath.c_str());
-            m_Executor = IndexSearchExecutor(m_Store);
-            m_Built = false;
-        }
+        if (m_IndexPath.empty()) return;
+
+        m_Store = make_shared<PostingStore>();
+        std::vector<SubIndexEntry> subindex;
+        uint64_t blocks_offset = 0;
+
+        if (!IndexSerializer::Load(*m_Store, m_IndexPath.c_str(),
+                                   &subindex, &blocks_offset))
+            return;
+
+        m_BlockTable.SetSubIndex(std::move(subindex));
+
+        auto fm = make_shared<FileBlockManager>(sizeof(IndexBlock), blocks_offset);
+        if (fm->open(m_IndexPath.c_str()))
+            m_BlockTable.SetFileManager(std::move(fm));
+
+        m_Executor = IndexSearchExecutor(m_Store);
+        m_Built    = true;
     }
 
     void LoadIndex(const char* path)
     {
-        if (!path || !*path)
-            return;
-
+        if (!path || !*path) return;
         m_IndexPath = path;
-        m_Store     = make_shared<PostingStore>();
-        IndexSerializer::Load(*m_Store, path);
-        m_Executor = IndexSearchExecutor(m_Store);
-        m_Built = false;
+        LoadIndex();
     }
 
 private:

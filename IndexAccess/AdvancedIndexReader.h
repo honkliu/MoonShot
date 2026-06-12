@@ -89,14 +89,11 @@ class AdvancedIndexReader : public IndexReader
         char*                       m_Word           = nullptr;
         uint32_t                    m_BlockSeqNumber = 0;
         uint32_t                    m_DocFreq        = 0;
-        IndexBlockTable*            m_BlockTable     = nullptr; // set by IndexContext, always non-null after Open
+        bool                        m_HasMore        = false; // true only when this term's data spans blocks
+        IndexBlockTable*            m_BlockTable     = nullptr;
         UnifiedDecoder              m_Decoder;
 
-        bool HasMoreBlocks() const
-        {
-            return m_IndexBlock
-                && (m_IndexBlock->IB_Header & IB_HEADER_HAS_MORE) != 0;
-        }
+        bool HasMoreBlocks() const { return m_HasMore; }
 };
 
 #endif

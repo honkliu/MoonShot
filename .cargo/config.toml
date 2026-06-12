@@ -1,0 +1,3 @@
+[build]
+# Route all Rust build artifacts to build/rust/ — mirrors cmake -B build for C++.
+target-dir = "build/rust"

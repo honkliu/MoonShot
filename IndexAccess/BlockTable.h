@@ -149,6 +149,14 @@ class BlockCache {
 
         ~BlockCache() = default;
 
+        void resize(uint32_t new_capacity)
+        {
+            m_Capacity    = new_capacity;
+            m_CacheSlots.reset(new CacheSlot[new_capacity]);
+            m_Hand        = 0;
+            m_PendingSlot = 0;
+        }
+
         bool DataLoaded(int block_seq, void** address)
         {
             uint32_t seq = static_cast<uint32_t>(block_seq);
@@ -226,117 +234,137 @@ class BlockCache {
 };
 
 /*
-* TermToBlock — maps a term+stream key (e.g. "rustT") to the block
-* sequence number of the first block holding its posting list.
-* Populated by IndexContext::Build() during the write→read transition.
+* SubIndex — sparse in-memory index mapping the lead term of each block
+* to its block_seq.  Mirrors Tiger's WordToPageMap / subDocData section.
+*
+* Stored sorted by term so binary search finds the right block in O(log N).
+* One entry per posting block (not per term); multiple terms share a block.
 */
-class TermToBlock {
-public:
-    /*
-    * Returns UINT32_MAX when the term is not in the index.
-    */
-    uint32_t Contains(const char* word) const
-    {
-        auto it = m_Map.find(word);
-        return it != m_Map.end() ? it->second : UINT32_MAX;
-    }
-
-    void AddMapping(const std::string& term, uint32_t block_seq)
-    {
-        m_Map[term] = block_seq;
-    }
-
-    bool HasTerm(const std::string& term) const
-    {
-        return m_Map.find(term) != m_Map.end();
-    }
-
-private:
-    std::unordered_map<std::string, uint32_t> m_Map;
+struct SubIndexEntry {
+    std::string term;       // lead term (first term whose data starts in this block)
+    uint32_t    block_seq;
 };
 
 /*
 * IndexBlockTable — the page manager for posting-list blocks.
-* Equivalent to REF's PageManager + HashCacheProxy.
+* Equivalent to REF's PageManager + WordToPageMap.
 *
-* GetIndexBlock(word):
-*   1. Lookup TermToBlock for the block sequence number.
-*   2. Check BlockCache (clock replacement).
-*   3. On cache miss: load from FileBlockManager (disk).
+* Block format (IB_Data contents):
+*   Normal block: packed term entries, sorted alphabetically.
+*     Each entry: [key_len:2B][key:key_len B][doc_freq:4B][data_len:4B][VarByte:data_len B]
+*     Terminated by: key_len == 0  (sentinel)
+*     If IB_HEADER_HAS_MORE is set: last entry's data continues in block_seq + 1.
 *
-* InsertBlock(seq, bytes, len):
-*   Write path — stores a VarByte-encoded posting list directly
-*   into the cache.  Used by IndexContext::Build().
+*   Continuation block (IB_Data[0..1] == 0xFFFF):
+*     Raw VarByte continuation bytes for the previous block's last term.
+*     Still uses IB_HEADER_HAS_MORE if the data continues further.
 *
-* AddTermMapping(term, seq):
-*   Register a term → first-block mapping during Build().
+* Lookup:
+*   FindTermData(term) → binary-search SubIndex → load block → linear scan in block.
+*
+* InsertBlock(seq, packed_block_data):
+*   Write path — stores a fully-constructed 4 KB block into the cache.
+*
+* SetSubIndex / AddSubIndexEntry:
+*   Populated by Build() (write path) or Load() (read path from file).
 */
+static constexpr uint16_t BLOCK_CONTINUATION_MARKER = 0xFFFFu;
+
 class IndexBlockTable
 {
     public:
         explicit IndexBlockTable(uint32_t cache_capacity = 512)
-            : m_TermToBlock(std::make_shared<TermToBlock>())
-            , m_BlockCache(cache_capacity)
+            : m_BlockCache(cache_capacity)
         {
             m_FileManager.reset();
         }
 
+        // ── Write path ──────────────────────────────────────────────────────
+
         /*
-        * Store a VarByte posting list directly into the block cache.
-        * hasMore = true means this posting list continues in block_seq + 1.
+        * Store a fully-constructed IndexBlock into the cache.
+        * Called by IndexContext::Build() after packing multi-term data.
         */
-        void InsertBlock(uint32_t    block_seq,
-                         const uint8_t* data,
-                         size_t         data_len,
-                         bool           hasMore = false)
+        void InsertBlock(uint32_t block_seq, const IndexBlock* block)
         {
             void* addr = nullptr;
             m_BlockCache.DataLoaded(static_cast<int>(block_seq), &addr);
-
-            if (!addr)
-                return;
-
-            IndexBlock* block = static_cast<IndexBlock*>(addr);
-
-            block->IB_Header = static_cast<uint64_t>(block_seq);
-            if (hasMore)
-                block->IB_Header |= IB_HEADER_HAS_MORE;
-
-            std::memset(block->IB_Skip, 0, sizeof(block->IB_Skip));
-            std::memset(block->IB_Data, 0, sizeof(block->IB_Data));
-
-            size_t copyLen = std::min(data_len, sizeof(block->IB_Data) - 1u);
-            std::memcpy(block->IB_Data, data, copyLen);
-
-            m_BlockCache.Add(block, block_seq);
+            if (!addr) return;
+            std::memcpy(addr, block, sizeof(IndexBlock));
+            m_BlockCache.Add(static_cast<IndexBlock*>(addr), block_seq);
         }
 
         /*
-        * Register term → first block mapping (called during Build()).
+        * Register the lead term of block_seq in the SubIndex.
+        * Called once per block by IndexContext::Build().
         */
-        void AddTermMapping(const std::string& term, uint32_t block_seq)
+        void AddSubIndexEntry(const std::string& lead_term, uint32_t block_seq)
         {
-            m_TermToBlock->AddMapping(term, block_seq);
+            m_SubIndex.push_back({lead_term, block_seq});
         }
 
-        IndexBlock* GetIndexBlock(uint32_t block_seq, uint32_t /*number*/)
+        /*
+        * Replace the entire SubIndex (used by IndexSerializer::Load).
+        */
+        void SetSubIndex(std::vector<SubIndexEntry> entries)
+        {
+            m_SubIndex = std::move(entries);
+        }
+
+        // ── Read path ────────────────────────────────────────────────────────
+
+        /*
+        * Find the posting data for `term` by:
+        *   1. Binary-searching SubIndex for the block whose lead term <= term.
+        *   2. Loading that block (cache or FileManager).
+        *   3. Linear-scanning IB_Data for the exact term.
+        *
+        * On success, sets *block_seq_out, *offset_out (byte offset of posting
+        * data within IB_Data), *data_len_out (bytes in this block only), and
+        * *doc_freq_out.
+        */
+        bool FindTermData(const char* term,
+                          uint32_t*   block_seq_out,
+                          uint32_t*   offset_out,
+                          uint32_t*   data_len_out,
+                          uint32_t*   doc_freq_out,
+                          bool*       is_last_entry_out = nullptr) const
+        {
+            if (m_SubIndex.empty()) return false;
+
+            // Binary search: find the last entry whose lead term <= term.
+            auto it = std::upper_bound(
+                m_SubIndex.begin(), m_SubIndex.end(), term,
+                [](const char* t, const SubIndexEntry& e) { return t < e.term; });
+
+            if (it == m_SubIndex.begin()) return false;
+            --it;
+
+            uint32_t block_seq = it->block_seq;
+
+            // Load block (cache or disk).
+            IndexBlock* block = const_cast<IndexBlockTable*>(this)
+                                    ->GetIndexBlock(block_seq, 1);
+            if (!block) return false;
+
+            // Linear scan within IB_Data for exact term.
+            return ScanBlock(block, term, block_seq,
+                             offset_out, data_len_out, doc_freq_out,
+                             block_seq_out, is_last_entry_out);
+        }
+
+        /*
+        * Load a block by seq — used for continuation blocks (HAS_MORE).
+        */
+        IndexBlock* GetIndexBlock(uint32_t block_seq, uint32_t /*hint*/)
         {
             void* address = nullptr;
             bool  inCache = m_BlockCache.DataLoaded(
                                 static_cast<int>(block_seq), &address);
 
-            if (inCache) {
-                /*
-                * Cache hit — block is already in memory.
-                */
+            if (inCache)
                 return static_cast<IndexBlock*>(address);
-            }
 
-            /*
-            * Cache miss.  Load from disk if a FileManager is configured.
-            * Without a FileManager (pure in-memory index) the block does
-            * not exist — return nullptr so callers treat it as absent.
-            */
             if (m_FileManager && address) {
                 m_FileManager->read(block_seq, address);
                 m_BlockCache.Add(static_cast<IndexBlock*>(address), block_seq);
@@ -346,35 +374,95 @@ class IndexBlockTable
             return nullptr;
         }
 
-        IndexBlock* GetIndexBlock(const char* word)
+        void SetFileManager(std::shared_ptr<FileBlockManager> fm)
         {
-            if (m_ElementFilter && m_ElementFilter->Contains(word))
-                return nullptr;
-
-            uint32_t block_seq = m_TermToBlock
-                                     ? m_TermToBlock->Contains(word)
-                                     : UINT32_MAX;
-
-            if (block_seq == UINT32_MAX)
-                return nullptr;
-
-            return GetIndexBlock(block_seq, 1);
+            m_FileManager = std::move(fm);
         }
 
-        bool HasTerm(const std::string& term) const
+        void ResizeCache(uint32_t capacity)
         {
-            return m_TermToBlock && m_TermToBlock->HasTerm(term);
+            m_BlockCache.resize(capacity);
         }
+
+        const std::vector<SubIndexEntry>& GetSubIndex() const { return m_SubIndex; }
 
     private:
         std::shared_ptr<FileBlockManager> m_FileManager;
-        std::shared_ptr<TermToBlock>      m_TermToBlock;
         std::shared_ptr<ElementFilter>    m_ElementFilter;
         BlockCache                        m_BlockCache;
+        std::vector<SubIndexEntry>        m_SubIndex;   // sorted by term
+
+        /*
+        * Scan a normal block for `term`.
+        * Returns true and fills output params on success.
+        */
+        static bool ScanBlock(const IndexBlock* block,
+                              const char*       term,
+                              uint32_t          block_seq,
+                              uint32_t*         offset_out,
+                              uint32_t*         data_len_out,
+                              uint32_t*         doc_freq_out,
+                              uint32_t*         block_seq_out,
+                              bool*             is_last_entry_out = nullptr)
+        {
+            const uint8_t* ptr = block->IB_Data;
+            const uint8_t* end = block->IB_Data + sizeof(block->IB_Data);
+
+            // Continuation blocks have no term entries.
+            if (ptr + 2 <= end) {
+                uint16_t marker;
+                std::memcpy(&marker, ptr, 2);
+                if (marker == BLOCK_CONTINUATION_MARKER) return false;
+            }
+
+            while (ptr + 2 <= end) {
+                uint16_t key_len;
+                std::memcpy(&key_len, ptr, 2);
+                ptr += 2;
+
+                if (key_len == 0) break;  // sentinel — no more entries
+
+                if (ptr + key_len + 8 > end) break;  // malformed
+
+                const char* key = reinterpret_cast<const char*>(ptr);
+                ptr += key_len;
+
+                uint32_t doc_freq, data_len;
+                std::memcpy(&doc_freq, ptr,     4);
+                std::memcpy(&data_len, ptr + 4, 4);
+                ptr += 8;
+
+                if (static_cast<size_t>(key_len) == std::strlen(term)
+                    && std::memcmp(key, term, key_len) == 0)
+                {
+                    *block_seq_out  = block_seq;
+                    *offset_out     = static_cast<uint32_t>(
+                                          ptr - block->IB_Data);
+                    *data_len_out   = data_len;
+                    *doc_freq_out   = doc_freq;
+
+                    // Detect whether this is the last entry in the block.
+                    // HAS_MORE on the block refers ONLY to the last entry.
+                    if (is_last_entry_out) {
+                        const uint8_t* next = ptr + data_len;
+                        uint16_t next_kl = 0;
+                        if (next + 2 <= end)
+                            std::memcpy(&next_kl, next, 2);
+                        *is_last_entry_out = (next + 2 > end || next_kl == 0);
+                    }
+                    return true;
+                }
+
+                // Skip this entry's posting data.
+                if (ptr + data_len > end) break;
+                ptr += data_len;
+            }
+            return false;
+        }
 };
 
 /*
-* Global singleton — kept for AdvancedIndexReader backward compatibility.
+* Global singleton — kept for backward compatibility.
 * New code should use the IndexBlockTable owned by IndexContext.
 */
 inline IndexBlockTable& GetIndexBlockTable()

@@ -1,16 +1,29 @@
 [package]
 name = "rustblade"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-description = "MoonShot search engine — Rust implementation with inverted index + HNSW vector index"
+description = "MoonShot search engine — Rust implementation, v2 block-based index format"
+
+[lib]
+name = "rustblade"
+
+[features]
+default = ["native-alloc"]
+# Use mimalloc on native targets; disable for WASM
+native-alloc = ["mimalloc"]
+# Enable WASM bindings
+wasm = ["wasm-bindgen", "js-sys", "serde-wasm-bindgen"]
 
 [dependencies]
-serde             = { version = "1", features = ["derive"] }
-serde_json        = "1"
-thiserror         = "1"
-rand              = "0.8"
+serde                = { version = "1", features = ["derive"] }
+serde_json           = "1"
+thiserror            = "1"
+rand                 = { version = "0.8", features = ["small_rng"] }
 unicode-segmentation = "1"
-mimalloc          = { version = "0.1", default-features = false }
+mimalloc             = { version = "0.1", default-features = false, optional = true }
+wasm-bindgen         = { version = "0.2", optional = true }
+js-sys               = { version = "0.3", optional = true }
+serde-wasm-bindgen   = { version = "0.6", optional = true }
 
 [dev-dependencies]
 tempfile = "3"

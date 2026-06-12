@@ -14,7 +14,7 @@ else()
     set(CARGO_SUBDIR  "release")
 endif()
 
-set(CARGO_TARGET_DIR "${CMAKE_BINARY_DIR}/RustBlade")
+set(CARGO_TARGET_DIR "${CMAKE_BINARY_DIR}/rust")
 
 add_custom_target(rustblade ALL
     COMMAND ${CARGO} build ${CARGO_PROFILE}

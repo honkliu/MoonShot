@@ -1,0 +1,423 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>MoonShot Index Viewer</title>
+<style>
+* { box-sizing:border-box; margin:0; padding:0; }
+body { font:13px 'Segoe UI',sans-serif; background:#1e1e1e; color:#d4d4d4;
+       height:100vh; display:flex; flex-direction:column; overflow:hidden; }
+
+/* toolbar */
+#toolbar { background:#252526; border-bottom:1px solid #3e3e42; padding:6px 12px;
+           display:flex; align-items:center; gap:10px; flex-shrink:0; }
+#toolbar h1 { font-size:14px; color:#ccc; font-weight:600; margin-right:8px; }
+.btn  { padding:4px 10px; border:1px solid #555; border-radius:3px; cursor:pointer;
+        background:#3c3c3c; color:#ccc; font-size:12px; }
+.btn:hover { background:#505050; }
+#status { margin-left:auto; font-size:11px; color:#888; }
+#srch   { padding:3px 8px; background:#3c3c3c; border:1px solid #555; color:#d4d4d4;
+          border-radius:3px; width:180px; outline:none; font-size:12px; }
+
+/* drop */
+#drop { flex:1; display:flex; align-items:center; justify-content:center;
+        flex-direction:column; gap:12px; border:2px dashed #555; margin:20px;
+        border-radius:8px; cursor:pointer; }
+#drop h2 { color:#888; }
+#drop p  { color:#555; font-size:12px; }
+#drop:hover { border-color:#007acc; }
+
+/* main layout */
+#main  { display:none; flex:1; overflow:hidden; }
+#left  { width:48%; border-right:1px solid #3e3e42; display:flex; flex-direction:column; overflow:hidden; }
+#right { flex:1; display:flex; flex-direction:column; overflow:hidden; }
+
+/* ── hex view: continuous full-file ── */
+#hex-header { background:#2d2d30; padding:4px 10px; font-size:11px; color:#555;
+              border-bottom:1px solid #3e3e42; flex-shrink:0;
+              font-family:'Cascadia Code','Consolas',monospace; }
+#hex-body   { flex:1; overflow-y:auto; padding:4px 2px;
+              font:11px/1.65 'Cascadia Code','Consolas',monospace; }
+
+.hrow  { display:flex; }
+.haddr { color:#555; min-width:60px; padding-right:4px; -webkit-user-select:none; user-select:none; }
+.hbytes { display:flex; flex-wrap:nowrap; }
+.hb    { width:21px; text-align:right; padding-right:2px; cursor:pointer; border-radius:1px; }
+.hb:hover { background:#3a3d41 !important; color:#fff !important; }
+.gap   { width:8px; }   /* gap between byte 7 and byte 8 */
+.hascii { padding-left:6px; color:#555; letter-spacing:0.5px; }
+
+/* section colours (dim — show structure without distracting) */
+.s-hdr  { color:#569cd6; }
+.s-si   { color:#4ec9b0; }
+.s-dd   { color:#ce9178; }
+.s-b0   { color:#9a9a9a; }
+.s-b1   { color:#888; }
+.s-b2   { color:#aaa; }
+.s-b3   { color:#969696; }
+
+/* highlight: clicked / selected range */
+.hb.hl   { background:#094771 !important; color:#fff !important; }
+.hac.hl  { background:#094771; color:#fff; }
+
+/* ── right pane ── */
+#dec-tabs  { display:flex; background:#2d2d30; border-bottom:1px solid #3e3e42; flex-shrink:0; }
+.dtab      { padding:5px 12px; cursor:pointer; font-size:12px; color:#888;
+             border-right:1px solid #3e3e42; }
+.dtab.active { color:#fff; background:#1e1e1e; border-bottom:2px solid #007acc; }
+#dec-body  { flex:1; overflow:auto; }
+.panel     { display:none; }
+.panel.active { display:block; }
+
+table { width:100%; border-collapse:collapse; }
+th    { background:#252526; padding:4px 8px; text-align:left; color:#9cdcfe;
+        font-size:11px; font-weight:600; position:sticky; top:0; z-index:1;
+        border-bottom:1px solid #3e3e42; }
+td    { padding:3px 8px; border-bottom:1px solid #2a2a2a; font-size:12px; }
+tr:hover td { background:#2a2d2e; cursor:pointer; }
+.mono { font-family:'Cascadia Code','Consolas',monospace; }
+.num  { color:#b5cea8; }
+.key  { color:#9cdcfe; }
+.path { color:#ce9178; }
+.badge      { display:inline-block; padding:1px 5px; border-radius:3px; font-size:10px; margin-left:4px; }
+.badge-more { background:#ca5010; color:#fff; }
+.badge-cont { background:#5c8a3a; color:#fff; }
+
+.bcard     { border-bottom:1px solid #2a2a2a; }
+.bcard-hdr { padding:5px 10px; background:#252526; display:flex; align-items:center;
+             gap:6px; cursor:pointer; font-size:12px; }
+.bcard-body { display:none; }
+.bcard.open .bcard-body { display:block; }
+.posting   { color:#4ec9b0; font-size:11px; padding:1px 4px; }
+.sres      { padding:4px 8px; border-bottom:1px solid #2a2a2a; display:flex; gap:12px; }
+.hidden  { display:none; }
+.srch-hint { color:#888; padding:8px; }
+</style>
+</head>
+<body>
+
+<div id="toolbar">
+  <h1>&#128269; MoonShot Viewer</h1>
+  <input type="file" id="file-input" accept=".idx" class="hidden">
+  <button type="button" class="btn" onclick="document.getElementById('file-input').click()">Open .idx</button>
+  <button type="button" class="btn hidden" id="metabtn"
+          onclick="document.getElementById('meta-input').click()">Load .meta</button>
+  <input type="file" id="meta-input" class="hidden">
+  <input id="srch" placeholder="Filter terms / search…" oninput="onSearch(this.value)">
+  <span id="status">Drop a .idx file to begin</span>
+</div>
+
+<div id="drop" onclick="document.getElementById('file-input').click()">
+  <h2>&#128196; Drop .idx here</h2><p>or click to open</p>
+</div>
+
+<div id="main">
+  <div id="left">
+    <div id="hex-header">
+      Offset&nbsp;&nbsp;&nbsp;
+      00&nbsp;01&nbsp;02&nbsp;03&nbsp;04&nbsp;05&nbsp;06&nbsp;07&nbsp;&nbsp;
+      08&nbsp;09&nbsp;0A&nbsp;0B&nbsp;0C&nbsp;0D&nbsp;0E&nbsp;0F&nbsp;&nbsp;&nbsp;&nbsp;ASCII
+    </div>
+    <div id="hex-body"></div>
+  </div>
+  <div id="right">
+    <div id="dec-tabs">
+      <div class="dtab active" data-p="hdr-panel"  onclick="switchTab(this)">Header</div>
+      <div class="dtab"        data-p="si-panel"   onclick="switchTab(this)">SubIndex</div>
+      <div class="dtab"        data-p="dd-panel"   onclick="switchTab(this)">DocData</div>
+      <div class="dtab"        data-p="blk-panel"  onclick="switchTab(this)">Blocks</div>
+      <div class="dtab"        data-p="srch-panel" onclick="switchTab(this)">Search</div>
+    </div>
+    <div id="dec-body">
+      <div id="hdr-panel"  class="panel active"></div>
+      <div id="si-panel"   class="panel"></div>
+      <div id="dd-panel"   class="panel"></div>
+      <div id="blk-panel"  class="panel"></div>
+      <div id="srch-panel" class="panel">
+        <div id="srch-out"><p class="srch-hint">Type a query above.</p></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script type="module">
+import init, { parse_index, search_index } from './pkg/moon_wasm.js';
+await init();
+window._wasm = { parse_index, search_index };
+
+let G = { bytes: null, meta: {}, parsed: null, spanByOff: null };
+
+// ── loading ───────────────────────────────────────────────────────────────────
+function loadFile(file) {
+  const r = new FileReader();
+  r.onload = e => {
+    G.bytes = new Uint8Array(e.target.result);
+    setStatus(`Parsing ${file.name}…`);
+    try {
+      G.parsed = JSON.parse(window._wasm.parse_index(G.bytes));
+      if (G.parsed.error) { setStatus('Error: '+G.parsed.error); return; }
+      document.getElementById('drop').style.display = 'none';
+      document.getElementById('main').style.display = 'flex';
+      document.getElementById('metabtn').classList.remove('hidden');
+      buildHex();
+      renderHeader(); renderSubIndex(); renderDocData(); renderBlocks();
+      setStatus(`${G.parsed.header.num_docs} docs · ${G.parsed.header.num_terms} terms · ${G.parsed.blocks.length} blocks`);
+    } catch(ex) { setStatus('Error: '+ex); console.error(ex); }
+  };
+  r.readAsArrayBuffer(file);
+}
+
+function loadMeta(file) {
+  const r = new FileReader();
+  r.onload = e => {
+    const dv = new DataView(e.target.result);
+    let p = 0;
+    const n = Number(dv.getBigUint64(p,true)); p+=8;
+    for (let i=0;i<n;i++) {
+      const id=dv.getBigUint64(p,true).toString(); p+=8;
+      const len=dv.getUint32(p,true); p+=4;
+      G.meta[id]=new TextDecoder().decode(new Uint8Array(e.target.result,p,len)); p+=len;
+    }
+    renderDocData(); renderBlocks();
+    setStatus('Meta: '+Object.keys(G.meta).length+' paths');
+  };
+  r.readAsArrayBuffer(file);
+}
+
+document.getElementById('file-input').onchange = e => { if(e.target.files[0]) loadFile(e.target.files[0]); };
+document.getElementById('meta-input').onchange  = e => { if(e.target.files[0]) loadMeta(e.target.files[0]); };
+document.body.ondragover = e => e.preventDefault();
+document.body.ondrop     = e => { e.preventDefault(); if(e.dataTransfer.files[0]) loadFile(e.dataTransfer.files[0]); };
+
+// ── build full hex view ───────────────────────────────────────────────────────
+// Renders ALL bytes from offset 0 to end. Called once per file.
+// Each byte is a <span class="hb"> so we can highlight arbitrary ranges.
+function buildHex() {
+  const data = G.bytes;
+  const h    = G.parsed.header;
+  const COLS = 16;
+
+  // Per-byte section class lookup
+  const CLS = ['','s-hdr','s-si','s-dd','s-b0','s-b1','s-b2','s-b3'];
+  const sc   = new Uint8Array(data.length);
+  for (let i=0; i<Math.min(80,data.length); i++) sc[i]=1;
+  for (let i=h.subindex_off; i<h.subindex_off+h.subindex_size && i<data.length; i++) sc[i]=2;
+  for (let i=h.docdata_off;  i<h.docdata_off +h.docdata_size  && i<data.length; i++) sc[i]=3;
+  for (let b=0; b<G.parsed.blocks.length; b++) {
+    const s=h.blocks_off+b*4096, e=s+4096, c=4+(b%4);
+    for (let i=s; i<e && i<data.length; i++) sc[i]=c;
+  }
+
+  // Build HTML in chunks for speed
+  const parts = [];
+  G.spanByOff = new Array(data.length).fill(null);
+
+  for (let row=0; row<data.length; row+=COLS) {
+    const rowEnd = Math.min(row+COLS, data.length);
+    let hex='', asc='';
+
+    for (let j=row; j<rowEnd; j++) {
+      const b=data[j], c=CLS[sc[j]];
+      hex += `<span class="hb ${c}" data-o="${j}">${b.toString(16).padStart(2,'0')}</span>`;
+      if (j%16===7) hex += '<span class="gap"> </span>';
+      asc += `<span class="hac" data-o="${j}">${b>=32&&b<127?String.fromCharCode(b):'.'}</span>`;
+    }
+    // pad short last row
+    for (let j=rowEnd; j<row+COLS; j++) {
+      hex += '<span class="hb" style="visibility:hidden">00</span>';
+      if (j%16===7) hex += '<span class="gap"> </span>';
+    }
+
+    parts.push(
+      `<div class="hrow" data-r="${row}">` +
+      `<span class="haddr">${row.toString(16).padStart(6,'0')}&nbsp;&nbsp;</span>` +
+      `<span class="hbytes">${hex}</span>` +
+      `<span class="hascii">${asc}</span>` +
+      `</div>`
+    );
+  }
+
+  const body = document.getElementById('hex-body');
+  body.innerHTML = parts.join('');
+
+  // Cache span refs for O(1) highlight
+  body.querySelectorAll('.hb[data-o]').forEach(el => {
+    G.spanByOff[parseInt(el.dataset.o)] = el;
+  });
+}
+
+// ── highlight + scroll ────────────────────────────────────────────────────────
+function gotoRange(start, end) {
+  // Clear previous
+  document.querySelectorAll('#hex-body .hl').forEach(e => e.classList.remove('hl'));
+
+  const s = Math.max(0, start|0);
+  const e = Math.min((end|0), G.bytes.length);
+
+  for (let i=s; i<e; i++) {
+    const sp = G.spanByOff[i];
+    if (sp) {
+      sp.classList.add('hl');
+      // ASCII column in same row
+      const row = sp.closest('.hrow');
+      if (row) {
+        const ac = row.querySelector(`.hac[data-o="${i}"]`);
+        if (ac) ac.classList.add('hl');
+      }
+    }
+  }
+
+  if (G.spanByOff[s]) {
+    G.spanByOff[s].closest('.hrow')
+      .scrollIntoView({ behavior:'smooth', block:'center' });
+  }
+}
+window.gotoRange = gotoRange;
+
+function gotoBlock(seq) {
+  const h = G.parsed.header;
+  gotoRange(h.blocks_off + seq*4096, h.blocks_off + (seq+1)*4096);
+  switchTabByName('blk-panel');
+  const card = document.getElementById('bc'+seq);
+  if (card) { card.classList.add('open'); card.scrollIntoView({behavior:'smooth',block:'start'}); }
+}
+function toggleBlock(seq) {
+  const h    = G.parsed.header;
+  const card = document.getElementById('bc'+seq);
+  if (!card) return;
+  const opening = !card.classList.contains('open');
+  card.classList.toggle('open');
+  if (opening) gotoRange(h.blocks_off + seq*4096, h.blocks_off + (seq+1)*4096);
+}
+window.gotoBlock   = gotoBlock;
+window.toggleBlock = toggleBlock;
+
+// ── decoded panels ────────────────────────────────────────────────────────────
+function renderHeader() {
+  const h = G.parsed.header;
+  const fields = [
+    ['Magic',        'MOONSHOT',                                       0,  8 ],
+    ['Version',      h.version,                                        8,  4 ],
+    ['Num docs',     h.num_docs,                                      16,  8 ],
+    ['Num terms',    h.num_terms,                                     24,  8 ],
+    ['SubIndex off', `0x${h.subindex_off.toString(16)} (${h.subindex_size} B)`, 32, 16],
+    ['DocData off',  `0x${h.docdata_off.toString(16)}  (${h.docdata_size} B)`,  48, 16],
+    ['Blocks off',   `0x${h.blocks_off.toString(16)}`,                64,  8 ],
+    ['Num blocks',   h.num_blocks,                                    72,  8 ],
+    ['File size',    h.file_size+' B',                                -1, -1 ],
+  ];
+  let html = '<table><tr><th>Field</th><th>Value</th><th>Offset</th></tr>';
+  for (const [n,v,off,len] of fields) {
+    const cl = off>=0 ? `onclick="gotoRange(${off},${off+len})"` : '';
+    html += `<tr ${cl}><td>${n}</td><td class="mono num">${v}</td>` +
+            `<td class="num">${off>=0?'0x'+off.toString(16):'—'}</td></tr>`;
+  }
+  document.getElementById('hdr-panel').innerHTML = html+'</table>';
+}
+
+function renderSubIndex() {
+  const h = G.parsed.header;
+  let html = '<table><tr><th>#</th><th>Block</th><th>Lead term</th></tr>';
+  for (const [i,e] of G.parsed.subindex.entries())
+    html += `<tr onclick="gotoBlock(${e.block_seq})">` +
+            `<td class="num">${i}</td><td class="num">${e.block_seq}</td>` +
+            `<td class="key mono">${esc(e.term)}</td></tr>`;
+  document.getElementById('si-panel').innerHTML = html+'</table>';
+}
+
+function renderDocData() {
+  const h = G.parsed.header;
+  let html = '<table><tr><th>doc_id</th><th>importance</th><th>doc_len</th><th>path</th></tr>';
+  for (const [i,d] of G.parsed.docdata.entries()) {
+    const off = h.docdata_off + i*16;
+    const fp  = G.meta[d.doc_id]||'';
+    html += `<tr onclick="gotoRange(${off},${off+16})">` +
+            `<td class="mono num" style="font-size:10px">${d.doc_id}</td>` +
+            `<td class="num">${d.importance}</td><td class="num">${d.doc_len}</td>` +
+            `<td class="path">${esc(fp)}</td></tr>`;
+  }
+  document.getElementById('dd-panel').innerHTML = html+'</table>';
+}
+
+function renderBlocks() {
+  const h = G.parsed.header;
+  let html = '';
+  for (const blk of G.parsed.blocks) {
+    const blkOff = h.blocks_off + blk.seq*4096;
+    let badges = '';
+    if (blk.has_more)        badges += `<span class="badge badge-more">HAS_MORE</span>`;
+    if (blk.is_continuation) badges += `<span class="badge badge-cont">continuation</span>`;
+
+    html += `<div class="bcard" id="bc${blk.seq}">` +
+            `<div class="bcard-hdr" onclick="toggleBlock(${blk.seq})">` +
+            `<span class="key">Block</span> <span class="num">${blk.seq}</span>${badges}` +
+            `<span style="color:#555;font-size:11px;margin-left:auto">` +
+            `0x${blkOff.toString(16)}</span></div>` +
+            `<div class="bcard-body" id="bb${blk.seq}">`;
+
+    if (!blk.is_continuation && blk.terms.length>0) {
+      html += '<table><tr><th>Term</th><th>freq</th><th>Postings</th></tr>';
+      for (const t of blk.terms) {
+        // highlight from term header start to end of posting data
+        const termStart = blkOff + 208 + t.data_off - t.key.length - 10;
+        const termEnd   = blkOff + 208 + t.data_off + t.data_len;
+        let posts='';
+        for (const p of t.postings) {
+          const fp=G.meta[p.doc_id]||'';
+          posts+=`<div class="posting">id=${p.doc_id} tf=${p.tf}${fp?' <span class="path">'+esc(fp)+'</span>':''}</div>`;
+        }
+        html += `<tr class="term-entry" data-term="${esc(t.key)}"` +
+                ` onclick="gotoRange(${termStart},${termEnd})">` +
+                `<td class="key mono">${esc(t.key)}` +
+                `${t.is_last_entry&&blk.has_more?'<span class="badge badge-more">→cont</span>':''}</td>` +
+                `<td class="num">${t.freq}</td><td>${posts}</td></tr>`;
+      }
+      html += '</table>';
+    } else if (blk.is_continuation) {
+      html += `<div style="color:#888;padding:8px;font-size:11px">Continuation block — raw posting bytes</div>`;
+    }
+    html += '</div></div>';
+  }
+  document.getElementById('blk-panel').innerHTML = html;
+}
+
+// ── search ────────────────────────────────────────────────────────────────────
+window.onSearch = function(q) {
+  if (!G.bytes) return;
+  document.querySelectorAll('.term-entry').forEach(r => {
+    r.style.display = (!q || (r.dataset.term||'').toLowerCase().includes(q.toLowerCase())) ? '' : 'none';
+  });
+  if (q.length>2) {
+    try {
+      const res=JSON.parse(window._wasm.search_index(G.bytes,q,'AUTB'));
+      if (Array.isArray(res)&&res.length>0) {
+        let html=`<h3 style="padding:8px;color:#9cdcfe;font-size:12px">Results for "${esc(q)}"</h3>`;
+        for (const r of res) {
+          const fp=G.meta[r.doc_id]||r.doc_id;
+          html+=`<div class="sres"><span class="score">${r.score.toFixed(3)}</span><span class="path">${esc(fp)}</span></div>`;
+        }
+        document.getElementById('srch-out').innerHTML=html;
+        switchTabByName('srch-panel'); return;
+      }
+    } catch(e){}
+  }
+  if (q.length>0) switchTabByName('blk-panel');
+};
+
+function switchTab(el) {
+  document.querySelectorAll('.dtab').forEach(t=>t.classList.remove('active'));
+  document.querySelectorAll('.panel').forEach(p=>p.classList.remove('active'));
+  el.classList.add('active');
+  document.getElementById(el.dataset.p).classList.add('active');
+}
+function switchTabByName(id) {
+  document.querySelectorAll('.dtab').forEach(t=>t.classList.toggle('active',t.dataset.p===id));
+  document.querySelectorAll('.panel').forEach(p=>p.classList.toggle('active',p.id===id));
+}
+window.switchTab=switchTab;
+
+function setStatus(s){ document.getElementById('status').textContent=s; }
+function esc(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+</script>
+</body>
+</html>

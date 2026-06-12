@@ -1,5 +1,7 @@
+#[cfg(feature = "native-alloc")]
 use mimalloc::MiMalloc;
 
+#[cfg(feature = "native-alloc")]
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
@@ -20,6 +22,9 @@ pub mod serializer;
 pub mod index_context;
 pub mod vector_index;
 pub mod fusion;
+
+#[cfg(feature = "wasm")]
+pub mod wasm_api;
 
 pub use error::{RustBladeError, Result};
 pub use tokenizer::SmartTokenizer;

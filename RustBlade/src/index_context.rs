@@ -12,21 +12,8 @@ use crate::tokenizer::SmartTokenizer;
 use crate::serializer::IndexSerializer;
 use crate::error::Result;
 
-/*
-* IndexContext — central factory that owns all search engine components.
-*
-* Write path:  get_writer() → AdvancedIndexWriter → PostingStore
-* Build step:  build() encodes PostingStore entries into IndexBlocks,
-*              populates BlockTable + TermToBlock mapping.
-* Read path:   get_reader(EvalTree) → ISR tree
-*              BuildIndexReader recursively:
-*                TermNode → AdvancedIndexReader  (leaf, = REF ISRWord)
-*                AndNode  → AndIndexReader
-*                OrNode   → OrIndexReader
-*                NotNode  → NotIndexReader
-*
-* Mirrors MoonShot's IndexContext.h.
-*/
+/// Central factory — owns PostingStore, BlockTable and all search components.
+/// Mirrors MoonShot's IndexContext.h.
 pub struct IndexContext {
     store:       Arc<Mutex<PostingStore>>,
     block_table: Arc<IndexBlockTable>,
@@ -37,9 +24,7 @@ pub struct IndexContext {
 }
 
 impl IndexContext {
-    pub fn new() -> Self {
-        Self::with_path(None)
-    }
+    pub fn new() -> Self { Self::with_path(None) }
 
     pub fn with_path(index_path: Option<String>) -> Self {
         let store = Arc::new(Mutex::new(PostingStore::new()));
@@ -64,36 +49,28 @@ impl IndexContext {
     pub fn get_tokenizer(&self) -> &SmartTokenizer { &self.tokenizer }
     pub fn get_compiler(&self)  -> &IndexSearchCompiler { &self.compiler }
 
+    // ── Build (in-memory) ────────────────────────────────────────────────────
+
+    /// Pack PostingStore entries into multi-term IndexBlocks (sorted alphabetically)
+    /// and populate the SubIndex.  Called lazily on first search.
     pub fn build(&mut self) {
         if self.built { return; }
 
-        let block_capacity = crate::block_table::DATA_SIZE - 1;
-        let mut block_seq  = 0u32;
-
         let store = self.store.lock().unwrap();
 
-        /* SAFETY: no readers exist yet — we're the only Arc holder at build time.
-         * If other Arcs exist (shouldn't during build), this will panic. */
         let table = Arc::get_mut(&mut self.block_table)
-            .expect("BlockTable should have no other references during build");
+            .expect("BlockTable must have no other refs during build");
 
-        for (stream_key, posting_list) in store.all_postings() {
-            let bytes = posting_list.get_bytes_ref();
-            if bytes.is_empty() { continue; }
+        let (blocks, subindex) = IndexSerializer::build_blocks_pub(&store);
+        let n = blocks.len();
+        // Resize cache to fit all blocks — no eviction during pure in-memory use.
+        // (Same rationale as C++ ResizeCache workaround, but done properly here.)
+        *table = IndexBlockTable::new(n.max(512) + 64);
 
-            let num_blocks = (bytes.len() + block_capacity - 1) / block_capacity;
-            let first_seq  = block_seq;
-
-            for blk in 0..num_blocks {
-                let offset   = blk * block_capacity;
-                let end      = (offset + block_capacity).min(bytes.len());
-                let has_more = blk + 1 < num_blocks;
-                table.insert_block(block_seq, &bytes[offset..end], has_more);
-                block_seq += 1;
-            }
-
-            table.add_term_mapping(stream_key, first_seq);
+        for (seq, blk) in blocks.into_iter().enumerate() {
+            table.insert_block(seq as u32, blk);
         }
+        table.set_subindex(subindex);
 
         self.built = true;
     }
@@ -102,46 +79,36 @@ impl IndexContext {
         if !self.built { self.build(); }
     }
 
-    /* Compile a query string and return the ISR tree. */
-    pub fn get_reader_for_query(
-        &mut self,
-        query:      &str,
-        stream_set: &str,
-    ) -> Box<dyn IndexReader> {
+    // ── Search ───────────────────────────────────────────────────────────────
+
+    pub fn get_reader_for_query(&mut self, query: &str, stream_set: &str)
+        -> Box<dyn IndexReader>
+    {
         self.ensure_built();
         let tree = self.compiler.compile(query, stream_set);
         self.build_index_reader(tree.root)
     }
 
-    /* Build an ISR tree from an already-compiled EvalTree. */
     pub fn get_reader(&mut self, tree: EvalTree) -> Box<dyn IndexReader> {
         self.ensure_built();
         self.build_index_reader(tree.root)
     }
 
-    /* Open a reader for a specific stream key (debug / low-level access). */
     pub fn get_stream_reader(&mut self, stream_key: &str) -> Box<dyn IndexReader> {
         self.ensure_built();
         let doc_freq = self.store.lock().unwrap().doc_freq(stream_key);
         Box::new(AdvancedIndexReader::open(
-            stream_key,
-            Arc::clone(&self.block_table),
-            doc_freq,
-        ))
+            stream_key, Arc::clone(&self.block_table), doc_freq))
     }
 
-    /* Run a query and return ranked results in one call. */
-    pub fn search(
-        &mut self,
-        query:      &str,
-        top_k:      usize,
-        stream_set: &str,
-    ) -> Vec<SearchResult> {
+    pub fn search(&mut self, query: &str, top_k: usize, stream_set: &str) -> Vec<SearchResult> {
         let mut reader = self.get_reader_for_query(query, stream_set);
         let store      = self.store.lock().unwrap();
         let executor   = IndexSearchExecutor::new(&store);
         executor.execute(reader.as_mut(), top_k)
     }
+
+    // ── Persistence ─────────────────────────────────────────────────────────
 
     pub fn save_index(&mut self, path: &str) -> Result<()> {
         self.index_path = Some(path.to_string());
@@ -152,77 +119,81 @@ impl IndexContext {
     pub fn load_index(&mut self, path: &str) -> Result<()> {
         self.index_path = Some(path.to_string());
         let mut store = PostingStore::new();
-        IndexSerializer::load(&mut store, path)?;
-        self.store = Arc::new(Mutex::new(store));
-        self.block_table = Arc::new(IndexBlockTable::new(512));
-        self.built = false;
+        let (subindex, blocks) = IndexSerializer::load(&mut store, path)?;
+
+        // Resize cache to fit all blocks so nothing is evicted.
+        let mut table = IndexBlockTable::new(blocks.len().max(512) + 64);
+        for (seq, blk) in blocks.into_iter().enumerate() {
+            table.insert_block(seq as u32, blk);
+        }
+        table.set_subindex(subindex);
+
+        self.store       = Arc::new(Mutex::new(store));
+        self.block_table = Arc::new(table);
+        self.built       = true;
         Ok(())
     }
 
-    /* Borrow the PostingStore for direct access. */
+    /// Load from raw bytes (WASM path — no file system access needed).
+    pub fn load_from_bytes(&mut self, data: &[u8]) -> Result<()> {
+        let mut store = PostingStore::new();
+        let (subindex, blocks) = IndexSerializer::decode(&mut store, data)?;
+
+        let mut table = IndexBlockTable::new(blocks.len().max(512) + 64);
+        for (seq, blk) in blocks.into_iter().enumerate() {
+            table.insert_block(seq as u32, blk);
+        }
+        table.set_subindex(subindex);
+
+        self.store       = Arc::new(Mutex::new(store));
+        self.block_table = Arc::new(table);
+        self.built       = true;
+        Ok(())
+    }
+
     pub fn with_store<F, R>(&self, f: F) -> R
-    where
-        F: FnOnce(&PostingStore) -> R,
-    {
+    where F: FnOnce(&PostingStore) -> R {
         let store = self.store.lock().unwrap();
         f(&store)
     }
 
-    /* ------------------------------------------------------------------ */
+    // ── ISR tree builder ─────────────────────────────────────────────────────
 
     fn build_index_reader(&self, node: Option<EvalNode>) -> Box<dyn IndexReader> {
         match node {
-            None => {
-                let empty = AdvancedIndexReader::open("", Arc::clone(&self.block_table), 0);
-                Box::new(empty)
+            None => Box::new(AdvancedIndexReader::open("", Arc::clone(&self.block_table), 0)),
+
+            Some(EvalNode::Term(tn)) => {
+                let doc_freq = self.store.lock().unwrap().doc_freq(&tn.stream_key);
+                Box::new(AdvancedIndexReader::open(&tn.stream_key, Arc::clone(&self.block_table), doc_freq))
             }
 
-            Some(EvalNode::Term(term_node)) => {
-                let doc_freq = self.store.lock().unwrap()
-                    .doc_freq(&term_node.stream_key);
-                Box::new(AdvancedIndexReader::open(
-                    &term_node.stream_key,
-                    Arc::clone(&self.block_table),
-                    doc_freq,
-                ))
-            }
-
-            Some(EvalNode::And(and_node)) => {
-                let mut children: Vec<Box<dyn IndexReader>> = and_node.children
-                    .into_iter()
-                    .map(|c| self.build_index_reader(Some(c)))
-                    .collect();
-
-                /* prune empty leaves — any empty child makes the whole AND empty */
+            Some(EvalNode::And(an)) => {
+                let children: Vec<Box<dyn IndexReader>> = an.children.into_iter()
+                    .map(|c| self.build_index_reader(Some(c))).collect();
                 if children.iter().any(|c| c.is_end()) {
-                    return Box::new(AdvancedIndexReader::open(
-                        "", Arc::clone(&self.block_table), 0));
+                    return Box::new(AdvancedIndexReader::open("", Arc::clone(&self.block_table), 0));
                 }
-
-                if children.len() == 1 { return children.remove(0); }
-                Box::new(AndIndexReader::new(children))
+                let mut v = children;
+                if v.len() == 1 { return v.remove(0); }
+                Box::new(AndIndexReader::new(v))
             }
 
-            Some(EvalNode::Or(or_node)) => {
-                let children: Vec<Box<dyn IndexReader>> = or_node.children
-                    .into_iter()
+            Some(EvalNode::Or(on)) => {
+                let children: Vec<Box<dyn IndexReader>> = on.children.into_iter()
                     .map(|c| self.build_index_reader(Some(c)))
-                    .filter(|r| !r.is_end())    /* prune empty leaves */
-                    .collect();
-
+                    .filter(|r| !r.is_end()).collect();
                 if children.is_empty() {
-                    return Box::new(AdvancedIndexReader::open(
-                        "", Arc::clone(&self.block_table), 0));
+                    return Box::new(AdvancedIndexReader::open("", Arc::clone(&self.block_table), 0));
                 }
-                if children.len() == 1 {
-                    return children.into_iter().next().unwrap();
-                }
-                Box::new(OrIndexReader::new(children))
+                let mut v = children;
+                if v.len() == 1 { return v.remove(0); }
+                Box::new(OrIndexReader::new(v))
             }
 
-            Some(EvalNode::Not(not_node)) => {
-                let base    = self.build_index_reader(Some(*not_node.base));
-                let exclude = self.build_index_reader(Some(*not_node.exclude));
+            Some(EvalNode::Not(nn)) => {
+                let base    = self.build_index_reader(Some(*nn.base));
+                let exclude = self.build_index_reader(Some(*nn.exclude));
                 Box::new(NotIndexReader::new(base, exclude))
             }
         }

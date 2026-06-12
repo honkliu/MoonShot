@@ -91,6 +91,7 @@ if(CMAKE_PROJECT_NAME STREQUAL PROJECT_NAME)
     add_subdirectory(RustBlade)
     # add_subdirectory(Service)   # requires gRPC
     add_subdirectory(Test/UnitTest)
+    add_subdirectory(Tools)
 endif()
 
 # -------------------------------------------------------------------------

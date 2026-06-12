@@ -13,14 +13,23 @@ void AdvancedIndexReader::Open(const char*      streamKey,
     m_BlockTable = blockTable;
     m_DocFreq    = docFreq;
 
-    IndexBlock* block = m_BlockTable->GetIndexBlock(streamKey);
-
-    if (block) {
-        m_BlockSeqNumber = static_cast<uint32_t>(
-            block->IB_Header & ~IB_HEADER_HAS_MORE);
-
-        m_IndexBlock = std::shared_ptr<IndexBlock>(block, [](IndexBlock*){});
-        m_Decoder.Open(m_IndexBlock.get(), 0);
+    uint32_t block_seq = 0, offset = 0, data_len = 0, freq = 0;
+    bool is_last = false;
+    bool found = m_BlockTable->FindTermData(streamKey,
+                                            &block_seq, &offset,
+                                            &data_len,  &freq,
+                                            &is_last);
+    if (found) {
+        IndexBlock* block = m_BlockTable->GetIndexBlock(block_seq, 1);
+        if (block) {
+            m_BlockSeqNumber = block_seq;
+            m_IndexBlock = std::shared_ptr<IndexBlock>(block, [](IndexBlock*){});
+            // HAS_MORE on the block only means THIS term continues iff
+            // it is the last entry in the block.
+            m_HasMore = is_last && (block->IB_Header & IB_HEADER_HAS_MORE);
+            m_Decoder.OpenRaw(block->IB_Data + offset, data_len,
+                              /*last_doc_id=*/0);
+        }
     }
 
     GoNext();
@@ -32,9 +41,15 @@ void AdvancedIndexReader::GoNext()
         IndexBlock* next = m_BlockTable->GetIndexBlock(m_BlockSeqNumber + 1, 1);
 
         if (next) {
+            uint64_t lastDoc = m_Decoder.GetDocumentID();
             ++m_BlockSeqNumber;
             m_IndexBlock = std::shared_ptr<IndexBlock>(next, [](IndexBlock*){});
-            m_Decoder.Open(m_IndexBlock.get(), m_Decoder.GetDocumentID());
+            m_HasMore = (next->IB_Header & IB_HEADER_HAS_MORE) != 0;
+
+            // Continuation block: skip the 0xFFFF marker and read raw bytes.
+            const uint8_t* data = next->IB_Data + 2;
+            size_t         len  = sizeof(next->IB_Data) - 2;
+            m_Decoder.OpenRaw(data, len, lastDoc);
         }
     }
 

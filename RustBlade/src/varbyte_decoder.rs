@@ -1,72 +1,58 @@
 use std::sync::Arc;
-use crate::block_table::{IndexBlock, DATA_SIZE};
+use crate::block_table::IndexBlock;
 
-/*
-* VarByteDecoder — stateful decoder for VarByte-delta-encoded (docId, tf) pairs.
-* Two open modes:
-*   open(block)       — block-based; zero sentinel ends the stream
-*   open_raw(data)    — raw byte slice; ptr >= end ends the stream
-*
-* Mirrors MoonShot's UnifiedDecoder.
-*/
+/// Stateful VarByte-delta decoder.  Two modes:
+///   open_raw — reads from an explicit byte slice (offset + len within a block).
+///   open_cont — reads continuation bytes from the start of a continuation block.
 pub struct VarByteDecoder {
     block:       Option<Arc<IndexBlock>>,
     raw_data:    Vec<u8>,
     pos:         usize,
     end:         usize,
+    raw_mode:    bool,
     current_doc: u64,
     current_tf:  u32,
     has_current: bool,
-    raw_mode:    bool,
 }
 
 impl VarByteDecoder {
     pub fn new() -> Self {
         Self {
-            block:       None,
-            raw_data:    Vec::new(),
-            pos:         0,
-            end:         0,
-            current_doc: 0,
-            current_tf:  0,
-            has_current: false,
-            raw_mode:    false,
+            block: None, raw_data: Vec::new(),
+            pos: 0, end: 0, raw_mode: false,
+            current_doc: 0, current_tf: 0, has_current: false,
         }
     }
 
-    pub fn open(&mut self, block: Arc<IndexBlock>, last_doc: u64) {
+    /// Open on the term's posting bytes within a block's ib_data.
+    /// `offset` and `len` are the byte range returned by IndexBlockTable::find_term_data.
+    pub fn open_raw(&mut self, block: Arc<IndexBlock>, offset: usize, len: usize, last_doc: u64) {
+        let end = (offset + len).min(block.ib_data.len());
+        self.raw_data    = block.ib_data[offset..end].to_vec();
         self.block       = Some(block);
-        self.raw_mode    = false;
-        self.pos         = 0;
-        self.end         = DATA_SIZE;
-        self.current_doc = last_doc;
-        self.current_tf  = 0;
-        self.has_current = false;
-    }
-
-    pub fn open_raw(&mut self, data: Vec<u8>, last_doc: u64) {
-        self.end         = data.len();
-        self.raw_data    = data;
-        self.block       = None;
         self.raw_mode    = true;
         self.pos         = 0;
+        self.end         = self.raw_data.len();
         self.current_doc = last_doc;
         self.current_tf  = 0;
         self.has_current = false;
     }
 
-    fn data_byte(&self, pos: usize) -> u8 {
-        if self.raw_mode {
-            self.raw_data[pos]
-        } else {
-            self.block.as_ref().unwrap().ib_data[pos]
-        }
+    /// Open on a continuation block (skip 2-byte CONT_MARKER, read remainder).
+    pub fn open_continuation(&mut self, block: Arc<IndexBlock>, last_doc: u64) {
+        let data = if block.ib_data.len() > 2 { &block.ib_data[2..] } else { &[] };
+        self.raw_data    = data.to_vec();
+        self.block       = Some(block);
+        self.raw_mode    = true;
+        self.pos         = 0;
+        self.end         = self.raw_data.len();
+        self.current_doc = last_doc;
+        self.current_tf  = 0;
+        self.has_current = false;
     }
 
     fn has_more_bytes(&self) -> bool {
-        if self.pos >= self.end { return false; }
-        if !self.raw_mode && self.data_byte(self.pos) == 0 { return false; }
-        true
+        self.pos < self.end
     }
 
     pub fn go_next(&mut self) {
@@ -74,40 +60,53 @@ impl VarByteDecoder {
             self.has_current = false;
             return;
         }
-
-        let mut delta = 0u64;
-        let mut shift = 0u8;
-        loop {
-            let b = self.data_byte(self.pos); self.pos += 1;
-            delta |= ((b & 0x7F) as u64) << shift;
-            if (b & 0x80) == 0 { break; }
-            shift += 7;
+        let (delta, n) = vb_read(&self.raw_data, self.pos);
+        self.pos += n;
+        if self.pos >= self.end && n == 0 {
+            self.has_current = false;
+            return;
         }
+        let (tf, m) = vb_read(&self.raw_data, self.pos);
+        self.pos += m;
+
         self.current_doc += delta;
-
-        let mut tf    = 0u32;
-        let mut shift = 0u8;
-        loop {
-            let b = self.data_byte(self.pos); self.pos += 1;
-            tf |= ((b & 0x7F) as u32) << shift;
-            if (b & 0x80) == 0 { break; }
-            shift += 7;
-        }
-        self.current_tf  = tf;
-        self.has_current = true;
+        self.current_tf   = tf as u32;
+        self.has_current  = true;
     }
 
     pub fn go_until(&mut self, target: u64) {
-        if !self.has_current && self.has_more_bytes() {
-            self.go_next();
-        }
-        while self.has_current && self.current_doc < target {
-            self.go_next();
-        }
+        if !self.has_current && self.has_more_bytes() { self.go_next(); }
+        while self.has_current && self.current_doc < target { self.go_next(); }
     }
 
     pub fn is_end(&self)             -> bool  { !self.has_current }
     pub fn get_document_id(&self)    -> u64   { self.current_doc }
     pub fn get_term_frequency(&self) -> u32   { self.current_tf }
     pub fn get_current_block(&self)  -> Option<&Arc<IndexBlock>> { self.block.as_ref() }
+}
+
+impl Default for VarByteDecoder {
+    fn default() -> Self { Self::new() }
+}
+
+pub fn vb_read(data: &[u8], start: usize) -> (u64, usize) {
+    let mut val = 0u64; let mut shift = 0u8; let mut pos = start;
+    loop {
+        if pos >= data.len() { break; }
+        let b = data[pos]; pos += 1;
+        val |= ((b & 0x7F) as u64) << shift;
+        if (b & 0x80) == 0 { break; }
+        shift += 7;
+    }
+    (val, pos - start)
+}
+
+pub fn vb_encode(mut v: u64) -> Vec<u8> {
+    let mut out = Vec::new();
+    loop {
+        if v < 0x80 { out.push(v as u8); break; }
+        out.push((v as u8 & 0x7F) | 0x80);
+        v >>= 7;
+    }
+    out
 }

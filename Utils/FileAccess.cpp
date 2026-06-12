@@ -72,14 +72,15 @@ int FileAccess::GetData(void * buffer, int numBytes)
 #endif
 }
 
-bool FileAccess::ReadBlock(uint32_t block_seq, void* buffer, size_t block_size)
+bool FileAccess::ReadBlock(uint32_t block_seq, void* buffer, size_t block_size,
+                           uint64_t base_byte_offset)
 {
 #ifdef _WIN32
     if (m_FileHandle == INVALID_HANDLE_VALUE) {
         return false;
     }
 
-    uint64_t position = static_cast<uint64_t>(block_seq) * block_size;
+    uint64_t position = base_byte_offset + static_cast<uint64_t>(block_seq) * block_size;
 
     LARGE_INTEGER liPosition;
     liPosition.QuadPart = position;
@@ -99,7 +100,8 @@ bool FileAccess::ReadBlock(uint32_t block_seq, void* buffer, size_t block_size)
         return false;
     }
 
-    off_t position = static_cast<off_t>(block_seq) * block_size;
+    off_t position = static_cast<off_t>(base_byte_offset)
+                   + static_cast<off_t>(block_seq) * static_cast<off_t>(block_size);
 
     if (lseek(m_FileHandle, position, SEEK_SET) == -1) {
         return false;

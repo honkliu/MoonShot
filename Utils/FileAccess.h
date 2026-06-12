@@ -29,7 +29,8 @@ class FileAccess {
 		bool InitWrite();
 		int GetData(void * buffer, int numBytes);
 
-		bool ReadBlock(uint32_t block_seq, void* buffer, size_t block_size);
+		bool ReadBlock(uint32_t block_seq, void* buffer, size_t block_size,
+		               uint64_t base_byte_offset = 0);
 		bool WriteBlock(uint32_t block_seq, const void* buffer, size_t block_size);
 		bool SetPosition(uint64_t position);
 
