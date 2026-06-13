@@ -3,6 +3,7 @@
 
 #include "IndexWriter.h"
 #include "PostingStore.h"
+#include "EvalExpression.h"  /* BIGRAM_SEP */
 
 #include <cctype>
 #include <string>
@@ -45,14 +46,16 @@ public:
             m_Store->AddPosting(term + abbrev, documentId, tf);
 
         /*
-        * Index bigrams: adjacent pairs joined by '_'.
-        * Key format: "good_morning" + abbrev  →  "good_morningT"
-        * TF counts repeated occurrences of the same adjacent pair.
+        * Index bigrams: adjacent pairs joined by BIGRAM_SEP (\x1F).
+        * Using \x1F (Unit Separator) instead of '_' mirrors REF's
+        * CreateBigramString approach: the separator is never produced by
+        * ICU's word breaker, so "morning\x1FcallT" (bigram) is unambiguous
+        * from "morning_callT" (unigram token containing an underscore).
         */
         std::unordered_map<std::string, uint32_t> bigramTf;
         for (size_t i = 0; i + 1 < words.size(); ++i) {
             if (!words[i].empty() && !words[i + 1].empty()) {
-                std::string bigram = words[i] + "_" + words[i + 1];
+                std::string bigram = words[i] + BIGRAM_SEP + words[i + 1];
                 ++bigramTf[bigram];
             }
         }

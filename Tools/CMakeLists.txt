@@ -45,6 +45,9 @@ else()
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
                 "${CMAKE_CURRENT_SOURCE_DIR}/moon_wasm/index.html"
                 "${CMAKE_BINARY_DIR}/Tools/$<CONFIG>/moon_wasm/index.html"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${CMAKE_CURRENT_SOURCE_DIR}/moon_wasm/serve.py"
+                "${CMAKE_BINARY_DIR}/Tools/$<CONFIG>/moon_wasm/serve.py"
         WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/moon_wasm"
         COMMENT "Building moon_wasm (Rust → WASM viewer)"
         VERBATIM

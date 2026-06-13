@@ -11,11 +11,13 @@
  */
 
 #include "moonshot.h"
+#include "IndexSerializer.h"
 
 #include <cstdint>
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
+#include <map>
 #include <sstream>
 #include <string>
 #include <unordered_map>
@@ -74,62 +76,25 @@ static std::string DefaultIdxPath()
     return HomeDir() + PathSep() + "moon.idx";
 }
 
-static std::string MetaPath(const std::string& idxPath)
+// ─── path→id map: loaded from existing .idx DocData ───────────────────────────
+
+using PathMap = std::map<std::string, uint64_t>;  // filepath → sequential id
+
+static PathMap LoadPathMap(const std::string& idxPath, uint64_t& max_id)
 {
-    return idxPath + ".meta";
-}
+    PathMap m;
+    max_id = 0;
+    if (!IndexSerializer::IsValidIndex(idxPath.c_str())) return m;
 
-// ─── doc-id: FNV-1a 64-bit hash of the canonical file path ───────────────────
-
-static uint64_t DocId(const std::string& path)
-{
-    uint64_t h = 14695981039346656037ULL;
-    for (unsigned char c : path) {
-        h ^= c;
-        h *= 1099511628211ULL;
-    }
-    return h;
-}
-
-// ─── metadata: docid ↔ filepath (binary, portable) ───────────────────────────
-
-using MetaMap = std::unordered_map<uint64_t, std::string>;
-
-static MetaMap LoadMeta(const std::string& path)
-{
-    MetaMap m;
-    std::ifstream f(path, std::ios::binary);
-    if (!f) return m;
-
-    uint64_t n = 0;
-    f.read(reinterpret_cast<char*>(&n), sizeof(n));
-
-    for (uint64_t i = 0; i < n && f; ++i) {
-        uint64_t id  = 0;
-        uint32_t len = 0;
-        f.read(reinterpret_cast<char*>(&id),  sizeof(id));
-        f.read(reinterpret_cast<char*>(&len), sizeof(len));
-        std::string p(len, '\0');
-        f.read(p.data(), static_cast<std::streamsize>(len));
-        m[id] = std::move(p);
+    PostingStore tmp;
+    IndexSerializer::Load(tmp, idxPath.c_str(), nullptr, nullptr, nullptr);
+    for (const auto& [id, ds] : tmp.AllDocStats()) {
+        if (!ds.path.empty()) {
+            m[ds.path] = id;
+            max_id = std::max(max_id, id);
+        }
     }
     return m;
-}
-
-static void SaveMeta(const std::string& path, const MetaMap& m)
-{
-    std::ofstream f(path, std::ios::binary);
-    if (!f) { std::cerr << "Cannot write meta: " << path << "\n"; return; }
-
-    uint64_t n = m.size();
-    f.write(reinterpret_cast<const char*>(&n), sizeof(n));
-
-    for (auto& [id, p] : m) {
-        uint32_t len = static_cast<uint32_t>(p.size());
-        f.write(reinterpret_cast<const char*>(&id),  sizeof(id));
-        f.write(reinterpret_cast<const char*>(&len), sizeof(len));
-        f.write(p.data(), static_cast<std::streamsize>(len));
-    }
 }
 
 // ─── file helpers ─────────────────────────────────────────────────────────────
@@ -156,24 +121,24 @@ static std::string Stem(const std::string& path)
     return (dot == std::string::npos) ? name : name.substr(0, dot);
 }
 
-// ─── index: always rebuild from all known files (clean + correct) ─────────────
+// ─── index: rebuild from all known files ─────────────────────────────────────
 
-static void Rebuild(const std::string& idxPath, MetaMap& meta)
+static void Rebuild(const std::string& idxPath, const PathMap& pathMap)
 {
     SmartTokenizer tok;
-    IndexContext   ctx;           // fresh in-memory, no file path
+    IndexContext   ctx;
     auto           writer = ctx.GetWriter();
 
-    for (auto& [id, fp] : meta) {
+    for (auto& [fp, id] : pathMap) {
         std::string content = ReadFile(fp);
         if (content.empty()) {
             std::cerr << "  skipping (unreadable): " << fp << "\n";
             continue;
         }
-        // Filename stem → Title stream (matches filename-based queries)
         writer->Write(tok.Tokenize(Stem(fp).c_str()), id, "Title");
-        // File content   → Body stream
         writer->Write(tok.Tokenize(content.c_str()),  id, "Body");
+        // Path stored in DocData — no separate .meta file needed
+        ctx.GetStore()->SetDocPath(id, fp);
     }
 
     ctx.SaveIndex(idxPath.c_str());
@@ -181,7 +146,7 @@ static void Rebuild(const std::string& idxPath, MetaMap& meta)
 
 // ─── search ──────────────────────────────────────────────────────────────────
 
-static void Search(IndexContext& ctx, const MetaMap& meta, const std::string& query)
+static void Search(IndexContext& ctx, const std::string& query)
 {
     IndexSearchCompiler compiler;
     auto* tree = compiler.Compile(query.c_str(), "AUTB");
@@ -202,8 +167,8 @@ static void Search(IndexContext& ctx, const MetaMap& meta, const std::string& qu
     }
 
     for (auto& r : results) {
-        auto it = meta.find(r.doc_id);
-        std::cout << (it != meta.end() ? it->second : "[unknown]") << "\n";
+        const std::string& path = ctx.GetStore()->GetDocPath(r.doc_id);
+        std::cout << (path.empty() ? "[unknown]" : path) << "\n";
     }
 }
 
@@ -251,33 +216,34 @@ int main(int argc, char* argv[])
             std::cerr << "Usage: moon -name <filepath>\n";
             return 1;
         }
-        std::string fp   = filePath;
-        MetaMap     meta = LoadMeta(MetaPath(idxPath));
-        uint64_t    id   = DocId(fp);
+        std::string fp = filePath;
 
-        if (meta.count(id))
-            std::cout << "Re-indexing: " << fp << "\n";
-
-        // Verify the file is readable before committing
         if (ReadFile(fp).empty()) {
             std::cerr << "Cannot read file: " << fp << "\n";
             return 1;
         }
 
-        meta[id] = fp;
-        Rebuild(idxPath, meta);
-        SaveMeta(MetaPath(idxPath), meta);
+        uint64_t max_id = 0;
+        PathMap  pathMap = LoadPathMap(idxPath, max_id);
+
+        if (pathMap.count(fp))
+            std::cout << "Re-indexing: " << fp << "\n";
+        else
+            pathMap[fp] = ++max_id;  // sequential id
+
+        Rebuild(idxPath, pathMap);
 
         std::cout << "Indexed: " << fp << "\n"
-                  << "Total:   " << meta.size() << " document(s) in " << idxPath << "\n";
+                  << "Total:   " << pathMap.size()
+                  << " document(s) in " << idxPath << "\n";
 
     // ── interactive search ────────────────────────────────────────────────────
     } else if (cmd == "-i") {
-        MetaMap     meta = LoadMeta(MetaPath(idxPath));
         IndexContext ctx("", idxPath.c_str());
 
-        std::cout << "moon search — " << meta.size() << " document(s)\n"
-                  << "Type a query, or 'quit' to exit.\n";
+        std::cout << "moon search — "
+                  << ctx.GetStore()->AllDocStats().size()
+                  << " document(s)\nType a query, or 'quit' to exit.\n";
 
         std::string line;
         while (true) {
@@ -286,7 +252,7 @@ int main(int argc, char* argv[])
             if (!std::getline(std::cin, line)) break;
             if (line == "quit" || line == "exit" || line == "q") break;
             if (line.empty()) continue;
-            Search(ctx, meta, line);
+            Search(ctx, line);
         }
 
     } else {

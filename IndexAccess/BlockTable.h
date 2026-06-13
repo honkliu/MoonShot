@@ -233,41 +233,30 @@ class BlockCache {
         }
 };
 
-/*
-* SubIndex — sparse in-memory index mapping the lead term of each block
-* to its block_seq.  Mirrors Tiger's WordToPageMap / subDocData section.
-*
-* Stored sorted by term so binary search finds the right block in O(log N).
-* One entry per posting block (not per term); multiple terms share a block.
-*/
+
+/* SubIndex - sparse in-memory index: one entry per block, sorted by lead term.
+ * Mirrors Tiger SubIndexPageRecord.
+ * block_entry_start: byte offset in IB_Data where entries start.
+ *   0 for normal blocks; 4+cont_len for mixed continuation blocks.
+ * page_skip_offset: index into m_PageSkipData (0 = single-block term).
+ */
 struct SubIndexEntry {
-    std::string term;       // lead term (first term whose data starts in this block)
+    std::string term;
     uint32_t    block_seq;
+    uint32_t    block_entry_start = 0;
+    uint32_t    page_skip_offset  = 0;
 };
 
-/*
-* IndexBlockTable — the page manager for posting-list blocks.
-* Equivalent to REF's PageManager + WordToPageMap.
-*
-* Block format (IB_Data contents):
-*   Normal block: packed term entries, sorted alphabetically.
-*     Each entry: [key_len:2B][key:key_len B][doc_freq:4B][data_len:4B][VarByte:data_len B]
-*     Terminated by: key_len == 0  (sentinel)
-*     If IB_HEADER_HAS_MORE is set: last entry's data continues in block_seq + 1.
-*
-*   Continuation block (IB_Data[0..1] == 0xFFFF):
-*     Raw VarByte continuation bytes for the previous block's last term.
-*     Still uses IB_HEADER_HAS_MORE if the data continues further.
-*
-* Lookup:
-*   FindTermData(term) → binary-search SubIndex → load block → linear scan in block.
-*
-* InsertBlock(seq, packed_block_data):
-*   Write path — stores a fully-constructed 4 KB block into the cache.
-*
-* SetSubIndex / AddSubIndexEntry:
-*   Populated by Build() (write path) or Load() (read path from file).
-*/
+/* IndexBlockTable - page manager + SubIndex. Mirrors Tiger PageManager + WordToPageMap.
+ *
+ * Continuation block new format (no wasted space):
+ *   [CONT_MARKER:2B][cont_len:2B][VarByte:cont_len B][optional new entries...]
+ *   New terms after cont data get block_entry_start = 4 + cont_len in SubIndex.
+ *
+ * PageSkipData: flat vector of uint64_t.
+ *   Per multi-block term: [0, base_blk2, base_blk3, ..., UINT64_MAX]
+ *   Enables O(log P) GoUntil() cross-block seek.
+ */
 static constexpr uint16_t BLOCK_CONTINUATION_MARKER = 0xFFFFu;
 
 class IndexBlockTable
@@ -279,12 +268,6 @@ class IndexBlockTable
             m_FileManager.reset();
         }
 
-        // ── Write path ──────────────────────────────────────────────────────
-
-        /*
-        * Store a fully-constructed IndexBlock into the cache.
-        * Called by IndexContext::Build() after packing multi-term data.
-        */
         void InsertBlock(uint32_t block_seq, const IndexBlock* block)
         {
             void* addr = nullptr;
@@ -294,166 +277,113 @@ class IndexBlockTable
             m_BlockCache.Add(static_cast<IndexBlock*>(addr), block_seq);
         }
 
-        /*
-        * Register the lead term of block_seq in the SubIndex.
-        * Called once per block by IndexContext::Build().
-        */
-        void AddSubIndexEntry(const std::string& lead_term, uint32_t block_seq)
+        void AddSubIndexEntry(const std::string& lead_term, uint32_t block_seq,
+                              uint32_t block_entry_start = 0,
+                              uint32_t page_skip_offset  = 0)
         {
-            m_SubIndex.push_back({lead_term, block_seq});
+            m_SubIndex.push_back({lead_term, block_seq, block_entry_start, page_skip_offset});
         }
 
-        /*
-        * Replace the entire SubIndex (used by IndexSerializer::Load).
-        */
-        void SetSubIndex(std::vector<SubIndexEntry> entries)
+        void SetSubIndex(std::vector<SubIndexEntry> entries)    { m_SubIndex = std::move(entries); }
+        void SetPageSkipData(std::vector<uint64_t>  data)       { m_PageSkipData = std::move(data); }
+
+        const uint64_t* GetPageSkipPtr(uint32_t offset) const
         {
-            m_SubIndex = std::move(entries);
+            if (offset == 0 || offset >= m_PageSkipData.size()) return nullptr;
+            return m_PageSkipData.data() + offset;
         }
 
-        // ── Read path ────────────────────────────────────────────────────────
-
-        /*
-        * Find the posting data for `term` by:
-        *   1. Binary-searching SubIndex for the block whose lead term <= term.
-        *   2. Loading that block (cache or FileManager).
-        *   3. Linear-scanning IB_Data for the exact term.
-        *
-        * On success, sets *block_seq_out, *offset_out (byte offset of posting
-        * data within IB_Data), *data_len_out (bytes in this block only), and
-        * *doc_freq_out.
-        */
         bool FindTermData(const char* term,
                           uint32_t*   block_seq_out,
                           uint32_t*   offset_out,
                           uint32_t*   data_len_out,
                           uint32_t*   doc_freq_out,
-                          bool*       is_last_entry_out = nullptr) const
+                          bool*       is_last_entry_out    = nullptr,
+                          uint32_t*   page_skip_offset_out = nullptr) const
         {
             if (m_SubIndex.empty()) return false;
-
-            // Binary search: find the last entry whose lead term <= term.
-            auto it = std::upper_bound(
-                m_SubIndex.begin(), m_SubIndex.end(), term,
+            auto it = std::upper_bound(m_SubIndex.begin(), m_SubIndex.end(), term,
                 [](const char* t, const SubIndexEntry& e) { return t < e.term; });
-
             if (it == m_SubIndex.begin()) return false;
             --it;
 
-            uint32_t block_seq = it->block_seq;
-
-            // Load block (cache or disk).
             IndexBlock* block = const_cast<IndexBlockTable*>(this)
-                                    ->GetIndexBlock(block_seq, 1);
+                                    ->GetIndexBlock(it->block_seq, 1);
             if (!block) return false;
 
-            // Linear scan within IB_Data for exact term.
-            return ScanBlock(block, term, block_seq,
-                             offset_out, data_len_out, doc_freq_out,
-                             block_seq_out, is_last_entry_out);
+            bool found = ScanBlock(block, term, it->block_seq, it->block_entry_start,
+                                   offset_out, data_len_out, doc_freq_out,
+                                   block_seq_out, is_last_entry_out);
+            if (found && page_skip_offset_out)
+                *page_skip_offset_out = it->page_skip_offset;
+            return found;
         }
 
-        /*
-        * Load a block by seq — used for continuation blocks (HAS_MORE).
-        */
-        IndexBlock* GetIndexBlock(uint32_t block_seq, uint32_t /*hint*/)
+        IndexBlock* GetIndexBlock(uint32_t block_seq, uint32_t)
         {
             void* address = nullptr;
-            bool  inCache = m_BlockCache.DataLoaded(
-                                static_cast<int>(block_seq), &address);
-
-            if (inCache)
-                return static_cast<IndexBlock*>(address);
-
+            bool inCache = m_BlockCache.DataLoaded(static_cast<int>(block_seq), &address);
+            if (inCache) return static_cast<IndexBlock*>(address);
             if (m_FileManager && address) {
                 m_FileManager->read(block_seq, address);
                 m_BlockCache.Add(static_cast<IndexBlock*>(address), block_seq);
                 return static_cast<IndexBlock*>(address);
             }
-
             return nullptr;
         }
 
-        void SetFileManager(std::shared_ptr<FileBlockManager> fm)
-        {
-            m_FileManager = std::move(fm);
-        }
+        void SetFileManager(std::shared_ptr<FileBlockManager> fm) { m_FileManager = std::move(fm); }
+        void ResizeCache(uint32_t capacity) { m_BlockCache.resize(capacity); }
 
-        void ResizeCache(uint32_t capacity)
-        {
-            m_BlockCache.resize(capacity);
-        }
-
-        const std::vector<SubIndexEntry>& GetSubIndex() const { return m_SubIndex; }
+        const std::vector<SubIndexEntry>& GetSubIndex()     const { return m_SubIndex; }
+        const std::vector<uint64_t>&      GetPageSkipData() const { return m_PageSkipData; }
 
     private:
         std::shared_ptr<FileBlockManager> m_FileManager;
         std::shared_ptr<ElementFilter>    m_ElementFilter;
         BlockCache                        m_BlockCache;
-        std::vector<SubIndexEntry>        m_SubIndex;   // sorted by term
+        std::vector<SubIndexEntry>        m_SubIndex;
+        std::vector<uint64_t>             m_PageSkipData;
 
-        /*
-        * Scan a normal block for `term`.
-        * Returns true and fills output params on success.
-        */
-        static bool ScanBlock(const IndexBlock* block,
-                              const char*       term,
-                              uint32_t          block_seq,
-                              uint32_t*         offset_out,
-                              uint32_t*         data_len_out,
-                              uint32_t*         doc_freq_out,
-                              uint32_t*         block_seq_out,
-                              bool*             is_last_entry_out = nullptr)
+        /* Scan from scan_start in IB_Data. scan_start = block_entry_start from SubIndex. */
+        static bool ScanBlock(const IndexBlock* block, const char* term,
+                              uint32_t block_seq, uint32_t scan_start,
+                              uint32_t* offset_out, uint32_t* data_len_out,
+                              uint32_t* doc_freq_out, uint32_t* block_seq_out,
+                              bool* is_last_entry_out = nullptr)
         {
-            const uint8_t* ptr = block->IB_Data;
-            const uint8_t* end = block->IB_Data + sizeof(block->IB_Data);
-
-            // Continuation blocks have no term entries.
-            if (ptr + 2 <= end) {
-                uint16_t marker;
-                std::memcpy(&marker, ptr, 2);
-                if (marker == BLOCK_CONTINUATION_MARKER) return false;
-            }
+            const uint8_t* base = block->IB_Data;
+            const uint8_t* ptr  = base + scan_start;
+            const uint8_t* end  = base + sizeof(block->IB_Data);
 
             while (ptr + 2 <= end) {
                 uint16_t key_len;
-                std::memcpy(&key_len, ptr, 2);
-                ptr += 2;
-
-                if (key_len == 0) break;  // sentinel — no more entries
-
-                if (ptr + key_len + 8 > end) break;  // malformed
+                std::memcpy(&key_len, ptr, 2); ptr += 2;
+                if (key_len == 0) break;
+                if (ptr + key_len + 8 > end) break;
 
                 const char* key = reinterpret_cast<const char*>(ptr);
                 ptr += key_len;
-
                 uint32_t doc_freq, data_len;
-                std::memcpy(&doc_freq, ptr,     4);
+                std::memcpy(&doc_freq, ptr, 4);
                 std::memcpy(&data_len, ptr + 4, 4);
                 ptr += 8;
 
                 if (static_cast<size_t>(key_len) == std::strlen(term)
                     && std::memcmp(key, term, key_len) == 0)
                 {
-                    *block_seq_out  = block_seq;
-                    *offset_out     = static_cast<uint32_t>(
-                                          ptr - block->IB_Data);
-                    *data_len_out   = data_len;
-                    *doc_freq_out   = doc_freq;
-
-                    // Detect whether this is the last entry in the block.
-                    // HAS_MORE on the block refers ONLY to the last entry.
+                    *block_seq_out = block_seq;
+                    *offset_out    = static_cast<uint32_t>(ptr - base);
+                    *data_len_out  = data_len;
+                    *doc_freq_out  = doc_freq;
                     if (is_last_entry_out) {
                         const uint8_t* next = ptr + data_len;
-                        uint16_t next_kl = 0;
-                        if (next + 2 <= end)
-                            std::memcpy(&next_kl, next, 2);
-                        *is_last_entry_out = (next + 2 > end || next_kl == 0);
+                        uint16_t nkl = 0;
+                        if (next + 2 <= end) std::memcpy(&nkl, next, 2);
+                        *is_last_entry_out = (next + 2 > end || nkl == 0);
                     }
                     return true;
                 }
-
-                // Skip this entry's posting data.
                 if (ptr + data_len > end) break;
                 ptr += data_len;
             }

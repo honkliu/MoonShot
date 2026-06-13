@@ -30,7 +30,7 @@ fn parse_index_inner(data: &[u8]) -> Result<String, String> {
     }
 
     let mut store = PostingStore::new();
-    let (subindex, blocks) = IndexSerializer::decode(&mut store, data)
+    let (subindex, blocks, _pageskip) = IndexSerializer::decode(&mut store, data)
         .map_err(|e| format!("{e:?}"))?;
 
     let file_size = data.len();
@@ -40,9 +40,10 @@ fn parse_index_inner(data: &[u8]) -> Result<String, String> {
 
     // Header
     out.push_str(&format!(
-        r#""header":{{"size":{},"magic":"MOONSHOT","version":{},"num_docs":{},"num_terms":{},"subindex_off":{},"subindex_size":{},"docdata_off":{},"docdata_size":{},"blocks_off":{},"num_blocks":{},"file_size":{}}},"#,
-        80, hdr.version, hdr.num_docs, hdr.num_terms,
+        r#""header":{{"size":96,"magic":"MOONSHOT","version":{},"num_docs":{},"num_terms":{},"subindex_off":{},"subindex_size":{},"pageskip_off":{},"pageskip_size":{},"docdata_off":{},"docdata_size":{},"blocks_off":{},"num_blocks":{},"file_size":{}}},"#,
+        hdr.version, hdr.num_docs, hdr.num_terms,
         hdr.subindex_off, hdr.subindex_size,
+        hdr.pageskip_off, hdr.pageskip_size,
         hdr.docdata_off, hdr.docdata_size,
         hdr.blocks_off, hdr.num_blocks, file_size
     ));
@@ -66,8 +67,9 @@ fn parse_index_inner(data: &[u8]) -> Result<String, String> {
     for (i, (doc_id, stats)) in docs.iter().enumerate() {
         if i > 0 { out.push(','); }
         out.push_str(&format!(
-            r#"{{"doc_id":"{}","importance":{:.4},"doc_len":{}}}"#,
-            doc_id, stats.importance, stats.doc_len
+            r#"{{"doc_id":"{}","importance":{:.4},"doc_len":{},"path":{}}}"#,
+            doc_id, stats.importance, stats.doc_len,
+            serde_json::to_string(&stats.path).unwrap_or_default()
         ));
     }
     out.push_str("],");
@@ -87,8 +89,9 @@ fn parse_index_inner(data: &[u8]) -> Result<String, String> {
             hdr.blocks_off as usize + i * PAGE_SIZE
         ));
 
-        if !is_cont {
-            let terms = decode_block_terms(blk, &store, &docs);
+        // For mixed cont blocks, decode_block_terms handles scanning from correct offset
+        if true {
+            let terms = decode_block_terms(blk, is_cont, &store, &docs);
             for (j, t) in terms.iter().enumerate() {
                 if j > 0 { out.push(','); }
                 out.push_str(t);
@@ -102,14 +105,19 @@ fn parse_index_inner(data: &[u8]) -> Result<String, String> {
 }
 
 fn decode_block_terms(
-    blk:   &crate::block_table::IndexBlock,
+    blk:    &crate::block_table::IndexBlock,
+    is_cont: bool,
     _store: &PostingStore,
-    _docs: &[(&u64, &crate::posting_store::DocStats)],
+    _docs:  &[(&u64, &crate::posting_store::DocStats)],
 ) -> Vec<String> {
     let data = &blk.ib_data;
     let len  = data.len();
     let mut terms = Vec::new();
-    let mut ptr = 0usize;
+    // For mixed continuation blocks: skip CONT_MARKER(2) + cont_len(2) + cont_len bytes
+    let mut ptr = if is_cont && len >= 4 {
+        let cont_len = u16::from_le_bytes([data[2], data[3]]) as usize;
+        (4 + cont_len).min(len)
+    } else { 0usize };
 
     while ptr + 2 <= len {
         let key_len = u16::from_le_bytes([data[ptr], data[ptr+1]]) as usize;
@@ -174,7 +182,10 @@ pub fn search_index(data: &[u8], query: &str, streams: &str) -> String {
     let mut out = String::from("[");
     for (i, r) in results.iter().enumerate() {
         if i > 0 { out.push(','); }
-        out.push_str(&format!(r#"{{"doc_id":"{}","score":{:.4}}}"#, r.doc_id, r.score));
+        let path = ctx.with_store(|s| s.get_doc_path(r.doc_id).to_string());
+        out.push_str(&format!(r#"{{"doc_id":"{}","score":{:.4},"path":{}}}"#,
+            r.doc_id, r.score,
+            serde_json::to_string(&path).unwrap_or_default()));
     }
     out.push(']');
     out
@@ -185,18 +196,26 @@ pub fn search_index(data: &[u8], query: &str, streams: &str) -> String {
 struct Header {
     version: u32, num_docs: u64, num_terms: u64,
     subindex_off: u64, subindex_size: u64,
+    pageskip_off: u64, pageskip_size: u64,
     docdata_off: u64, docdata_size: u64,
     blocks_off: u64, num_blocks: u64,
 }
 
 fn parse_header(d: &[u8]) -> Header {
+    // v3 header layout (96B):
+    // [magic:8][version:4][reserved:4][num_docs:8][num_terms:8]
+    // [subindex_off:8][subindex_size:8]
+    // [pageskip_off:8][pageskip_size:8]   ← NEW in v3
+    // [docdata_off:8][docdata_size:8]
+    // [blocks_off:8][num_blocks:8]
     Header {
         version:      u32_at(d, 8),
         num_docs:     u64_at(d, 16),
         num_terms:    u64_at(d, 24),
         subindex_off: u64_at(d, 32), subindex_size: u64_at(d, 40),
-        docdata_off:  u64_at(d, 48), docdata_size:  u64_at(d, 56),
-        blocks_off:   u64_at(d, 64), num_blocks:    u64_at(d, 72),
+        pageskip_off: u64_at(d, 48), pageskip_size: u64_at(d, 56),
+        docdata_off:  u64_at(d, 64), docdata_size:  u64_at(d, 72),
+        blocks_off:   u64_at(d, 80), num_blocks:    u64_at(d, 88),
     }
 }
 

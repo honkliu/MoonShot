@@ -7,6 +7,16 @@
 
 enum class NodeType { Term, And, Or, Not };
 
+/*
+* Bigram separator — mirrors REF's CreateBigramString().
+* \x1F (ASCII Unit Separator) is never produced by ICU's word breaker,
+* so it unambiguously marks a bigram key vs a unigram that happens to
+* contain an underscore (e.g. a variable name "morning_call").
+*
+* REF equivalent: AtomType_Bigram with wordSpan = 2.
+*/
+static constexpr char BIGRAM_SEP = '\x1F';
+
 struct EvalNode {
     virtual ~EvalNode() = default;
     virtual NodeType GetType() const = 0;
@@ -14,42 +24,35 @@ struct EvalNode {
 
 /*
 * Leaf node — stream_key is term + stream abbreviation, e.g. "foxT".
+* word_span mirrors REF's AtomType / wordSpan:
+*   1 = unigram  (AtomType_Unigram, wordSpan = 1)
+*   2 = bigram   (AtomType_Bigram,  wordSpan = 2)
 */
 struct TermNode : EvalNode {
     std::string stream_key;
+    uint32_t    word_span = 1;
 
-    explicit TermNode(std::string key) : stream_key(std::move(key)) {}
+    explicit TermNode(std::string key, uint32_t span = 1)
+        : stream_key(std::move(key)), word_span(span) {}
     NodeType GetType() const override { return NodeType::Term; }
 };
 
-/*
-* All children must match.
-*/
 struct AndNode : EvalNode {
     std::vector<std::shared_ptr<EvalNode>> children;
     NodeType GetType() const override { return NodeType::And; }
 };
 
-/*
-* At least one child must match.
-*/
 struct OrNode : EvalNode {
     std::vector<std::shared_ptr<EvalNode>> children;
     NodeType GetType() const override { return NodeType::Or; }
 };
 
-/*
-* base must match; exclude must NOT match.
-*/
 struct NotNode : EvalNode {
     std::shared_ptr<EvalNode> base;
     std::shared_ptr<EvalNode> exclude;
     NodeType GetType() const override { return NodeType::Not; }
 };
 
-/*
-* Wrapper returned by IndexSearchCompiler::Compile().
-*/
 class EvalTree {
 public:
     std::shared_ptr<EvalNode> root;

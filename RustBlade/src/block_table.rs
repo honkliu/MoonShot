@@ -37,17 +37,20 @@ impl Default for IndexBlock {
 /// Mirrors Tiger's WordToPageMap / MoonShot's SubIndex.
 #[derive(Debug, Clone)]
 pub struct SubIndexEntry {
-    pub term:      String,
-    pub block_seq: u32,
+    pub term:               String,
+    pub block_seq:          u32,
+    pub block_entry_start:  u32,  // byte offset in ib_data where entries start
+    pub page_skip_offset:   u32,  // 0 = single-block; else index into page_skip_data
 }
 
 // ── Location of a term's posting data within a block ────────────────────────
 pub struct TermLocation {
-    pub block_seq:     u32,
-    pub data_offset:   usize,  // byte offset within ib_data
-    pub data_len:      usize,  // posting bytes in THIS block
-    pub doc_freq:      u32,
-    pub is_last_entry: bool,   // true → HAS_MORE on block applies to this term
+    pub block_seq:          u32,
+    pub data_offset:        usize,
+    pub data_len:           usize,
+    pub doc_freq:           u32,
+    pub is_last_entry:      bool,
+    pub page_skip_offset:   u32,
 }
 
 // ── BlockCache ───────────────────────────────────────────────────────────────
@@ -105,13 +108,14 @@ impl BlockCache {
 // ── IndexBlockTable ──────────────────────────────────────────────────────────
 /// Page manager + SubIndex.  Mirrors C++ IndexBlockTable.
 pub struct IndexBlockTable {
-    cache:    RefCell<BlockCache>,
-    subindex: Vec<SubIndexEntry>,   // sorted by term; replaces term_to_block
+    cache:          RefCell<BlockCache>,
+    subindex:       Vec<SubIndexEntry>,
+    page_skip_data: Vec<u64>,   // per-term base_doc arrays for PageSkipList
 }
 
 impl IndexBlockTable {
     pub fn new(capacity: usize) -> Self {
-        Self { cache: RefCell::new(BlockCache::new(capacity)), subindex: Vec::new() }
+        Self { cache: RefCell::new(BlockCache::new(capacity)), subindex: Vec::new(), page_skip_data: Vec::new() }
     }
 
     // ── write path ───────────────────────────────────────────────────────────
@@ -121,9 +125,19 @@ impl IndexBlockTable {
         self.cache.borrow_mut().insert(seq, block);
     }
 
-    /// Register the lead term of a new block.
-    pub fn add_subindex_entry(&mut self, lead_term: &str, block_seq: u32) {
-        self.subindex.push(SubIndexEntry { term: lead_term.to_string(), block_seq });
+    pub fn add_subindex_entry(&mut self, lead_term: &str, block_seq: u32,
+                              block_entry_start: u32, page_skip_offset: u32) {
+        self.subindex.push(SubIndexEntry {
+            term: lead_term.to_string(), block_seq, block_entry_start, page_skip_offset
+        });
+    }
+
+    pub fn set_page_skip_data(&mut self, data: Vec<u64>) { self.page_skip_data = data; }
+
+    pub fn get_page_skip_ptr(&self, offset: u32) -> Option<&[u64]> {
+        let o = offset as usize;
+        if offset == 0 || o >= self.page_skip_data.len() { None }
+        else { Some(&self.page_skip_data[o..]) }
     }
 
     /// Replace the entire SubIndex (called by LoadIndex).
@@ -137,15 +151,12 @@ impl IndexBlockTable {
     /// then linear-scan IB_Data to find the exact entry.
     pub fn find_term_data(&self, term: &str) -> Option<(TermLocation, Arc<IndexBlock>)> {
         if self.subindex.is_empty() { return None; }
-
-        // upper_bound: first entry whose lead term > term
         let pos = self.subindex.partition_point(|e| e.term.as_str() <= term);
         if pos == 0 { return None; }
-
-        let block_seq = self.subindex[pos - 1].block_seq;
-        let block     = self.get_block_by_seq(block_seq)?;
-
-        let loc = Self::scan_block(&block, term, block_seq)?;
+        let entry     = &self.subindex[pos - 1];
+        let block     = self.get_block_by_seq(entry.block_seq)?;
+        let mut loc   = Self::scan_block(&block, term, entry.block_seq, entry.block_entry_start as usize)?;
+        loc.page_skip_offset = entry.page_skip_offset;
         Some((loc, block))
     }
 
@@ -154,20 +165,15 @@ impl IndexBlockTable {
         self.cache.borrow_mut().get(seq)
     }
 
-    pub fn subindex(&self) -> &[SubIndexEntry] { &self.subindex }
+    pub fn subindex(&self)         -> &[SubIndexEntry] { &self.subindex }
+    pub fn page_skip_data(&self)   -> &[u64]           { &self.page_skip_data }
 
     // ── block scanner ────────────────────────────────────────────────────────
 
-    fn scan_block(block: &IndexBlock, term: &str, block_seq: u32) -> Option<TermLocation> {
+    fn scan_block(block: &IndexBlock, term: &str, block_seq: u32, scan_start: usize) -> Option<TermLocation> {
         let data = &block.ib_data;
         let len  = data.len();
-
-        // Continuation blocks have no term entries.
-        if len >= 2 && u16::from_le_bytes([data[0], data[1]]) == CONT_MARKER {
-            return None;
-        }
-
-        let mut ptr = 0usize;
+        let mut ptr = scan_start;
         while ptr + 2 <= len {
             let key_len = u16::from_le_bytes([data[ptr], data[ptr + 1]]) as usize;
             ptr += 2;
@@ -201,6 +207,7 @@ impl IndexBlockTable {
                     data_len,
                     doc_freq,
                     is_last_entry: is_last,
+                    page_skip_offset: 0,  // filled in by find_term_data
                 });
             }
 

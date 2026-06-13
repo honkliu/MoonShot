@@ -59,6 +59,7 @@ fn vb_write(mut v: u64, out: &mut Vec<u8>) {
 pub struct DocStats {
     pub doc_len:    u32,
     pub importance: f32,
+    pub path:       String,
 }
 
 #[derive(Debug, Default)]
@@ -87,6 +88,14 @@ impl PostingStore {
 
     pub fn set_doc_importance(&mut self, doc_id: u64, score: f32) {
         self.doc_stats.entry(doc_id).or_default().importance = score;
+    }
+
+    pub fn set_doc_path(&mut self, doc_id: u64, path: String) {
+        self.doc_stats.entry(doc_id).or_default().path = path;
+    }
+
+    pub fn get_doc_path(&self, doc_id: u64) -> &str {
+        self.doc_stats.get(&doc_id).map(|s| s.path.as_str()).unwrap_or("")
     }
 
     pub fn get_posting_list(&self, key: &str) -> Option<&PostingList> {

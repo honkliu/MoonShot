@@ -29,7 +29,15 @@ body { font:13px 'Segoe UI',sans-serif; background:#1e1e1e; color:#d4d4d4;
 
 /* main layout */
 #main  { display:none; flex:1; overflow:hidden; }
-#left  { width:48%; border-right:1px solid #3e3e42; display:flex; flex-direction:column; overflow:hidden; }
+#left  { width:min(480px,44%); flex-shrink:0; border-right:1px solid #3e3e42;
+          display:flex; flex-direction:row; overflow:hidden; transition:width .2s; }
+#left.collapsed { width:6px !important; }
+#left.collapsed #left-inner { display:none; }
+#left-inner { flex:1; display:flex; flex-direction:column; overflow:hidden; min-width:0; }
+#hex-toggle { width:6px; flex-shrink:0; background:#3e3e42; border:none; cursor:col-resize;
+               color:transparent; font-size:1px; border-left:1px solid #555;
+               border-right:1px solid #555; transition:background .15s; }
+#hex-toggle:hover { background:#007acc; }
 #right { flex:1; display:flex; flex-direction:column; overflow:hidden; }
 
 /* ── hex view: continuous full-file ── */
@@ -89,7 +97,20 @@ tr:hover td { background:#2a2d2e; cursor:pointer; }
 .bcard-body { display:none; }
 .bcard.open .bcard-body { display:block; }
 .posting   { color:#4ec9b0; font-size:11px; padding:1px 4px; }
-.sres      { padding:4px 8px; border-bottom:1px solid #2a2a2a; display:flex; gap:12px; }
+.sres      { padding:4px 8px; border-bottom:1px solid #2a2a2a; display:flex; gap:12px; align-items:baseline; }
+.sres .score { color:#b5cea8; min-width:55px; font-size:11px; }
+.sres .spath { color:#ce9178; cursor:pointer; text-decoration:underline; }
+.sres .spath:hover { color:#f08030; }
+#file-viewer { position:fixed; top:40px; right:20px; bottom:20px; width:50%;
+                background:#1a1a1a; border:1px solid #555; border-radius:6px;
+                display:none; flex-direction:column; z-index:100; box-shadow:0 4px 24px #000a; }
+#file-viewer-hdr { background:#2d2d30; padding:6px 10px; display:flex;
+                    align-items:center; gap:8px; border-radius:6px 6px 0 0; }
+#file-viewer-title { flex:1; color:#9cdcfe; font-size:12px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+#file-viewer-close { background:none; border:none; color:#888; font-size:16px; cursor:pointer; padding:0 4px; }
+#file-viewer-close:hover { color:#fff; }
+#file-viewer-body { flex:1; overflow:auto; padding:8px;
+                     font:12px/1.6 'Cascadia Code','Consolas',monospace; white-space:pre-wrap; color:#d4d4d4; }
 .hidden  { display:none; }
 .srch-hint { color:#888; padding:8px; }
 </style>
@@ -100,11 +121,8 @@ tr:hover td { background:#2a2d2e; cursor:pointer; }
   <h1>&#128269; MoonShot Viewer</h1>
   <input type="file" id="file-input" accept=".idx" class="hidden">
   <button type="button" class="btn" onclick="document.getElementById('file-input').click()">Open .idx</button>
-  <button type="button" class="btn hidden" id="metabtn"
-          onclick="document.getElementById('meta-input').click()">Load .meta</button>
-  <input type="file" id="meta-input" class="hidden">
   <input id="srch" placeholder="Filter terms / search…" oninput="onSearch(this.value)">
-  <span id="status">Drop a .idx file to begin</span>
+  <span id="status">Drop .idx or use ?idx=URL to load</span>
 </div>
 
 <div id="drop" onclick="document.getElementById('file-input').click()">
@@ -113,12 +131,15 @@ tr:hover td { background:#2a2d2e; cursor:pointer; }
 
 <div id="main">
   <div id="left">
-    <div id="hex-header">
-      Offset&nbsp;&nbsp;&nbsp;
-      00&nbsp;01&nbsp;02&nbsp;03&nbsp;04&nbsp;05&nbsp;06&nbsp;07&nbsp;&nbsp;
-      08&nbsp;09&nbsp;0A&nbsp;0B&nbsp;0C&nbsp;0D&nbsp;0E&nbsp;0F&nbsp;&nbsp;&nbsp;&nbsp;ASCII
+    <div id="left-inner">
+      <div id="hex-header">
+        Offset&nbsp;&nbsp;&nbsp;
+        00&nbsp;01&nbsp;02&nbsp;03&nbsp;04&nbsp;05&nbsp;06&nbsp;07&nbsp;&nbsp;
+        08&nbsp;09&nbsp;0A&nbsp;0B&nbsp;0C&nbsp;0D&nbsp;0E&nbsp;0F&nbsp;&nbsp;&nbsp;&nbsp;ASCII
+      </div>
+      <div id="hex-body"></div>
     </div>
-    <div id="hex-body"></div>
+    <button type="button" id="hex-toggle" title="Drag to resize · Click to collapse" onclick="void 0"></button>
   </div>
   <div id="right">
     <div id="dec-tabs">
@@ -140,52 +161,101 @@ tr:hover td { background:#2a2d2e; cursor:pointer; }
   </div>
 </div>
 
+<!-- File content viewer panel -->
+<div id="file-viewer">
+  <div id="file-viewer-hdr">
+    <span id="file-viewer-title"></span>
+    <button type="button" id="file-viewer-close" onclick="closeFileViewer()">✕</button>
+  </div>
+  <div id="file-viewer-body"></div>
+</div>
+
+<script src="moonshot-config.js" onerror="void 0"></script>
 <script type="module">
 import init, { parse_index, search_index } from './pkg/moon_wasm.js';
 await init();
 window._wasm = { parse_index, search_index };
 
-let G = { bytes: null, meta: {}, parsed: null, spanByOff: null };
+let G = { bytes: null, parsed: null, spanByOff: null };
+
+// ── Drag-to-resize + click-to-collapse for hex pane divider ──────────────────
+(function() {
+  const left   = document.getElementById('left');
+  const toggle = document.getElementById('hex-toggle');
+  let dragging = false, startX = 0, startW = 0, savedW = 480;
+
+  toggle.addEventListener('mousedown', e => {
+    if (left.classList.contains('collapsed')) return;
+    dragging = true;
+    startX   = e.clientX;
+    startW   = left.getBoundingClientRect().width;
+    document.body.style.cursor     = 'col-resize';
+    document.body.style.userSelect = 'none';
+    // Hide hex content during drag — prevents layout thrashing over 50k+ spans
+    document.getElementById('hex-body').style.visibility = 'hidden';
+    e.preventDefault();
+  });
+
+  document.addEventListener('mousemove', e => {
+    if (!dragging) return;
+    const newW = Math.max(120, Math.min(900, startW + e.clientX - startX));
+    left.style.width = newW + 'px';
+    savedW = newW;
+  });
+
+  document.addEventListener('mouseup', e => {
+    if (!dragging) return;
+    const moved = Math.abs(e.clientX - startX);
+    dragging = false;
+    document.body.style.cursor     = '';
+    document.body.style.userSelect = '';
+    document.getElementById('hex-body').style.visibility = '';
+    if (moved < 4) toggleHex();
+  });
+
+  window.toggleHex = function() {
+    const col = left.classList.toggle('collapsed');
+    left.style.width = col ? '' : savedW + 'px';
+  };
+})();
+
+// ── Auto-load: from serve.py config OR ?idx=URL param ────────────────────────
+(function() {
+  const p = new URLSearchParams(window.location.search);
+  const u = p.get('idx') || (typeof window.MOONSHOT_IDX === 'string' && window.MOONSHOT_IDX) || '';
+  if (u) {
+    setStatus('Loading ' + u + '…');
+    fetch(u).then(r => r.ok ? r.arrayBuffer() : Promise.reject(r.status))
+      .then(buf => loadData(new Uint8Array(buf), u.split('/').pop()))
+      .catch(e => setStatus('Cannot load ' + u + ': ' + e));
+  }
+})();
 
 // ── loading ───────────────────────────────────────────────────────────────────
 function loadFile(file) {
   const r = new FileReader();
-  r.onload = e => {
-    G.bytes = new Uint8Array(e.target.result);
-    setStatus(`Parsing ${file.name}…`);
-    try {
-      G.parsed = JSON.parse(window._wasm.parse_index(G.bytes));
-      if (G.parsed.error) { setStatus('Error: '+G.parsed.error); return; }
-      document.getElementById('drop').style.display = 'none';
-      document.getElementById('main').style.display = 'flex';
-      document.getElementById('metabtn').classList.remove('hidden');
-      buildHex();
-      renderHeader(); renderSubIndex(); renderDocData(); renderBlocks();
-      setStatus(`${G.parsed.header.num_docs} docs · ${G.parsed.header.num_terms} terms · ${G.parsed.blocks.length} blocks`);
-    } catch(ex) { setStatus('Error: '+ex); console.error(ex); }
-  };
+  r.onload = e => { loadData(new Uint8Array(e.target.result), file.name); };
   r.readAsArrayBuffer(file);
 }
 
-function loadMeta(file) {
-  const r = new FileReader();
-  r.onload = e => {
-    const dv = new DataView(e.target.result);
-    let p = 0;
-    const n = Number(dv.getBigUint64(p,true)); p+=8;
-    for (let i=0;i<n;i++) {
-      const id=dv.getBigUint64(p,true).toString(); p+=8;
-      const len=dv.getUint32(p,true); p+=4;
-      G.meta[id]=new TextDecoder().decode(new Uint8Array(e.target.result,p,len)); p+=len;
-    }
-    renderDocData(); renderBlocks();
-    setStatus('Meta: '+Object.keys(G.meta).length+' paths');
-  };
-  r.readAsArrayBuffer(file);
+function loadData(bytes, name) {
+  G.bytes = bytes;
+  setStatus('Parsing ' + (name||'file') + '…');
+  try {
+    G.parsed = JSON.parse(window._wasm.parse_index(G.bytes));
+    if (G.parsed.error) { setStatus('Error: '+G.parsed.error); return; }
+    document.getElementById('drop').style.display = 'none';
+    document.getElementById('main').style.display = 'flex';
+    buildHex();
+    renderHeader(); renderSubIndex(); renderDocData(); renderBlocks();
+    setStatus(G.parsed.header.num_docs + ' docs · ' + G.parsed.header.num_terms + ' terms · ' + G.parsed.blocks.length + ' blocks');
+  } catch(ex) { setStatus('Error: '+ex); console.error(ex); }
 }
+
+// Paths are now stored in DocData — no separate .meta file needed
 
 document.getElementById('file-input').onchange = e => { if(e.target.files[0]) loadFile(e.target.files[0]); };
-document.getElementById('meta-input').onchange  = e => { if(e.target.files[0]) loadMeta(e.target.files[0]); };
+
 document.body.ondragover = e => e.preventDefault();
 document.body.ondrop     = e => { e.preventDefault(); if(e.dataTransfer.files[0]) loadFile(e.dataTransfer.files[0]); };
 
@@ -327,14 +397,16 @@ function renderSubIndex() {
 
 function renderDocData() {
   const h = G.parsed.header;
-  let html = '<table><tr><th>doc_id</th><th>importance</th><th>doc_len</th><th>path</th></tr>';
+  let html = '<table><tr><th>id</th><th>importance</th><th>doc_len</th><th>path</th></tr>';
   for (const [i,d] of G.parsed.docdata.entries()) {
-    const off = h.docdata_off + i*16;
-    const fp  = G.meta[d.doc_id]||'';
-    html += `<tr onclick="gotoRange(${off},${off+16})">` +
+    const off = h.docdata_off + i*256;  // 256B DocRec
+    const fp  = d.path || '';
+    const link = fp ? `<span class="spath" onclick="openFile('${esc(fp)}')" title="Open file">${esc(fp)}</span>`
+                    : '<span style="color:#555">—</span>';
+    html += `<tr onclick="gotoRange(${off},${off+256})">` +
             `<td class="mono num" style="font-size:10px">${d.doc_id}</td>` +
             `<td class="num">${d.importance}</td><td class="num">${d.doc_len}</td>` +
-            `<td class="path">${esc(fp)}</td></tr>`;
+            `<td>${link}</td></tr>`;
   }
   document.getElementById('dd-panel').innerHTML = html+'</table>';
 }
@@ -355,15 +427,16 @@ function renderBlocks() {
             `0x${blkOff.toString(16)}</span></div>` +
             `<div class="bcard-body" id="bb${blk.seq}">`;
 
-    if (!blk.is_continuation && blk.terms.length>0) {
+    if (blk.terms.length > 0) {
+      if (blk.is_continuation)
+        html += `<div style="color:#5c8a3a;padding:4px 8px;font-size:11px">↳ continuation data + new terms below</div>`;
       html += '<table><tr><th>Term</th><th>freq</th><th>Postings</th></tr>';
       for (const t of blk.terms) {
-        // highlight from term header start to end of posting data
         const termStart = blkOff + 208 + t.data_off - t.key.length - 10;
         const termEnd   = blkOff + 208 + t.data_off + t.data_len;
         let posts='';
         for (const p of t.postings) {
-          const fp=G.meta[p.doc_id]||'';
+          const fp=G.pathOf(p.doc_id);
           posts+=`<div class="posting">id=${p.doc_id} tf=${p.tf}${fp?' <span class="path">'+esc(fp)+'</span>':''}</div>`;
         }
         html += `<tr class="term-entry" data-term="${esc(t.key)}"` +
@@ -374,7 +447,7 @@ function renderBlocks() {
       }
       html += '</table>';
     } else if (blk.is_continuation) {
-      html += `<div style="color:#888;padding:8px;font-size:11px">Continuation block — raw posting bytes</div>`;
+      html += `<div style="color:#888;padding:8px;font-size:11px">Continuation — raw posting bytes only, no new terms</div>`;
     }
     html += '</div></div>';
   }
@@ -393,8 +466,8 @@ window.onSearch = function(q) {
       if (Array.isArray(res)&&res.length>0) {
         let html=`<h3 style="padding:8px;color:#9cdcfe;font-size:12px">Results for "${esc(q)}"</h3>`;
         for (const r of res) {
-          const fp=G.meta[r.doc_id]||r.doc_id;
-          html+=`<div class="sres"><span class="score">${r.score.toFixed(3)}</span><span class="path">${esc(fp)}</span></div>`;
+          const fp=G.pathOf(r.doc_id)||r.doc_id;
+          html+=`<div class="sres"><span class="score">${r.score.toFixed(3)}</span><span class="spath" onclick="openFile('${esc(fp)}')" title="Click to open">${esc(fp)}</span></div>`;
         }
         document.getElementById('srch-out').innerHTML=html;
         switchTabByName('srch-panel'); return;
@@ -417,6 +490,33 @@ function switchTabByName(id) {
 window.switchTab=switchTab;
 
 function setStatus(s){ document.getElementById('status').textContent=s; }
+
+// Path helper — looks up file path from DocData by doc_id string
+G.pathOf = function(docId) {
+  if (!G.parsed) return '';
+  const s = String(docId);
+  const d = G.parsed.docdata.find(d => String(d.doc_id) === s);
+  return d ? (d.path||'') : '';
+};
+
+// File viewer
+window.openFile = function(path) {
+  if (!path) return;
+  const v = document.getElementById('file-viewer');
+  document.getElementById('file-viewer-title').textContent = path;
+  document.getElementById('file-viewer-body').textContent = 'Loading…';
+  v.style.display = 'flex';
+  // Try relative path first, then as-is
+  const url = path.startsWith('/') || path.match(/^[A-Za-z]:/) ? null : path;
+  fetch(url || path)
+    .then(r => r.ok ? r.text() : Promise.reject(r.status))
+    .then(t => { document.getElementById('file-viewer-body').textContent = t; })
+    .catch(() => { document.getElementById('file-viewer-body').textContent =
+      `Cannot fetch file via HTTP.\nPath: ${path}\n\nTip: start the HTTP server from the directory containing the indexed files.`; });
+};
+window.closeFileViewer = function() {
+  document.getElementById('file-viewer').style.display = 'none';
+};
 function esc(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
 </script>
 </body>

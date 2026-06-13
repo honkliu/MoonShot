@@ -561,9 +561,9 @@ void TestBigram()
     auto           writer = engine.GetWriter();
 
     /*
-    * Doc 1: "good morning vietnam" — bigrams: good_morning, morning_vietnam
-    * Doc 2: "bad morning london"   — bigrams: bad_morning,  morning_london
-    * Doc 3: "good night vietnam"   — bigrams: good_night,   night_vietnam
+    * Doc 1: "good morning vietnam" — bigrams: good·morning, morning·vietnam
+    * Doc 2: "bad morning london"   — bigrams: bad·morning,  morning·london
+    * Doc 3: "good night vietnam"   — bigrams: good·night,   night·vietnam
     */
     writer->Write(tok.Tokenize("good morning vietnam"), 1, "Title");
     writer->SetDocImportance(1, 0.9f);
@@ -579,15 +579,20 @@ void TestBigram()
     /*
     * Verify bigrams were written into the Title stream posting store.
     */
-    assert(store->GetPostingList("good_morningT")    != nullptr);
-    assert(store->GetPostingList("morning_vietnamT") != nullptr);
-    assert(store->GetPostingList("bad_morningT")     != nullptr);
-    assert(store->GetPostingList("good_nightT")      != nullptr);
+    /* Helper: build bigram posting-store key (word1 \x1F word2 + stream) */
+    auto BK = [](const char* a, const char* b, char st) {
+        return std::string(a) + BIGRAM_SEP + b + st;
+    };
 
-    std::cout << "  good_morningT    doc_freq="
-              << store->GetPostingList("good_morningT")->doc_freq() << "\n";
-    std::cout << "  morning_vietnamT doc_freq="
-              << store->GetPostingList("morning_vietnamT")->doc_freq() << "\n";
+    assert(store->GetPostingList(BK("good","morning",'T'))    != nullptr);
+    assert(store->GetPostingList(BK("morning","vietnam",'T')) != nullptr);
+    assert(store->GetPostingList(BK("bad","morning",'T'))     != nullptr);
+    assert(store->GetPostingList(BK("good","night",'T'))      != nullptr);
+
+    std::cout << "  good·morningT    doc_freq="
+              << store->GetPostingList(BK("good","morning",'T'))->doc_freq() << "\n";
+    std::cout << "  morning·vietnamT doc_freq="
+              << store->GetPostingList(BK("morning","vietnam",'T'))->doc_freq() << "\n";
 
     IndexSearchCompiler compiler;
     auto exec = engine.GetExecutor();
@@ -631,7 +636,7 @@ void TestBigram()
     /*
     * Verify the compiled EvalTree structure for "good morning" on stream T.
     * Expected:
-    *   Or( TermNode("good_morningT"),          ← bigram arm
+    *   Or( TermNode("good·morningT"),          ← bigram arm
     *       And( TermNode("goodT"),              ← unigram arm
     *            TermNode("morningT") ) )
     */
@@ -645,7 +650,7 @@ void TestBigram()
 
         assert(orNode->children[0]->GetType() == NodeType::Term);
         auto* bigramNode = static_cast<TermNode*>(orNode->children[0].get());
-        assert(bigramNode->stream_key == "good_morningT");
+        assert(bigramNode->stream_key == std::string("good") + BIGRAM_SEP + "morningT");
         std::cout << "  bigram arm key: " << bigramNode->stream_key << "\n";
 
         assert(orNode->children[1]->GetType() == NodeType::And);

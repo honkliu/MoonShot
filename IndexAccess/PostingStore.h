@@ -75,8 +75,9 @@ private:
 * Per-document metadata needed for ranking.
 */
 struct DocStats {
-    uint32_t doc_len    = 0;
-    float    importance = 0.0f;
+    uint32_t    doc_len    = 0;
+    float       importance = 0.0f;
+    std::string path;              // file path stored in DocData (256B record)
 };
 
 /*
@@ -114,6 +115,18 @@ public:
     void SetDocImportance(uint64_t doc_id, float score)
     {
         m_DocStats[doc_id].importance = score;
+    }
+
+    void SetDocPath(uint64_t doc_id, const std::string& path)
+    {
+        m_DocStats[doc_id].path = path;
+    }
+
+    const std::string& GetDocPath(uint64_t doc_id) const
+    {
+        static const std::string empty;
+        auto it = m_DocStats.find(doc_id);
+        return it != m_DocStats.end() ? it->second.path : empty;
     }
 
     const PostingList* GetPostingList(const std::string& key) const

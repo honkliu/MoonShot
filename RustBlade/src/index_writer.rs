@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use crate::posting_store::PostingStore;
+use crate::eval_tree::BIGRAM_SEP;
 
 pub trait IndexWriter {
     fn write(&mut self, tokens: Vec<String>, doc_id: u64, stream: &str);
@@ -66,7 +67,7 @@ impl IndexWriter for AdvancedIndexWriter {
         let mut bigram_tf: HashMap<String, u32> = HashMap::new();
         for i in 0..tokens.len().saturating_sub(1) {
             if !tokens[i].is_empty() && !tokens[i + 1].is_empty() {
-                let bigram = format!("{}_{}", tokens[i], tokens[i + 1]);
+                let bigram = format!("{}{}{}", tokens[i], BIGRAM_SEP, tokens[i + 1]);
                 *bigram_tf.entry(bigram).or_insert(0) += 1;
             }
         }

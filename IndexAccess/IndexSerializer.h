@@ -8,43 +8,40 @@
 #include <string>
 
 /*
- * Binary index file format (version 2).
- *
- * Mirrors Tiger's file layout: every section after the header is stored
- * as fixed-size pages so FileBlockManager can do direct random I/O.
+ * Binary index file format (version 3).
  *
  * Layout:
- *   [FileHeader]  64 bytes   — magic, version, section offsets
- *   [SubIndex]    variable   — packed (key_len, key, block_seq) entries,
- *                              sorted by term (one entry per block)
- *   [DocData]     N × 16 B  — per-document: doc_id, importance, doc_len
- *   [Padding]     0..4095 B — zero-fill to align Blocks to PAGE_SIZE
- *   [Blocks]      M × 4096 B — raw IndexBlock structs; block_seq 0 is at
- *                              blocks_offset in the file
+ *   [Header 96B]       magic, version, all section offsets
+ *   [SubIndex]         (key_len, key, block_seq, block_entry_start, page_skip_offset) per entry
+ *   [PageSkipList]     flat uint64_t arrays — per-term base_doc_id per cont. block
+ *   [DocData]          N × 16 B — doc_id, importance, doc_len
+ *   [Padding]          to PAGE_SIZE
+ *   [Blocks]           raw IndexBlock structs
  */
+
+struct BuildBlocksResult {
+    std::vector<IndexBlock>    blocks;
+    std::vector<SubIndexEntry> subindex;
+    std::vector<uint64_t>      pageskip;
+};
+
 class IndexSerializer {
 public:
-    /*
-     * Save the index to path.
-     * Packs terms alphabetically into IndexBlocks (multiple terms per block),
-     * writes the SubIndex, DocData, and Blocks sections.
-     */
+    /* Internal type alias exposed for IndexContext::Build() */
+    using BlockResult = BuildBlocksResult;
+
     static bool Save(const PostingStore& store, const char* path);
 
-    /*
-     * Load an index from path.
-     * Restores DocData into store; returns SubIndex and blocks_offset so
-     * IndexContext::LoadIndex can wire up the BlockTable and FileBlockManager.
-     */
     static bool Load(PostingStore&              store,
                      const char*                path,
                      std::vector<SubIndexEntry>* subindex_out,
-                     uint64_t*                   blocks_offset_out);
+                     uint64_t*                   blocks_offset_out,
+                     std::vector<uint64_t>*      pageskip_out = nullptr);
 
-    /*
-     * Quick magic-byte check.
-     */
     static bool IsValidIndex(const char* path);
+
+    /* Used by IndexContext::Build() to pack blocks without writing to disk. */
+    static BlockResult BuildBlocksForContext(const PostingStore& store);
 };
 
 #endif

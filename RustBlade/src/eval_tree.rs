@@ -14,9 +14,18 @@
 * Mirrors MoonShot's EvalExpression.h.
 */
 
+/*
+* Bigram separator — mirrors C++ BIGRAM_SEP / REF's CreateBigramString.
+* \x1F (ASCII Unit Separator) is never produced by the word tokenizer,
+* so "morning\x1Fcall" (bigram) is unambiguous from "morning_call" (unigram).
+*/
+pub const BIGRAM_SEP: char = '\x1F';
+
 #[derive(Debug, Clone)]
 pub struct TermNode {
     pub stream_key: String,
+    /// 1 = unigram (REF AtomType_Unigram), 2 = bigram (REF AtomType_Bigram / wordSpan=2)
+    pub word_span: u32,
 }
 
 #[derive(Debug, Clone)]

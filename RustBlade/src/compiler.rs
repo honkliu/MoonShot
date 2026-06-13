@@ -1,4 +1,4 @@
-use crate::eval_tree::{EvalTree, EvalNode, TermNode, AndNode, OrNode};
+use crate::eval_tree::{EvalTree, EvalNode, TermNode, AndNode, OrNode, BIGRAM_SEP};
 use crate::tokenizer::Tokenizer;
 
 /*
@@ -48,13 +48,19 @@ fn parse_stream_set(s: &str) -> Vec<String> {
     streams
 }
 
-fn make_term_group(term: &str, streams: &[String]) -> EvalNode {
+fn make_term_group(term: &str, streams: &[String], word_span: u32) -> EvalNode {
     if streams.len() == 1 {
-        return EvalNode::Term(TermNode { stream_key: format!("{}{}", term, streams[0]) });
+        return EvalNode::Term(TermNode {
+            stream_key: format!("{}{}", term, streams[0]),
+            word_span,
+        });
     }
     EvalNode::Or(OrNode {
         children: streams.iter()
-            .map(|s| EvalNode::Term(TermNode { stream_key: format!("{}{}", term, s) }))
+            .map(|s| EvalNode::Term(TermNode {
+                stream_key: format!("{}{}", term, s),
+                word_span,
+            }))
             .collect(),
     })
 }
@@ -63,7 +69,11 @@ fn build_bigram_query(terms: &[String], streams: &[String]) -> Option<EvalNode> 
     if terms.len() < 2 { return None; }
     let groups: Vec<EvalNode> = terms.windows(2)
         .filter(|w| !w[0].is_empty() && !w[1].is_empty())
-        .map(|w| make_term_group(&format!("{}_{}", w[0], w[1]), streams))
+        .map(|w| make_term_group(
+            &format!("{}{}{}", w[0], BIGRAM_SEP, w[1]),
+            streams,
+            2,  /* word_span = 2, mirrors REF AtomType_Bigram */
+        ))
         .collect();
     if groups.is_empty()   { return None; }
     if groups.len() == 1   { return Some(groups.into_iter().next().unwrap()); }
@@ -72,7 +82,7 @@ fn build_bigram_query(terms: &[String], streams: &[String]) -> Option<EvalNode> 
 
 fn build_query(tokens: &[String], streams: &[String]) -> Option<EvalNode> {
     let free_nodes: Vec<EvalNode> = tokens.iter()
-        .map(|t| make_term_group(t, streams))
+        .map(|t| make_term_group(t, streams, 1))
         .collect();
 
     let unigram_base = if free_nodes.len() == 1 {

@@ -86,14 +86,19 @@ class AdvancedIndexReader : public IndexReader
 
     private:
         std::shared_ptr<IndexBlock> m_IndexBlock;
-        char*                       m_Word           = nullptr;
-        uint32_t                    m_BlockSeqNumber = 0;
-        uint32_t                    m_DocFreq        = 0;
-        bool                        m_HasMore        = false; // true only when this term's data spans blocks
-        IndexBlockTable*            m_BlockTable     = nullptr;
+        char*                       m_Word            = nullptr;
+        uint32_t                    m_BlockSeqNumber  = 0;
+        uint32_t                    m_InitialBlockSeq = 0;   // first block of this term
+        uint32_t                    m_DocFreq         = 0;
+        uint32_t                    m_PageSkipOffset  = 0;   // 0 = no skip list
+        bool                        m_HasMore         = false;
+        IndexBlockTable*            m_BlockTable      = nullptr;
         UnifiedDecoder              m_Decoder;
 
         bool HasMoreBlocks() const { return m_HasMore; }
+
+        /* Open decoder on a continuation block, reading cont_len from the block header. */
+        void OpenContinuation(IndexBlock* blk, uint64_t lastDoc);
 };
 
 #endif

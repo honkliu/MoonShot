@@ -62,92 +62,23 @@ public:
     }
 
     /*
-    * Build() — packs PostingStore entries into multi-term IndexBlocks,
-    * sorted alphabetically, and populates the SubIndex.
-    * Called lazily on first GetReader() for in-memory indexes.
-    * Not called when the index was loaded from disk (m_Built = true).
+    * Build() — delegates to IndexSerializer::BuildBlocksForContext so the
+    * packing logic (continuation fix, PageSkipList) is in one place.
     */
     void Build()
     {
-        if (m_Built)
-            return;
+        if (m_Built) return;
 
-        std::vector<std::pair<std::string, const PostingList*>> sorted;
-        sorted.reserve(m_Store->AllPostings().size());
-        for (const auto& [k, pl] : m_Store->AllPostings())
-            sorted.push_back({k, &pl});
-        std::sort(sorted.begin(), sorted.end());
+        auto br = IndexSerializer::BuildBlocksForContext(*m_Store);
 
-        constexpr size_t   DATA_CAP = sizeof(IndexBlock::IB_Data) - 1u;
-        constexpr uint16_t CONT     = BLOCK_CONTINUATION_MARKER;
+        size_t n = br.blocks.size();
+        m_BlockTable.ResizeCache(static_cast<uint32_t>(n) + 64);
 
-        IndexBlock cur = {};
-        uint8_t*   wptr  = cur.IB_Data;
-        uint8_t*   wend  = cur.IB_Data + DATA_CAP;
-        uint32_t   seq   = 0;
-        bool       fresh = true;
+        for (size_t i = 0; i < n; ++i)
+            m_BlockTable.InsertBlock(static_cast<uint32_t>(i), &br.blocks[i]);
 
-        auto flush = [&](bool has_more) {
-            cur.IB_Header = static_cast<uint64_t>(seq);
-            if (has_more) cur.IB_Header |= IB_HEADER_HAS_MORE;
-            if (!has_more && wptr + 2 <= wend + 1) {
-                *wptr++ = 0; *wptr = 0;
-            }
-            m_BlockTable.InsertBlock(seq, &cur);
-            ++seq;
-            cur   = {};
-            wptr  = cur.IB_Data;
-            fresh = true;
-        };
-
-        for (const auto& [term, pl] : sorted) {
-            const auto& bytes = pl->GetBytes();
-            if (bytes.empty()) continue;
-
-            uint16_t kl       = static_cast<uint16_t>(term.size());
-            uint32_t freq     = pl->doc_freq();
-            size_t   hdr_size = 2u + kl + 4u + 4u;
-
-            if (static_cast<size_t>(wend - wptr) < hdr_size + 1u)
-                flush(false);
-
-            if (fresh) {
-                m_BlockTable.AddSubIndexEntry(term, seq);
-                fresh = false;
-            }
-
-            const uint8_t* src       = bytes.data();
-            size_t         remaining = bytes.size();
-            size_t         data_space = static_cast<size_t>(wend - wptr) - hdr_size;
-            size_t         data_here  = std::min(remaining, data_space);
-            bool           has_more   = (data_here < remaining);
-
-            std::memcpy(wptr, &kl,   2); wptr += 2;
-            std::memcpy(wptr, term.c_str(), kl); wptr += kl;
-            std::memcpy(wptr, &freq, 4); wptr += 4;
-            uint32_t dl = static_cast<uint32_t>(data_here);
-            std::memcpy(wptr, &dl,   4); wptr += 4;
-            std::memcpy(wptr, src,   data_here); wptr += data_here;
-            src       += data_here;
-            remaining -= data_here;
-
-            if (has_more) {
-                flush(true);
-                while (remaining > 0) {
-                    std::memcpy(wptr, &CONT, 2); wptr += 2;
-                    size_t cont_here = std::min(remaining,
-                                                static_cast<size_t>(wend - wptr));
-                    bool   more_cont = (cont_here < remaining);
-                    std::memcpy(wptr, src, cont_here);
-                    wptr      += cont_here;
-                    src       += cont_here;
-                    remaining -= cont_here;
-                    flush(more_cont);
-                }
-            }
-        }
-        if (!fresh || wptr != cur.IB_Data)
-            flush(false);
+        m_BlockTable.SetSubIndex(std::move(br.subindex));
+        m_BlockTable.SetPageSkipData(std::move(br.pageskip));
 
         m_Built = true;
     }
@@ -224,13 +155,15 @@ public:
 
         m_Store = make_shared<PostingStore>();
         std::vector<SubIndexEntry> subindex;
+        std::vector<uint64_t>      pageskip;
         uint64_t blocks_offset = 0;
 
         if (!IndexSerializer::Load(*m_Store, m_IndexPath.c_str(),
-                                   &subindex, &blocks_offset))
+                                   &subindex, &blocks_offset, &pageskip))
             return;
 
         m_BlockTable.SetSubIndex(std::move(subindex));
+        m_BlockTable.SetPageSkipData(std::move(pageskip));
 
         auto fm = make_shared<FileBlockManager>(sizeof(IndexBlock), blocks_offset);
         if (fm->open(m_IndexPath.c_str()))

@@ -68,17 +68,20 @@ private:
         return streams;
     }
 
-    /* OR(termA, termU, termT, ...) across all streams for one token. */
+    /* OR(termA, termU, termT, ...) across all streams for one token.
+     * word_span: 1 = unigram, 2 = bigram (mirrors REF's AtomType/wordSpan). */
     std::shared_ptr<EvalNode> MakeTermGroup(
             const std::string&              term,
-            const std::vector<std::string>& streams)
+            const std::vector<std::string>& streams,
+            uint32_t                        word_span = 1)
     {
         if (streams.size() == 1)
-            return std::make_shared<TermNode>(term + streams[0]);
+            return std::make_shared<TermNode>(term + streams[0], word_span);
 
         auto orNode = std::make_shared<OrNode>();
         for (auto& st : streams)
-            orNode->children.push_back(std::make_shared<TermNode>(term + st));
+            orNode->children.push_back(
+                std::make_shared<TermNode>(term + st, word_span));
         return orNode;
     }
 
@@ -93,7 +96,8 @@ private:
         std::vector<std::shared_ptr<EvalNode>> groups;
         for (size_t i = 0; i + 1 < terms.size(); ++i)
             groups.push_back(
-                MakeTermGroup(terms[i] + "_" + terms[i+1], streams));
+                MakeTermGroup(terms[i] + BIGRAM_SEP + terms[i+1],
+                              streams, /*word_span=*/2));
 
         if (groups.size() == 1) return groups[0];
 
