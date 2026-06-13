@@ -44,8 +44,8 @@ body { font:13px 'Segoe UI',sans-serif; background:#1e1e1e; color:#d4d4d4;
 #hex-header { background:#2d2d30; padding:4px 10px; font-size:11px; color:#555;
               border-bottom:1px solid #3e3e42; flex-shrink:0;
               font-family:'Cascadia Code','Consolas',monospace; }
-#hex-body   { flex:1; overflow-y:auto; padding:4px 2px;
-              font:11px/1.65 'Cascadia Code','Consolas',monospace; }
+#hex-body   { flex:1; overflow-y:auto; padding:0 2px;
+              font:11px/18px 'Cascadia Code','Consolas',monospace; }
 
 .hrow  { display:flex; }
 .haddr { color:#555; min-width:60px; padding-right:4px; -webkit-user-select:none; user-select:none; }
@@ -176,7 +176,7 @@ import init, { parse_index, search_index } from './pkg/moon_wasm.js';
 await init();
 window._wasm = { parse_index, search_index };
 
-let G = { bytes: null, parsed: null, spanByOff: null };
+let G = { bytes: null, parsed: null, sc: null };
 
 // ── Drag-to-resize + click-to-collapse for hex pane divider ──────────────────
 (function() {
@@ -191,8 +191,6 @@ let G = { bytes: null, parsed: null, spanByOff: null };
     startW   = left.getBoundingClientRect().width;
     document.body.style.cursor     = 'col-resize';
     document.body.style.userSelect = 'none';
-    // Hide hex content during drag — prevents layout thrashing over 50k+ spans
-    document.getElementById('hex-body').style.visibility = 'hidden';
     e.preventDefault();
   });
 
@@ -209,7 +207,6 @@ let G = { bytes: null, parsed: null, spanByOff: null };
     dragging = false;
     document.body.style.cursor     = '';
     document.body.style.userSelect = '';
-    document.getElementById('hex-body').style.visibility = '';
     if (moved < 4) toggleHex();
   });
 
@@ -262,14 +259,21 @@ document.body.ondrop     = e => { e.preventDefault(); if(e.dataTransfer.files[0]
 // ── build full hex view ───────────────────────────────────────────────────────
 // Renders ALL bytes from offset 0 to end. Called once per file.
 // Each byte is a <span class="hb"> so we can highlight arbitrary ranges.
+// ── Virtual-scroll hex view ───────────────────────────────────────────────────
+// Only renders the visible rows (~100) instead of all 57 000+ spans.
+const HEX_COLS = 16;
+const HEX_RH   = 18;   // row height px — must match line-height in CSS
+const HEX_BUF  = 50;   // extra rows rendered above/below viewport
+const HEX_CLS  = ['','s-hdr','s-si','s-dd','s-b0','s-b1','s-b2','s-b3'];
+
+let G_HL = { s:-1, e:-1 };   // current highlight range (replaces spanByOff)
+
 function buildHex() {
   const data = G.bytes;
   const h    = G.parsed.header;
-  const COLS = 16;
 
-  // Per-byte section class lookup
-  const CLS = ['','s-hdr','s-si','s-dd','s-b0','s-b1','s-b2','s-b3'];
-  const sc   = new Uint8Array(data.length);
+  // Per-byte section colour (computed once, stored on G)
+  const sc = new Uint8Array(data.length);
   for (let i=0; i<Math.min(80,data.length); i++) sc[i]=1;
   for (let i=h.subindex_off; i<h.subindex_off+h.subindex_size && i<data.length; i++) sc[i]=2;
   for (let i=h.docdata_off;  i<h.docdata_off +h.docdata_size  && i<data.length; i++) sc[i]=3;
@@ -277,70 +281,78 @@ function buildHex() {
     const s=h.blocks_off+b*4096, e=s+4096, c=4+(b%4);
     for (let i=s; i<e && i<data.length; i++) sc[i]=c;
   }
+  G.sc = sc;
+  G_HL = { s:-1, e:-1 };
 
-  // Build HTML in chunks for speed
+  const totalRows = Math.ceil(data.length / HEX_COLS);
+  const body = document.getElementById('hex-body');
+  body.innerHTML =
+    `<div id="hex-spacer" style="height:${totalRows*HEX_RH}px;pointer-events:none"></div>` +
+    `<div id="hex-vp" style="position:absolute;top:0;left:0;right:0"></div>`;
+  body.style.position = 'relative';
+
+  body.addEventListener('scroll', () => {
+    renderVP(Math.floor(body.scrollTop / HEX_RH));
+  });
+  renderVP(0);
+}
+
+function renderVP(firstVis) {
+  const body = document.getElementById('hex-body');
+  const vp   = document.getElementById('hex-vp');
+  if (!vp || !G.bytes || !G.sc) return;
+
+  const data  = G.bytes;
+  const sc    = G.sc;
+  const total = Math.ceil(data.length / HEX_COLS);
+  const vis   = Math.ceil((body.clientHeight || 600) / HEX_RH);
+  const start = Math.max(0, firstVis - HEX_BUF);
+  const end   = Math.min(total, firstVis + vis + HEX_BUF);
+
   const parts = [];
-  G.spanByOff = new Array(data.length).fill(null);
-
-  for (let row=0; row<data.length; row+=COLS) {
-    const rowEnd = Math.min(row+COLS, data.length);
+  for (let row=start; row<end; row++) {
+    const base   = row * HEX_COLS;
+    const rowEnd = Math.min(base + HEX_COLS, data.length);
     let hex='', asc='';
 
-    for (let j=row; j<rowEnd; j++) {
-      const b=data[j], c=CLS[sc[j]];
-      hex += `<span class="hb ${c}" data-o="${j}">${b.toString(16).padStart(2,'0')}</span>`;
+    for (let j=base; j<rowEnd; j++) {
+      const b  = data[j];
+      const cl = HEX_CLS[sc[j]] || '';
+      const hl = (j>=G_HL.s && j<G_HL.e) ? ' hl' : '';
+      hex += `<span class="hb ${cl}${hl}" data-o="${j}">${b.toString(16).padStart(2,'0')}</span>`;
       if (j%16===7) hex += '<span class="gap"> </span>';
-      asc += `<span class="hac" data-o="${j}">${b>=32&&b<127?String.fromCharCode(b):'.'}</span>`;
+      asc += `<span class="hac${hl}" data-o="${j}">${b>=32&&b<127?String.fromCharCode(b):'.'}</span>`;
     }
-    // pad short last row
-    for (let j=rowEnd; j<row+COLS; j++) {
+    for (let j=rowEnd; j<base+HEX_COLS; j++) {
       hex += '<span class="hb" style="visibility:hidden">00</span>';
       if (j%16===7) hex += '<span class="gap"> </span>';
     }
 
     parts.push(
-      `<div class="hrow" data-r="${row}">` +
-      `<span class="haddr">${row.toString(16).padStart(6,'0')}&nbsp;&nbsp;</span>` +
+      `<div class="hrow" style="height:${HEX_RH}px" data-r="${base}">` +
+      `<span class="haddr">${base.toString(16).padStart(6,'0')}&nbsp;&nbsp;</span>` +
       `<span class="hbytes">${hex}</span>` +
-      `<span class="hascii">${asc}</span>` +
-      `</div>`
+      `<span class="hascii">${asc}</span></div>`
     );
   }
 
-  const body = document.getElementById('hex-body');
-  body.innerHTML = parts.join('');
-
-  // Cache span refs for O(1) highlight
-  body.querySelectorAll('.hb[data-o]').forEach(el => {
-    G.spanByOff[parseInt(el.dataset.o)] = el;
-  });
+  vp.style.top  = (start * HEX_RH) + 'px';
+  vp.innerHTML  = parts.join('');
 }
 
 // ── highlight + scroll ────────────────────────────────────────────────────────
 function gotoRange(start, end) {
-  // Clear previous
-  document.querySelectorAll('#hex-body .hl').forEach(e => e.classList.remove('hl'));
+  G_HL.s = Math.max(0, start|0);
+  G_HL.e = Math.min((end|0), G.bytes.length);
 
-  const s = Math.max(0, start|0);
-  const e = Math.min((end|0), G.bytes.length);
+  // Scroll so the highlighted region is near the top third of the viewport
+  const body = document.getElementById('hex-body');
+  if (!body) return;
+  const row     = Math.floor(G_HL.s / HEX_COLS);
+  const viewH   = body.clientHeight || 600;
+  body.scrollTop = Math.max(0, row * HEX_RH - viewH / 3);
 
-  for (let i=s; i<e; i++) {
-    const sp = G.spanByOff[i];
-    if (sp) {
-      sp.classList.add('hl');
-      // ASCII column in same row
-      const row = sp.closest('.hrow');
-      if (row) {
-        const ac = row.querySelector(`.hac[data-o="${i}"]`);
-        if (ac) ac.classList.add('hl');
-      }
-    }
-  }
-
-  if (G.spanByOff[s]) {
-    G.spanByOff[s].closest('.hrow')
-      .scrollIntoView({ behavior:'smooth', block:'center' });
-  }
+  renderVP(Math.floor(body.scrollTop / HEX_RH));
 }
 window.gotoRange = gotoRange;
 
