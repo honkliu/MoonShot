@@ -27,6 +27,7 @@
 #else
 #  include <pwd.h>
 #  include <unistd.h>
+#  include <limits.h>
 #endif
 
 #ifdef _WIN32
@@ -110,6 +111,32 @@ static std::string ReadFile(const std::string& path)
     std::ostringstream ss;
     ss << f.rdbuf();
     return ss.str();
+}
+
+static std::string AbsolutePath(const std::string& path)
+{
+#ifdef _WIN32
+    std::wstring input = Utf8ToWide(path);
+    DWORD needed = GetFullPathNameW(input.c_str(), 0, nullptr, nullptr);
+    if (needed == 0) return path;
+
+    std::wstring full(needed, L'\0');
+    DWORD written = GetFullPathNameW(input.c_str(), needed, full.data(), nullptr);
+    if (written == 0) return path;
+    if (!full.empty() && full.back() == L'\0') full.pop_back();
+    return WideToUtf8(full.c_str());
+#else
+    char resolved[PATH_MAX];
+    if (realpath(path.c_str(), resolved))
+        return resolved;
+    if (!path.empty() && path[0] == '/')
+        return path;
+
+    char cwd[PATH_MAX];
+    if (getcwd(cwd, sizeof(cwd)))
+        return std::string(cwd) + "/" + path;
+    return path;
+#endif
 }
 
 // Returns the filename without extension — used as the Title stream.
@@ -216,7 +243,7 @@ int main(int argc, char* argv[])
             std::cerr << "Usage: moon -name <filepath>\n";
             return 1;
         }
-        std::string fp = filePath;
+        std::string fp = AbsolutePath(filePath);
 
         if (ReadFile(fp).empty()) {
             std::cerr << "Cannot read file: " << fp << "\n";

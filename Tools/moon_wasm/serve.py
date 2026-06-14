@@ -7,7 +7,7 @@ Usage:
     python3 serve.py ~/moon.idx         # auto-load idx at startup
     python3 serve.py ~/moon.idx 8080    # custom port
 """
-import sys, os, json, http.server, socketserver
+import sys, os, json, http.server, socketserver, urllib.parse, mimetypes
 
 idx_path = sys.argv[1] if len(sys.argv) > 1 else ''
 port     = int(sys.argv[2]) if len(sys.argv) > 2 else 8080
@@ -41,11 +41,45 @@ else:
 with open('moonshot-config.js', 'w') as f:
     f.write(f'window.MOONSHOT_IDX = {json.dumps(config_val)};\n')
 
+class MoonShotHandler(http.server.SimpleHTTPRequestHandler):
+    def do_GET(self):
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path == '/file':
+            query = urllib.parse.parse_qs(parsed.query)
+            raw_path = query.get('path', [''])[0]
+            if not raw_path:
+                self.send_error(400, 'missing path')
+                return
+
+            file_path = os.path.abspath(os.path.expanduser(raw_path))
+            if not os.path.isfile(file_path):
+                self.send_error(404, 'file not found')
+                return
+
+            try:
+                with open(file_path, 'rb') as f:
+                    data = f.read()
+            except OSError as exc:
+                self.send_error(500, str(exc))
+                return
+
+            self.send_response(200)
+            content_type = mimetypes.guess_type(file_path)[0] or 'application/octet-stream'
+            if content_type.startswith('text/') or content_type in ('application/json', 'application/xml'):
+                content_type += '; charset=utf-8'
+            self.send_header('Content-Type', content_type)
+            self.send_header('Content-Length', str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+            return
+
+        return super().do_GET()
+
 print(f'MoonShot viewer  →  http://localhost:{port}/index.html')
 if config_val:
     print(f'Auto-loading     →  {idx_path}')
 else:
     print('No idx specified  →  use the Open / Drop zone in the browser')
 
-with socketserver.TCPServer(('', port), http.server.SimpleHTTPRequestHandler) as srv:
+with socketserver.TCPServer(('', port), MoonShotHandler) as srv:
     srv.serve_forever()

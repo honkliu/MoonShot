@@ -198,6 +198,7 @@ impl IndexContext {
     }
 }
 
+
 impl Default for IndexContext {
     fn default() -> Self { Self::new() }
 }

@@ -38,5 +38,5 @@ Then open `http://localhost:8080`.
    - **Term Directory** — hierarchical physical layout tree: TermHeaderTable → DirectoryEntry → TermHeaderBlock → TermHeader → PostingBlock bytes
    - **DocData** — doc_id, importance, doc_len, filepath (if .meta loaded)
    - **Posting Blocks** — click a posting block header → expands decoded terms & highlights block bytes in hex; click a term row → highlights that term's posting bytes
-   - **Search** — type a query; results show doc scores + paths
-5. **Filter box** (top) — type to filter term rows live; if 3+ chars, also runs an index search
+   - **Search** — real MoonShot document search; results show filename, path, doc id, and score; click a result to display file content in the page
+5. **Filter box** (top) — filters visible term rows only; it does not run document search
