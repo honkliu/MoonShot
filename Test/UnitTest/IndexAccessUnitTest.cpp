@@ -187,19 +187,19 @@ void TestOrSearch()
 }
 
 /*
-* NOT query — exclude documents that match the exclusion ISR.
+* Minus query — exclude documents that match the exclusion ISR.
 */
 void TestNotSearch()
 {
     BuildSharedIndex();
 
     auto compiler = new IndexSearchCompiler();
-    auto tree     = compiler->Compile("good NOT hunting", "AUTB");
+    auto tree     = compiler->Compile("good -hunting", "AUTB");
     auto reader   = g_ctx->GetReader(tree);
     auto executor = g_ctx->GetExecutor();
     auto results  = executor->Execute(reader, 10);
 
-    PrintResults(results, "good NOT hunting");
+    PrintResults(results, "good -hunting");
 
     AssertContains   (results, 1, "NOT: doc1 present");
     AssertNotContains(results, 4, "NOT: doc4 excluded");
@@ -265,11 +265,12 @@ void TestEvalTree()
     {
         auto tree = compiler->Compile("fox quick", "T");
         assert(tree && !tree->IsEmpty());
-        assert(tree->root->GetType() == NodeType::And);
-        auto* andNode = static_cast<AndNode*>(tree->root.get());
-        assert(andNode->children.size() == 2);
-        std::cout << "  Compile('fox quick','T') → AndNode with "
-                  << andNode->children.size() << " children\n";
+        assert(tree->root->GetType() == NodeType::Or);
+        auto* orNode = static_cast<OrNode*>(tree->root.get());
+        assert(orNode->children.size() == 2);
+        assert(orNode->children[0]->GetType() == NodeType::Term);
+        assert(orNode->children[1]->GetType() == NodeType::And);
+        std::cout << "  Compile('fox quick','T') → OrNode(bigram, unigram AND)\n";
         delete tree;
     }
 
@@ -302,10 +303,10 @@ void TestEvalTree()
     }
 
     {
-        auto tree = compiler->Compile("good NOT hunting", "T");
+        auto tree = compiler->Compile("good -hunting", "T");
         assert(tree && !tree->IsEmpty());
         assert(tree->root->GetType() == NodeType::Not);
-        std::cout << "  Compile('good NOT hunting','T') → NotNode\n";
+        std::cout << "  Compile('good -hunting','T') → NotNode\n";
         delete tree;
     }
 

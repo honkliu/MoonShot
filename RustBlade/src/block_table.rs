@@ -3,14 +3,14 @@ use std::sync::Arc;
 
 pub const PAGE_SIZE:          usize = 4096;
 pub const IB_SKIP_SLOTS:      usize = 50;
-pub const IB_DATA_OFFSET:     usize = 8 + IB_SKIP_SLOTS * 4;   /* 208 bytes */
-pub const DATA_SIZE:          usize = PAGE_SIZE - IB_DATA_OFFSET; /* 3888 bytes */
+pub const IB_DATA_OFFSET:     usize = 8 + IB_SKIP_SLOTS * 4;
+pub const DATA_SIZE:          usize = PAGE_SIZE - IB_DATA_OFFSET;
 pub const IB_HEADER_HAS_MORE: u64   = 1u64 << 63;
 pub const CONT_MARKER:        u16   = 0xFFFF;
 
-/// One 4 KB page — identical layout to C++ IndexBlock.
-///   ib_header bit 63: HAS_MORE (posting list continues in block_seq + 1)
-///   ib_header bits 62..0: block sequence number
+/// Number of TermHeader records per Level-2 header block.
+pub const TERM_HEADERS_PER_BLOCK: usize = 32;
+
 #[derive(Clone)]
 pub struct IndexBlock {
     pub ib_header: u64,
@@ -32,25 +32,54 @@ impl Default for IndexBlock {
     }
 }
 
-// ── SubIndex ────────────────────────────────────────────────────────────────
-/// Sparse in-memory index: one entry per block, sorted by lead term.
-/// Mirrors Tiger's WordToPageMap / MoonShot's SubIndex.
-#[derive(Debug, Clone)]
-pub struct SubIndexEntry {
-    pub term:               String,
-    pub block_seq:          u32,
-    pub block_entry_start:  u32,  // byte offset in ib_data where entries start
-    pub page_skip_offset:   u32,  // 0 = single-block; else index into page_skip_data
+// ── BloomFilter placeholder ─────────────────────────────────────────────────
+pub struct BloomFilter;
+impl BloomFilter {
+    pub fn can_term_exist(&self, _term: &str) -> bool { true }
 }
 
-// ── Location of a term's posting data within a block ────────────────────────
+// ── Term lookup two-level structure ──────────────────────────────────────────
+//
+// Level-1  TermDirectoryEntry — sparse directory, memory resident.
+//   Sorted by first_term. Binary search finds the candidate TermHeaderBlock.
+//
+// Level-2  TermHeaderBlock — fixed-size group of TermHeader records.
+//   Each TermHeader describes where posting bytes are stored; it never stores
+//   posting bytes directly.
+
+/// Level-1 directory entry.
+#[derive(Debug, Clone)]
+pub struct TermDirectoryEntry {
+    pub first_term:           String,
+    pub term_header_block_id: u32,
+}
+
+/// Level-2 per-term posting descriptor (lives inside a TermHeaderBlock).
+#[derive(Debug, Clone)]
+pub struct TermHeader {
+    pub term:                     String,
+    pub doc_freq:                 u32,
+    pub posting_block_id:         u32,
+    pub posting_offset:           u32,
+    pub posting_length:           u32,
+    pub skip_list_offset:         u32,
+    pub continuation_block_count: u32,
+    pub flags:                    u32,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct TermHeaderBlock {
+    pub headers: Vec<TermHeader>,
+}
+
+// ── TermLocation (returned by find_term_data) ────────────────────────────────
 pub struct TermLocation {
-    pub block_seq:          u32,
-    pub data_offset:        usize,
-    pub data_len:           usize,
-    pub doc_freq:           u32,
-    pub is_last_entry:      bool,
-    pub page_skip_offset:   u32,
+    pub posting_block_id:         u32,
+    pub posting_offset:           usize,
+    pub posting_length:           usize,
+    pub doc_freq:                 u32,
+    pub continuation_block_count: u32,
+    pub skip_list_offset:         u32,
 }
 
 // ── BlockCache ───────────────────────────────────────────────────────────────
@@ -95,8 +124,7 @@ impl BlockCache {
     fn pick_victim(&mut self) -> usize {
         let n = self.slots.len();
         for _ in 0..n * 2 {
-            let i = self.hand;
-            self.hand = (self.hand + 1) % n;
+            let i = self.hand; self.hand = (self.hand + 1) % n;
             if !self.slots[i].valid   { return i; }
             if !self.slots[i].touched { self.slots[i].valid = false; return i; }
             self.slots[i].touched = false;
@@ -106,30 +134,46 @@ impl BlockCache {
 }
 
 // ── IndexBlockTable ──────────────────────────────────────────────────────────
-/// Page manager + SubIndex.  Mirrors C++ IndexBlockTable.
+/// Posting block manager + two-level term header table.
+///
+/// Lookup path:
+///   BloomFilter.can_term_exist()              → reject obviously absent terms
+///   Level-1 binary search on term_directory   → term_header_block_id
+///   Level-2 binary search in TermHeaderBlock  → TermHeader
+///   get_block_by_seq(header.posting_block_id) → load posting block
 pub struct IndexBlockTable {
-    cache:          RefCell<BlockCache>,
-    subindex:       Vec<SubIndexEntry>,
-    page_skip_data: Vec<u64>,   // per-term base_doc arrays for PageSkipList
+    cache:            RefCell<BlockCache>,
+    /// Level-1: directory sorted by first_term
+    term_directory:   Vec<TermDirectoryEntry>,
+    /// Level-2: fixed-size TermHeader blocks
+    term_header_blocks: Vec<TermHeaderBlock>,
+    page_skip_data:   Vec<u64>,
+    bloom:            BloomFilter,
 }
 
 impl IndexBlockTable {
     pub fn new(capacity: usize) -> Self {
-        Self { cache: RefCell::new(BlockCache::new(capacity)), subindex: Vec::new(), page_skip_data: Vec::new() }
+        Self {
+            cache:           RefCell::new(BlockCache::new(capacity)),
+            term_directory:    Vec::new(),
+            term_header_blocks: Vec::new(),
+            page_skip_data:  Vec::new(),
+            bloom:           BloomFilter,
+        }
     }
 
     // ── write path ───────────────────────────────────────────────────────────
 
-    /// Store a fully-constructed IndexBlock (multi-term packed) into the cache.
     pub fn insert_block(&self, seq: u32, block: IndexBlock) {
         self.cache.borrow_mut().insert(seq, block);
     }
 
-    pub fn add_subindex_entry(&mut self, lead_term: &str, block_seq: u32,
-                              block_entry_start: u32, page_skip_offset: u32) {
-        self.subindex.push(SubIndexEntry {
-            term: lead_term.to_string(), block_seq, block_entry_start, page_skip_offset
-        });
+    pub fn set_term_header_table(&mut self,
+                                 dir:    Vec<TermDirectoryEntry>,
+                                 blocks: Vec<TermHeaderBlock>)
+    {
+        self.term_directory     = dir;
+        self.term_header_blocks = blocks;
     }
 
     pub fn set_page_skip_data(&mut self, data: Vec<u64>) { self.page_skip_data = data; }
@@ -140,81 +184,50 @@ impl IndexBlockTable {
         else { Some(&self.page_skip_data[o..]) }
     }
 
-    /// Replace the entire SubIndex (called by LoadIndex).
-    pub fn set_subindex(&mut self, entries: Vec<SubIndexEntry>) {
-        self.subindex = entries;
-    }
-
     // ── read path ────────────────────────────────────────────────────────────
 
-    /// Binary-search SubIndex for the block containing `term`, load block,
-    /// then linear-scan IB_Data to find the exact entry.
+    /// Two-level lookup through TermDirectory + TermHeaderBlock:
+    ///   Step 1 — BloomFilter check (placeholder).
+    ///   Step 2 — Level-1: binary search term_directory for last entry with
+    ///             first_term <= term.
+    ///   Step 3 — Level-2: binary search within that TermHeaderBlock for exact term.
     pub fn find_term_data(&self, term: &str) -> Option<(TermLocation, Arc<IndexBlock>)> {
-        if self.subindex.is_empty() { return None; }
-        let pos = self.subindex.partition_point(|e| e.term.as_str() <= term);
+        if !self.bloom.can_term_exist(term) { return None; }
+        if self.term_directory.is_empty()   { return None; }
+
+        // Level-1: find last dir entry whose first_term <= term
+        let pos = self.term_directory.partition_point(|e| e.first_term.as_str() <= term);
         if pos == 0 { return None; }
-        let entry     = &self.subindex[pos - 1];
-        let block     = self.get_block_by_seq(entry.block_seq)?;
-        let mut loc   = Self::scan_block(&block, term, entry.block_seq, entry.block_entry_start as usize)?;
-        loc.page_skip_offset = entry.page_skip_offset;
-        Some((loc, block))
+        let block_idx = self.term_directory[pos - 1].term_header_block_id as usize;
+        if block_idx >= self.term_header_blocks.len() { return None; }
+
+        // Level-2: binary search for exact term in the TermHeaderBlock
+        let blk = &self.term_header_blocks[block_idx].headers;
+        let ep  = blk.partition_point(|e| e.term.as_str() < term);
+        if ep >= blk.len() || blk[ep].term != term { return None; }
+        let header = &blk[ep];
+
+        let block = self.get_block_by_seq(header.posting_block_id)?;
+        Some((TermLocation {
+            posting_block_id:         header.posting_block_id,
+            posting_offset:           header.posting_offset as usize,
+            posting_length:           header.posting_length as usize,
+            doc_freq:                 header.doc_freq,
+            continuation_block_count: header.continuation_block_count,
+            skip_list_offset:         header.skip_list_offset,
+        }, block))
     }
 
-    /// Load a block by seq (continuation blocks, cache or disk).
     pub fn get_block_by_seq(&self, seq: u32) -> Option<Arc<IndexBlock>> {
         self.cache.borrow_mut().get(seq)
     }
 
-    pub fn subindex(&self)         -> &[SubIndexEntry] { &self.subindex }
-    pub fn page_skip_data(&self)   -> &[u64]           { &self.page_skip_data }
+    pub fn term_directory(&self)      -> &[TermDirectoryEntry] { &self.term_directory }
+    pub fn term_header_blocks(&self)  -> &[TermHeaderBlock]    { &self.term_header_blocks }
+    pub fn page_skip_data(&self)      -> &[u64]                { &self.page_skip_data }
 
-    // ── block scanner ────────────────────────────────────────────────────────
-
-    fn scan_block(block: &IndexBlock, term: &str, block_seq: u32, scan_start: usize) -> Option<TermLocation> {
-        let data = &block.ib_data;
-        let len  = data.len();
-        let mut ptr = scan_start;
-        while ptr + 2 <= len {
-            let key_len = u16::from_le_bytes([data[ptr], data[ptr + 1]]) as usize;
-            ptr += 2;
-
-            if key_len == 0               { break; }  // sentinel
-            if key_len == CONT_MARKER as usize { break; }  // shouldn't appear mid-block
-
-            if ptr + key_len + 8 > len { break; }
-
-            let key = match std::str::from_utf8(&data[ptr..ptr + key_len]) {
-                Ok(s)  => s,
-                Err(_) => { ptr += key_len + 8; continue; }
-            };
-            ptr += key_len;
-
-            let doc_freq = u32::from_le_bytes([data[ptr], data[ptr+1], data[ptr+2], data[ptr+3]]);
-            let data_len = u32::from_le_bytes([data[ptr+4], data[ptr+5], data[ptr+6], data[ptr+7]]) as usize;
-            ptr += 8;
-
-            if key == term {
-                // Detect if this is the last term entry (determines HAS_MORE applicability).
-                let next_ptr   = ptr + data_len;
-                let next_kl    = if next_ptr + 2 <= len {
-                    u16::from_le_bytes([data[next_ptr], data[next_ptr + 1]])
-                } else { 0 };
-                let is_last = next_ptr + 2 > len || next_kl == 0;
-
-                return Some(TermLocation {
-                    block_seq,
-                    data_offset: ptr,
-                    data_len,
-                    doc_freq,
-                    is_last_entry: is_last,
-                    page_skip_offset: 0,  // filled in by find_term_data
-                });
-            }
-
-            // Bounds check before skipping posting data.
-            if ptr + data_len > len { break; }
-            ptr += data_len;
-        }
-        None
+    /// Iterate all TermHeader records (flattened) — used by the WASM viewer.
+    pub fn all_headers(&self) -> impl Iterator<Item = &TermHeader> {
+        self.term_header_blocks.iter().flat_map(|blk| blk.headers.iter())
     }
 }

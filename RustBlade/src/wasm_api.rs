@@ -9,13 +9,13 @@
 use wasm_bindgen::prelude::*;
 use crate::serializer::IndexSerializer;
 use crate::posting_store::PostingStore;
-use crate::block_table::{PAGE_SIZE, IB_HEADER_HAS_MORE, CONT_MARKER};
+use crate::block_table::{PAGE_SIZE, IB_HEADER_HAS_MORE};
 use crate::index_context::IndexContext;
 
 // ── parse_index ──────────────────────────────────────────────────────────────
 
 /// Parse a .idx file from raw bytes and return a JSON description of every
-/// section (Header, SubIndex, DocData, Blocks with decoded term entries).
+/// section (Header, TermHeaderTable, DocData, Blocks with decoded term entries).
 #[wasm_bindgen]
 pub fn parse_index(data: &[u8]) -> String {
     match parse_index_inner(data) {
@@ -30,11 +30,44 @@ fn parse_index_inner(data: &[u8]) -> Result<String, String> {
     }
 
     let mut store = PostingStore::new();
-    let (subindex, blocks, _pageskip) = IndexSerializer::decode(&mut store, data)
+    let (term_directory, term_header_blocks, blocks, _pageskip) = IndexSerializer::decode(&mut store, data)
         .map_err(|e| format!("{e:?}"))?;
+
+    // Flatten TermHeaders for display and posting-block matching
+    let term_headers: Vec<&crate::block_table::TermHeader> =
+        term_header_blocks.iter().flat_map(|b| b.headers.iter()).collect();
+
+    // Build posting_block_id → [TermHeader] map once, reused per block (O(N) not O(N×M))
+    let mut block_entry_map: std::collections::HashMap<u32, Vec<&crate::block_table::TermHeader>> =
+        std::collections::HashMap::new();
+    for e in &term_headers {
+        block_entry_map.entry(e.posting_block_id).or_default().push(e);
+    }
 
     let file_size = data.len();
     let hdr = parse_header(data);
+
+    let mut dir_ranges: Vec<(usize, usize)> = Vec::with_capacity(term_directory.len());
+    let mut block_ranges: Vec<(usize, usize, Vec<(usize, usize)>)> =
+        Vec::with_capacity(term_header_blocks.len());
+    let mut table_pos = hdr.subindex_off as usize + 4; // dir_count
+    for d in &term_directory {
+        let len = 2 + d.first_term.len() + 4;
+        dir_ranges.push((table_pos, len));
+        table_pos += len;
+    }
+    table_pos += 4; // block_count
+    for block in &term_header_blocks {
+        let block_start = table_pos;
+        table_pos += 4; // entry_count
+        let mut header_ranges = Vec::with_capacity(block.headers.len());
+        for header in &block.headers {
+            let len = 2 + header.term.len() + 28;
+            header_ranges.push((table_pos, len));
+            table_pos += len;
+        }
+        block_ranges.push((block_start, table_pos - block_start, header_ranges));
+    }
 
     let mut out = String::from("{");
 
@@ -48,17 +81,44 @@ fn parse_index_inner(data: &[u8]) -> Result<String, String> {
         hdr.blocks_off, hdr.num_blocks, file_size
     ));
 
-    // SubIndex
-    out.push_str(r#""subindex":["#);
-    for (i, e) in subindex.iter().enumerate() {
+    // TermHeaderTable — show two-level structure
+    out.push_str(r#""term_header_table":{"dir":["#);
+    for (i, d) in term_directory.iter().enumerate() {
         if i > 0 { out.push(','); }
+        let (byte_offset, byte_len) = dir_ranges[i];
+        let block_id = d.term_header_block_id as usize;
+        let (block_offset, block_len) = block_ranges
+            .get(block_id)
+            .map(|(offset, len, _)| (*offset, *len))
+            .unwrap_or((0, 0));
         out.push_str(&format!(
-            r#"{{"term":{},"block_seq":{}}}"#,
-            serde_json::to_string(&e.term).unwrap_or_default(),
-            e.block_seq
+            r#"{{"first_term":{},"term_header_block_id":{},"byte_offset":{},"byte_len":{},"header_block_offset":{},"header_block_len":{}}}"#,
+            serde_json::to_string(&d.first_term).unwrap_or_default(),
+            d.term_header_block_id,
+            byte_offset, byte_len, block_offset, block_len
         ));
     }
-    out.push_str("],");
+    out.push_str(r#"],"blocks":["#);
+    for (i, block) in term_header_blocks.iter().enumerate() {
+        if i > 0 { out.push(','); }
+        let (block_offset, block_len, header_ranges) = &block_ranges[i];
+        out.push_str(&format!(
+            r#"{{"id":{},"byte_offset":{},"byte_len":{},"headers":["#,
+            i, block_offset, block_len));
+        for (j, e) in block.headers.iter().enumerate() {
+            if j > 0 { out.push(','); }
+            let (byte_offset, byte_len) = header_ranges[j];
+            out.push_str(&format!(
+                r#"{{"term":{},"doc_freq":{},"posting_block_id":{},"posting_offset":{},"posting_length":{},"skip_list_offset":{},"continuation_block_count":{},"flags":{},"byte_offset":{},"byte_len":{}}}"#,
+                serde_json::to_string(&e.term).unwrap_or_default(),
+                e.doc_freq, e.posting_block_id, e.posting_offset, e.posting_length,
+                e.skip_list_offset, e.continuation_block_count, e.flags,
+                byte_offset, byte_len
+            ));
+        }
+        out.push_str("]}");
+    }
+    out.push_str("]},");
 
     // DocData
     out.push_str(r#""docdata":["#);
@@ -80,8 +140,7 @@ fn parse_index_inner(data: &[u8]) -> Result<String, String> {
         if i > 0 { out.push(','); }
         let seq      = (blk.ib_header & !IB_HEADER_HAS_MORE) as u32;
         let has_more = (blk.ib_header & IB_HEADER_HAS_MORE) != 0;
-        let is_cont  = blk.ib_data.len() >= 2
-            && u16::from_le_bytes([blk.ib_data[0], blk.ib_data[1]]) == CONT_MARKER;
+        let is_cont  = blk.is_continuation();
 
         out.push_str(&format!(
             r#"{{"seq":{},"has_more":{},"is_continuation":{},"byte_off":{},"terms":["#,
@@ -89,13 +148,12 @@ fn parse_index_inner(data: &[u8]) -> Result<String, String> {
             hdr.blocks_off as usize + i * PAGE_SIZE
         ));
 
-        // For mixed cont blocks, decode_block_terms handles scanning from correct offset
-        if true {
-            let terms = decode_block_terms(blk, is_cont, &store, &docs);
-            for (j, t) in terms.iter().enumerate() {
-                if j > 0 { out.push(','); }
-                out.push_str(t);
-            }
+        let terms = decode_block_terms_from_headers(
+            blk,
+            block_entry_map.get(&seq).map(|v| v.as_slice()).unwrap_or(&[]));
+        for (j, t) in terms.iter().enumerate() {
+            if j > 0 { out.push(','); }
+            out.push_str(t);
         }
         out.push_str("]}");
     }
@@ -104,53 +162,64 @@ fn parse_index_inner(data: &[u8]) -> Result<String, String> {
     Ok(out)
 }
 
-fn decode_block_terms(
-    blk:    &crate::block_table::IndexBlock,
-    is_cont: bool,
-    _store: &PostingStore,
-    _docs:  &[(&u64, &crate::posting_store::DocStats)],
+/// Decode terms in a block using TermHeader records (blocks no longer store key headers).
+/// For continuation blocks: the ib_data starts with CONT_MARKER + cont_len + cont_bytes.
+/// For term-start blocks: entries are raw posting bytes located by TermHeader posting offsets.
+fn decode_block_terms_from_headers(
+    blk:      &crate::block_table::IndexBlock,
+    entries:  &[&crate::block_table::TermHeader],
 ) -> Vec<String> {
     let data = &blk.ib_data;
     let len  = data.len();
     let mut terms = Vec::new();
-    // For mixed continuation blocks: skip CONT_MARKER(2) + cont_len(2) + cont_len bytes
-    let mut ptr = if is_cont && len >= 4 {
-        let cont_len = u16::from_le_bytes([data[2], data[3]]) as usize;
-        (4 + cont_len).min(len)
-    } else { 0usize };
 
-    while ptr + 2 <= len {
-        let key_len = u16::from_le_bytes([data[ptr], data[ptr+1]]) as usize;
-        ptr += 2;
-        if key_len == 0 || key_len == CONT_MARKER as usize { break; }
-        if ptr + key_len + 8 > len { break; }
-
-        let key = match std::str::from_utf8(&data[ptr..ptr+key_len]) {
-            Ok(s) => s.to_string(), Err(_) => { ptr += key_len + 8; continue; }
-        };
-        ptr += key_len;
-        let doc_freq = u32::from_le_bytes([data[ptr],data[ptr+1],data[ptr+2],data[ptr+3]]);
-        let data_len = u32::from_le_bytes([data[ptr+4],data[ptr+5],data[ptr+6],data[ptr+7]]) as usize;
-        ptr += 8;
-
-        let dend = (ptr + data_len).min(len);
-        let postings = decode_postings(&data[ptr..dend]);
+    for e in entries {
+        let start = e.posting_offset as usize;
+        let end   = (start + e.posting_length as usize).min(len);
+        if start >= len { continue; }
+        let postings = decode_postings(&data[start..end]);
+        let shown = postings.len().min(5);  // cap at 5 to keep JSON small
 
         let mut entry = format!(
-            r#"{{"key":{},"freq":{},"data_len":{},"data_off":{},"postings":["#,
-            serde_json::to_string(&key).unwrap_or_default(),
-            doc_freq, data_len, ptr
+            r#"{{"key":{},"freq":{},"data_len":{},"data_off":{},"continuation_block_count":{},"postings":["#,
+            serde_json::to_string(&e.term).unwrap_or_default(),
+            e.doc_freq, e.posting_length, e.posting_offset, e.continuation_block_count
         );
-        for (j, (doc_id, tf)) in postings.iter().enumerate() {
+        for (j, (doc_id, tf)) in postings[..shown].iter().enumerate() {
             if j > 0 { entry.push(','); }
             entry.push_str(&format!(r#"{{"doc_id":"{}","tf":{}}}"#, doc_id, tf));
         }
+        if postings.len() > shown {
+            if shown > 0 { entry.push(','); }
+            entry.push_str(&format!(r#"{{"doc_id":"…","tf":"({} more)"}}"#,
+                postings.len() - shown));
+        }
         entry.push_str("]}");
         terms.push(entry);
-
-        if ptr + data_len > len { break; }
-        ptr += data_len;
     }
+
+    // If this is a continuation block, also show the cont section summary
+    if blk.is_continuation() && len >= 4 {
+        let cont_len = u16::from_le_bytes([data[2], data[3]]) as usize;
+        let postings = decode_postings(&data[4..((4 + cont_len).min(len))]);
+        let shown = postings.len().min(5);
+        let mut entry = format!(
+            r#"{{"key":"[continuation]","freq":0,"data_len":{},"data_off":4,"postings":["#,
+            cont_len
+        );
+        for (j, (doc_id, tf)) in postings[..shown].iter().enumerate() {
+            if j > 0 { entry.push(','); }
+            entry.push_str(&format!(r#"{{"doc_id":"{}","tf":{}}}"#, doc_id, tf));
+        }
+        if postings.len() > shown {
+            if shown > 0 { entry.push(','); }
+            entry.push_str(&format!(r#"{{"doc_id":"…","tf":"({} more)"}}"#,
+                postings.len() - shown));
+        }
+        entry.push_str("]}");
+        terms.insert(0, entry);
+    }
+
     terms
 }
 

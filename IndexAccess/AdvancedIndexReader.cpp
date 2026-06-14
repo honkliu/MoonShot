@@ -10,27 +10,31 @@ void AdvancedIndexReader::Open(const char*      streamKey,
     std::strcpy(m_Word, streamKey);
 
     m_BlockTable      = blockTable;
-    m_DocFreq         = docFreq;
+    m_DocFreq         = docFreq;   // fallback; overwritten below if term found
     m_PageSkipOffset  = 0;
     m_InitialBlockSeq = 0;
 
-    uint32_t block_seq = 0, offset = 0, data_len = 0, freq = 0;
-    bool is_last = false;
-    uint32_t pso = 0;
+    uint32_t posting_block_id = 0, offset = 0, posting_length = 0, freq = 0;
+    uint32_t continuation_block_count = 0;
+    uint32_t skip_list_offset = 0;
 
     bool found = m_BlockTable->FindTermData(streamKey,
-                                            &block_seq, &offset,
-                                            &data_len,  &freq,
-                                            &is_last,   &pso);
+                                            &posting_block_id, &offset,
+                                            &posting_length,   &freq,
+                                            &continuation_block_count,
+                                            &skip_list_offset);
     if (found) {
-        IndexBlock* block = m_BlockTable->GetIndexBlock(block_seq, 1);
+        /* Use doc_freq from TermHeader — correct after Load(), unlike PostingStore */
+        m_DocFreq = freq;
+
+        IndexBlock* block = m_BlockTable->GetIndexBlock(posting_block_id, 1);
         if (block) {
-            m_BlockSeqNumber  = block_seq;
-            m_InitialBlockSeq = block_seq;
-            m_PageSkipOffset  = pso;
-            m_HasMore         = is_last && (block->IB_Header & IB_HEADER_HAS_MORE);
+            m_BlockSeqNumber  = posting_block_id;
+            m_InitialBlockSeq = posting_block_id;
+            m_PageSkipOffset  = skip_list_offset;
+            m_HasMore         = continuation_block_count > 0;
             m_IndexBlock      = std::shared_ptr<IndexBlock>(block, [](IndexBlock*){});
-            m_Decoder.OpenRaw(block->IB_Data + offset, data_len, 0);
+            m_Decoder.OpenRaw(block->IB_Data + offset, posting_length, 0);
         }
     }
 

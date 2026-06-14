@@ -52,7 +52,7 @@ impl IndexContext {
     // ── Build (in-memory) ────────────────────────────────────────────────────
 
     /// Pack PostingStore entries into multi-term IndexBlocks (sorted alphabetically)
-    /// and populate the SubIndex.  Called lazily on first search.
+    /// and populate the TermHeaderTable. Called lazily on first search.
     pub fn build(&mut self) {
         if self.built { return; }
 
@@ -61,14 +61,14 @@ impl IndexContext {
         let table = Arc::get_mut(&mut self.block_table)
             .expect("BlockTable must have no other refs during build");
 
-        let (blocks, subindex, pageskip) = IndexSerializer::build_blocks_pub(&store);
+        let (blocks, term_directory, term_header_blocks, pageskip) = IndexSerializer::build_blocks_pub(&store);
         let n = blocks.len();
         *table = IndexBlockTable::new(n.max(512) + 64);
 
         for (seq, blk) in blocks.into_iter().enumerate() {
             table.insert_block(seq as u32, blk);
         }
-        table.set_subindex(subindex);
+        table.set_term_header_table(term_directory, term_header_blocks);
         table.set_page_skip_data(pageskip);
 
         self.built = true;
@@ -118,12 +118,12 @@ impl IndexContext {
     pub fn load_index(&mut self, path: &str) -> Result<()> {
         self.index_path = Some(path.to_string());
         let mut store = PostingStore::new();
-        let (subindex, blocks, pageskip) = IndexSerializer::load(&mut store, path)?;
+        let (term_directory, term_header_blocks, blocks, pageskip) = IndexSerializer::load(&mut store, path)?;
         let mut table = IndexBlockTable::new(blocks.len().max(512) + 64);
         for (seq, blk) in blocks.into_iter().enumerate() {
             table.insert_block(seq as u32, blk);
         }
-        table.set_subindex(subindex);
+        table.set_term_header_table(term_directory, term_header_blocks);
         table.set_page_skip_data(pageskip);
 
         self.store       = Arc::new(Mutex::new(store));
@@ -135,12 +135,12 @@ impl IndexContext {
     /// Load from raw bytes (WASM path — no file system access needed).
     pub fn load_from_bytes(&mut self, data: &[u8]) -> Result<()> {
         let mut store = PostingStore::new();
-        let (subindex, blocks, pageskip) = IndexSerializer::decode(&mut store, data)?;
+        let (term_directory, term_header_blocks, blocks, pageskip) = IndexSerializer::decode(&mut store, data)?;
         let mut table = IndexBlockTable::new(blocks.len().max(512) + 64);
         for (seq, blk) in blocks.into_iter().enumerate() {
             table.insert_block(seq as u32, blk);
         }
-        table.set_subindex(subindex);
+        table.set_term_header_table(term_directory, term_header_blocks);
         table.set_page_skip_data(pageskip);
 
         self.store       = Arc::new(Mutex::new(store));

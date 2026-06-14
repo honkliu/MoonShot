@@ -31,11 +31,13 @@ impl AdvancedIndexReader {
         };
 
         if let Some((loc, block)) = reader.block_table.find_term_data(stream_key) {
-            reader.block_seq         = loc.block_seq;
-            reader.initial_block_seq = loc.block_seq;
-            reader.has_more          = loc.is_last_entry && block.has_more();
-            reader.page_skip_offset  = loc.page_skip_offset;
-            reader.decoder.open_raw(block, loc.data_offset, loc.data_len, 0);
+            reader.block_seq         = loc.posting_block_id;
+            reader.initial_block_seq = loc.posting_block_id;
+            reader.has_more          = loc.continuation_block_count > 0;
+            reader.page_skip_offset  = loc.skip_list_offset;
+            /* Use doc_freq from TermHeader — correct after load(), PostingStore has none */
+            reader.doc_freq          = loc.doc_freq;
+            reader.decoder.open_raw(block, loc.posting_offset, loc.posting_length, 0);
         }
 
         reader.go_next();

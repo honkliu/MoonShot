@@ -51,6 +51,7 @@ public:
         , m_Executor(m_Store)
         , m_IndexPath(indexFile ? indexFile : "")
         , m_Built(false)
+        , m_LoadedFromDisk(false)
     {
         if (!m_IndexPath.empty())
             LoadIndex();
@@ -58,6 +59,13 @@ public:
 
     shared_ptr<IndexWriter> GetWriter()
     {
+        if (m_LoadedFromDisk) {
+            m_Store = make_shared<PostingStore>();
+            m_BlockTable.Reset(512);
+            m_Executor = IndexSearchExecutor(m_Store);
+            m_Built = false;
+            m_LoadedFromDisk = false;
+        }
         return make_shared<AdvancedIndexWriter>(m_Store);
     }
 
@@ -77,10 +85,12 @@ public:
         for (size_t i = 0; i < n; ++i)
             m_BlockTable.InsertBlock(static_cast<uint32_t>(i), &br.blocks[i]);
 
-        m_BlockTable.SetSubIndex(std::move(br.subindex));
+        m_BlockTable.SetTermHeaderTable(std::move(br.term_directory),
+                        std::move(br.term_header_blocks));
         m_BlockTable.SetPageSkipData(std::move(br.pageskip));
 
         m_Built = true;
+        m_LoadedFromDisk = false;
     }
 
     /*
@@ -100,7 +110,7 @@ public:
 
     Tokenizer*           GetTokenizer() { return &m_Tokenizer; }
     IndexSearchCompiler* GetCompiler()  { return &m_Compiler; }
-    IndexSearchExecutor* GetExecutor()  { return &m_Executor; }
+    IndexSearchExecutor* GetExecutor()  { return new IndexSearchExecutor(m_Store); }
 
     /* Compile query string and return an ISR tree ready for traversal. */
     shared_ptr<IndexReader> GetReader(const char* queryString,
@@ -137,10 +147,9 @@ public:
         if (!IndexSerializer::Save(*m_Store, path)) return false;
 
         // Wire up FileBlockManager so cache misses reload from the .idx file.
-        std::vector<SubIndexEntry> dummy_si;
         uint64_t blocks_offset = 0;
         PostingStore tmp;
-        IndexSerializer::Load(tmp, path, &dummy_si, &blocks_offset);
+        IndexSerializer::Load(tmp, path, nullptr, nullptr, &blocks_offset);
 
         auto fm = make_shared<FileBlockManager>(sizeof(IndexBlock), blocks_offset);
         if (fm->open(path))
@@ -154,15 +163,18 @@ public:
         if (m_IndexPath.empty()) return;
 
         m_Store = make_shared<PostingStore>();
-        std::vector<SubIndexEntry> subindex;
-        std::vector<uint64_t>      pageskip;
+        std::vector<TermDirectoryEntry>          term_directory;
+        std::vector<TermHeaderBlock>             term_header_blocks;
+        std::vector<uint64_t>                    pageskip;
         uint64_t blocks_offset = 0;
 
         if (!IndexSerializer::Load(*m_Store, m_IndexPath.c_str(),
-                                   &subindex, &blocks_offset, &pageskip))
+                                   &term_directory, &term_header_blocks,
+                                   &blocks_offset, &pageskip))
             return;
 
-        m_BlockTable.SetSubIndex(std::move(subindex));
+        m_BlockTable.SetTermHeaderTable(std::move(term_directory),
+                                        std::move(term_header_blocks));
         m_BlockTable.SetPageSkipData(std::move(pageskip));
 
         auto fm = make_shared<FileBlockManager>(sizeof(IndexBlock), blocks_offset);
@@ -171,6 +183,7 @@ public:
 
         m_Executor = IndexSearchExecutor(m_Store);
         m_Built    = true;
+        m_LoadedFromDisk = true;
     }
 
     void LoadIndex(const char* path)
@@ -189,6 +202,7 @@ private:
     IndexSearchExecutor          m_Executor;
     std::string                  m_IndexPath;
     bool                         m_Built;
+    bool                         m_LoadedFromDisk;
 
     void EnsureBuilt()
     {

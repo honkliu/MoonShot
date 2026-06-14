@@ -96,6 +96,16 @@ tr:hover td { background:#2a2d2e; cursor:pointer; }
              gap:6px; cursor:pointer; font-size:12px; }
 .bcard-body { display:none; }
 .bcard.open .bcard-body { display:block; }
+.term-explorer { height:calc(100vh - 94px); overflow:auto; min-height:0; }
+.term-toolbar { padding:5px 8px; font-size:11px; color:#888; background:#252526; border-bottom:1px solid #3e3e42; }
+.icon-btn { width:18px; height:18px; padding:0; border:1px solid #555; border-radius:2px;
+            background:#2d2d30; color:#ccc; cursor:pointer; font:12px 'Cascadia Code','Consolas',monospace; }
+.icon-btn:hover { background:#094771; color:#fff; border-color:#007acc; }
+.tree-row.active td { background:#094771; }
+.tree-row .indent { display:inline-block; width:18px; }
+.tree-kind { color:#888; font-size:11px; }
+.term-jump { color:#9cdcfe; text-decoration:underline; cursor:pointer; }
+.term-empty { padding:12px; color:#777; font-size:12px; }
 .posting   { color:#4ec9b0; font-size:11px; padding:1px 4px; }
 .sres      { padding:4px 8px; border-bottom:1px solid #2a2a2a; display:flex; gap:12px; align-items:baseline; }
 .sres .score { color:#b5cea8; min-width:55px; font-size:11px; }
@@ -143,10 +153,10 @@ tr:hover td { background:#2a2d2e; cursor:pointer; }
   </div>
   <div id="right">
     <div id="dec-tabs">
-      <div class="dtab active" data-p="hdr-panel"  onclick="switchTab(this)">Header</div>
-      <div class="dtab"        data-p="si-panel"   onclick="switchTab(this)">SubIndex</div>
+      <div class="dtab active" data-p="hdr-panel"  onclick="switchTab(this)">File Header</div>
+      <div class="dtab"        data-p="si-panel"   onclick="switchTab(this)">Term Directory</div>
       <div class="dtab"        data-p="dd-panel"   onclick="switchTab(this)">DocData</div>
-      <div class="dtab"        data-p="blk-panel"  onclick="switchTab(this)">Blocks</div>
+      <div class="dtab"        data-p="blk-panel"  onclick="switchTab(this)">Posting Blocks</div>
       <div class="dtab"        data-p="srch-panel" onclick="switchTab(this)">Search</div>
     </div>
     <div id="dec-body">
@@ -241,11 +251,14 @@ function loadData(bytes, name) {
   try {
     G.parsed = JSON.parse(window._wasm.parse_index(G.bytes));
     if (G.parsed.error) { setStatus('Error: '+G.parsed.error); return; }
+    G.termHeaderBlocksById = new Map((G.parsed.term_header_table?.blocks || []).map(b => [b.id, b]));
+    G_ExpandedTree = new Set();
+    G_SelectedTreeNode = '';
     document.getElementById('drop').style.display = 'none';
     document.getElementById('main').style.display = 'flex';
     buildHex();
-    renderHeader(); renderSubIndex(); renderDocData(); renderBlocks();
-    setStatus(G.parsed.header.num_docs + ' docs · ' + G.parsed.header.num_terms + ' terms · ' + G.parsed.blocks.length + ' blocks');
+    renderHeader(); renderTermHeaders(); renderDocData(); renderBlocks();
+    setStatus(G.parsed.header.num_docs + ' docs · ' + G.parsed.header.num_terms + ' terms · ' + G.parsed.blocks.length + ' posting blocks');
   } catch(ex) { setStatus('Error: '+ex); console.error(ex); }
 }
 
@@ -267,6 +280,8 @@ const HEX_BUF  = 50;   // extra rows rendered above/below viewport
 const HEX_CLS  = ['','s-hdr','s-si','s-dd','s-b0','s-b1','s-b2','s-b3'];
 
 let G_HL = { s:-1, e:-1 };   // current highlight range (replaces spanByOff)
+let G_ExpandedTree = new Set();
+let G_SelectedTreeNode = '';
 
 function buildHex() {
   const data = G.bytes;
@@ -355,6 +370,8 @@ function gotoRange(start, end) {
   renderVP(Math.floor(body.scrollTop / HEX_RH));
 }
 window.gotoRange = gotoRange;
+window.selectTreeNode = selectTreeNode;
+window.toggleTreeNode = toggleTreeNode;
 
 function gotoBlock(seq) {
   const h = G.parsed.header;
@@ -382,10 +399,11 @@ function renderHeader() {
     ['Version',      h.version,                                        8,  4 ],
     ['Num docs',     h.num_docs,                                      16,  8 ],
     ['Num terms',    h.num_terms,                                     24,  8 ],
-    ['SubIndex off', `0x${h.subindex_off.toString(16)} (${h.subindex_size} B)`, 32, 16],
-    ['DocData off',  `0x${h.docdata_off.toString(16)}  (${h.docdata_size} B)`,  48, 16],
-    ['Blocks off',   `0x${h.blocks_off.toString(16)}`,                64,  8 ],
-    ['Num blocks',   h.num_blocks,                                    72,  8 ],
+    ['TermHeaderTable off', `0x${h.subindex_off.toString(16)} (${h.subindex_size} B)`, 32, 16],
+    ['PageSkip off', `0x${h.pageskip_off.toString(16)} (${h.pageskip_size} B)`, 48, 16],
+    ['DocData off',  `0x${h.docdata_off.toString(16)}  (${h.docdata_size} B)`,  64, 16],
+    ['PostingBlocks off', `0x${h.blocks_off.toString(16)}`,           80,  8 ],
+    ['Num posting blocks', h.num_blocks,                              88,  8 ],
     ['File size',    h.file_size+' B',                                -1, -1 ],
   ];
   let html = '<table><tr><th>Field</th><th>Value</th><th>Offset</th></tr>';
@@ -397,14 +415,162 @@ function renderHeader() {
   document.getElementById('hdr-panel').innerHTML = html+'</table>';
 }
 
-function renderSubIndex() {
+function renderTermHeaders() {
+  const si = G.parsed.term_header_table;
   const h = G.parsed.header;
-  let html = '<table><tr><th>#</th><th>Block</th><th>Lead term</th></tr>';
-  for (const [i,e] of G.parsed.subindex.entries())
-    html += `<tr onclick="gotoBlock(${e.block_seq})">` +
-            `<td class="num">${i}</td><td class="num">${e.block_seq}</td>` +
-            `<td class="key mono">${esc(e.term)}</td></tr>`;
-  document.getElementById('si-panel').innerHTML = html+'</table>';
+
+  let html = '<div class="term-explorer">';
+  html += `<div class="term-toolbar">`
+       + `TermHeaderTable @ 0x${h.subindex_off.toString(16)} (${h.subindex_size} bytes). `
+       + `Use + to expand physical layout nodes; click any row to highlight its on-disk bytes.</div>`;
+  html += '<table><tr><th></th><th>Object</th><th>Disk bytes</th><th>Target / fields</th><th>Posting</th></tr>';
+  html += renderTreeRoot(h, si);
+  html += '</table></div>';
+  document.getElementById('si-panel').innerHTML = html;
+}
+
+function renderTreeRoot(h, si) {
+  const node = 'table';
+  const expanded = G_ExpandedTree.has(node);
+  const active = G_SelectedTreeNode === node ? ' active' : '';
+  let html = `<tr class="tree-row${active}" onclick="selectTreeNode('${node}',${h.subindex_off},${h.subindex_off + h.subindex_size})">`
+       + `<td><button type="button" class="icon-btn" onclick="event.stopPropagation();toggleTreeNode('${node}')">${expanded ? '-' : '+'}</button></td>`
+       + `<td><span class="tree-kind">section</span> <span class="key mono">TermHeaderTable</span></td>`
+       + `<td class="num">0x${h.subindex_off.toString(16)} +${h.subindex_size}</td>`
+       + `<td>${si.dir.length} DirectoryEntry rows, ${(si.blocks || []).length} TermHeaderBlocks</td>`
+       + `<td></td></tr>`;
+
+  if (expanded) {
+    for (const d of si.dir) html += renderDirectoryEntry(d);
+  }
+  return html;
+}
+
+function renderDirectoryEntry(d) {
+  const node = `dir:${d.term_header_block_id}`;
+  const expanded = G_ExpandedTree.has(node);
+  const active = G_SelectedTreeNode === node ? ' active' : '';
+  let html = `<tr class="tree-row${active}" onclick="selectTreeNode('${node}',${d.byte_offset},${d.byte_offset + d.byte_len})">`
+       + `<td><span class="indent"></span><button type="button" class="icon-btn" onclick="event.stopPropagation();toggleTreeNode('${node}')">${expanded ? '-' : '+'}</button></td>`
+       + `<td><span class="tree-kind">DirectoryEntry</span> <span class="key mono">${esc(d.first_term)}</span></td>`
+       + `<td class="num">0x${d.byte_offset.toString(16)} +${d.byte_len}</td>`
+       + `<td>points to TermHeaderBlock[${d.term_header_block_id}] @ 0x${d.header_block_offset.toString(16)} +${d.header_block_len}</td>`
+       + `<td></td></tr>`;
+
+  if (expanded) html += renderHeaderBlock(d.term_header_block_id, 2);
+  return html;
+}
+
+function renderHeaderBlock(block_idx, depth) {
+  const block = G.termHeaderBlocksById?.get(block_idx);
+  if (!block) return '';
+  const node = `thb:${block_idx}`;
+  const expanded = G_ExpandedTree.has(node);
+  const active = G_SelectedTreeNode === node ? ' active' : '';
+  const indent = '<span class="indent"></span>'.repeat(depth);
+  let html = `<tr class="tree-row${active}" onclick="selectTreeNode('${node}',${block.byte_offset},${block.byte_offset + block.byte_len})">`
+       + `<td>${indent}<button type="button" class="icon-btn" onclick="event.stopPropagation();toggleTreeNode('${node}')">${expanded ? '-' : '+'}</button></td>`
+       + `<td><span class="tree-kind">TermHeaderBlock</span> <span class="num">${block_idx}</span></td>`
+       + `<td class="num">0x${block.byte_offset.toString(16)} +${block.byte_len}</td>`
+       + `<td>${block.headers.length} TermHeader records</td>`
+       + `<td></td></tr>`;
+
+  if (expanded) {
+    for (let i=0; i<block.headers.length; i++) html += renderTermHeader(block_idx, i, block.headers[i], depth + 1);
+  }
+  return html;
+}
+
+function renderTermHeader(block_idx, header_idx, e, depth) {
+  const h = G.parsed.header;
+  const node = `term:${block_idx}:${header_idx}`;
+  const active = G_SelectedTreeNode === node ? ' active' : '';
+  const postingStart = h.blocks_off + e.posting_block_id * 4096 + 208 + e.posting_offset;
+  const postingEnd = postingStart + e.posting_length;
+  const indent = '<span class="indent"></span>'.repeat(depth);
+  return `<tr class="tree-row${active}" onclick="selectTreeNode('${node}',${e.byte_offset},${e.byte_offset + e.byte_len})">`
+       + `<td>${indent}<button type="button" class="icon-btn" title="Toggle posting detail" onclick="event.stopPropagation();toggleTreeNode('${node}')">${G_ExpandedTree.has(node) ? '-' : '+'}</button></td>`
+       + `<td><span class="tree-kind">TermHeader</span> <span class="key mono">${esc(e.term)}</span></td>`
+       + `<td class="num">0x${e.byte_offset.toString(16)} +${e.byte_len}</td>`
+       + `<td>df=<span class="num">${e.doc_freq}</span> skip=<span class="num">${e.skip_list_offset}</span> cont=<span class="num">${e.continuation_block_count}</span> flags=<span class="num">${e.flags}</span></td>`
+       + `<td>PostingBlock[${e.posting_block_id}] 0x${postingStart.toString(16)} +${e.posting_length}</td></tr>`
+       + (G_ExpandedTree.has(node) ? renderPostingInline(node, e, depth + 1, postingStart, postingEnd) : '');
+}
+
+function renderPostingInline(node, e, depth, postingStart, postingEnd) {
+  const indent = '<span class="indent"></span>'.repeat(depth);
+  const block = (G.parsed.blocks || []).find(b => b.seq === e.posting_block_id);
+  const term = block ? (block.terms || []).find(t => t.key === e.term && t.data_off === e.posting_offset) : null;
+  let posts = '';
+  if (term && term.postings && term.postings.length) {
+    posts = term.postings.map(p => {
+      const fp = G.pathOf(p.doc_id);
+      return `<div class="posting">doc=${p.doc_id} tf=${p.tf}${fp?' <span class="path">'+esc(fp)+'</span>':''}</div>`;
+    }).join('');
+  } else {
+    posts = '<div class="posting" style="color:#888">No decoded sample postings in parser output.</div>';
+  }
+  return `<tr class="tree-row${G_SelectedTreeNode === node + ':posting' ? ' active' : ''}" onclick="selectTreeNode('${node}:posting',${postingStart},${postingEnd})">`
+       + `<td>${indent}</td>`
+       + `<td><span class="tree-kind">Posting bytes</span> <span class="key mono">${esc(e.term)}</span></td>`
+       + `<td class="num">0x${postingStart.toString(16)} +${e.posting_length}</td>`
+       + `<td>PostingBlock[${e.posting_block_id}] offset=<span class="num">${e.posting_offset}</span> length=<span class="num">${e.posting_length}</span></td>`
+       + `<td>${posts}</td></tr>`;
+}
+
+function selectTreeNode(node, start, end) {
+  G_SelectedTreeNode = node;
+  gotoRange(start, end);
+  document.querySelectorAll('.tree-row').forEach(r => r.classList.remove('active'));
+  renderTermHeadersPreserveScroll();
+}
+
+function toggleTreeNode(node) {
+  const panel = document.getElementById('si-panel');
+  const scrollTop = panel ? panel.scrollTop : 0;
+  if (G_ExpandedTree.has(node)) {
+    collapseTreeSubtree(node);
+  } else {
+    G_ExpandedTree.add(node);
+  }
+  renderTermHeaders();
+  if (panel) panel.scrollTop = scrollTop;
+}
+
+function collapseTreeSubtree(node) {
+  G_ExpandedTree.delete(node);
+
+  if (node === 'table') {
+    G_ExpandedTree.clear();
+    G_SelectedTreeNode = '';
+  } else if (node.startsWith('dir:')) {
+    const blockId = node.slice(4);
+    for (const key of Array.from(G_ExpandedTree)) {
+      if (key === `thb:${blockId}` || key.startsWith(`term:${blockId}:`))
+        G_ExpandedTree.delete(key);
+    }
+    if (G_SelectedTreeNode === `thb:${blockId}` || G_SelectedTreeNode.startsWith(`term:${blockId}:`))
+      G_SelectedTreeNode = '';
+  } else if (node.startsWith('thb:')) {
+    const blockId = node.slice(4);
+    for (const key of Array.from(G_ExpandedTree)) {
+      if (key.startsWith(`term:${blockId}:`))
+        G_ExpandedTree.delete(key);
+    }
+    if (G_SelectedTreeNode.startsWith(`term:${blockId}:`))
+      G_SelectedTreeNode = '';
+  }
+
+  if (G_SelectedTreeNode === node || G_SelectedTreeNode.startsWith(node + ':'))
+    G_SelectedTreeNode = '';
+}
+
+function renderTermHeadersPreserveScroll() {
+  const panel = document.getElementById('si-panel');
+  const scrollTop = panel ? panel.scrollTop : 0;
+  renderTermHeaders();
+  const next = document.getElementById('si-panel');
+  if (next) next.scrollTop = scrollTop;
 }
 
 function renderDocData() {
@@ -434,7 +600,7 @@ function renderBlocks() {
 
     html += `<div class="bcard" id="bc${blk.seq}">` +
             `<div class="bcard-hdr" onclick="toggleBlock(${blk.seq})">` +
-            `<span class="key">Block</span> <span class="num">${blk.seq}</span>${badges}` +
+            `<span class="key">PostingBlock</span> <span class="num">${blk.seq}</span>${badges}` +
             `<span style="color:#555;font-size:11px;margin-left:auto">` +
             `0x${blkOff.toString(16)}</span></div>` +
             `<div class="bcard-body" id="bb${blk.seq}">`;
@@ -444,7 +610,7 @@ function renderBlocks() {
         html += `<div style="color:#5c8a3a;padding:4px 8px;font-size:11px">↳ continuation data + new terms below</div>`;
       html += '<table><tr><th>Term</th><th>freq</th><th>Postings</th></tr>';
       for (const t of blk.terms) {
-        const termStart = blkOff + 208 + t.data_off - t.key.length - 10;
+        const termStart = blkOff + 208 + t.data_off;
         const termEnd   = blkOff + 208 + t.data_off + t.data_len;
         let posts='';
         for (const p of t.postings) {
@@ -454,7 +620,7 @@ function renderBlocks() {
         html += `<tr class="term-entry" data-term="${esc(t.key)}"` +
                 ` onclick="gotoRange(${termStart},${termEnd})">` +
                 `<td class="key mono">${esc(t.key)}` +
-                `${t.is_last_entry&&blk.has_more?'<span class="badge badge-more">→cont</span>':''}</td>` +
+                `${t.continuation_block_count>0?'<span class="badge badge-more">→cont</span>':''}</td>` +
                 `<td class="num">${t.freq}</td><td>${posts}</td></tr>`;
       }
       html += '</table>';
@@ -494,12 +660,17 @@ function switchTab(el) {
   document.querySelectorAll('.panel').forEach(p=>p.classList.remove('active'));
   el.classList.add('active');
   document.getElementById(el.dataset.p).classList.add('active');
+  if (el.dataset.p === 'si-panel' && G.parsed) {
+    const h = G.parsed.header;
+    gotoRange(h.subindex_off, h.subindex_off + h.subindex_size);
+  }
 }
 function switchTabByName(id) {
   document.querySelectorAll('.dtab').forEach(t=>t.classList.toggle('active',t.dataset.p===id));
   document.querySelectorAll('.panel').forEach(p=>p.classList.toggle('active',p.id===id));
 }
 window.switchTab=switchTab;
+window.switchTabByName=switchTabByName;
 
 function setStatus(s){ document.getElementById('status').textContent=s; }
 
