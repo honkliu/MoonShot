@@ -312,7 +312,8 @@ bool IndexSerializer::Load(PostingStore&                           store,
                            std::vector<TermDirectoryEntry>*        dir_out,
                            std::vector<TermHeaderBlock>*           blocks_out,
                            uint64_t*                              blocks_offset_out,
-                           std::vector<uint64_t>*                 pageskip_out)
+                           std::vector<uint64_t>*                 pageskip_out,
+                           uint64_t*                              num_blocks_out)
 {
     if (!path || !*path) return false;
     FILE* f = fopen(path, "rb");
@@ -396,6 +397,7 @@ bool IndexSerializer::Load(PostingStore&                           store,
     }
 
     if (blocks_offset_out) *blocks_offset_out = hdr.blocks_off;
+    if (num_blocks_out)    *num_blocks_out    = hdr.num_blocks;
 
     /* ── DocData ──────────────────────────────────────────────────────────*/
     {

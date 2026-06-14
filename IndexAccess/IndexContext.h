@@ -16,6 +16,7 @@
 #include <memory>
 #include <string>
 #include <algorithm>
+#include <cstdint>
 
 #include <cstdio>
 
@@ -61,7 +62,7 @@ public:
     {
         if (m_LoadedFromDisk) {
             m_Store = make_shared<PostingStore>();
-            m_BlockTable.Reset(512);
+            m_BlockTable.Reset(PostingBlockCacheSlots(0));
             m_Executor = IndexSearchExecutor(m_Store);
             m_Built = false;
             m_LoadedFromDisk = false;
@@ -80,7 +81,7 @@ public:
         auto br = IndexSerializer::BuildBlocksForContext(*m_Store);
 
         size_t n = br.blocks.size();
-        m_BlockTable.ResizeCache(static_cast<uint32_t>(n) + 64);
+        m_BlockTable.ResizeCache(PostingBlockCacheSlots(n));
 
         for (size_t i = 0; i < n; ++i)
             m_BlockTable.InsertBlock(static_cast<uint32_t>(i), &br.blocks[i]);
@@ -167,12 +168,15 @@ public:
         std::vector<TermHeaderBlock>             term_header_blocks;
         std::vector<uint64_t>                    pageskip;
         uint64_t blocks_offset = 0;
+        uint64_t num_blocks = 0;
 
         if (!IndexSerializer::Load(*m_Store, m_IndexPath.c_str(),
                                    &term_directory, &term_header_blocks,
-                                   &blocks_offset, &pageskip))
+                                   &blocks_offset, &pageskip, &num_blocks))
             return;
 
+        m_BlockTable.Reset(PostingBlockCacheSlots(num_blocks));
+        m_BlockTable.ReserveBlockMap(static_cast<uint32_t>(std::min<uint64_t>(num_blocks, UINT32_MAX)));
         m_BlockTable.SetTermHeaderTable(std::move(term_directory),
                                         std::move(term_header_blocks));
         m_BlockTable.SetPageSkipData(std::move(pageskip));
@@ -203,6 +207,17 @@ private:
     std::string                  m_IndexPath;
     bool                         m_Built;
     bool                         m_LoadedFromDisk;
+
+    static uint32_t PostingBlockCacheSlots(uint64_t postingBlockCount)
+    {
+        static constexpr uint64_t MIN_CACHE_BYTES = 64ull * 1024ull * 1024ull;
+        static constexpr uint64_t MAX_CACHE_BYTES = 1024ull * 1024ull * 1024ull;
+        uint64_t minSlots = MIN_CACHE_BYTES / sizeof(IndexBlock);
+        uint64_t maxSlots = MAX_CACHE_BYTES / sizeof(IndexBlock);
+        uint64_t wanted = std::max<uint64_t>(postingBlockCount, minSlots);
+        wanted = std::min<uint64_t>(wanted, maxSlots);
+        return static_cast<uint32_t>(std::max<uint64_t>(wanted, 1));
+    }
 
     void EnsureBuilt()
     {

@@ -9,7 +9,18 @@
 #include <cstring>
 #include <string>
 #include <algorithm>
-#include <unordered_map>
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#ifdef PAGE_SIZE
+#undef PAGE_SIZE
+#endif
+#else
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
 #include "FileBlockManager.h"
 #include "ElementFilter.h"
 
@@ -80,33 +91,84 @@ struct CacheSlot {
     IndexBlock  CS_Data;
 };
 
+static inline bool PinMemoryPages(void* address, size_t bytes)
+{
+    if (!address || bytes == 0) return false;
+#ifdef _WIN32
+    SIZE_T minWorkingSet = 0, maxWorkingSet = 0;
+    HANDLE process = GetCurrentProcess();
+    if (GetProcessWorkingSetSize(process, &minWorkingSet, &maxWorkingSet)) {
+        SIZE_T desired = bytes + (16ull * 1024ull * 1024ull);
+        if (maxWorkingSet < desired)
+            SetProcessWorkingSetSize(process, minWorkingSet, desired);
+    }
+    return VirtualLock(address, bytes) != 0;
+#else
+    return mlock(address, bytes) == 0;
+#endif
+}
+
+static inline void UnpinMemoryPages(void* address, size_t bytes)
+{
+    if (!address || bytes == 0) return;
+#ifdef _WIN32
+    VirtualUnlock(address, bytes);
+#else
+    munlock(address, bytes);
+#endif
+}
+
 class BlockCache {
     public:
         explicit BlockCache(uint32_t slot_count)
-            : m_Capacity(slot_count), m_CacheSlots(new CacheSlot[slot_count]), m_Hand(0) {}
-        ~BlockCache() = default;
+            : m_Capacity(std::max<uint32_t>(slot_count, 1)),
+              m_CacheSlots(new CacheSlot[std::max<uint32_t>(slot_count, 1)]),
+              m_Hand(0)
+        {
+            m_PinBytes = sizeof(CacheSlot) * static_cast<size_t>(m_Capacity);
+            m_IsPinned = PinMemoryPages(m_CacheSlots.get(), m_PinBytes);
+        }
+        ~BlockCache() { UnpinMemoryPages(m_CacheSlots.get(), m_PinBytes); }
 
         void resize(uint32_t new_capacity) {
+            new_capacity = std::max<uint32_t>(new_capacity, 1);
+            UnpinMemoryPages(m_CacheSlots.get(), m_PinBytes);
             m_Capacity    = new_capacity;
             m_CacheSlots.reset(new CacheSlot[new_capacity]);
+            m_BlockToSlot.clear();
             m_Hand = m_PendingSlot = 0;
+            m_PinBytes = sizeof(CacheSlot) * static_cast<size_t>(m_Capacity);
+            m_IsPinned = PinMemoryPages(m_CacheSlots.get(), m_PinBytes);
         }
 
         bool DataLoaded(int block_seq, void** address) {
             uint32_t seq = static_cast<uint32_t>(block_seq);
-            for (uint32_t i = 0; i < m_Capacity; ++i) {
-                ReaderSpinLock guard(m_CacheSlots[i].CS_lock);
-                if (m_CacheSlots[i].CS_Valid && m_CacheSlots[i].CS_BlockNum == seq) {
-                    m_CacheSlots[i].CS_Touched = true;
-                    *address = &m_CacheSlots[i].CS_Data;
-                    return true;
+            if (seq < m_BlockToSlot.size()) {
+                uint32_t slot = m_BlockToSlot[seq];
+                if (slot != UINT32_MAX && slot < m_Capacity) {
+                    ReaderSpinLock guard(m_CacheSlots[slot].CS_lock);
+                    if (m_CacheSlots[slot].CS_Valid && m_CacheSlots[slot].CS_BlockNum == seq) {
+                        m_CacheSlots[slot].CS_Touched = true;
+                        *address = &m_CacheSlots[slot].CS_Data;
+                        return true;
+                    }
+
+                    *address = &m_CacheSlots[slot].CS_Data;
+                    m_PendingSlot = slot;
+                    return false;
                 }
             }
+
             uint32_t victim = PickVictim();
             { WriterSpinLock guard(m_CacheSlots[victim].CS_lock);
+              uint32_t oldBlock = m_CacheSlots[victim].CS_BlockNum;
+              if (oldBlock < m_BlockToSlot.size() && m_BlockToSlot[oldBlock] == victim)
+                  m_BlockToSlot[oldBlock] = UINT32_MAX;
               m_CacheSlots[victim].CS_BlockNum = seq;
               m_CacheSlots[victim].CS_Valid    = false;
               m_CacheSlots[victim].CS_Touched  = false; }
+            EnsureBlockMapSize(seq + 1);
+            m_BlockToSlot[seq] = victim;
             *address      = &m_CacheSlots[victim].CS_Data;
             m_PendingSlot = victim;
             return false;
@@ -114,21 +176,35 @@ class BlockCache {
 
         void Add(IndexBlock* block, uint32_t block_seq) {
             if (!block) return;
-            for (uint32_t i = 0; i < m_Capacity; ++i) {
-                if (m_CacheSlots[i].CS_BlockNum == block_seq && !m_CacheSlots[i].CS_Valid) {
-                    WriterSpinLock guard(m_CacheSlots[i].CS_lock);
-                    if (block != &m_CacheSlots[i].CS_Data) m_CacheSlots[i].CS_Data = *block;
-                    m_CacheSlots[i].CS_Valid = m_CacheSlots[i].CS_Touched = true;
-                    return;
-                }
+            if (block_seq >= m_BlockToSlot.size() || m_BlockToSlot[block_seq] == UINT32_MAX)
+                return;
+
+            uint32_t slot = m_BlockToSlot[block_seq];
+            if (slot >= m_Capacity) return;
+            WriterSpinLock guard(m_CacheSlots[slot].CS_lock);
+            if (m_CacheSlots[slot].CS_BlockNum == block_seq) {
+                if (block != &m_CacheSlots[slot].CS_Data) m_CacheSlots[slot].CS_Data = *block;
+                m_CacheSlots[slot].CS_Valid = m_CacheSlots[slot].CS_Touched = true;
             }
         }
+
+        uint32_t capacity() const { return m_Capacity; }
+        bool isPinned() const { return m_IsPinned; }
+        void ReserveBlockMap(uint32_t block_count) { EnsureBlockMapSize(block_count); }
 
     private:
         uint32_t                     m_Capacity;
         std::unique_ptr<CacheSlot[]> m_CacheSlots;
+        std::vector<uint32_t>        m_BlockToSlot;
         uint32_t                     m_Hand;
         uint32_t                     m_PendingSlot = 0;
+        size_t                       m_PinBytes = 0;
+        bool                         m_IsPinned = false;
+
+        void EnsureBlockMapSize(uint32_t size) {
+            if (m_BlockToSlot.size() < size)
+                m_BlockToSlot.resize(size, UINT32_MAX);
+        }
 
         uint32_t PickVictim() {
             for (uint32_t i = 0; i < m_Capacity * 2; ++i) {
@@ -287,6 +363,7 @@ class IndexBlockTable
 
         void SetFileManager(std::shared_ptr<FileBlockManager> fm) { m_FileManager = std::move(fm); }
         void ResizeCache(uint32_t capacity) { m_BlockCache.resize(capacity); }
+        void ReserveBlockMap(uint32_t block_count) { m_BlockCache.ReserveBlockMap(block_count); }
         void Reset(uint32_t cache_capacity = 512)
         {
             m_FileManager.reset();

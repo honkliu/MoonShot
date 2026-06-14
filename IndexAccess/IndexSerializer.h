@@ -44,7 +44,8 @@ public:
                      std::vector<TermDirectoryEntry>*        dir_out,
                      std::vector<TermHeaderBlock>*           blocks_out,
                      uint64_t*                              blocks_offset_out,
-                     std::vector<uint64_t>*                 pageskip_out = nullptr);
+                     std::vector<uint64_t>*                 pageskip_out = nullptr,
+                     uint64_t*                              num_blocks_out = nullptr);
 
     static bool IsValidIndex(const char* path);
 
