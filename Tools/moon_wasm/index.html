@@ -111,6 +111,7 @@ tr:hover td { background:#2a2d2e; cursor:pointer; }
 .tree-row .indent { display:inline-block; width:18px; }
 .tree-cell { display:flex; align-items:center; gap:4px; }
 .tree-kind { color:#888; font-size:11px; }
+.tree-field { color:#888; font-size:11px; margin-right:4px; }
 .term-jump { color:#9cdcfe; text-decoration:underline; cursor:pointer; }
 .term-empty { padding:12px; color:#777; font-size:12px; }
 .posting   { color:#4ec9b0; font-size:11px; padding:1px 4px; }
@@ -1158,30 +1159,20 @@ function renderHeadLeafTerms() {
       + `Head/Leaf term table @ 0x${h.subindex_off.toString(16)} (${h.subindex_size} bytes). `
        + `Use + to expand physical layout nodes; click any row to highlight its on-disk bytes.</div>`;
   html += '<table><tr><th></th><th>Object</th><th>Disk bytes</th><th>Target / fields</th><th>IndexEntry</th></tr>';
-  html += renderTreeRoot(h, si);
+  html += renderHeadTermRows(si);
   html += '</table></div>';
   document.getElementById('si-panel').innerHTML = html;
 }
 
-function renderTreeRoot(h, si) {
-  const node = 'table';
+function renderHeadTermRows(si) {
   const filtering = !!G_TermFilter;
-  const expanded = filtering || G_ExpandedTree.has(node);
-  const active = G_SelectedTreeNode === node ? ' active' : '';
-  let html = `<tr class="tree-row${active}" onclick="selectTreeNode('${node}',${h.subindex_off},${h.subindex_off + h.subindex_size})">`
-       + `<td><button type="button" class="icon-btn" onclick="event.stopPropagation();toggleTreeNode('${node}')">${expanded ? '-' : '+'}</button></td>`
-      + `<td><span class="tree-kind">section</span> <span class="key mono">Head/LeafTermTable</span></td>`
-       + `<td class="num">0x${h.subindex_off.toString(16)} +${h.subindex_size}</td>`
-      + `<td>${si.head.length} HeadTermEntry rows, ${(si.leaf_blocks || []).length} LeafTermBlocks</td>`
-       + `<td></td></tr>`;
-
-  if (expanded) {
-    const all = filtering ? si.head.filter(d => headTermEntryMatchesFilter(d)) : si.head;
-    const pageSize = HEAD_ROWS_PER_PAGE;
-    const pageCount = Math.max(1, Math.ceil(all.length / pageSize));
-    G_HeadPage = Math.min(Math.max(0, G_HeadPage), pageCount - 1);
-    const start = G_HeadPage * pageSize;
-    const shown = all.slice(start, start + pageSize);
+  let html = '';
+  const all = filtering ? si.head.filter(d => headTermEntryMatchesFilter(d)) : si.head;
+  const pageSize = HEAD_ROWS_PER_PAGE;
+  const pageCount = Math.max(1, Math.ceil(all.length / pageSize));
+  G_HeadPage = Math.min(Math.max(0, G_HeadPage), pageCount - 1);
+  const start = G_HeadPage * pageSize;
+  const shown = all.slice(start, start + pageSize);
 
             html += `<tr class="tree-row"><td></td><td colspan="4"><div class="pager">`
               + `<button type="button" class="icon-btn" title="Previous page" onclick="setHeadPage(${G_HeadPage - 1})" ${G_HeadPage <= 0 ? 'disabled' : ''}>‹</button>`
@@ -1190,8 +1181,7 @@ function renderTreeRoot(h, si) {
               + `<span>page</span><input class="tool-input" type="number" min="1" max="${pageCount}" value="${G_HeadPage + 1}" onchange="setHeadPage(Number(this.value)-1)" title="Head page"><span>/ ${pageCount}</span>`
                 + `</div></td></tr>`;
 
-    for (const d of shown) html += renderHeadTermEntry(d);
-  }
+  for (const d of shown) html += renderHeadTermEntry(d);
   return html;
 }
 
@@ -1207,13 +1197,13 @@ function renderHeadTermEntry(d) {
   const expanded = filtering || G_ExpandedTree.has(node);
   const active = G_SelectedTreeNode === node ? ' active' : '';
   let html = `<tr class="tree-row${active}" onclick="selectTreeNode('${node}',${d.byte_offset},${d.byte_offset + d.byte_len})">`
-      + `<td><div class="tree-cell"><span class="indent"></span><button type="button" class="icon-btn" onclick="event.stopPropagation();toggleTreeNode('${node}')">${expanded ? '-' : '+'}</button></div></td>`
+      + `<td><div class="tree-cell"><button type="button" class="icon-btn" onclick="event.stopPropagation();toggleTreeNode('${node}')">${expanded ? '-' : '+'}</button></div></td>`
       + `<td><span class="tree-kind">HeadTermEntry</span> <span class="key mono">${esc(d.hte_first_term)}</span></td>`
        + `<td class="num">0x${d.byte_offset.toString(16)} +${d.byte_len}</td>`
       + `<td>LeafTermBlock[${d.hte_leaf_term_block_id}] @ 0x${d.leaf_term_block_offset.toString(16)}</td>`
        + `<td></td></tr>`;
 
-  if (expanded) html += renderLeafTermBlock(d.hte_leaf_term_block_id, 2);
+  if (expanded) html += renderLeafTermBlock(d.hte_leaf_term_block_id, 1);
   return html;
 }
 
@@ -1284,7 +1274,7 @@ function renderIndexEntriesInline(node, e, depth, indexStart, indexEnd) {
     });
     return `<tr class="tree-row${G_SelectedTreeNode === node + ':index' ? ' active' : ''}" onclick="selectTreeNode('${node}:index',${indexStart},${indexEnd})">`
        + `<td>${indent}</td>`
-      + `<td><span class="tree-kind">IndexEntry bytes</span> <span class="key mono">${esc(e.lte_term)}</span></td>`
+      + `<td><span class="tree-kind">IndexEntry</span> <span class="key mono">${esc(e.lte_term)}</span></td>`
       + `<td class="num">0x${indexStart.toString(16)} +${e.lte_index_length}</td>`
       + `<td>IndexBlock[${e.lte_index_block_id}] offset=<span class="num">${e.lte_index_offset}</span> length=<span class="num">${e.lte_index_length}</span> cont=<span class="num">${e.lte_continuation_block_count}</span></td>`
        + `<td></td></tr>`
@@ -1294,19 +1284,22 @@ function renderIndexEntriesInline(node, e, depth, indexStart, indexEnd) {
   const term = block ? (block.terms || []).find(t => t.lte_term === e.lte_term && t.lte_index_offset === e.lte_index_offset) : null;
   let posts = '';
   if (term && term.index_entries && term.index_entries.length) {
-    posts = term.index_entries.map(p => {
-      const fp = G.pathOf(p.ie_doc_id);
-      return `<div class="posting">doc=${p.ie_doc_id} tf=${p.ie_term_frequency}${fp?' <span class="path">'+esc(fp)+'</span>':''}</div>`;
-    }).join('');
+    const postings = term.index_entries.map(p => ({
+      doc_id: p.ie_doc_id,
+      tf: p.ie_term_frequency,
+      path: G.pathOf(p.ie_doc_id),
+    }));
+    posts = renderPostingRowsForLeaf(node, postings, depth + 1);
   } else {
-    posts = '<div class="posting" style="color:#888">No decoded sample IndexEntry rows in parser output.</div>';
+    posts = `<tr class="tree-row"><td>${'<span class="indent"></span>'.repeat(depth + 1)}</td><td colspan="4"><div class="posting" style="color:#888">No decoded sample IndexEntry rows in parser output.</div></td></tr>`;
   }
     return `<tr class="tree-row${G_SelectedTreeNode === node + ':index' ? ' active' : ''}" onclick="selectTreeNode('${node}:index',${indexStart},${indexEnd})">`
        + `<td>${indent}</td>`
-      + `<td><span class="tree-kind">IndexEntry bytes</span> <span class="key mono">${esc(e.lte_term)}</span></td>`
+      + `<td><span class="tree-kind">IndexEntry</span> <span class="key mono">${esc(e.lte_term)}</span></td>`
       + `<td class="num">0x${indexStart.toString(16)} +${e.lte_index_length}</td>`
       + `<td>IndexBlock[${e.lte_index_block_id}] offset=<span class="num">${e.lte_index_offset}</span> length=<span class="num">${e.lte_index_length}</span></td>`
-       + `<td>${posts}</td></tr>`;
+       + `<td></td></tr>`
+       + posts;
 }
 
 function renderPostingListForLeaf(node, postings) {
@@ -1318,15 +1311,15 @@ function renderPostingRowsForLeaf(node, postings, depth) {
   if (!postings.length) {
     return `<tr class="tree-row"><td>${indent}</td><td colspan="4"><div class="posting" style="color:#888">No decoded postings.</div></td></tr>`;
   }
-  let html = '';
+  let html = `<tr class="tree-row"><td>${indent}</td><td><span class="tree-kind">IndexEntry rows</span></td><td><span class="tree-field">IE_DocID</span></td><td><span class="tree-field">IE_TermFrequency</span></td><td><span class="tree-field">DocData.path</span></td></tr>`;
   for (let i = 0; i < postings.length; i++) {
     const p = postings[i];
     html += `<tr class="tree-row" onclick="event.stopPropagation()">`
       + `<td>${indent}</td>`
-      + `<td class="mono num">doc=${p.doc_id}</td>`
-      + `<td></td>`
-      + `<td class="num">tf=${p.tf}</td>`
-      + `<td>${p.path ? esc(p.path) : ''}</td>`
+      + `<td><span class="tree-kind">IndexEntry</span></td>`
+      + `<td class="mono num">${p.doc_id}</td>`
+      + `<td class="num">${p.tf}</td>`
+      + `<td class="path">${p.path ? esc(p.path) : ''}</td>`
       + `</tr>`;
   }
   return html;
