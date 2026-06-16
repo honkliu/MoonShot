@@ -322,7 +322,6 @@ struct DocMeta {
 
 static void write_u16(std::vector<uint8_t>& out, uint16_t v) { auto* p = reinterpret_cast<uint8_t*>(&v); out.insert(out.end(), p, p + 2); }
 static void write_u32(std::vector<uint8_t>& out, uint32_t v) { auto* p = reinterpret_cast<uint8_t*>(&v); out.insert(out.end(), p, p + 4); }
-static void write_u64(std::vector<uint8_t>& out, uint64_t v) { auto* p = reinterpret_cast<uint8_t*>(&v); out.insert(out.end(), p, p + 8); }
 
 static void vb_write(uint64_t v, std::vector<uint8_t>& out)
 {

@@ -84,10 +84,11 @@ public:
         size_t n = br.BBR_IndexBlocks.size();
         m_BlockTable.ResizeCache(PostingBlockCacheSlots(n));
 
-        for (size_t i = 0; i < n; ++i)
+        for (size_t i = 0; i < n; ++i) {
             m_BlockTable.InsertBlock(static_cast<uint32_t>(i), &br.BBR_IndexBlocks[i]);
+        }
 
-            m_BlockTable.SetPagedLeafTermBlocks(std::move(br.BBR_HeadTermEntries),
+        m_BlockTable.SetPagedLeafTermBlocks(std::move(br.BBR_HeadTermEntries),
             std::move(br.BBR_LeafTermPages));
         m_BlockTable.SetPageSkipData(std::move(br.BBR_PageSkipList));
 

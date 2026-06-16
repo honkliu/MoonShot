@@ -228,7 +228,7 @@ void TestFieldConstraint()
             bool inTitle = false;
             if (postingList)
                 for (auto& entry : postingList->entries)
-                    if (entry.doc_id == result.doc_id) { inTitle = true; break; }
+                    if (entry.IE_DocID == result.doc_id) { inTitle = true; break; }
             assert(inTitle && "title:vietnam matched a doc not in vietnamT");
         }
         delete compiler; delete tree;

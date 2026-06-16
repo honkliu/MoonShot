@@ -51,7 +51,7 @@ static size_t leaf_entry_bytes(const LeafTermEntry& e)
 
 static void encode_leaf_page(const std::vector<LeafTermEntry>& entries, LeafTermPage& page)
 {
-    std::memset(&page, 0, sizeof(page));
+    page = LeafTermPage{};
     uint8_t* ptr = page.LTP_Data;
     auto write_u16 = [&](uint16_t v) { std::memcpy(ptr, &v, 2); ptr += 2; };
     auto write_u32 = [&](uint32_t v) { std::memcpy(ptr, &v, 4); ptr += 4; };
