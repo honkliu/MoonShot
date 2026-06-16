@@ -13,6 +13,21 @@ pub struct SmartTokenizer;
 
 impl SmartTokenizer {
     pub fn new() -> Self { Self }
+
+    fn is_indexable_token(token: &str) -> bool {
+        !token.is_empty()
+            && token.len() <= 64
+            && !token.chars().any(|ch| {
+                ch.is_control()
+                    || matches!(ch as u32,
+                        0x200B..=0x200F | // zero-width / bidi format controls
+                        0x202A..=0x202E | // bidi embeddings/overrides
+                        0x2060..=0x206F | // word joiner / invisible operators
+                        0xE000..=0xF8FF | // BMP private use
+                        0xF0000..=0xFFFFD | // supplementary private use A
+                        0x100000..=0x10FFFD) // supplementary private use B
+            })
+    }
 }
 
 impl Default for SmartTokenizer {
@@ -34,7 +49,7 @@ impl Tokenizer for SmartTokenizer {
                     || segment.chars().any(|ch| ch.is_alphanumeric());
                 if keep {
                     let token = segment.to_lowercase();
-                    if !token.is_empty() && token.len() <= 64 {
+                    if Self::is_indexable_token(&token) {
                         out.push(token);
                     }
                 }

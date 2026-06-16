@@ -12,7 +12,8 @@ pub struct AdvancedIndexReader {
     doc_freq:         u32,
     block_seq:        u32,
     initial_block_seq: u32,   // first block of this term
-    has_more:         bool,
+    total_continuation_blocks: u32,
+    remaining_continuation_blocks: u32,
     page_skip_offset: u32,    // 0 = single-block term
     decoder:          VarByteDecoder,
 }
@@ -25,19 +26,21 @@ impl AdvancedIndexReader {
             doc_freq,
             block_seq: 0,
             initial_block_seq: 0,
-            has_more: false,
+            total_continuation_blocks: 0,
+            remaining_continuation_blocks: 0,
             page_skip_offset: 0,
             decoder: VarByteDecoder::new(),
         };
 
         if let Some((loc, block)) = reader.block_table.find_term_data(stream_key) {
-            reader.block_seq         = loc.posting_block_id;
-            reader.initial_block_seq = loc.posting_block_id;
-            reader.has_more          = loc.continuation_block_count > 0;
-            reader.page_skip_offset  = loc.skip_list_offset;
-            /* Use doc_freq from TermHeader — correct after load(), PostingStore has none */
+            reader.block_seq         = loc.index_block_id;
+            reader.initial_block_seq = loc.index_block_id;
+            reader.total_continuation_blocks = loc.continuation_block_count;
+            reader.remaining_continuation_blocks = loc.continuation_block_count;
+            reader.page_skip_offset  = loc.page_skip_offset;
+            /* Use doc_freq from LeafTermEntry — correct after load(), PostingStore has none */
             reader.doc_freq          = loc.doc_freq;
-            reader.decoder.open_raw(block, loc.posting_offset, loc.posting_length, 0);
+            reader.decoder.open_raw(block, loc.index_offset, loc.index_length, 0);
         }
 
         reader.go_next();
@@ -48,8 +51,8 @@ impl AdvancedIndexReader {
         if let Some(block) = self.block_table.get_block_by_seq(seq) {
             let last_doc = self.decoder.get_document_id();
             self.block_seq = seq;
-            self.has_more  = block.has_more();
             self.open_continuation(block, last_doc);
+            self.remaining_continuation_blocks = self.remaining_continuation_blocks.saturating_sub(1);
             true
         } else { false }
     }
@@ -70,7 +73,7 @@ impl AdvancedIndexReader {
 
 impl IndexReader for AdvancedIndexReader {
     fn go_next(&mut self) {
-        if self.decoder.is_end() && self.has_more {
+        if self.decoder.is_end() && self.remaining_continuation_blocks > 0 {
             self.load_continuation(self.block_seq + 1);
         }
         self.decoder.go_next();
@@ -78,7 +81,7 @@ impl IndexReader for AdvancedIndexReader {
 
     fn go_until(&mut self, target: u64) {
         // Fast path: use PageSkipList to jump to the right block
-        if self.page_skip_offset > 0 && self.has_more {
+        if self.page_skip_offset > 0 && self.remaining_continuation_blocks > 0 {
             if let Some(skip) = self.block_table.get_page_skip_ptr(self.page_skip_offset) {
                 let cur_idx = (self.block_seq - self.initial_block_seq) as usize;
                 let mut tgt_idx = cur_idx;
@@ -93,7 +96,7 @@ impl IndexReader for AdvancedIndexReader {
                     let base_loc     = skip[tgt_idx];
                     if let Some(block) = self.block_table.get_block_by_seq(target_block) {
                         self.block_seq = target_block;
-                        self.has_more  = block.has_more();
+                        self.remaining_continuation_blocks = self.total_continuation_blocks.saturating_sub(tgt_idx as u32);
                         self.open_continuation(block, base_loc);
                         self.decoder.go_next();
                         if !self.decoder.is_end() {
@@ -109,7 +112,7 @@ impl IndexReader for AdvancedIndexReader {
         loop {
             self.decoder.go_until(target);
             if !self.decoder.is_end() { break; }
-            if !self.has_more          { break; }
+            if self.remaining_continuation_blocks == 0 { break; }
             if !self.load_continuation(self.block_seq + 1) { break; }
             self.decoder.go_next();
             if self.decoder.is_end()   { break; }

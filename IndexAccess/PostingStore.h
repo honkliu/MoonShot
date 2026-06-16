@@ -10,9 +10,9 @@
 /*
 * One (docId, termFrequency) pair inside a posting list.
 */
-struct PostingEntry {
-    uint64_t doc_id;
-    uint32_t tf;
+struct IndexEntry {
+    uint64_t IE_DocID;
+    uint32_t IE_TermFrequency;
 };
 
 /*
@@ -24,7 +24,7 @@ struct PostingEntry {
 *             GetBytes() so encoding only runs once per posting list.
 */
 struct PostingList {
-    std::vector<PostingEntry>    entries;
+    std::vector<IndexEntry>      entries;
     mutable std::vector<uint8_t> bytes;
 
     uint32_t doc_freq() const { return static_cast<uint32_t>(entries.size()); }
@@ -64,9 +64,9 @@ private:
 
         uint64_t prev = 0;
         for (const auto& e : entries) {
-            vb_write(e.doc_id - prev, bytes);
-            vb_write(e.tf,            bytes);
-            prev = e.doc_id;
+            vb_write(e.IE_DocID - prev, bytes);
+            vb_write(e.IE_TermFrequency, bytes);
+            prev = e.IE_DocID;
         }
     }
 };
@@ -77,7 +77,7 @@ private:
 struct DocStats {
     uint32_t    doc_len    = 0;
     float       importance = 0.0f;
-    std::string path;              // file path stored in DocData (256B record)
+    std::string path;              // file path stored in DocData
 };
 
 /*
@@ -91,12 +91,13 @@ public:
     {
         auto& pl = m_Postings[stream_key];
         auto  it = std::lower_bound(pl.entries.begin(), pl.entries.end(), doc_id,
-            [](const PostingEntry& e, uint64_t d) { return e.doc_id < d; });
+            [](const IndexEntry& e, uint64_t d) { return e.IE_DocID < d; });
 
-        if (it != pl.entries.end() && it->doc_id == doc_id) {
-            it->tf += tf;
+        if (it != pl.entries.end() && it->IE_DocID == doc_id) {
+            it->IE_TermFrequency += tf;
         } else {
-            pl.entries.insert(it, PostingEntry{doc_id, tf});
+            pl.entries.insert(it, IndexEntry{doc_id, tf});
+            ++m_PostingEntries;
         }
 
         /*
@@ -181,10 +182,15 @@ public:
 
     uint64_t TotalTerms() const { return m_TotalTerms; }
 
+    uint64_t TotalPostingEntries() const { return m_PostingEntries; }
+
+    size_t UniqueTermCount() const { return m_Postings.size(); }
+
 private:
     std::unordered_map<std::string, PostingList> m_Postings;
     std::unordered_map<uint64_t, DocStats>       m_DocStats;
     uint64_t m_TotalTerms = 0;
+    uint64_t m_PostingEntries = 0;
 };
 
 #endif

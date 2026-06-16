@@ -32,11 +32,11 @@ Then open `http://localhost:8080`.
 1. Drag & drop a `.idx` file — or click **Open .idx**
 2. Optionally load the companion `.idx.meta` for doc-id → filepath mapping
 3. **Left panel** — hex view of the file; bytes coloured by section:
-   - Blue = File Header, Green = TermHeaderTable, Orange = DocData, Gray shades = PostingBlocks
+   - Blue = File Header, Green = Head/Leaf term table, Orange = DocData, Gray shades = IndexBlocks
 4. **Right panel tabs**:
    - **File Header** — magic, version, section byte offsets
-   - **Term Directory** — hierarchical physical layout tree: TermHeaderTable → DirectoryEntry → TermHeaderBlock → TermHeader → PostingBlock bytes
+   - **Head/Leaf Terms** — hierarchical physical layout tree: Head/Leaf term table → HeadTermEntry → LeafTermBlock → LeafTermEntry → IndexEntry bytes
    - **DocData** — doc_id, importance, doc_len, filepath (if .meta loaded)
-   - **Posting Blocks** — click a posting block header → expands decoded terms & highlights block bytes in hex; click a term row → highlights that term's posting bytes
+   - **IndexBlocks** — click an IndexBlock header → expands decoded terms and highlights block bytes in hex; click a term row → highlights that term's IndexEntry bytes
    - **Search** — real MoonShot document search; results show filename, path, doc id, and score; click a result to display file content in the page
 5. **Filter box** (top) — filters visible term rows only; it does not run document search

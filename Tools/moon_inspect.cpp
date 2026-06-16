@@ -10,7 +10,7 @@
 #include <vector>
 
 static const uint8_t MAGIC[8] = {'M','O','O','N','S','H','O','T'};
-static const uint32_t FORMAT_VERSION = 5;
+static const uint32_t FORMAT_VERSION = 6;
 static const int PAGE_SIZE = 4096;
 static const int IB_DATA_OFF = 8 + 50 * 4;
 static const int IB_DATA_LEN = PAGE_SIZE - IB_DATA_OFF;
@@ -34,35 +34,35 @@ struct DocRec {
     uint32_t doc_len;
     uint16_t path_len;
     uint8_t pad[6];
-    char path[232];
+    char path[1000];
 };
 #pragma pack(pop)
 
 static_assert(sizeof(FileHdr) == 96);
-static_assert(sizeof(DocRec) == 256);
+static_assert(sizeof(DocRec) == 1024);
 
-struct TermDirectoryEntry {
-    std::string first_term;
-    uint32_t term_header_block_id = 0;
+struct HeadTermEntry {
+    std::string HTE_FirstTerm;
+    uint32_t HTE_LeafTermBlockID = 0;
 };
 
-struct TermHeader {
+struct LeafTermEntry {
     std::string term;
-    uint32_t doc_freq = 0;
-    uint32_t posting_block_id = 0;
-    uint32_t posting_offset = 0;
-    uint32_t posting_length = 0;
-    uint32_t skip_list_offset = 0;
-    uint32_t continuation_block_count = 0;
+    uint32_t LTE_DocFreq = 0;
+    uint32_t LTE_IndexBlockID = 0;
+    uint32_t LTE_IndexOffset = 0;
+    uint32_t LTE_IndexLength = 0;
+    uint32_t LTE_PageSkipOffset = 0;
+    uint32_t LTE_ContinuationBlockCount = 0;
     uint32_t flags = 0;
 };
 
-struct TermHeaderBlock { std::vector<TermHeader> headers; };
-struct Posting { uint64_t doc_id; uint32_t tf; };
+struct LeafTermBlock { std::vector<LeafTermEntry> LTB_Entries; };
+struct IndexEntry { uint64_t doc_id; uint32_t tf; };
 
 struct TermView {
-    const TermHeader* header = nullptr;
-    std::vector<Posting> postings;
+    const LeafTermEntry* header = nullptr;
+    std::vector<IndexEntry> IndexEntrys;
 };
 
 struct BlockView {
@@ -75,9 +75,9 @@ struct BlockView {
 struct Index {
     FileHdr hdr{};
     std::vector<uint8_t> bytes;
-    std::vector<TermDirectoryEntry> directory;
-    std::vector<TermHeaderBlock> header_blocks;
-    std::vector<TermHeader> headers;
+    std::vector<HeadTermEntry> directory;
+    std::vector<LeafTermBlock> header_blocks;
+    std::vector<LeafTermEntry> LTB_Entries;
     std::vector<uint64_t> pageskip;
     std::vector<DocRec> docs;
     std::vector<BlockView> blocks;
@@ -136,19 +136,19 @@ static uint64_t vb_read(const uint8_t* data, size_t size, size_t& pos)
     return value;
 }
 
-static std::vector<Posting> decode_postings(const uint8_t* data, size_t size)
+static std::vector<IndexEntry> decode_IndexEntrys(const uint8_t* data, size_t size)
 {
-    std::vector<Posting> postings;
+    std::vector<IndexEntry> IndexEntrys;
     uint64_t previous = 0;
     size_t pos = 0;
-    while (pos < size && postings.size() < 12) {
+    while (pos < size && IndexEntrys.size() < 12) {
         uint64_t delta = vb_read(data, size, pos);
         if (pos >= size) break;
         uint64_t tf = vb_read(data, size, pos);
         previous += delta;
-        postings.push_back({previous, static_cast<uint32_t>(tf)});
+        IndexEntrys.push_back({previous, static_cast<uint32_t>(tf)});
     }
-    return postings;
+    return IndexEntrys;
 }
 
 static std::string doc_path(const DocRec& rec)
@@ -196,20 +196,20 @@ static Index parse_index(const char* path)
         index.header_blocks.resize(block_count);
         for (uint32_t block_index = 0; block_index < block_count && ptr < end; ++block_index) {
             uint32_t entry_count = read_u32(ptr, end);
-            index.header_blocks[block_index].headers.reserve(entry_count);
+            index.header_blocks[block_index].LTB_Entries.reserve(entry_count);
             for (uint32_t i = 0; i < entry_count && ptr < end; ++i) {
-                TermHeader header;
+                LeafTermEntry header;
                 uint16_t len = read_u16(ptr, end);
-                header.term = read_string(ptr, end, len);
-                header.doc_freq = read_u32(ptr, end);
-                header.posting_block_id = read_u32(ptr, end);
-                header.posting_offset = read_u32(ptr, end);
-                header.posting_length = read_u32(ptr, end);
-                header.skip_list_offset = read_u32(ptr, end);
-                header.continuation_block_count = read_u32(ptr, end);
+                header.LTE_Term = read_string(ptr, end, len);
+                header.LTE_DocFreq = read_u32(ptr, end);
+                header.LTE_IndexBlockID = read_u32(ptr, end);
+                header.LTE_IndexOffset = read_u32(ptr, end);
+                header.LTE_IndexLength = read_u32(ptr, end);
+                header.LTE_PageSkipOffset = read_u32(ptr, end);
+                header.LTE_ContinuationBlockCount = read_u32(ptr, end);
                 header.flags = read_u32(ptr, end);
-                index.headers.push_back(header);
-                index.header_blocks[block_index].headers.push_back(std::move(header));
+                index.LTB_Entries.push_back(header);
+                index.header_blocks[block_index].LTB_Entries.push_back(std::move(header));
             }
         }
     }
@@ -226,9 +226,9 @@ static Index parse_index(const char* path)
         std::memcpy(index.docs.data(), data + index.hdr.docdata_off, count * sizeof(DocRec));
     }
 
-    std::unordered_map<uint32_t, std::vector<const TermHeader*>> terms_by_block;
-    for (const auto& header : index.headers) {
-        terms_by_block[header.posting_block_id].push_back(&header);
+    std::unordered_map<uint32_t, std::vector<const LeafTermEntry*>> terms_by_block;
+    for (const auto& header : index.LTB_Entries) {
+        terms_by_block[header.LTE_IndexBlockID].push_back(&header);
     }
 
     for (uint64_t seq = 0; seq < index.hdr.num_blocks; ++seq) {
@@ -249,12 +249,12 @@ static Index parse_index(const char* path)
 
         auto found = terms_by_block.find(view.seq);
         if (found != terms_by_block.end()) {
-            for (const TermHeader* header : found->second) {
-                if (header->posting_offset >= IB_DATA_LEN) continue;
-                size_t length = std::min<size_t>(header->posting_length, IB_DATA_LEN - header->posting_offset);
+            for (const LeafTermEntry* header : found->second) {
+                if (header->LTE_IndexOffset >= IB_DATA_LEN) continue;
+                size_t length = std::min<size_t>(header->LTE_IndexLength, IB_DATA_LEN - header->LTE_IndexOffset);
                 TermView term;
                 term.header = header;
-                term.postings = decode_postings(ib_data + header->posting_offset, length);
+                term.IndexEntrys = decode_IndexEntrys(ib_data + header->LTE_IndexOffset, length);
                 view.terms.push_back(std::move(term));
             }
         }
@@ -273,7 +273,7 @@ h1{font-size:16px;background:#252526;margin:0;padding:10px 14px;border-bottom:1p
 .tab{background:#3c3c3c;color:#ddd;border:1px solid #555;border-radius:3px;padding:4px 10px;cursor:pointer}.tab.active{background:#007acc;color:#fff}
 .panel{display:none;padding:12px}.panel.active{display:block}
 table{border-collapse:collapse;width:100%;margin-bottom:12px}th{background:#252526;color:#9cdcfe;text-align:left;position:sticky;top:39px}td,th{border-bottom:1px solid #2a2a2a;padding:4px 8px}tr:hover td{background:#2a2d2e}
-.mono{font-family:Cascadia Code,Consolas,monospace}.num{color:#b5cea8}.key{color:#9cdcfe}.path{color:#ce9178}.dim{color:#888}.posting{color:#4ec9b0;font-size:11px;margin:1px 0}.badge{display:inline-block;background:#555;color:#fff;border-radius:3px;padding:1px 5px;font-size:11px;margin-left:5px}.more{background:#ca5010}.cont{background:#5c8a3a}.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:8px}.kv{background:#252526;border:1px solid #3e3e42;padding:8px}.kv b{display:block;color:#9cdcfe;font-size:11px;margin-bottom:3px}.card{border:1px solid #3e3e42;background:#252526;margin-bottom:10px}.card-h{padding:6px 9px;background:#2d2d30;cursor:pointer}.card-b{display:none;padding:8px}.card.open .card-b{display:block}
+.mono{font-family:Cascadia Code,Consolas,monospace}.num{color:#b5cea8}.key{color:#9cdcfe}.path{color:#ce9178}.dim{color:#888}.IndexEntry{color:#4ec9b0;font-size:11px;margin:1px 0}.badge{display:inline-block;background:#555;color:#fff;border-radius:3px;padding:1px 5px;font-size:11px;margin-left:5px}.more{background:#ca5010}.cont{background:#5c8a3a}.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:8px}.kv{background:#252526;border:1px solid #3e3e42;padding:8px}.kv b{display:block;color:#9cdcfe;font-size:11px;margin-bottom:3px}.card{border:1px solid #3e3e42;background:#252526;margin-bottom:10px}.card-h{padding:6px 9px;background:#2d2d30;cursor:pointer}.card-b{display:none;padding:8px}.card.open .card-b{display:block}
 )css";
 }
 
@@ -282,7 +282,7 @@ static void emit(std::ostream& out, const Index& index, const char* path)
     const FileHdr& h = index.hdr;
     out << "<!DOCTYPE html><html><head><meta charset='utf-8'><title>moon_inspect</title><style>" << css() << "</style></head><body>";
     out << "<h1>moon_inspect <span class='dim'>" << esc(path) << "</span></h1>";
-    out << "<div class='tabs'><button class='tab active' onclick=\"tab('header',this)\">Header</button><button class='tab' onclick=\"tab('terms',this)\">Term Headers</button><button class='tab' onclick=\"tab('docs',this)\">DocData</button><button class='tab' onclick=\"tab('blocks',this)\">Posting Blocks</button></div>";
+    out << "<div class='tabs'><button class='tab active' onclick=\"tab('header',this)\">Header</button><button class='tab' onclick=\"tab('terms',this)\">Term LTB_Entries</button><button class='tab' onclick=\"tab('docs',this)\">DocData</button><button class='tab' onclick=\"tab('blocks',this)\">IndexEntry Blocks</button></div>";
 
     auto kv = [&](const char* name, const std::string& value) {
         out << "<div class='kv'><b>" << name << "</b><span class='mono'>" << value << "</span></div>";
@@ -292,24 +292,24 @@ static void emit(std::ostream& out, const Index& index, const char* path)
     kv("Version", std::to_string(h.version));
     kv("Documents", std::to_string(h.num_documents));
     kv("Terms", std::to_string(h.num_terms));
-    kv("TermHeaderTable", std::format("0x{:016X} ({} B)", h.subindex_off, h.subindex_size));
+    kv("LeafTermEntryTable", std::format("0x{:016X} ({} B)", h.subindex_off, h.subindex_size));
     kv("PageSkipList", std::format("0x{:016X} ({} B)", h.pageskip_off, h.pageskip_size));
     kv("DocData", std::format("0x{:016X} ({} B)", h.docdata_off, h.docdata_size));
-    kv("Posting blocks", std::format("0x{:016X} count={}", h.blocks_off, h.num_blocks));
+    kv("IndexEntry blocks", std::format("0x{:016X} count={}", h.blocks_off, h.num_blocks));
     kv("File size", std::to_string(index.bytes.size()) + " B");
     out << "</div></div>";
 
     out << "<div class='panel' id='terms'><h3>Term Directory</h3><table><tr><th>HeaderBlk</th><th>First term</th></tr>";
     for (const auto& entry : index.directory) {
-        out << "<tr><td class='num'>" << entry.term_header_block_id << "</td><td class='mono key'>" << esc(entry.first_term) << "</td></tr>";
+        out << "<tr><td class='num'>" << entry.HTE_LeafTermBlockID << "</td><td class='mono key'>" << esc(entry.HTE_FirstTerm) << "</td></tr>";
     }
-    out << "</table><h3>TermHeaderBlocks</h3>";
+    out << "</table><h3>LeafTermBlocks</h3>";
     for (size_t block_id = 0; block_id < index.header_blocks.size(); ++block_id) {
         const auto& block = index.header_blocks[block_id];
-        out << "<div class='card open'><div class='card-h'>TermHeaderBlock <span class='num'>" << block_id << "</span> <span class='dim'>" << block.headers.size() << " headers</span></div><div class='card-b'>";
-        out << "<table><tr><th>Term</th><th>df</th><th>PostingBlk</th><th>Off</th><th>Len</th><th>Cont</th><th>SkipOff</th></tr>";
-        for (const auto& term : block.headers) {
-            out << "<tr onclick=\"showBlock(" << term.posting_block_id << ")\"><td class='mono key'>" << esc(term.term) << "</td><td class='num'>" << term.doc_freq << "</td><td class='num'>" << term.posting_block_id << "</td><td class='num'>" << term.posting_offset << "</td><td class='num'>" << term.posting_length << "</td><td class='num'>" << term.continuation_block_count << "</td><td class='num'>" << term.skip_list_offset << "</td></tr>";
+        out << "<div class='card open'><div class='card-h'>LeafTermBlock <span class='num'>" << block_id << "</span> <span class='dim'>" << block.LTB_Entries.size() << " LTB_Entries</span></div><div class='card-b'>";
+        out << "<table><tr><th>Term</th><th>df</th><th>IndexEntryBlk</th><th>Off</th><th>Len</th><th>Cont</th><th>SkipOff</th></tr>";
+        for (const auto& term : block.LTB_Entries) {
+            out << "<tr onclick=\"showBlock(" << term.LTE_IndexBlockID << ")\"><td class='mono key'>" << esc(term.LTE_Term) << "</td><td class='num'>" << term.LTE_DocFreq << "</td><td class='num'>" << term.LTE_IndexBlockID << "</td><td class='num'>" << term.LTE_IndexOffset << "</td><td class='num'>" << term.LTE_IndexLength << "</td><td class='num'>" << term.LTE_ContinuationBlockCount << "</td><td class='num'>" << term.LTE_PageSkipOffset << "</td></tr>";
         }
         out << "</table></div></div>";
     }
@@ -317,24 +317,24 @@ static void emit(std::ostream& out, const Index& index, const char* path)
 
     out << "<div class='panel' id='docs'><table><tr><th>DocID</th><th>Importance</th><th>DocLen</th><th>Path</th></tr>";
     for (const auto& doc : index.docs) {
-        out << "<tr><td class='mono num'>" << doc.doc_id << "</td><td class='num'>" << doc.importance << "</td><td class='num'>" << doc.doc_len << "</td><td class='path'>" << esc(doc_path(doc)) << "</td></tr>";
+        out << "<tr><td class='mono num'>" << doc.IE_DocID << "</td><td class='num'>" << doc.importance << "</td><td class='num'>" << doc.doc_len << "</td><td class='path'>" << esc(doc_path(doc)) << "</td></tr>";
     }
     out << "</table></div>";
 
     out << "<div class='panel' id='blocks'>";
     for (const auto& block : index.blocks) {
-        out << "<div class='card' id='blk" << block.seq << "'><div class='card-h' onclick='this.parentNode.classList.toggle(\"open\")'>PostingBlock <span class='num'>" << block.seq << "</span>";
+        out << "<div class='card' id='blk" << block.seq << "'><div class='card-h' onclick='this.parentNode.classList.toggle(\"open\")'>IndexEntryBlock <span class='num'>" << block.seq << "</span>";
         if (block.has_more) out << "<span class='badge more'>HAS_MORE</span>";
         if (block.is_continuation) out << "<span class='badge cont'>continuation</span>";
         out << "<span class='dim'> " << block.terms.size() << " starting terms</span></div><div class='card-b'>";
         if (!block.terms.empty()) {
-            out << "<table><tr><th>Term</th><th>df</th><th>Off</th><th>Len</th><th>Sample postings</th></tr>";
+            out << "<table><tr><th>Term</th><th>df</th><th>Off</th><th>Len</th><th>Sample IndexEntrys</th></tr>";
             for (const auto& view : block.terms) {
-                const TermHeader& term = *view.header;
-                out << "<tr><td class='mono key'>" << esc(term.term);
-                if (term.continuation_block_count > 0) out << "<span class='badge more'>->" << term.continuation_block_count << "</span>";
-                out << "</td><td class='num'>" << term.doc_freq << "</td><td class='num'>" << term.posting_offset << "</td><td class='num'>" << term.posting_length << "</td><td>";
-                for (const auto& posting : view.postings) out << "<div class='posting'>doc=" << posting.doc_id << " tf=" << posting.tf << "</div>";
+                const LeafTermEntry& term = *view.header;
+                out << "<tr><td class='mono key'>" << esc(term.LTE_Term);
+                if (term.LTE_ContinuationBlockCount > 0) out << "<span class='badge more'>->" << term.LTE_ContinuationBlockCount << "</span>";
+                out << "</td><td class='num'>" << term.LTE_DocFreq << "</td><td class='num'>" << term.LTE_IndexOffset << "</td><td class='num'>" << term.LTE_IndexLength << "</td><td>";
+                for (const auto& IndexEntry : view.IndexEntrys) out << "<div class='IndexEntry'>doc=" << IndexEntry.IE_DocID << " tf=" << IndexEntry.IE_TermFrequency << "</div>";
                 out << "</td></tr>";
             }
             out << "</table>";

@@ -1,11 +1,11 @@
 /*
- * IndexSerializer — v5 two-level TermHeaderTable format.
+ * IndexSerializer — v7 paged Head/Leaf term table format.
  *
  * Block IB_Data: raw posting bytes only (no key/doc_freq/data_len headers).
- * TermHeaderTable: two-level term metadata structure.
- *   Level-1 dir: sorted (first_term, term_header_block_id) pairs.
- *   Level-2 blocks: fixed groups of TermHeader records, sorted by term.
- * Continuation blocks: dedicated (no new terms mixed in).
+ * Head/Leaf term table: two-level term metadata structure.
+ *   Level-1 head table: sorted (HTE_FirstTerm, HTE_LeafTermBlockID) pairs.
+ *   Level-2 leaf blocks: 4096-byte pages, sorted by term and loaded on demand.
+ * Continuation tails can be reused for new term starts; readers use continuation counts.
  */
 
 #include "IndexSerializer.h"
@@ -19,7 +19,7 @@
 #include <cassert>
 
 static const uint8_t  MAGIC[8]       = {'M','O','O','N','S','H','O','T'};
-static const uint32_t FORMAT_VERSION = 5;
+static const uint32_t FORMAT_VERSION = 7;
 
 /* ── helpers ─────────────────────────────────────────────────────────────── */
 
@@ -44,15 +44,42 @@ done:
     return prev;
 }
 
+static size_t leaf_entry_bytes(const LeafTermEntry& e)
+{
+    return 2u + e.LTE_Term.size() + 7u * sizeof(uint32_t);
+}
+
+static void encode_leaf_page(const std::vector<LeafTermEntry>& entries, LeafTermPage& page)
+{
+    std::memset(&page, 0, sizeof(page));
+    uint8_t* ptr = page.LTP_Data;
+    auto write_u16 = [&](uint16_t v) { std::memcpy(ptr, &v, 2); ptr += 2; };
+    auto write_u32 = [&](uint32_t v) { std::memcpy(ptr, &v, 4); ptr += 4; };
+
+    write_u32(static_cast<uint32_t>(entries.size()));
+    for (const auto& e : entries) {
+        write_u16(static_cast<uint16_t>(e.LTE_Term.size()));
+        std::memcpy(ptr, e.LTE_Term.data(), e.LTE_Term.size()); ptr += e.LTE_Term.size();
+        write_u32(e.LTE_DocFreq);
+        write_u32(e.LTE_IndexBlockID);
+        write_u32(e.LTE_IndexOffset);
+        write_u32(e.LTE_IndexLength);
+        write_u32(e.LTE_PageSkipOffset);
+        write_u32(e.LTE_ContinuationBlockCount);
+        write_u32(e.LTE_Flags);
+    }
+}
+
 /* ─────────────────────────────────────────────────────────────────────────
  * build_blocks
  *
  * 1. Pack posting bytes into IndexBlocks (no key/freq/len headers).
- *    Continuation blocks are dedicated — no mixed new-term entries.
- * 2. Build a flat sorted TermHeader list (one TermHeader per term).
- * 3. Organize into two-level TermHeaderTable:
- *    TermDirectory: one entry per TermHeaderBlock → first term in that block.
- *    TermHeaderBlocks: fixed-size chunks of TERM_HEADERS_PER_BLOCK headers.
+ *    Continuation blocks carry [marker,len,bytes] at the current offset; the
+ *    final continuation block can also host subsequent term starts.
+ * 2. Build a flat sorted LeafTermEntry list (one LeafTermEntry per term).
+ * 3. Organize into two-level Head/Leaf term table:
+ *    HeadTermEntry: one entry per 4096-byte LeafTermPage -> first term in page.
+ *    LeafTermPages: variable entry count, never crossing 4096-byte page boundary.
  * ─────────────────────────────────────────────────────────────────────────*/
 static BuildBlocksResult build_blocks(const PostingStore& store)
 {
@@ -72,15 +99,15 @@ static BuildBlocksResult build_blocks(const PostingStore& store)
     size_t     wptr  = 0;
     uint32_t   seq   = 0;
 
-    /* Flat sorted TermHeader list built during packing, distributed into two levels later. */
-    std::vector<TermHeader> flat;
+    /* Flat sorted LeafTermEntry list built during packing, distributed into two levels later. */
+    std::vector<LeafTermEntry> flat;
     flat.reserve(terms.size());
-    res.pageskip.push_back(UINT64_MAX); // offset 0 means no skip list
+    res.BBR_PageSkipList.push_back(UINT64_MAX); // offset 0 means no skip list
 
     auto flush = [&](bool has_more) {
         cur.IB_Header = static_cast<uint64_t>(seq);
         if (has_more) cur.IB_Header |= IB_HEADER_HAS_MORE;
-        res.blocks.push_back(cur);
+        res.BBR_IndexBlocks.push_back(cur);
         ++seq; cur = {}; wptr = 0;
     };
 
@@ -105,20 +132,20 @@ static BuildBlocksResult build_blocks(const PostingStore& store)
         remaining -= data_here;
 
         flat.push_back({key,
-                doc_freq,
-                seq,
-                static_cast<uint32_t>(data_offset),
-                static_cast<uint32_t>(data_here),
-                0u,
-                0u,
-                0u});
+            doc_freq,
+            seq,
+            static_cast<uint32_t>(data_offset),
+            static_cast<uint32_t>(data_here),
+            0u,
+            0u,
+            0u});
 
         if (has_more) {
             flush(true);
 
-            uint32_t skip_offset = static_cast<uint32_t>(res.pageskip.size());
-            res.pageskip.push_back(0u);
-            flat.back().skip_list_offset = skip_offset;
+            uint32_t skip_offset = static_cast<uint32_t>(res.BBR_PageSkipList.size());
+            res.BBR_PageSkipList.push_back(0u);
+            flat.back().LTE_PageSkipOffset = skip_offset;
 
             while (remaining > 0) {
                 constexpr size_t CONT_HDR = 4u;
@@ -128,7 +155,7 @@ static BuildBlocksResult build_blocks(const PostingStore& store)
 
                 size_t   bytes_before = bytes.size() - remaining;
                 uint64_t base_doc     = decode_last_docid(bytes.data(), bytes_before);
-                res.pageskip.push_back(base_doc);
+                res.BBR_PageSkipList.push_back(base_doc);
 
                 uint16_t cm = CONT, cl = static_cast<uint16_t>(cont_here);
                 std::memcpy(cur.IB_Data + wptr, &cm, 2); wptr += 2;
@@ -137,35 +164,45 @@ static BuildBlocksResult build_blocks(const PostingStore& store)
                 src       += cont_here;
                 remaining -= cont_here;
 
-                ++flat.back().continuation_block_count;
+                ++flat.back().LTE_ContinuationBlockCount;
 
-                flush(more_cont);
+                if (more_cont) flush(true);
             }
-            res.pageskip.push_back(UINT64_MAX);
+            res.BBR_PageSkipList.push_back(UINT64_MAX);
         }
     }
 
     if (wptr > 0) flush(false);
 
-    /* ── Build two-level TermHeaderTable ───────────────────────────────────
-     *
-     * TermHeaderBlocks are independent metadata blocks.  They are NOT grouped
-     * by posting_block_id.  Each block holds up to TERM_HEADERS_PER_BLOCK term
-     * headers and the directory stores the first term of each header block.
+    /* ── Build paged Head/Leaf term table ─────────────────────────────────
+     * LeafTermPages are physical 4096-byte pages. Entries never cross pages.
      */
-    for (size_t i = 0; i < flat.size(); i += TERM_HEADERS_PER_BLOCK) {
-        TermHeaderBlock block;
-        size_t end = std::min(i + static_cast<size_t>(TERM_HEADERS_PER_BLOCK), flat.size());
-        block.headers.reserve(end - i);
-        for (size_t j = i; j < end; ++j)
-            block.headers.push_back(std::move(flat[j]));
-
-        if (!block.headers.empty()) {
-            res.term_directory.push_back({block.headers.front().term,
-                                          static_cast<uint32_t>(res.term_header_blocks.size())});
-            res.term_header_blocks.push_back(std::move(block));
+    std::vector<LeafTermEntry> pageEntries;
+    size_t pageBytes = sizeof(uint32_t); // entry_count
+    for (auto& entry : flat) {
+        size_t need = leaf_entry_bytes(entry);
+        if (!pageEntries.empty() && pageBytes + need > PAGE_SIZE) {
+            LeafTermPage page{};
+            encode_leaf_page(pageEntries, page);
+            res.BBR_HeadTermEntries.push_back({pageEntries.front().LTE_Term,
+                static_cast<uint32_t>(res.BBR_LeafTermPages.size())});
+            res.BBR_LeafTermPages.push_back(page);
+            pageEntries.clear();
+            pageBytes = sizeof(uint32_t);
         }
+
+        pageBytes += need;
+        pageEntries.push_back(std::move(entry));
     }
+    if (!pageEntries.empty()) {
+        LeafTermPage page{};
+        encode_leaf_page(pageEntries, page);
+        res.BBR_HeadTermEntries.push_back({pageEntries.front().LTE_Term,
+            static_cast<uint32_t>(res.BBR_LeafTermPages.size())});
+        res.BBR_LeafTermPages.push_back(page);
+    }
+
+    res.BBR_TotalTerms = flat.size();
 
     return res;
 }
@@ -178,59 +215,44 @@ bool IndexSerializer::Save(const PostingStore& store, const char* path)
 
     BuildBlocksResult br = build_blocks(store);
 
-    /* ── Encode TermHeaderTable (two-level) ───────────────────────────────
+    /* ── Encode Head/Leaf term table (paged two-level) ────────────────────
      *
      * Format:
      *   [dir_count:4]
-     *     per dir entry: [key_len:2][first_term:key_len][term_header_block_id:4]
-     *   [block_count:4]
-     *     per block: [entry_count:4]
-     *       per entry: [key_len:2][term:key_len][doc_freq:4]
-     *                  [posting_block_id:4][posting_offset:4][posting_length:4]
-     *                  [skip_list_offset:4][continuation_block_count:4][flags:4]
+     *     per dir entry: [key_len:2][HTE_FirstTerm:key_len][HTE_LeafTermBlockID:4]
+     *   [leaf_page_count:4]
+     *   [LeafTermPage x leaf_page_count]  // each page is exactly 4096 bytes
      */
-    std::vector<uint8_t> term_header_table_buf;
+    std::vector<uint8_t> head_leaf_table_buf;
 
     auto append = [&](const void* p, size_t n) {
         auto* b = static_cast<const uint8_t*>(p);
-        term_header_table_buf.insert(term_header_table_buf.end(), b, b + n);
+        head_leaf_table_buf.insert(head_leaf_table_buf.end(), b, b + n);
     };
     auto append_u16 = [&](uint16_t v) { append(&v, 2); };
     auto append_u32 = [&](uint32_t v) { append(&v, 4); };
 
-    /* Level-1 directory */
-    append_u32(static_cast<uint32_t>(br.term_directory.size()));
-    for (const auto& d : br.term_directory) {
-        append_u16(static_cast<uint16_t>(d.first_term.size()));
-        append(d.first_term.data(), d.first_term.size());
-        append_u32(d.term_header_block_id);
+    /* Level-1 head table */
+    append_u32(static_cast<uint32_t>(br.BBR_HeadTermEntries.size()));
+    for (const auto& d : br.BBR_HeadTermEntries) {
+        append_u16(static_cast<uint16_t>(d.HTE_FirstTerm.size()));
+        append(d.HTE_FirstTerm.data(), d.HTE_FirstTerm.size());
+        append_u32(d.HTE_LeafTermBlockID);
     }
 
-    /* Level-2 blocks */
-    append_u32(static_cast<uint32_t>(br.term_header_blocks.size()));
-    for (const auto& blk : br.term_header_blocks) {
-        append_u32(static_cast<uint32_t>(blk.headers.size()));
-        for (const auto& e : blk.headers) {
-            append_u16(static_cast<uint16_t>(e.term.size()));
-            append(e.term.data(), e.term.size());
-            append_u32(e.doc_freq);
-            append_u32(e.posting_block_id);
-            append_u32(e.posting_offset);
-            append_u32(e.posting_length);
-            append_u32(e.skip_list_offset);
-            append_u32(e.continuation_block_count);
-            append_u32(e.flags);
-        }
-    }
+    /* Level-2 leaf pages */
+    append_u32(static_cast<uint32_t>(br.BBR_LeafTermPages.size()));
+    if (!br.BBR_LeafTermPages.empty())
+        append(br.BBR_LeafTermPages.data(), br.BBR_LeafTermPages.size() * sizeof(LeafTermPage));
 
     /* ── Encode PageSkipList ──────────────────────────────────────────────*/
-    std::vector<uint8_t> pageskip_buf(br.pageskip.size() * 8);
-    if (!br.pageskip.empty())
-        std::memcpy(pageskip_buf.data(), br.pageskip.data(), pageskip_buf.size());
+    std::vector<uint8_t> pageskip_buf(br.BBR_PageSkipList.size() * 8);
+    if (!br.BBR_PageSkipList.empty())
+        std::memcpy(pageskip_buf.data(), br.BBR_PageSkipList.data(), pageskip_buf.size());
 
     /* ── Encode DocData ───────────────────────────────────────────────────*/
-    static constexpr size_t DOC_REC_SIZE = 256;
-    static constexpr size_t DOC_PATH_MAX = 232;
+    static constexpr size_t DOC_REC_SIZE = 1024;
+    static constexpr size_t DOC_PATH_MAX = 1000;
 #pragma pack(push,1)
     struct DocRec { uint64_t doc_id; float importance; uint32_t doc_len;
                     uint16_t path_len; uint8_t _pad[6]; char path[DOC_PATH_MAX]; };
@@ -262,17 +284,13 @@ bool IndexSerializer::Save(const PostingStore& store, const char* path)
 #pragma pack(pop)
     const uint64_t HDR_SIZE  = sizeof(Hdr);
     uint64_t si_off          = HDR_SIZE;
-    uint64_t si_size         = term_header_table_buf.size();
+    uint64_t si_size         = head_leaf_table_buf.size();
     uint64_t ps_off          = si_off + si_size;
     uint64_t ps_size         = pageskip_buf.size();
     uint64_t dd_off          = ps_off + ps_size;
     uint64_t dd_size         = docdata.size() * DOC_REC_SIZE;
     uint64_t raw_blk_off     = dd_off + dd_size;
     uint64_t blk_off         = ((raw_blk_off + PAGE_SIZE - 1) / PAGE_SIZE) * PAGE_SIZE;
-
-    /* Count total terms across all TermHeaderBlocks */
-    uint64_t total_terms = 0;
-    for (const auto& blk : br.term_header_blocks) total_terms += blk.headers.size();
 
     FILE* f = fopen(path, "wb");
     if (!f) return false;
@@ -281,14 +299,14 @@ bool IndexSerializer::Save(const PostingStore& store, const char* path)
     std::memcpy(hdr.magic, MAGIC, 8);
     hdr.version       = FORMAT_VERSION;
     hdr.num_documents = static_cast<uint64_t>(docdata.size());
-    hdr.num_terms     = total_terms;
+    hdr.num_terms     = br.BBR_TotalTerms;
     hdr.subindex_off  = si_off;   hdr.subindex_size = si_size;
     hdr.pageskip_off  = ps_off;   hdr.pageskip_size = ps_size;
     hdr.docdata_off   = dd_off;   hdr.docdata_size  = dd_size;
-    hdr.blocks_off    = blk_off;  hdr.num_blocks    = br.blocks.size();
+    hdr.blocks_off    = blk_off;  hdr.num_blocks    = br.BBR_IndexBlocks.size();
     fwrite(&hdr, sizeof(hdr), 1, f);
 
-    fwrite(term_header_table_buf.data(), 1, term_header_table_buf.size(), f);
+    fwrite(head_leaf_table_buf.data(), 1, head_leaf_table_buf.size(), f);
     fwrite(pageskip_buf.data(), 1, pageskip_buf.size(), f);
     if (!docdata.empty())
         fwrite(docdata.data(), DOC_REC_SIZE, docdata.size(), f);
@@ -298,7 +316,7 @@ bool IndexSerializer::Save(const PostingStore& store, const char* path)
         std::vector<uint8_t> pad(static_cast<size_t>(blk_off - cur_pos), 0);
         fwrite(pad.data(), 1, pad.size(), f);
     }
-    for (const auto& b : br.blocks)
+    for (const auto& b : br.BBR_IndexBlocks)
         fwrite(&b, sizeof(IndexBlock), 1, f);
 
     fclose(f);
@@ -309,11 +327,13 @@ bool IndexSerializer::Save(const PostingStore& store, const char* path)
 
 bool IndexSerializer::Load(PostingStore&                           store,
                            const char*                            path,
-                           std::vector<TermDirectoryEntry>*        dir_out,
-                           std::vector<TermHeaderBlock>*           blocks_out,
+                           std::vector<HeadTermEntry>*             headTermEntriesOut,
+                           std::vector<LeafTermPage>*              leafTermPagesOut,
                            uint64_t*                              blocks_offset_out,
                            std::vector<uint64_t>*                 pageskip_out,
-                           uint64_t*                              num_blocks_out)
+                           uint64_t*                              num_blocks_out,
+                           uint64_t*                              leaf_blocks_offset_out,
+                           uint64_t*                              num_leaf_blocks_out)
 {
     if (!path || !*path) return false;
     FILE* f = fopen(path, "rb");
@@ -336,55 +356,40 @@ bool IndexSerializer::Load(PostingStore&                           store,
         || hdr.version != FORMAT_VERSION)
     { fclose(f); return false; }
 
-    /* ── TermHeaderTable ──────────────────────────────────────────────────*/
-    if ((dir_out || blocks_out) && hdr.subindex_size > 0) {
-        std::vector<uint8_t> buf(static_cast<size_t>(hdr.subindex_size));
+    /* ── Head/Leaf term table ─────────────────────────────────────────────*/
+    if ((headTermEntriesOut || leafTermPagesOut || leaf_blocks_offset_out || num_leaf_blocks_out) && hdr.subindex_size > 0) {
         fseek(f, static_cast<long>(hdr.subindex_off), SEEK_SET);
-        fread(buf.data(), 1, buf.size(), f);
 
-        const uint8_t* ptr = buf.data();
-        const uint8_t* end = buf.data() + buf.size();
+        auto read_u16_file = [&]() -> uint16_t {
+            uint16_t v = 0; fread(&v, 2, 1, f); return v;
+        };
+        auto read_u32_file = [&]() -> uint32_t {
+            uint32_t v = 0; fread(&v, 4, 1, f); return v;
+        };
+        auto read_str_file = [&](size_t n) -> std::string {
+            std::string s(n, '\0');
+            if (n) fread(s.data(), 1, n, f);
+            return s;
+        };
 
-        auto read_u16 = [&]() -> uint16_t {
-            if (ptr + 2 > end) return 0;
-            uint16_t v; std::memcpy(&v, ptr, 2); ptr += 2; return v; };
-        auto read_u32 = [&]() -> uint32_t {
-            if (ptr + 4 > end) return 0;
-            uint32_t v; std::memcpy(&v, ptr, 4); ptr += 4; return v; };
-        auto read_str = [&](size_t n) -> std::string {
-            if (ptr + n > end) return {};
-            std::string s(reinterpret_cast<const char*>(ptr), n); ptr += n; return s; };
-
-        /* Level-1 directory */
-        uint32_t dir_count = read_u32();
-        if (dir_out) dir_out->reserve(dir_count);
-        for (uint32_t i = 0; i < dir_count && ptr < end; ++i) {
-            uint16_t    kl    = read_u16();
-            std::string first = read_str(kl);
-            uint32_t    bidx  = read_u32();
-            if (dir_out) dir_out->push_back({std::move(first), bidx});
+        /* Level-1 head table — eagerly memory resident. */
+        uint32_t dir_count = read_u32_file();
+        if (headTermEntriesOut) headTermEntriesOut->reserve(dir_count);
+        for (uint32_t i = 0; i < dir_count; ++i) {
+            uint16_t    kl    = read_u16_file();
+            std::string first = read_str_file(kl);
+            uint32_t    bidx  = read_u32_file();
+            if (headTermEntriesOut) headTermEntriesOut->push_back({std::move(first), bidx});
         }
 
-        /* Level-2 blocks */
-        uint32_t blk_count = read_u32();
-        if (blocks_out) blocks_out->resize(blk_count);
-        for (uint32_t b = 0; b < blk_count && ptr < end; ++b) {
-            uint32_t entry_count = read_u32();
-            if (blocks_out) (*blocks_out)[b].headers.reserve(entry_count);
-            for (uint32_t i = 0; i < entry_count && ptr < end; ++i) {
-                uint16_t    kl   = read_u16();
-                std::string term = read_str(kl);
-                uint32_t freq    = read_u32();
-                uint32_t pbid    = read_u32();
-                uint32_t poff    = read_u32();
-                uint32_t plen    = read_u32();
-                uint32_t skip    = read_u32();
-                uint32_t cont    = read_u32();
-                uint32_t flags   = read_u32();
-                if (blocks_out)
-                    (*blocks_out)[b].headers.push_back(
-                        {std::move(term), freq, pbid, poff, plen, skip, cont, flags});
-            }
+        /* Level-2 leaf pages — only read into memory when explicitly requested. */
+        uint32_t leaf_page_count = read_u32_file();
+        uint64_t leaf_pages_offset = static_cast<uint64_t>(ftell(f));
+        if (leaf_blocks_offset_out) *leaf_blocks_offset_out = leaf_pages_offset;
+        if (num_leaf_blocks_out) *num_leaf_blocks_out = leaf_page_count;
+        if (leafTermPagesOut && leaf_page_count > 0) {
+            leafTermPagesOut->resize(leaf_page_count);
+            fread(leafTermPagesOut->data(), sizeof(LeafTermPage), leaf_page_count, f);
         }
     }
 
@@ -401,7 +406,7 @@ bool IndexSerializer::Load(PostingStore&                           store,
 
     /* ── DocData ──────────────────────────────────────────────────────────*/
     {
-        static constexpr size_t REC = 256, PMAX = 232;
+        static constexpr size_t REC = 1024, PMAX = 1000;
 #pragma pack(push,1)
         struct DocRec { uint64_t doc_id; float importance; uint32_t doc_len;
                         uint16_t path_len; uint8_t _pad[6]; char path[PMAX]; };

@@ -11,11 +11,15 @@ import sys, os, json, http.server, socketserver, urllib.parse, mimetypes
 
 idx_path = sys.argv[1] if len(sys.argv) > 1 else ''
 port     = int(sys.argv[2]) if len(sys.argv) > 2 else 8080
+LARGE_INDEX_COPY_LIMIT = 128 * 1024 * 1024
 
 # Write a tiny config that index.html reads to auto-load the idx.
 # Path is made relative to the HTTP server root (this script's directory).
 script_dir = os.path.dirname(os.path.abspath(__file__))
 os.chdir(script_dir)
+
+served_idx_abs = ''
+served_idx_size = 0
 
 if idx_path:
     abs_idx = os.path.abspath(idx_path)
@@ -27,23 +31,89 @@ if idx_path:
         if rel.startswith('..'):
             raise ValueError('outside serving root')
     except ValueError:
-        # Cross-drive or outside root: copy the file into the serving directory.
-        import shutil
-        dest = os.path.join(script_dir, 'moon.idx')
-        if abs_idx != dest:
-            shutil.copy2(abs_idx, dest)
-            print(f'Copied idx  →  {dest}')
-        rel = 'moon.idx'
+        # Cross-drive or outside root. Small files are copied for ordinary static
+        # loading; large files are exposed through /idx-range so startup does not
+        # duplicate a multi-GB index before the viewer can show a header summary.
+        if os.path.getsize(abs_idx) > LARGE_INDEX_COPY_LIMIT:
+            rel = '__configured_idx__'
+            print(f'Large idx range-served  →  {abs_idx}')
+        else:
+            import shutil
+            dest = os.path.join(script_dir, 'moon.idx')
+            if abs_idx != dest:
+                shutil.copy2(abs_idx, dest)
+                print(f'Copied idx  →  {dest}')
+            abs_idx = dest
+            rel = 'moon.idx'
     config_val = rel.replace('\\', '/')
+    served_idx_abs = abs_idx
+    served_idx_size = os.path.getsize(abs_idx) if os.path.isfile(abs_idx) else 0
 else:
     config_val = ''
 
 with open('moonshot-config.js', 'w') as f:
     f.write(f'window.MOONSHOT_IDX = {json.dumps(config_val)};\n')
+    f.write(f'window.MOONSHOT_IDX_SIZE = {served_idx_size};\n')
+
+class ThreadingReusableTCPServer(socketserver.ThreadingTCPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+
 
 class MoonShotHandler(http.server.SimpleHTTPRequestHandler):
+    def end_headers(self):
+        self.send_header('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0')
+        self.send_header('Pragma', 'no-cache')
+        self.send_header('Expires', '0')
+        super().end_headers()
+
     def do_GET(self):
+        # The viewer changes frequently during development; ignore browser
+        # conditional-cache headers so stale index.html / wasm bundles never win.
+        for header in ('If-Modified-Since', 'If-None-Match'):
+            if header in self.headers:
+                del self.headers[header]
+
         parsed = urllib.parse.urlparse(self.path)
+        if parsed.path == '/':
+            self.path = '/index.html'
+            parsed = urllib.parse.urlparse(self.path)
+
+        if parsed.path == '/idx-range':
+            if not served_idx_abs or not os.path.isfile(served_idx_abs):
+                self.send_error(404, 'no configured idx')
+                return
+
+            query = urllib.parse.parse_qs(parsed.query)
+            try:
+                start = int(query.get('start', ['0'])[0])
+                length = int(query.get('length', ['96'])[0])
+            except ValueError:
+                self.send_error(400, 'invalid range')
+                return
+
+            size = os.path.getsize(served_idx_abs)
+            start = max(0, min(start, size))
+            length = max(0, min(length, size - start))
+
+            try:
+                with open(served_idx_abs, 'rb') as f:
+                    f.seek(start)
+                    data = f.read(length)
+            except OSError as exc:
+                self.send_error(500, str(exc))
+                return
+
+            self.send_response(206)
+            self.send_header('Content-Type', 'application/octet-stream')
+            self.send_header('Accept-Ranges', 'bytes')
+            self.send_header('Content-Range', f'bytes {start}-{start + len(data) - 1}/{size}' if data else f'bytes */{size}')
+            self.send_header('X-File-Size', str(size))
+            self.send_header('Content-Length', str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+            return
+
         if parsed.path == '/file':
             query = urllib.parse.parse_qs(parsed.query)
             raw_path = query.get('path', [''])[0]
@@ -81,5 +151,5 @@ if config_val:
 else:
     print('No idx specified  →  use the Open / Drop zone in the browser')
 
-with socketserver.TCPServer(('', port), MoonShotHandler) as srv:
+with ThreadingReusableTCPServer(('', port), MoonShotHandler) as srv:
     srv.serve_forever()

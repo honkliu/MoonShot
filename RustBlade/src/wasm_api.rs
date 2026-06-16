@@ -2,6 +2,7 @@
  * wasm_api.rs — wasm-bindgen exports for the MoonShot index viewer.
  *
  * Exposed to JavaScript:
+ *   parse_index_summary(bytes: Uint8Array, file_size: usize) -> String (JSON)
  *   parse_index(bytes: Uint8Array) -> String (JSON)
  *   search_index(bytes: Uint8Array, query: String, streams: String) -> String (JSON)
  */
@@ -9,13 +10,48 @@
 use wasm_bindgen::prelude::*;
 use crate::serializer::IndexSerializer;
 use crate::posting_store::PostingStore;
-use crate::block_table::{PAGE_SIZE, IB_HEADER_HAS_MORE};
+use crate::block_table::{PAGE_SIZE, IB_HEADER_HAS_MORE, IB_DATA_OFFSET};
 use crate::index_context::IndexContext;
+
+// ── parse_index_summary ─────────────────────────────────────────────────────
+
+/// Parse only the fixed 96-byte header. This is safe for multi-GB indexes and
+/// lets the browser show metadata without expanding the entire file to JSON.
+#[wasm_bindgen]
+pub fn parse_index_summary(data: &[u8], file_size: usize) -> String {
+    match parse_index_summary_inner(data, file_size) {
+        Ok(s)  => s,
+        Err(e) => format!(r#"{{"error":"{}"}}"#, e),
+    }
+}
+
+fn parse_index_summary_inner(data: &[u8], file_size: usize) -> Result<String, String> {
+    if data.len() < 96 {
+        return Err("Index header is shorter than 96 bytes".to_string());
+    }
+    if &data[0..8] != b"MOONSHOT" {
+        return Err("Not a valid MOONSHOT index (bad magic)".to_string());
+    }
+    let version = u32_at(data, 8);
+    if version != 7 {
+        return Err(format!("Unsupported index version {}; expected 7", version));
+    }
+
+    let hdr = parse_header(data);
+    Ok(format!(
+        r#"{{"header":{{"size":96,"magic":"MOONSHOT","version":{},"num_docs":{},"num_terms":{},"subindex_off":{},"subindex_size":{},"pageskip_off":{},"pageskip_size":{},"docdata_off":{},"docdata_size":{},"blocks_off":{},"num_blocks":{},"ib_data_off":{},"file_size":{}}},"head_leaf_term_table":{{"head":[],"leaf_blocks":[]}},"docdata":[],"blocks":[],"summary_only":true}}"#,
+        hdr.version, hdr.num_docs, hdr.num_terms,
+        hdr.subindex_off, hdr.subindex_size,
+        hdr.pageskip_off, hdr.pageskip_size,
+        hdr.docdata_off, hdr.docdata_size,
+        hdr.blocks_off, hdr.num_blocks, IB_DATA_OFFSET, file_size
+    ))
+}
 
 // ── parse_index ──────────────────────────────────────────────────────────────
 
 /// Parse a .idx file from raw bytes and return a JSON description of every
-/// section (Header, TermHeaderTable, DocData, Blocks with decoded term entries).
+/// section (Header, Head/Leaf term table, DocData, IndexBlocks with decoded entries).
 #[wasm_bindgen]
 pub fn parse_index(data: &[u8]) -> String {
     match parse_index_inner(data) {
@@ -28,91 +64,98 @@ fn parse_index_inner(data: &[u8]) -> Result<String, String> {
     if !IndexSerializer::is_valid_bytes(data) {
         return Err("Not a valid MOONSHOT index (bad magic)".to_string());
     }
+    if data.len() >= 12 {
+        let version = u32_at(data, 8);
+        if version != 7 {
+            return Err(format!("Unsupported index version {}; expected 7", version));
+        }
+    }
 
     let mut store = PostingStore::new();
-    let (term_directory, term_header_blocks, blocks, _pageskip) = IndexSerializer::decode(&mut store, data)
+    let (head_term_entries, leaf_term_blocks, blocks, _pageskip) = IndexSerializer::decode(&mut store, data)
         .map_err(|e| format!("{e:?}"))?;
 
-    // Flatten TermHeaders for display and posting-block matching
-    let term_headers: Vec<&crate::block_table::TermHeader> =
-        term_header_blocks.iter().flat_map(|b| b.headers.iter()).collect();
+    // Flatten LeafTermEntries for display and IndexBlock matching.
+    let leaf_term_entries: Vec<&crate::block_table::LeafTermEntry> =
+        leaf_term_blocks.iter().flat_map(|b| b.ltb_entries.iter()).collect();
 
-    // Build posting_block_id → [TermHeader] map once, reused per block (O(N) not O(N×M))
-    let mut block_entry_map: std::collections::HashMap<u32, Vec<&crate::block_table::TermHeader>> =
+    // Build IndexBlockID -> [LeafTermEntry] map once, reused per block (O(N) not O(N x M)).
+    let mut block_entry_map: std::collections::HashMap<u32, Vec<&crate::block_table::LeafTermEntry>> =
         std::collections::HashMap::new();
-    for e in &term_headers {
-        block_entry_map.entry(e.posting_block_id).or_default().push(e);
+    for e in &leaf_term_entries {
+        block_entry_map.entry(e.lte_index_block_id).or_default().push(e);
     }
 
     let file_size = data.len();
     let hdr = parse_header(data);
 
-    let mut dir_ranges: Vec<(usize, usize)> = Vec::with_capacity(term_directory.len());
+    let mut head_ranges: Vec<(usize, usize)> = Vec::with_capacity(head_term_entries.len());
     let mut block_ranges: Vec<(usize, usize, Vec<(usize, usize)>)> =
-        Vec::with_capacity(term_header_blocks.len());
+        Vec::with_capacity(leaf_term_blocks.len());
     let mut table_pos = hdr.subindex_off as usize + 4; // dir_count
-    for d in &term_directory {
-        let len = 2 + d.first_term.len() + 4;
-        dir_ranges.push((table_pos, len));
+    for d in &head_term_entries {
+        let len = 2 + d.hte_first_term.len() + 4;
+        head_ranges.push((table_pos, len));
         table_pos += len;
     }
     table_pos += 4; // block_count
-    for block in &term_header_blocks {
+    for block in &leaf_term_blocks {
         let block_start = table_pos;
-        table_pos += 4; // entry_count
-        let mut header_ranges = Vec::with_capacity(block.headers.len());
-        for header in &block.headers {
-            let len = 2 + header.term.len() + 28;
-            header_ranges.push((table_pos, len));
-            table_pos += len;
+        let mut entry_pos = block_start + 4; // entry_count
+        let mut entry_ranges = Vec::with_capacity(block.ltb_entries.len());
+        for entry in &block.ltb_entries {
+            let len = 2 + entry.lte_term.len() + 28;
+            entry_ranges.push((entry_pos, len));
+            entry_pos += len;
         }
-        block_ranges.push((block_start, table_pos - block_start, header_ranges));
+        block_ranges.push((block_start, PAGE_SIZE, entry_ranges));
+        table_pos += PAGE_SIZE;
     }
 
     let mut out = String::from("{");
 
     // Header
     out.push_str(&format!(
-        r#""header":{{"size":96,"magic":"MOONSHOT","version":{},"num_docs":{},"num_terms":{},"subindex_off":{},"subindex_size":{},"pageskip_off":{},"pageskip_size":{},"docdata_off":{},"docdata_size":{},"blocks_off":{},"num_blocks":{},"file_size":{}}},"#,
+        r#""header":{{"size":96,"magic":"MOONSHOT","version":{},"num_docs":{},"num_terms":{},"subindex_off":{},"subindex_size":{},"pageskip_off":{},"pageskip_size":{},"docdata_off":{},"docdata_size":{},"blocks_off":{},"num_blocks":{},"ib_data_off":{},"file_size":{}}},"#,
         hdr.version, hdr.num_docs, hdr.num_terms,
         hdr.subindex_off, hdr.subindex_size,
         hdr.pageskip_off, hdr.pageskip_size,
         hdr.docdata_off, hdr.docdata_size,
-        hdr.blocks_off, hdr.num_blocks, file_size
+        hdr.blocks_off, hdr.num_blocks, IB_DATA_OFFSET, file_size
     ));
 
-    // TermHeaderTable — show two-level structure
-    out.push_str(r#""term_header_table":{"dir":["#);
-    for (i, d) in term_directory.iter().enumerate() {
+    // Head/Leaf term table — show two-level structure.
+    out.push_str(r#""head_leaf_term_table":{"head":["#);
+    for (i, d) in head_term_entries.iter().enumerate() {
         if i > 0 { out.push(','); }
-        let (byte_offset, byte_len) = dir_ranges[i];
-        let block_id = d.term_header_block_id as usize;
+        let (byte_offset, byte_len) = head_ranges[i];
+        let block_id = d.hte_leaf_term_block_id as usize;
         let (block_offset, block_len) = block_ranges
             .get(block_id)
             .map(|(offset, len, _)| (*offset, *len))
             .unwrap_or((0, 0));
         out.push_str(&format!(
-            r#"{{"first_term":{},"term_header_block_id":{},"byte_offset":{},"byte_len":{},"header_block_offset":{},"header_block_len":{}}}"#,
-            serde_json::to_string(&d.first_term).unwrap_or_default(),
-            d.term_header_block_id,
+            r#"{{"hte_first_term":{},"hte_leaf_term_block_id":{},"byte_offset":{},"byte_len":{},"leaf_term_block_offset":{},"leaf_term_block_len":{}}}"#,
+            serde_json::to_string(&d.hte_first_term).unwrap_or_default(),
+            d.hte_leaf_term_block_id,
             byte_offset, byte_len, block_offset, block_len
         ));
     }
-    out.push_str(r#"],"blocks":["#);
-    for (i, block) in term_header_blocks.iter().enumerate() {
+    out.push_str(r#"],"leaf_blocks":["#);
+    for (i, block) in leaf_term_blocks.iter().enumerate() {
         if i > 0 { out.push(','); }
-        let (block_offset, block_len, header_ranges) = &block_ranges[i];
+        let (block_offset, block_len, entry_ranges) = &block_ranges[i];
         out.push_str(&format!(
-            r#"{{"id":{},"byte_offset":{},"byte_len":{},"headers":["#,
+            r#"{{"id":{},"byte_offset":{},"byte_len":{},"entries":["#,
             i, block_offset, block_len));
-        for (j, e) in block.headers.iter().enumerate() {
+        for (j, e) in block.ltb_entries.iter().enumerate() {
             if j > 0 { out.push(','); }
-            let (byte_offset, byte_len) = header_ranges[j];
+            let (byte_offset, byte_len) = entry_ranges[j];
             out.push_str(&format!(
-                r#"{{"term":{},"doc_freq":{},"posting_block_id":{},"posting_offset":{},"posting_length":{},"skip_list_offset":{},"continuation_block_count":{},"flags":{},"byte_offset":{},"byte_len":{}}}"#,
-                serde_json::to_string(&e.term).unwrap_or_default(),
-                e.doc_freq, e.posting_block_id, e.posting_offset, e.posting_length,
-                e.skip_list_offset, e.continuation_block_count, e.flags,
+                r#"{{"lte_term":{},"lte_doc_freq":{},"lte_index_block_id":{},"lte_index_offset":{},"lte_index_length":{},"lte_page_skip_offset":{},"lte_continuation_block_count":{},"lte_flags":{},"byte_offset":{},"byte_len":{}}}"#,
+                serde_json::to_string(&e.lte_term).unwrap_or_default(),
+                e.lte_doc_freq, e.lte_index_block_id, e.lte_index_offset, e.lte_index_length,
+                e.lte_page_skip_offset, e.lte_continuation_block_count, e.lte_flags,
                 byte_offset, byte_len
             ));
         }
@@ -162,36 +205,36 @@ fn parse_index_inner(data: &[u8]) -> Result<String, String> {
     Ok(out)
 }
 
-/// Decode terms in a block using TermHeader records (blocks no longer store key headers).
+/// Decode terms in a block using LeafTermEntry records (blocks no longer store key headers).
 /// For continuation blocks: the ib_data starts with CONT_MARKER + cont_len + cont_bytes.
-/// For term-start blocks: entries are raw posting bytes located by TermHeader posting offsets.
+/// For term-start blocks: entries are raw index bytes located by LeafTermEntry offsets.
 fn decode_block_terms_from_headers(
     blk:      &crate::block_table::IndexBlock,
-    entries:  &[&crate::block_table::TermHeader],
+    entries:  &[&crate::block_table::LeafTermEntry],
 ) -> Vec<String> {
     let data = &blk.ib_data;
     let len  = data.len();
     let mut terms = Vec::new();
 
     for e in entries {
-        let start = e.posting_offset as usize;
-        let end   = (start + e.posting_length as usize).min(len);
+        let start = e.lte_index_offset as usize;
+        let end   = (start + e.lte_index_length as usize).min(len);
         if start >= len { continue; }
         let postings = decode_postings(&data[start..end]);
         let shown = postings.len().min(5);  // cap at 5 to keep JSON small
 
         let mut entry = format!(
-            r#"{{"key":{},"freq":{},"data_len":{},"data_off":{},"continuation_block_count":{},"postings":["#,
-            serde_json::to_string(&e.term).unwrap_or_default(),
-            e.doc_freq, e.posting_length, e.posting_offset, e.continuation_block_count
+            r#"{{"lte_term":{},"lte_doc_freq":{},"lte_index_length":{},"lte_index_offset":{},"lte_continuation_block_count":{},"index_entries":["#,
+            serde_json::to_string(&e.lte_term).unwrap_or_default(),
+            e.lte_doc_freq, e.lte_index_length, e.lte_index_offset, e.lte_continuation_block_count
         );
         for (j, (doc_id, tf)) in postings[..shown].iter().enumerate() {
             if j > 0 { entry.push(','); }
-            entry.push_str(&format!(r#"{{"doc_id":"{}","tf":{}}}"#, doc_id, tf));
+            entry.push_str(&format!(r#"{{"ie_doc_id":"{}","ie_term_frequency":{}}}"#, doc_id, tf));
         }
         if postings.len() > shown {
             if shown > 0 { entry.push(','); }
-            entry.push_str(&format!(r#"{{"doc_id":"…","tf":"({} more)"}}"#,
+            entry.push_str(&format!(r#"{{"ie_doc_id":"…","ie_term_frequency":"({} more)"}}"#,
                 postings.len() - shown));
         }
         entry.push_str("]}");
@@ -204,16 +247,16 @@ fn decode_block_terms_from_headers(
         let postings = decode_postings(&data[4..((4 + cont_len).min(len))]);
         let shown = postings.len().min(5);
         let mut entry = format!(
-            r#"{{"key":"[continuation]","freq":0,"data_len":{},"data_off":4,"postings":["#,
+            r#"{{"lte_term":"[continuation]","lte_doc_freq":0,"lte_index_length":{},"lte_index_offset":4,"index_entries":["#,
             cont_len
         );
         for (j, (doc_id, tf)) in postings[..shown].iter().enumerate() {
             if j > 0 { entry.push(','); }
-            entry.push_str(&format!(r#"{{"doc_id":"{}","tf":{}}}"#, doc_id, tf));
+            entry.push_str(&format!(r#"{{"ie_doc_id":"{}","ie_term_frequency":{}}}"#, doc_id, tf));
         }
         if postings.len() > shown {
             if shown > 0 { entry.push(','); }
-            entry.push_str(&format!(r#"{{"doc_id":"…","tf":"({} more)"}}"#,
+            entry.push_str(&format!(r#"{{"ie_doc_id":"…","ie_term_frequency":"({} more)"}}"#,
                 postings.len() - shown));
         }
         entry.push_str("]}");

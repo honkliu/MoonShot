@@ -61,6 +61,7 @@ body { font:13px 'Segoe UI',sans-serif; background:#1e1e1e; color:#d4d4d4;
 /* section colours (dim — show structure without distracting) */
 .s-hdr  { color:#569cd6; }
 .s-si   { color:#4ec9b0; }
+.s-ps   { color:#dcdcaa; }
 .s-dd   { color:#ce9178; }
 .s-b0   { color:#9a9a9a; }
 .s-b1   { color:#888; }
@@ -97,15 +98,18 @@ tr:hover td { background:#2a2d2e; cursor:pointer; }
 .bcard     { border-bottom:1px solid #2a2a2a; }
 .bcard-hdr { padding:5px 10px; background:#252526; display:flex; align-items:center;
              gap:6px; cursor:pointer; font-size:12px; }
-.bcard-body { display:none; }
-.bcard.open .bcard-body { display:block; }
 .term-explorer { height:calc(100vh - 94px); overflow:auto; min-height:0; }
 .term-toolbar { padding:5px 8px; font-size:11px; color:#888; background:#252526; border-bottom:1px solid #3e3e42; }
+.pager { display:flex; align-items:center; gap:6px; padding:2px 0; color:#888; font-size:11px; }
+.pager .icon-btn { width:24px; }
+.pager .tool-input { width:70px; height:22px; padding:2px 6px; font-size:11px; }
 .icon-btn { width:18px; height:18px; padding:0; border:1px solid #555; border-radius:2px;
             background:#2d2d30; color:#ccc; cursor:pointer; font:12px 'Cascadia Code','Consolas',monospace; }
 .icon-btn:hover { background:#094771; color:#fff; border-color:#007acc; }
+.icon-btn:disabled { opacity:.35; cursor:default; background:#2d2d30; color:#777; border-color:#444; }
 .tree-row.active td { background:#094771; }
 .tree-row .indent { display:inline-block; width:18px; }
+.tree-cell { display:flex; align-items:center; gap:4px; }
 .tree-kind { color:#888; font-size:11px; }
 .term-jump { color:#9cdcfe; text-decoration:underline; cursor:pointer; }
 .term-empty { padding:12px; color:#777; font-size:12px; }
@@ -176,9 +180,9 @@ tr:hover td { background:#2a2d2e; cursor:pointer; }
   <div id="right">
     <div id="dec-tabs">
       <div class="dtab active" data-p="hdr-panel"  onclick="switchTab(this)">File Header</div>
-      <div class="dtab"        data-p="si-panel"   onclick="switchTab(this)">Term Directory</div>
+      <div class="dtab"        data-p="si-panel"   onclick="switchTab(this)">Head/Leaf Terms</div>
       <div class="dtab"        data-p="dd-panel"   onclick="switchTab(this)">DocData</div>
-      <div class="dtab"        data-p="blk-panel"  onclick="switchTab(this)">Posting Blocks</div>
+      <div class="dtab"        data-p="blk-panel"  onclick="switchTab(this)">IndexBlocks</div>
       <div class="dtab"        data-p="srch-panel" onclick="switchTab(this)">Search</div>
     </div>
     <div id="dec-body">
@@ -212,11 +216,23 @@ tr:hover td { background:#2a2d2e; cursor:pointer; }
 <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/auto-render.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/mermaid@10.9.1/dist/mermaid.min.js"></script>
 <script type="module">
-import init, { parse_index, search_index } from './pkg/moon_wasm.js';
-await init();
-window._wasm = { parse_index, search_index };
+const BUILD_STAMP = 'v7-20260615-1';
+const LARGE_INDEX_LIMIT = 128 * 1024 * 1024;
+const PAGE_SIZE = 4096;
+const DOC_REC_SIZE = 1024;
+const HEAD_ROWS_PER_PAGE = 32;
+const DOCDATA_ROWS_PER_PAGE = 32;
+const INDEXBLOCKS_PER_PAGE = 32;
+const POSTING_ROWS_PER_PAGE = 32;
+const { default: init, parse_index_summary, parse_index, search_index } = await import(`./pkg/moon_wasm.js?${BUILD_STAMP}`);
+const wasmBytes = await fetch(`./pkg/moon_wasm_bg.wasm?${BUILD_STAMP}`, { cache: 'no-store' })
+  .then(r => r.ok ? r.arrayBuffer() : Promise.reject(r.status));
+await init(wasmBytes);
+window._wasm = { parse_index_summary, parse_index, search_index };
+window.MOONSHOT_VIEWER_BUILD = BUILD_STAMP;
 
 let G = { bytes: null, parsed: null, sc: null };
+const TEXT_DECODER = new TextDecoder('utf-8');
 
 // ── Drag-to-resize + click-to-collapse for hex pane divider ──────────────────
 (function() {
@@ -262,17 +278,79 @@ let G = { bytes: null, parsed: null, sc: null };
   const u = p.get('idx') || (typeof window.MOONSHOT_IDX === 'string' && window.MOONSHOT_IDX) || '';
   if (u) {
     setStatus('Loading ' + u + '…');
-    fetch(u).then(r => r.ok ? r.arrayBuffer() : Promise.reject(r.status))
-      .then(buf => loadData(new Uint8Array(buf), u.split('/').pop()))
+    loadRemoteIndex(u, Number(window.MOONSHOT_IDX_SIZE || 0))
       .catch(e => setStatus('Cannot load ' + u + ': ' + e));
   }
 })();
 
+function withCacheBuster(url) {
+  const sep = url.includes('?') ? '&' : '?';
+  return `${url}${sep}_=${BUILD_STAMP}-${Date.now()}`;
+}
+
 // ── loading ───────────────────────────────────────────────────────────────────
 function loadFile(file) {
+  if (file.size > LARGE_INDEX_LIMIT) {
+    setStatus('Loading header only for large local file ' + file.name + '…');
+    file.slice(0, 96).arrayBuffer()
+      .then(buf => loadSummaryData(new Uint8Array(buf), file.name, file.size, 'Large local file: summary mode'))
+      .catch(e => setStatus('Cannot read ' + file.name + ': ' + e));
+    return;
+  }
   const r = new FileReader();
   r.onload = e => { loadData(new Uint8Array(e.target.result), file.name); };
   r.readAsArrayBuffer(file);
+}
+
+async function loadRemoteIndex(url, size) {
+  if (size > LARGE_INDEX_LIMIT) {
+    const res = await fetch(`/idx-range?start=0&length=96&_=${BUILD_STAMP}-${Date.now()}`, { cache: 'no-store' });
+    if (!res.ok) throw res.status;
+    const fileSize = Number(res.headers.get('X-File-Size') || size || 0);
+    const buf = await res.arrayBuffer();
+    loadSummaryData(new Uint8Array(buf), url.split('/').pop(), fileSize, 'Large served index: summary mode');
+    return;
+  }
+  const res = await fetch(withCacheBuster(url));
+  if (!res.ok) throw res.status;
+  const buf = await res.arrayBuffer();
+  loadData(new Uint8Array(buf), url.split('/').pop());
+}
+
+function loadSummaryData(headerBytes, name, fileSize, reason) {
+  G.bytes = headerBytes;
+  setStatus('Parsing header for ' + (name||'file') + '…');
+  try {
+    G.parsed = JSON.parse(window._wasm.parse_index_summary(G.bytes, fileSize || G.bytes.length));
+    if (G.parsed.error) { setStatus('Error: '+G.parsed.error+' · viewer '+BUILD_STAMP); return; }
+    normalizeParsedIndex(G.parsed);
+    G.summaryOnly = true;
+    G.summaryReason = reason || 'summary mode';
+    G.paged = { leafCache: new Map(), blockCache: new Map(), docCache: new Map() };
+    G.leafTermBlocksById = new Map();
+    G_ExpandedTree = new Set();
+    G_SelectedTreeNode = '';
+    G_TermFilter = '';
+    G_HeadPage = 0;
+    G_DocPage = 0;
+    G_BlockPage = 0;
+    G_PostingPages = new Map();
+    document.getElementById('drop').style.display = 'none';
+    document.getElementById('main').style.display = 'flex';
+    buildHex();
+    renderAllPanels();
+    const h = G.parsed.header;
+    setStatus(`${h.num_docs} docs · ${h.num_terms} terms · ${h.num_blocks} IndexBlocks · ${formatBytes(h.file_size)} · ${G.summaryReason} · viewer ${BUILD_STAMP}`);
+    loadPagedHeadDirectory().then(() => {
+      renderHeadLeafTerms();
+      renderDocData();
+      renderBlocks();
+      setStatus(`${h.num_docs} docs · ${h.num_terms} terms · ${h.num_blocks} IndexBlocks · ${formatBytes(h.file_size)} · paged head loaded · viewer ${BUILD_STAMP}`);
+    }).catch(ex => {
+      console.error(ex);
+      setStatus(`Header loaded, but paged directory load failed: ${ex}`);
+    });
+  } catch(ex) { setStatus('Error: '+ex); console.error(ex); }
 }
 
 function loadData(bytes, name) {
@@ -280,17 +358,488 @@ function loadData(bytes, name) {
   setStatus('Parsing ' + (name||'file') + '…');
   try {
     G.parsed = JSON.parse(window._wasm.parse_index(G.bytes));
-    if (G.parsed.error) { setStatus('Error: '+G.parsed.error); return; }
-    G.termHeaderBlocksById = new Map((G.parsed.term_header_table?.blocks || []).map(b => [b.id, b]));
+    if (G.parsed.error) { setStatus('Error: '+G.parsed.error+' · viewer '+BUILD_STAMP); return; }
+    normalizeParsedIndex(G.parsed);
+    G.summaryOnly = false;
+    G.summaryReason = '';
+    G.leafTermBlocksById = new Map((G.parsed.head_leaf_term_table?.leaf_blocks || []).map(b => [b.id, b]));
     G_ExpandedTree = new Set();
     G_SelectedTreeNode = '';
     G_TermFilter = '';
+    G_HeadPage = 0;
+    G_DocPage = 0;
+    G_BlockPage = 0;
+    G_PostingPages = new Map();
     document.getElementById('drop').style.display = 'none';
     document.getElementById('main').style.display = 'flex';
     buildHex();
-    renderHeader(); renderTermHeaders(); renderDocData(); renderBlocks();
-    setStatus(G.parsed.header.num_docs + ' docs · ' + G.parsed.header.num_terms + ' terms · ' + G.parsed.blocks.length + ' posting blocks');
+    renderAllPanels();
+    setStatus(G.parsed.header.num_docs + ' docs · ' + G.parsed.header.num_terms + ' terms · ' + G.parsed.blocks.length + ' IndexBlocks · full parse · viewer ' + BUILD_STAMP);
   } catch(ex) { setStatus('Error: '+ex); console.error(ex); }
+}
+
+function renderAllPanels() {
+  const panels = [renderHeader, renderHeadLeafTerms, renderDocData, renderBlocks];
+  for (const render of panels) {
+    try {
+      const result = render();
+      if (result && typeof result.catch === 'function')
+        result.catch(ex => console.error(render.name + ' failed', ex));
+    }
+    catch (ex) { console.error(render.name + ' failed', ex); }
+  }
+}
+
+function normalizeParsedIndex(parsed) {
+  parsed.docdata = Array.isArray(parsed.docdata) ? parsed.docdata : [];
+  parsed.blocks = Array.isArray(parsed.blocks) ? parsed.blocks : [];
+  parsed.header = parsed.header || {};
+  parsed.header.ib_data_off = parsed.header.ib_data_off ?? 208;
+
+  if (!parsed.head_leaf_term_table && parsed.term_header_table) {
+    const old = parsed.term_header_table;
+    parsed.head_leaf_term_table = {
+      head: (old.dir || []).map(d => ({
+        hte_first_term: d.hte_first_term ?? d.first_term ?? '',
+        hte_leaf_term_block_id: d.hte_leaf_term_block_id ?? d.term_header_block_id ?? 0,
+        byte_offset: d.byte_offset ?? 0,
+        byte_len: d.byte_len ?? 0,
+        leaf_term_block_offset: d.leaf_term_block_offset ?? d.header_block_offset ?? 0,
+        leaf_term_block_len: d.leaf_term_block_len ?? d.header_block_len ?? 0,
+      })),
+      leaf_blocks: (old.leaf_blocks || old.blocks || []).map(b => ({
+        id: b.id,
+        byte_offset: b.byte_offset ?? 0,
+        byte_len: b.byte_len ?? 0,
+        entries: (b.entries || b.headers || []).map(normalizeLeafTermEntry),
+      })),
+    };
+  }
+
+  parsed.head_leaf_term_table = parsed.head_leaf_term_table || { head: [], leaf_blocks: [] };
+  parsed.head_leaf_term_table.head = parsed.head_leaf_term_table.head || [];
+  parsed.head_leaf_term_table.leaf_blocks = parsed.head_leaf_term_table.leaf_blocks || [];
+  parsed.head_leaf_term_table.leaf_blocks = parsed.head_leaf_term_table.leaf_blocks.map(b => ({
+    id: b.id,
+    byte_offset: b.byte_offset ?? 0,
+    byte_len: b.byte_len ?? 0,
+    entries: (b.entries || b.headers || []).map(normalizeLeafTermEntry),
+  }));
+
+  for (const block of parsed.blocks) {
+    block.terms = (block.terms || []).map(t => ({
+      lte_term: t.lte_term ?? t.key ?? '',
+      lte_doc_freq: t.lte_doc_freq ?? t.freq ?? 0,
+      lte_index_length: t.lte_index_length ?? t.data_len ?? 0,
+      lte_index_offset: t.lte_index_offset ?? t.data_off ?? 0,
+      lte_continuation_block_count: t.lte_continuation_block_count ?? t.continuation_block_count ?? 0,
+      index_entries: (t.index_entries || t.postings || []).map(normalizeIndexEntry),
+    }));
+  }
+}
+
+function normalizeLeafTermEntry(e) {
+  return {
+    lte_term: e.lte_term ?? e.term ?? '',
+    lte_doc_freq: e.lte_doc_freq ?? e.doc_freq ?? 0,
+    lte_index_block_id: e.lte_index_block_id ?? e.posting_block_id ?? 0,
+    lte_index_offset: e.lte_index_offset ?? e.posting_offset ?? 0,
+    lte_index_length: e.lte_index_length ?? e.posting_length ?? 0,
+    lte_page_skip_offset: e.lte_page_skip_offset ?? e.skip_list_offset ?? 0,
+    lte_continuation_block_count: e.lte_continuation_block_count ?? e.continuation_block_count ?? 0,
+    lte_flags: e.lte_flags ?? e.flags ?? 0,
+    byte_offset: e.byte_offset ?? 0,
+    byte_len: e.byte_len ?? 0,
+  };
+}
+
+function normalizeIndexEntry(e) {
+  return {
+    ie_doc_id: e.ie_doc_id ?? e.doc_id ?? '',
+    ie_term_frequency: e.ie_term_frequency ?? e.tf ?? 0,
+  };
+}
+
+// ── paged large-index helpers ────────────────────────────────────────────────
+async function rangeRead(start, length) {
+  const res = await fetch(`/idx-range?start=${start}&length=${length}&_=${BUILD_STAMP}-${Date.now()}`, { cache: 'no-store' });
+  if (!res.ok) throw new Error('range read failed: ' + res.status);
+  return new Uint8Array(await res.arrayBuffer());
+}
+
+function dv(bytes) { return new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength); }
+function u16(bytes, off) { return dv(bytes).getUint16(off, true); }
+function u32(bytes, off) { return dv(bytes).getUint32(off, true); }
+function u64n(bytes, off) { return Number(dv(bytes).getBigUint64(off, true)); }
+function f32(bytes, off) { return dv(bytes).getFloat32(off, true); }
+function textAt(bytes, off, len) { return TEXT_DECODER.decode(bytes.subarray(off, off + len)); }
+
+async function loadPagedHeadDirectory() {
+  if (!G.summaryOnly) return;
+  const h = G.parsed.header;
+  const prefix = await rangeRead(h.subindex_off, Math.min(h.subindex_size, 16 * 1024 * 1024));
+  let p = 0;
+  const headCount = u32(prefix, p); p += 4;
+  const head = [];
+  for (let i = 0; i < headCount; i++) {
+    const entryStart = p;
+    const len = u16(prefix, p); p += 2;
+    const first = textAt(prefix, p, len); p += len;
+    const blockId = u32(prefix, p); p += 4;
+    head.push({
+      hte_first_term: first,
+      hte_leaf_term_block_id: blockId,
+      byte_offset: h.subindex_off + entryStart,
+      byte_len: 2 + len + 4,
+      leaf_term_block_offset: 0,
+      leaf_term_block_len: PAGE_SIZE,
+    });
+  }
+  const leafCountOffset = h.subindex_off + p;
+  const leafPageCount = p + 4 <= prefix.length ? u32(prefix, p) : 0;
+  p += 4;
+  const leafBase = leafCountOffset + 4;
+  for (const d of head) {
+    d.leaf_term_block_offset = leafBase + d.hte_leaf_term_block_id * PAGE_SIZE;
+  }
+  G.parsed.head_leaf_term_table.head = head;
+  G.parsed.head_leaf_term_table.leaf_blocks = [];
+  G.paged = {
+    leafBase,
+    leafPageCount,
+    leafCache: new Map(),
+    blockCache: new Map(),
+    docCache: new Map(),
+    blockOwnerCache: new Map(),
+    continuationOwnerCache: new Map(),
+    ownerScanPage: 0,
+    ownerScanDone: false,
+  };
+}
+
+async function loadPagedLeafBlock(blockId) {
+  if (!G.summaryOnly) return G.leafTermBlocksById?.get(blockId);
+  if (G.paged.leafCache.has(blockId)) return G.paged.leafCache.get(blockId);
+  const off = G.paged.leafBase + blockId * PAGE_SIZE;
+  const page = await rangeRead(off, PAGE_SIZE);
+  const entries = [];
+  let p = 0;
+  const count = u32(page, p); p += 4;
+  for (let i = 0; i < count && p + 2 <= page.length; i++) {
+    const entryStart = p;
+    const len = u16(page, p); p += 2;
+    if (p + len + 28 > page.length) break;
+    const term = textAt(page, p, len); p += len;
+    const entry = normalizeLeafTermEntry({
+      lte_term: term,
+      lte_doc_freq: u32(page, p),
+      lte_index_block_id: u32(page, p + 4),
+      lte_index_offset: u32(page, p + 8),
+      lte_index_length: u32(page, p + 12),
+      lte_page_skip_offset: u32(page, p + 16),
+      lte_continuation_block_count: u32(page, p + 20),
+      lte_flags: u32(page, p + 24),
+      byte_offset: off + entryStart,
+      byte_len: 2 + len + 28,
+    });
+    p += 28;
+    entries.push(entry);
+  }
+  const block = { id: blockId, byte_offset: off, byte_len: PAGE_SIZE, entries };
+  G.paged.leafCache.set(blockId, block);
+  G.leafTermBlocksById.set(blockId, block);
+  cacheLeafOwners(block);
+  return block;
+}
+
+function cacheLeafOwners(block) {
+  if (!G.summaryOnly || !G.paged || !block) return;
+  for (const e of block.entries) {
+    if (!G.paged.blockOwnerCache.has(e.lte_index_block_id))
+      G.paged.blockOwnerCache.set(e.lte_index_block_id, []);
+    G.paged.blockOwnerCache.get(e.lte_index_block_id).push(e);
+
+    for (let i = 1; i <= e.lte_continuation_block_count; i++) {
+      const seq = e.lte_index_block_id + i;
+      if (!G.paged.continuationOwnerCache.has(seq))
+        G.paged.continuationOwnerCache.set(seq, []);
+      G.paged.continuationOwnerCache.get(seq).push(e);
+    }
+  }
+}
+
+async function ensureBlockOwnersUpTo(maxSeq) {
+  if (!G.summaryOnly || !G.paged || G.paged.ownerScanDone) return;
+  while (G.paged.ownerScanPage < G.paged.leafPageCount) {
+    const pageId = G.paged.ownerScanPage++;
+    const block = await loadPagedLeafBlock(pageId);
+    const first = block.entries[0]?.lte_index_block_id ?? 0;
+    if (first > maxSeq) break;
+  }
+  if (G.paged.ownerScanPage >= G.paged.leafPageCount) G.paged.ownerScanDone = true;
+}
+
+async function loadPagedIndexBlock(seq) {
+  if (!G.summaryOnly) return (G.parsed.blocks || []).find(b => b.seq === seq);
+  if (G.paged.blockCache.has(seq)) return G.paged.blockCache.get(seq);
+  const h = G.parsed.header;
+  const off = h.blocks_off + seq * PAGE_SIZE;
+  const bytes = await rangeRead(off, PAGE_SIZE);
+  const header = u64n(bytes, 0);
+  const blk = {
+    seq,
+    byte_off: off,
+    has_more: (header & 0x8000000000000000) !== 0,
+    is_continuation: u16(bytes, h.ib_data_off) === 0xffff,
+    continuation_length: u16(bytes, h.ib_data_off) === 0xffff ? u16(bytes, h.ib_data_off + 2) : 0,
+    bytes,
+    terms: [],
+  };
+  G.paged.blockCache.set(seq, blk);
+  return blk;
+}
+
+async function loadPagedIndexBlockPage(startSeq, count) {
+  if (!G.summaryOnly) return G.parsed.blocks.slice(startSeq, startSeq + count);
+  const h = G.parsed.header;
+  const bytes = await rangeRead(h.blocks_off + startSeq * PAGE_SIZE, count * PAGE_SIZE);
+  const blocks = [];
+  for (let i = 0; i < count; i++) {
+    const seq = startSeq + i;
+    if (G.paged.blockCache.has(seq)) {
+      blocks.push(G.paged.blockCache.get(seq));
+      continue;
+    }
+    const base = i * PAGE_SIZE;
+    const page = bytes.subarray(base, base + PAGE_SIZE);
+    const header = u64n(page, 0);
+    const blk = {
+      seq,
+      byte_off: h.blocks_off + seq * PAGE_SIZE,
+      has_more: (header & 0x8000000000000000) !== 0,
+      is_continuation: u16(page, h.ib_data_off) === 0xffff,
+      continuation_length: u16(page, h.ib_data_off) === 0xffff ? u16(page, h.ib_data_off + 2) : 0,
+      bytes: page,
+      terms: [],
+    };
+    G.paged.blockCache.set(seq, blk);
+    blocks.push(blk);
+  }
+  return blocks;
+}
+
+async function loadDocRecordByOrdinal(ordinal) {
+  const h = G.parsed.header;
+  if (ordinal < 0 || ordinal >= h.num_docs) return null;
+  if (G.paged?.docCache?.has(ordinal)) return G.paged.docCache.get(ordinal);
+  const off = h.docdata_off + ordinal * DOC_REC_SIZE;
+  const rec = await rangeRead(off, DOC_REC_SIZE);
+  const pathLen = Math.min(u16(rec, 16), 999);
+  const doc = {
+    doc_id: String(u64n(rec, 0)),
+    importance: f32(rec, 8),
+    doc_len: u32(rec, 12),
+    path: pathLen ? textAt(rec, 24, pathLen) : '',
+    byte_offset: off,
+  };
+  G.paged.docCache.set(ordinal, doc);
+  return doc;
+}
+
+async function loadDocPage(startOrdinal, count) {
+  const h = G.parsed.header;
+  if (count <= 0) return [];
+  const off = h.docdata_off + startOrdinal * DOC_REC_SIZE;
+  const bytes = await rangeRead(off, count * DOC_REC_SIZE);
+  const docs = [];
+  for (let i = 0; i < count; i++) {
+    const base = i * DOC_REC_SIZE;
+    const pathLen = Math.min(u16(bytes, base + 16), 999);
+    const doc = {
+      doc_id: String(u64n(bytes, base)),
+      importance: f32(bytes, base + 8),
+      doc_len: u32(bytes, base + 12),
+      path: pathLen ? textAt(bytes, base + 24, pathLen) : '',
+      byte_offset: off + base,
+    };
+    docs.push(doc);
+    G.paged?.docCache?.set(startOrdinal + i, doc);
+  }
+  return docs;
+}
+
+async function loadDocRecordById(docId) {
+  const id = Number(docId);
+  if (!Number.isFinite(id) || id < 1) return null;
+  // Current generated indexes assign dense 1-based doc IDs in docdata order.
+  return loadDocRecordByOrdinal(id - 1);
+}
+
+function decodePostings(bytes, start, length, limit = 1000000) {
+  const end = Math.min(bytes.length, start + length);
+  let pos = start;
+  let prev = 0;
+  const out = [];
+  while (pos < end && out.length < limit) {
+    const d = vbRead(bytes, pos, end); if (!d) break; pos = d.next;
+    const tf = vbRead(bytes, pos, end); if (!tf) break; pos = tf.next;
+    prev += d.value;
+    out.push({ doc_id: prev, tf: tf.value });
+  }
+  return out;
+}
+
+function decodePostingSample(bytes, start, length) {
+  const postings = decodePostings(bytes, start, length);
+  return {
+    postings,
+  };
+}
+
+function renderPostingSample(sample, key, unknownOwner = false) {
+  if (!sample.postings.length) return '<div class="posting" style="color:#888">No decodable VarByte postings in this slice.</div>';
+  const pageCount = Math.max(1, Math.ceil(sample.postings.length / POSTING_ROWS_PER_PAGE));
+  const page = Math.min(Math.max(0, G_PostingPages.get(key) || 0), pageCount - 1);
+  G_PostingPages.set(key, page);
+  const start = page * POSTING_ROWS_PER_PAGE;
+  const rows = sample.postings.slice(start, start + POSTING_ROWS_PER_PAGE);
+
+  let html = unknownOwner ? '<div style="color:#888;padding:4px 0;font-size:11px">Decoded VarByte delta-docid/tf pairs for this bounded slice.</div>' : '';
+  html += `<div class="pager">`
+    + `<button type="button" class="icon-btn" title="Previous postings" onclick="event.stopPropagation();setPostingPage('${htmlAttr(key)}',${page - 1})" ${page <= 0 ? 'disabled' : ''}>‹</button>`
+    + `<button type="button" class="icon-btn" title="Next postings" onclick="event.stopPropagation();setPostingPage('${htmlAttr(key)}',${page + 1})" ${page >= pageCount - 1 ? 'disabled' : ''}>›</button>`
+    + `<span class="num">${start + 1}-${start + rows.length}</span><span>of ${sample.postings.length} postings</span>`
+    + `<span>page</span><input class="tool-input" type="number" min="1" max="${pageCount}" value="${page + 1}" onclick="event.stopPropagation()" onchange="event.stopPropagation();setPostingPage('${htmlAttr(key)}',Number(this.value)-1)" title="Posting page"><span>/ ${pageCount}</span>`
+    + `</div>`;
+  html += '<table><tr><th>doc</th><th>tf</th><th>path</th></tr>';
+  for (const p of rows) {
+    const fp = G.pathOf(p.doc_id);
+    html += `<tr><td class="mono num">${p.doc_id}</td><td class="num">${p.tf}</td><td>${fp ? esc(fp) : ''}</td></tr>`;
+  }
+  html += '</table>';
+  return html;
+}
+
+window.setPostingPage = function(key, page) {
+  G_PostingPages.set(key, Math.max(0, page|0));
+  if (String(key).startsWith('leaf:')) renderHeadLeafTermsPreserveScroll();
+  else renderBlocks().catch(e => setStatus('Failed to render posting page: ' + e));
+};
+
+function renderRawBytesPreview(bytes, start, length) {
+  const end = Math.min(bytes.length, start + length);
+  let html = '<div class="mono" style="padding:6px 8px;color:#aaa;font-size:11px;white-space:pre-wrap">';
+  for (let pos = start; pos < end; pos += 16) {
+    const rowEnd = Math.min(end, pos + 16);
+    const hex = [];
+    let asc = '';
+    for (let i = pos; i < rowEnd; i++) {
+      const b = bytes[i];
+      hex.push(b.toString(16).padStart(2, '0'));
+      asc += (b >= 32 && b < 127) ? String.fromCharCode(b) : '.';
+    }
+    html += `${(pos - start).toString(16).padStart(4, '0')}: ${hex.join(' ').padEnd(47, ' ')}  ${esc(asc)}\n`;
+  }
+  if (end < start + length) html += '...\n';
+  html += '</div>';
+  return html;
+}
+
+function vbRead(bytes, pos, end) {
+  let value = 0, shift = 0;
+  while (pos < end) {
+    const b = bytes[pos++];
+    value += (b & 0x7f) * Math.pow(2, shift);
+    if ((b & 0x80) === 0) return { value, next: pos };
+    shift += 7;
+  }
+  return null;
+}
+
+async function findPagedTerm(term) {
+  const head = G.parsed.head_leaf_term_table.head;
+  let lo = 0, hi = head.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (head[mid].hte_first_term <= term) lo = mid + 1;
+    else hi = mid;
+  }
+  if (lo === 0) return null;
+  const d = head[lo - 1];
+  const block = await loadPagedLeafBlock(d.hte_leaf_term_block_id);
+  let l = 0, r = block.entries.length;
+  while (l < r) {
+    const m = (l + r) >> 1;
+    if (block.entries[m].lte_term < term) l = m + 1;
+    else r = m;
+  }
+  if (l >= block.entries.length || block.entries[l].lte_term !== term) return null;
+  return block.entries[l];
+}
+
+function queryTerms(q) {
+  const raw = (q || '').toLowerCase().match(/[\p{L}\p{N}_]+/gu) || [];
+  const suffixes = ['B', 'T'];
+  const terms = [];
+  for (const tok of raw) for (const s of suffixes) terms.push(tok + s);
+  return [...new Set(terms)];
+}
+
+async function runPagedSearch(q) {
+  const terms = queryTerms(q);
+  const scores = new Map();
+  for (const term of terms) {
+    const e = await findPagedTerm(term);
+    if (!e) continue;
+    const postings = await loadPagedPostings(e);
+    for (const p of postings) scores.set(p.doc_id, (scores.get(p.doc_id) || 0) + p.tf);
+  }
+  const ranked = [...scores.entries()].sort((a, b) => b[1] - a[1]).slice(0, 20);
+  const out = [];
+  for (const [docId, score] of ranked) {
+    const doc = await loadDocRecordById(docId);
+    out.push({ doc_id: String(docId), score, path: doc?.path || '' });
+  }
+  return out;
+}
+
+async function loadPagedPostings(e) {
+  const h = G.parsed.header;
+  const chunks = [];
+  const first = await loadPagedIndexBlock(e.lte_index_block_id);
+  const firstStart = h.ib_data_off + e.lte_index_offset;
+  chunks.push(first.bytes.subarray(firstStart, firstStart + e.lte_index_length));
+
+  for (let i = 0; i < e.lte_continuation_block_count; i++) {
+    const cont = await loadPagedIndexBlock(e.lte_index_block_id + 1 + i);
+    const contStart = h.ib_data_off;
+    if (u16(cont.bytes, contStart) !== 0xffff) break;
+    const len = u16(cont.bytes, contStart + 2);
+    chunks.push(cont.bytes.subarray(contStart + 4, contStart + 4 + len));
+  }
+
+  const total = chunks.reduce((sum, c) => sum + c.length, 0);
+  const all = new Uint8Array(total);
+  let pos = 0;
+  for (const c of chunks) { all.set(c, pos); pos += c.length; }
+  return decodePostings(all, 0, all.length);
+}
+
+async function hydratePostingPaths(postings) {
+  if (!G.summaryOnly) {
+    return postings.map(p => ({ ...p, path: G.pathOf(p.doc_id) }));
+  }
+  const pages = new Set();
+  for (const p of postings) {
+    const id = Number(p.doc_id);
+    if (Number.isFinite(id) && id > 0) pages.add(Math.floor((id - 1) / DOCDATA_ROWS_PER_PAGE));
+  }
+  await Promise.all([...pages].map(page => loadDocPage(page * DOCDATA_ROWS_PER_PAGE, Math.min(DOCDATA_ROWS_PER_PAGE, G.parsed.header.num_docs - page * DOCDATA_ROWS_PER_PAGE))));
+  return postings.map(p => {
+    const id = Number(p.doc_id);
+    const doc = Number.isFinite(id) && id > 0 ? G.paged.docCache.get(id - 1) : null;
+    return { ...p, path: doc?.path || '' };
+  });
 }
 
 // Paths are now stored in DocData — no separate .meta file needed
@@ -308,24 +857,47 @@ document.body.ondrop     = e => { e.preventDefault(); if(e.dataTransfer.files[0]
 const HEX_COLS = 16;
 const HEX_RH   = 18;   // row height px — must match line-height in CSS
 const HEX_BUF  = 50;   // extra rows rendered above/below viewport
-const HEX_CLS  = ['','s-hdr','s-si','s-dd','s-b0','s-b1','s-b2','s-b3'];
+const HEX_CLS  = ['','s-hdr','s-si','s-ps','s-dd','s-b0','s-b1','s-b2','s-b3'];
 
 let G_HL = { s:-1, e:-1 };   // current highlight range (replaces spanByOff)
 let G_ExpandedTree = new Set();
 let G_SelectedTreeNode = '';
 let G_TermFilter = '';
+let G_HeadPage = 0;
+let G_DocPage = 0;
+let G_BlockPage = 0;
+let G_PostingPages = new Map();
+let G_HexAnchorRow = 0;
 
 function buildHex() {
   const data = G.bytes;
   const h    = G.parsed.header;
 
+  if (G.summaryOnly) {
+    G.sc = null;
+    G_HL = { s:-1, e:-1 };
+    G_HexAnchorRow = 0;
+    const localRows = 1000;
+    const body = document.getElementById('hex-body');
+    body.innerHTML =
+      `<div id="hex-spacer" style="height:${localRows*HEX_RH}px;pointer-events:none"></div>` +
+      `<div id="hex-vp" style="position:absolute;top:0;left:0;right:0"></div>`;
+    body.style.position = 'relative';
+    body.addEventListener('scroll', () => {
+      renderVP(Math.floor(body.scrollTop / HEX_RH));
+    });
+    renderVP(0);
+    return;
+  }
+
   // Per-byte section colour (computed once, stored on G)
   const sc = new Uint8Array(data.length);
   for (let i=0; i<Math.min(80,data.length); i++) sc[i]=1;
   for (let i=h.subindex_off; i<h.subindex_off+h.subindex_size && i<data.length; i++) sc[i]=2;
-  for (let i=h.docdata_off;  i<h.docdata_off +h.docdata_size  && i<data.length; i++) sc[i]=3;
+  for (let i=h.pageskip_off; i<h.pageskip_off+h.pageskip_size && i<data.length; i++) sc[i]=3;
+  for (let i=h.docdata_off;  i<h.docdata_off +h.docdata_size  && i<data.length; i++) sc[i]=4;
   for (let b=0; b<G.parsed.blocks.length; b++) {
-    const s=h.blocks_off+b*4096, e=s+4096, c=4+(b%4);
+    const s=h.blocks_off+b*4096, e=s+4096, c=5+(b%4);
     for (let i=s; i<e && i<data.length; i++) sc[i]=c;
   }
   G.sc = sc;
@@ -345,6 +917,10 @@ function buildHex() {
 }
 
 function renderVP(firstVis) {
+  if (G.summaryOnly) {
+    renderVPPaged(firstVis).catch(e => console.error('paged hex render failed', e));
+    return;
+  }
   const body = document.getElementById('hex-body');
   const vp   = document.getElementById('hex-vp');
   if (!vp || !G.bytes || !G.sc) return;
@@ -387,16 +963,129 @@ function renderVP(firstVis) {
   vp.innerHTML  = parts.join('');
 }
 
+async function renderVPPaged(firstVis) {
+  const body = document.getElementById('hex-body');
+  const vp   = document.getElementById('hex-vp');
+  if (!vp || !G.parsed) return;
+
+  const h = G.parsed.header;
+  const fileSize = Number(h.file_size || G.bytes.length);
+  const total = Math.ceil(fileSize / HEX_COLS);
+  const vis   = Math.ceil((body.clientHeight || 600) / HEX_RH);
+  const startRow = Math.max(0, G_HexAnchorRow + firstVis - HEX_BUF);
+  const endRow   = Math.min(total, G_HexAnchorRow + firstVis + vis + HEX_BUF);
+  const startByte = startRow * HEX_COLS;
+  const endByte = Math.min(fileSize, endRow * HEX_COLS);
+  const data = await rangeRead(startByte, endByte - startByte);
+
+  const parts = [];
+  for (let row = startRow; row < endRow; row++) {
+    const base = row * HEX_COLS;
+    const rowEnd = Math.min(base + HEX_COLS, fileSize);
+    let hex='', asc='';
+    for (let abs = base; abs < rowEnd; abs++) {
+      const b = data[abs - startByte];
+      const cl = sectionClassForOffset(abs);
+      const hl = (abs >= G_HL.s && abs < G_HL.e) ? ' hl' : '';
+      hex += `<span class="hb ${cl}${hl}" data-o="${abs}">${b.toString(16).padStart(2,'0')}</span>`;
+      if (abs % 16 === 7) hex += '<span class="gap"> </span>';
+      asc += `<span class="hac${hl}" data-o="${abs}">${b>=32&&b<127?String.fromCharCode(b):'.'}</span>`;
+    }
+    for (let abs = rowEnd; abs < base + HEX_COLS; abs++) {
+      hex += '<span class="hb" style="visibility:hidden">00</span>';
+      if (abs % 16 === 7) hex += '<span class="gap"> </span>';
+    }
+    parts.push(
+      `<div class="hrow" style="height:${HEX_RH}px" data-r="${base}">` +
+      `<span class="haddr">${base.toString(16).padStart(6,'0')}&nbsp;&nbsp;</span>` +
+      `<span class="hbytes">${hex}</span>` +
+      `<span class="hascii">${asc}</span></div>`
+    );
+  }
+  vp.style.top = ((startRow - G_HexAnchorRow) * HEX_RH) + 'px';
+  vp.innerHTML = parts.join('');
+}
+
+function sectionClassForOffset(offset) {
+  const h = G.parsed.header;
+  if (offset < 96) return 's-hdr';
+  if (offset >= h.subindex_off && offset < h.subindex_off + h.subindex_size) return 's-si';
+  if (offset >= h.pageskip_off && offset < h.pageskip_off + h.pageskip_size) return 's-ps';
+  if (offset >= h.docdata_off && offset < h.docdata_off + h.docdata_size) return 's-dd';
+  if (offset >= h.blocks_off && offset < h.blocks_off + h.num_blocks * PAGE_SIZE) {
+    const seq = Math.floor((offset - h.blocks_off) / PAGE_SIZE);
+    return HEX_CLS[5 + (seq % 4)] || '';
+  }
+  return '';
+}
+
+function currentHeadPageRange() {
+  const si = G.parsed?.head_leaf_term_table;
+  if (!si || !si.head.length) return null;
+  const all = G_TermFilter ? si.head.filter(d => headTermEntryMatchesFilter(d)) : si.head;
+  if (!all.length) return null;
+  const pageSize = HEAD_ROWS_PER_PAGE;
+  const pageCount = Math.max(1, Math.ceil(all.length / pageSize));
+  const page = Math.min(Math.max(0, G_HeadPage), pageCount - 1);
+  const start = page * pageSize;
+  const shown = all.slice(start, start + pageSize);
+  if (!shown.length) return null;
+  return {
+    start: shown[0].byte_offset,
+    end: shown[shown.length - 1].byte_offset + shown[shown.length - 1].byte_len,
+  };
+}
+
+function currentDocPageRange() {
+  const h = G.parsed?.header;
+  if (!h) return null;
+  const total = Number(h.num_docs || G.parsed.docdata?.length || 0);
+  if (!total) return null;
+  const page = Math.min(Math.max(0, G_DocPage), Math.max(0, Math.ceil(total / DOCDATA_ROWS_PER_PAGE) - 1));
+  const startDoc = page * DOCDATA_ROWS_PER_PAGE;
+  const count = Math.min(DOCDATA_ROWS_PER_PAGE, total - startDoc);
+  return {
+    start: h.docdata_off + startDoc * DOC_REC_SIZE,
+    end: h.docdata_off + (startDoc + count) * DOC_REC_SIZE,
+  };
+}
+
+function currentBlockPageRange() {
+  const h = G.parsed?.header;
+  if (!h) return null;
+  const total = Number(h.num_blocks || G.parsed.blocks?.length || 0);
+  if (!total) return null;
+  const page = Math.min(Math.max(0, G_BlockPage), Math.max(0, Math.ceil(total / INDEXBLOCKS_PER_PAGE) - 1));
+  const startBlock = page * INDEXBLOCKS_PER_PAGE;
+  const count = Math.min(INDEXBLOCKS_PER_PAGE, total - startBlock);
+  return {
+    start: h.blocks_off + startBlock * PAGE_SIZE,
+    end: h.blocks_off + (startBlock + count) * PAGE_SIZE,
+  };
+}
+
+function gotoRangeObject(range) {
+  if (range) gotoRange(range.start, range.end);
+}
+
 // ── highlight + scroll ────────────────────────────────────────────────────────
 function gotoRange(start, end) {
-  G_HL.s = Math.max(0, start|0);
-  G_HL.e = Math.min((end|0), G.bytes.length);
+  const fileSize = Number(G.parsed?.header?.file_size || G.bytes.length);
+  G_HL.s = Math.max(0, Number(start));
+  G_HL.e = Math.min(Number(end), fileSize);
 
   // Scroll so the highlighted region is near the top third of the viewport
   const body = document.getElementById('hex-body');
   if (!body) return;
   const row     = Math.floor(G_HL.s / HEX_COLS);
   const viewH   = body.clientHeight || 600;
+  if (G.summaryOnly) {
+    const rowsAbove = Math.floor((viewH / 3) / HEX_RH);
+    G_HexAnchorRow = Math.max(0, row - rowsAbove);
+    body.scrollTop = 0;
+    renderVP(0);
+    return;
+  }
   body.scrollTop = Math.max(0, row * HEX_RH - viewH / 3);
 
   renderVP(Math.floor(body.scrollTop / HEX_RH));
@@ -407,18 +1096,14 @@ window.toggleTreeNode = toggleTreeNode;
 
 function gotoBlock(seq) {
   const h = G.parsed.header;
-  gotoRange(h.blocks_off + seq*4096, h.blocks_off + (seq+1)*4096);
   switchTabByName('blk-panel');
+  gotoRange(h.blocks_off + seq*4096, h.blocks_off + (seq+1)*4096);
   const card = document.getElementById('bc'+seq);
-  if (card) { card.classList.add('open'); card.scrollIntoView({behavior:'smooth',block:'start'}); }
+  if (card) { card.scrollIntoView({behavior:'smooth',block:'nearest'}); }
 }
 function toggleBlock(seq) {
-  const h    = G.parsed.header;
-  const card = document.getElementById('bc'+seq);
-  if (!card) return;
-  const opening = !card.classList.contains('open');
-  card.classList.toggle('open');
-  if (opening) gotoRange(h.blocks_off + seq*4096, h.blocks_off + (seq+1)*4096);
+  const h = G.parsed.header;
+  gotoRange(h.blocks_off + seq*4096, h.blocks_off + (seq+1)*4096);
 }
 window.gotoBlock   = gotoBlock;
 window.toggleBlock = toggleBlock;
@@ -431,11 +1116,11 @@ function renderHeader() {
     ['Version',      h.version,                                        8,  4 ],
     ['Num docs',     h.num_docs,                                      16,  8 ],
     ['Num terms',    h.num_terms,                                     24,  8 ],
-    ['TermHeaderTable off', `0x${h.subindex_off.toString(16)} (${h.subindex_size} B)`, 32, 16],
+    ['Head/Leaf term table off', `0x${h.subindex_off.toString(16)} (${h.subindex_size} B)`, 32, 16],
     ['PageSkip off', `0x${h.pageskip_off.toString(16)} (${h.pageskip_size} B)`, 48, 16],
     ['DocData off',  `0x${h.docdata_off.toString(16)}  (${h.docdata_size} B)`,  64, 16],
-    ['PostingBlocks off', `0x${h.blocks_off.toString(16)}`,           80,  8 ],
-    ['Num posting blocks', h.num_blocks,                              88,  8 ],
+    ['IndexBlocks off', `0x${h.blocks_off.toString(16)}`,             80,  8 ],
+    ['Num IndexBlocks', h.num_blocks,                                 88,  8 ],
     ['File size',    h.file_size+' B',                                -1, -1 ],
   ];
   let html = '<table><tr><th>Field</th><th>Value</th><th>Offset</th></tr>';
@@ -447,15 +1132,32 @@ function renderHeader() {
   document.getElementById('hdr-panel').innerHTML = html+'</table>';
 }
 
-function renderTermHeaders() {
-  const si = G.parsed.term_header_table;
+function summaryModeNotice(extra = '') {
+  if (!G.summaryOnly) return '';
+  const h = G.parsed.header;
+  return `<div class="search-summary">Paged mode for a large index (${formatBytes(h.file_size)}). `
+       + `The viewer uses HTTP range reads instead of expanding the full index in browser memory. `
+       + `${extra}</div>`;
+}
+
+function formatBytes(bytes) {
+  const n = Number(bytes || 0);
+  if (n >= 1024 * 1024 * 1024) return (n / (1024 * 1024 * 1024)).toFixed(2) + ' GB';
+  if (n >= 1024 * 1024) return (n / (1024 * 1024)).toFixed(1) + ' MB';
+  if (n >= 1024) return (n / 1024).toFixed(1) + ' KB';
+  return n + ' B';
+}
+
+function renderHeadLeafTerms() {
+  const si = G.parsed.head_leaf_term_table;
   const h = G.parsed.header;
 
   let html = '<div class="term-explorer">';
+  html += summaryModeNotice('Expand a HeadTermEntry to fetch only its 4KB LeafTermPage.');
   html += `<div class="term-toolbar">`
-       + `TermHeaderTable @ 0x${h.subindex_off.toString(16)} (${h.subindex_size} bytes). `
+      + `Head/Leaf term table @ 0x${h.subindex_off.toString(16)} (${h.subindex_size} bytes). `
        + `Use + to expand physical layout nodes; click any row to highlight its on-disk bytes.</div>`;
-  html += '<table><tr><th></th><th>Object</th><th>Disk bytes</th><th>Target / fields</th><th>Posting</th></tr>';
+  html += '<table><tr><th></th><th>Object</th><th>Disk bytes</th><th>Target / fields</th><th>IndexEntry</th></tr>';
   html += renderTreeRoot(h, si);
   html += '</table></div>';
   document.getElementById('si-panel').innerHTML = html;
@@ -468,102 +1170,177 @@ function renderTreeRoot(h, si) {
   const active = G_SelectedTreeNode === node ? ' active' : '';
   let html = `<tr class="tree-row${active}" onclick="selectTreeNode('${node}',${h.subindex_off},${h.subindex_off + h.subindex_size})">`
        + `<td><button type="button" class="icon-btn" onclick="event.stopPropagation();toggleTreeNode('${node}')">${expanded ? '-' : '+'}</button></td>`
-       + `<td><span class="tree-kind">section</span> <span class="key mono">TermHeaderTable</span></td>`
+      + `<td><span class="tree-kind">section</span> <span class="key mono">Head/LeafTermTable</span></td>`
        + `<td class="num">0x${h.subindex_off.toString(16)} +${h.subindex_size}</td>`
-       + `<td>${si.dir.length} DirectoryEntry rows, ${(si.blocks || []).length} TermHeaderBlocks</td>`
+      + `<td>${si.head.length} HeadTermEntry rows, ${(si.leaf_blocks || []).length} LeafTermBlocks</td>`
        + `<td></td></tr>`;
 
   if (expanded) {
-    for (const d of si.dir) {
-      if (!filtering || directoryMatchesFilter(d))
-        html += renderDirectoryEntry(d);
-    }
+    const all = filtering ? si.head.filter(d => headTermEntryMatchesFilter(d)) : si.head;
+    const pageSize = HEAD_ROWS_PER_PAGE;
+    const pageCount = Math.max(1, Math.ceil(all.length / pageSize));
+    G_HeadPage = Math.min(Math.max(0, G_HeadPage), pageCount - 1);
+    const start = G_HeadPage * pageSize;
+    const shown = all.slice(start, start + pageSize);
+
+            html += `<tr class="tree-row"><td></td><td colspan="4"><div class="pager">`
+              + `<button type="button" class="icon-btn" title="Previous page" onclick="setHeadPage(${G_HeadPage - 1})" ${G_HeadPage <= 0 ? 'disabled' : ''}>‹</button>`
+              + `<button type="button" class="icon-btn" title="Next page" onclick="setHeadPage(${G_HeadPage + 1})" ${G_HeadPage >= pageCount - 1 ? 'disabled' : ''}>›</button>`
+              + `<span class="num">${start + 1}-${start + shown.length}</span><span>of ${all.length} HeadTermEntry rows</span>`
+              + `<span>page</span><input class="tool-input" type="number" min="1" max="${pageCount}" value="${G_HeadPage + 1}" onchange="setHeadPage(Number(this.value)-1)" title="Head page"><span>/ ${pageCount}</span>`
+                + `</div></td></tr>`;
+
+    for (const d of shown) html += renderHeadTermEntry(d);
   }
   return html;
 }
 
-function renderDirectoryEntry(d) {
-  const node = `dir:${d.term_header_block_id}`;
+window.setHeadPage = function(page) {
+  G_HeadPage = Math.max(0, page|0);
+  renderHeadLeafTermsPreserveScroll();
+  gotoRangeObject(currentHeadPageRange());
+};
+
+function renderHeadTermEntry(d) {
+  const node = `head:${d.hte_leaf_term_block_id}`;
   const filtering = !!G_TermFilter;
   const expanded = filtering || G_ExpandedTree.has(node);
   const active = G_SelectedTreeNode === node ? ' active' : '';
   let html = `<tr class="tree-row${active}" onclick="selectTreeNode('${node}',${d.byte_offset},${d.byte_offset + d.byte_len})">`
-       + `<td><span class="indent"></span><button type="button" class="icon-btn" onclick="event.stopPropagation();toggleTreeNode('${node}')">${expanded ? '-' : '+'}</button></td>`
-       + `<td><span class="tree-kind">DirectoryEntry</span> <span class="key mono">${esc(d.first_term)}</span></td>`
+      + `<td><div class="tree-cell"><span class="indent"></span><button type="button" class="icon-btn" onclick="event.stopPropagation();toggleTreeNode('${node}')">${expanded ? '-' : '+'}</button></div></td>`
+      + `<td><span class="tree-kind">HeadTermEntry</span> <span class="key mono">${esc(d.hte_first_term)}</span></td>`
        + `<td class="num">0x${d.byte_offset.toString(16)} +${d.byte_len}</td>`
-       + `<td>points to TermHeaderBlock[${d.term_header_block_id}] @ 0x${d.header_block_offset.toString(16)} +${d.header_block_len}</td>`
+      + `<td>LeafTermBlock[${d.hte_leaf_term_block_id}] @ 0x${d.leaf_term_block_offset.toString(16)}</td>`
        + `<td></td></tr>`;
 
-  if (expanded) html += renderHeaderBlock(d.term_header_block_id, 2);
+  if (expanded) html += renderLeafTermBlock(d.hte_leaf_term_block_id, 2);
   return html;
 }
 
-function renderHeaderBlock(block_idx, depth) {
-  const block = G.termHeaderBlocksById?.get(block_idx);
+function renderLeafTermBlock(block_idx, depth) {
+  const block = G.leafTermBlocksById?.get(block_idx);
+  if (!block && G.summaryOnly) {
+    const indent = '<span class="indent"></span>'.repeat(depth);
+      return `<tr class="tree-row"><td><div class="tree-cell">${indent}<span class="indent"></span></div></td><td><span class="tree-kind">LeafTermBlock</span> <span class="num">${block_idx}</span></td>`
+        + `<td class="num">paged</td><td><button type="button" class="icon-btn" title="Load 4KB page" onclick="loadLeafBlockAndRender(${block_idx})">↧</button> Load 4KB page</td><td></td></tr>`;
+  }
   if (!block) return '';
-  const node = `thb:${block_idx}`;
+  const node = `ltb:${block_idx}`;
   const filtering = !!G_TermFilter;
   const expanded = filtering || G_ExpandedTree.has(node);
   const active = G_SelectedTreeNode === node ? ' active' : '';
   const indent = '<span class="indent"></span>'.repeat(depth);
   let html = `<tr class="tree-row${active}" onclick="selectTreeNode('${node}',${block.byte_offset},${block.byte_offset + block.byte_len})">`
-       + `<td>${indent}<button type="button" class="icon-btn" onclick="event.stopPropagation();toggleTreeNode('${node}')">${expanded ? '-' : '+'}</button></td>`
-       + `<td><span class="tree-kind">TermHeaderBlock</span> <span class="num">${block_idx}</span></td>`
-       + `<td class="num">0x${block.byte_offset.toString(16)} +${block.byte_len}</td>`
-       + `<td>${block.headers.length} TermHeader records</td>`
+      + `<td><div class="tree-cell">${indent}<button type="button" class="icon-btn" onclick="event.stopPropagation();toggleTreeNode('${node}')">${expanded ? '-' : '+'}</button></div></td>`
+      + `<td><span class="tree-kind">LeafTermBlock</span> <span class="num">${block_idx}</span></td>`
+      + `<td class="num">0x${block.byte_offset.toString(16)}</td>`
+      + `<td>${block.entries.length} LeafTermEntry records</td>`
        + `<td></td></tr>`;
 
   if (expanded) {
-    for (let i=0; i<block.headers.length; i++) {
-      if (!filtering || termMatchesFilter(block.headers[i]))
-        html += renderTermHeader(block_idx, i, block.headers[i], depth + 1);
+    for (let i=0; i<block.entries.length; i++) {
+      if (!filtering || leafTermEntryMatchesFilter(block.entries[i]))
+        html += renderLeafTermEntry(block_idx, i, block.entries[i], depth + 1);
     }
   }
   return html;
 }
 
-function renderTermHeader(block_idx, header_idx, e, depth) {
+window.loadLeafBlockAndRender = async function(blockIdx) {
+  try {
+    const block = await loadPagedLeafBlock(blockIdx);
+    renderHeadLeafTermsPreserveScroll();
+    if (block) gotoRange(block.byte_offset, block.byte_offset + block.byte_len);
+  } catch (e) {
+    setStatus('Failed to load LeafTermBlock[' + blockIdx + ']: ' + e);
+  }
+};
+
+function renderLeafTermEntry(block_idx, entry_idx, e, depth) {
   const h = G.parsed.header;
-  const node = `term:${block_idx}:${header_idx}`;
+  const node = `leaf:${block_idx}:${entry_idx}`;
   const active = G_SelectedTreeNode === node ? ' active' : '';
-  const postingStart = h.blocks_off + e.posting_block_id * 4096 + 208 + e.posting_offset;
-  const postingEnd = postingStart + e.posting_length;
+  const indexStart = h.blocks_off + e.lte_index_block_id * 4096 + h.ib_data_off + e.lte_index_offset;
+  const indexEnd = indexStart + e.lte_index_length;
   const indent = '<span class="indent"></span>'.repeat(depth);
   return `<tr class="tree-row${active}" onclick="selectTreeNode('${node}',${e.byte_offset},${e.byte_offset + e.byte_len})">`
        + `<td>${indent}<button type="button" class="icon-btn" title="Toggle posting detail" onclick="event.stopPropagation();toggleTreeNode('${node}')">${G_ExpandedTree.has(node) ? '-' : '+'}</button></td>`
-       + `<td><span class="tree-kind">TermHeader</span> <span class="key mono">${esc(e.term)}</span></td>`
+      + `<td><span class="tree-kind">LeafTermEntry</span> <span class="key mono">${esc(e.lte_term)}</span></td>`
        + `<td class="num">0x${e.byte_offset.toString(16)} +${e.byte_len}</td>`
-       + `<td>df=<span class="num">${e.doc_freq}</span> skip=<span class="num">${e.skip_list_offset}</span> cont=<span class="num">${e.continuation_block_count}</span> flags=<span class="num">${e.flags}</span></td>`
-       + `<td>PostingBlock[${e.posting_block_id}] 0x${postingStart.toString(16)} +${e.posting_length}</td></tr>`
-       + (G_ExpandedTree.has(node) ? renderPostingInline(node, e, depth + 1, postingStart, postingEnd) : '');
+      + `<td>df=<span class="num">${e.lte_doc_freq}</span> skip=<span class="num">${e.lte_page_skip_offset}</span> cont=<span class="num">${e.lte_continuation_block_count}</span> flags=<span class="num">${e.lte_flags}</span></td>`
+      + `<td>IndexBlock[${e.lte_index_block_id}] 0x${indexStart.toString(16)} +${e.lte_index_length}</td></tr>`
+      + (G_ExpandedTree.has(node) ? renderIndexEntriesInline(node, e, depth + 1, indexStart, indexEnd) : '');
 }
 
-function renderPostingInline(node, e, depth, postingStart, postingEnd) {
+function renderIndexEntriesInline(node, e, depth, indexStart, indexEnd) {
   const indent = '<span class="indent"></span>'.repeat(depth);
-  const block = (G.parsed.blocks || []).find(b => b.seq === e.posting_block_id);
-  const term = block ? (block.terms || []).find(t => t.key === e.term && t.data_off === e.posting_offset) : null;
+  if (G.summaryOnly) {
+    loadPagedPostings(e).then(hydratePostingPaths).then(postings => {
+      const row = document.getElementById(`posting-rows-${cssId(node)}`);
+      if (row) row.outerHTML = renderPostingRowsForLeaf(node, postings, depth + 1);
+    }).catch(err => {
+      const row = document.getElementById(`posting-rows-${cssId(node)}`);
+      if (row) row.outerHTML = `<tr class="tree-row"><td>${'<span class="indent"></span>'.repeat(depth + 1)}</td><td colspan="4"><div class="posting" style="color:#f66">Failed to decode postings: ${esc(err)}</div></td></tr>`;
+    });
+    return `<tr class="tree-row${G_SelectedTreeNode === node + ':index' ? ' active' : ''}" onclick="selectTreeNode('${node}:index',${indexStart},${indexEnd})">`
+       + `<td>${indent}</td>`
+      + `<td><span class="tree-kind">IndexEntry bytes</span> <span class="key mono">${esc(e.lte_term)}</span></td>`
+      + `<td class="num">0x${indexStart.toString(16)} +${e.lte_index_length}</td>`
+      + `<td>IndexBlock[${e.lte_index_block_id}] offset=<span class="num">${e.lte_index_offset}</span> length=<span class="num">${e.lte_index_length}</span> cont=<span class="num">${e.lte_continuation_block_count}</span></td>`
+       + `<td></td></tr>`
+       + `<tr class="tree-row" id="posting-rows-${cssId(node)}"><td>${'<span class="indent"></span>'.repeat(depth + 1)}</td><td colspan="4"><div class="posting" style="color:#888">Loading posting list…</div></td></tr>`;
+  }
+  const block = (G.parsed.blocks || []).find(b => b.seq === e.lte_index_block_id);
+  const term = block ? (block.terms || []).find(t => t.lte_term === e.lte_term && t.lte_index_offset === e.lte_index_offset) : null;
   let posts = '';
-  if (term && term.postings && term.postings.length) {
-    posts = term.postings.map(p => {
-      const fp = G.pathOf(p.doc_id);
-      return `<div class="posting">doc=${p.doc_id} tf=${p.tf}${fp?' <span class="path">'+esc(fp)+'</span>':''}</div>`;
+  if (term && term.index_entries && term.index_entries.length) {
+    posts = term.index_entries.map(p => {
+      const fp = G.pathOf(p.ie_doc_id);
+      return `<div class="posting">doc=${p.ie_doc_id} tf=${p.ie_term_frequency}${fp?' <span class="path">'+esc(fp)+'</span>':''}</div>`;
     }).join('');
   } else {
-    posts = '<div class="posting" style="color:#888">No decoded sample postings in parser output.</div>';
+    posts = '<div class="posting" style="color:#888">No decoded sample IndexEntry rows in parser output.</div>';
   }
-  return `<tr class="tree-row${G_SelectedTreeNode === node + ':posting' ? ' active' : ''}" onclick="selectTreeNode('${node}:posting',${postingStart},${postingEnd})">`
+    return `<tr class="tree-row${G_SelectedTreeNode === node + ':index' ? ' active' : ''}" onclick="selectTreeNode('${node}:index',${indexStart},${indexEnd})">`
        + `<td>${indent}</td>`
-       + `<td><span class="tree-kind">Posting bytes</span> <span class="key mono">${esc(e.term)}</span></td>`
-       + `<td class="num">0x${postingStart.toString(16)} +${e.posting_length}</td>`
-       + `<td>PostingBlock[${e.posting_block_id}] offset=<span class="num">${e.posting_offset}</span> length=<span class="num">${e.posting_length}</span></td>`
+      + `<td><span class="tree-kind">IndexEntry bytes</span> <span class="key mono">${esc(e.lte_term)}</span></td>`
+      + `<td class="num">0x${indexStart.toString(16)} +${e.lte_index_length}</td>`
+      + `<td>IndexBlock[${e.lte_index_block_id}] offset=<span class="num">${e.lte_index_offset}</span> length=<span class="num">${e.lte_index_length}</span></td>`
        + `<td>${posts}</td></tr>`;
+}
+
+function renderPostingListForLeaf(node, postings) {
+  return renderPostingRowsForLeaf(node, postings, 0);
+}
+
+function renderPostingRowsForLeaf(node, postings, depth) {
+  const indent = '<span class="indent"></span>'.repeat(depth);
+  if (!postings.length) {
+    return `<tr class="tree-row"><td>${indent}</td><td colspan="4"><div class="posting" style="color:#888">No decoded postings.</div></td></tr>`;
+  }
+  let html = '';
+  for (let i = 0; i < postings.length; i++) {
+    const p = postings[i];
+    html += `<tr class="tree-row" onclick="event.stopPropagation()">`
+      + `<td>${indent}</td>`
+      + `<td class="mono num">doc=${p.doc_id}</td>`
+      + `<td></td>`
+      + `<td class="num">tf=${p.tf}</td>`
+      + `<td>${p.path ? esc(p.path) : ''}</td>`
+      + `</tr>`;
+  }
+  return html;
+}
+
+function cssId(s) {
+  return String(s).replace(/[^a-zA-Z0-9_-]/g, '_');
 }
 
 function selectTreeNode(node, start, end) {
   G_SelectedTreeNode = node;
   gotoRange(start, end);
   document.querySelectorAll('.tree-row').forEach(r => r.classList.remove('active'));
-  renderTermHeadersPreserveScroll();
+  renderHeadLeafTermsPreserveScroll();
 }
 
 function toggleTreeNode(node) {
@@ -574,7 +1351,7 @@ function toggleTreeNode(node) {
   } else {
     G_ExpandedTree.add(node);
   }
-  renderTermHeaders();
+  renderHeadLeafTerms();
   if (panel) panel.scrollTop = scrollTop;
 }
 
@@ -584,21 +1361,21 @@ function collapseTreeSubtree(node) {
   if (node === 'table') {
     G_ExpandedTree.clear();
     G_SelectedTreeNode = '';
-  } else if (node.startsWith('dir:')) {
-    const blockId = node.slice(4);
+  } else if (node.startsWith('head:')) {
+    const blockId = node.slice(5);
     for (const key of Array.from(G_ExpandedTree)) {
-      if (key === `thb:${blockId}` || key.startsWith(`term:${blockId}:`))
+      if (key === `ltb:${blockId}` || key.startsWith(`leaf:${blockId}:`))
         G_ExpandedTree.delete(key);
     }
-    if (G_SelectedTreeNode === `thb:${blockId}` || G_SelectedTreeNode.startsWith(`term:${blockId}:`))
+    if (G_SelectedTreeNode === `ltb:${blockId}` || G_SelectedTreeNode.startsWith(`leaf:${blockId}:`))
       G_SelectedTreeNode = '';
-  } else if (node.startsWith('thb:')) {
+  } else if (node.startsWith('ltb:')) {
     const blockId = node.slice(4);
     for (const key of Array.from(G_ExpandedTree)) {
-      if (key.startsWith(`term:${blockId}:`))
+      if (key.startsWith(`leaf:${blockId}:`))
         G_ExpandedTree.delete(key);
     }
-    if (G_SelectedTreeNode.startsWith(`term:${blockId}:`))
+    if (G_SelectedTreeNode.startsWith(`leaf:${blockId}:`))
       G_SelectedTreeNode = '';
   }
 
@@ -606,34 +1383,63 @@ function collapseTreeSubtree(node) {
     G_SelectedTreeNode = '';
 }
 
-function termMatchesFilter(e) {
-  return !G_TermFilter || String(e.term || '').toLowerCase().includes(G_TermFilter);
+function leafTermEntryMatchesFilter(e) {
+  return !G_TermFilter || String(e.lte_term || '').toLowerCase().includes(G_TermFilter);
 }
 
-function directoryMatchesFilter(d) {
+function headTermEntryMatchesFilter(d) {
   if (!G_TermFilter) return true;
-  if (String(d.first_term || '').toLowerCase().includes(G_TermFilter)) return true;
-  const block = G.termHeaderBlocksById?.get(d.term_header_block_id);
-  return !!block && block.headers.some(termMatchesFilter);
+  if (String(d.hte_first_term || '').toLowerCase().includes(G_TermFilter)) return true;
+  const block = G.leafTermBlocksById?.get(d.hte_leaf_term_block_id);
+  if (G.summaryOnly && !block) return false;
+  return !!block && block.entries.some(leafTermEntryMatchesFilter);
 }
 
-function renderTermHeadersPreserveScroll() {
+function renderHeadLeafTermsPreserveScroll() {
   const panel = document.getElementById('si-panel');
   const scrollTop = panel ? panel.scrollTop : 0;
-  renderTermHeaders();
+  renderHeadLeafTerms();
   const next = document.getElementById('si-panel');
   if (next) next.scrollTop = scrollTop;
 }
 
-function renderDocData() {
+async function renderDocData() {
+  const h = G.parsed.header;
+  if (G.summaryOnly) {
+    const total = Number(h.num_docs || 0);
+    const pageCount = Math.max(1, Math.ceil(total / DOCDATA_ROWS_PER_PAGE));
+    G_DocPage = Math.min(Math.max(0, G_DocPage), pageCount - 1);
+    const start = G_DocPage * DOCDATA_ROWS_PER_PAGE;
+    const count = Math.min(DOCDATA_ROWS_PER_PAGE, total - start);
+    const docs = await loadDocPage(start, count);
+    renderDocDataRows(docs, start, total, pageCount);
+    if (document.getElementById('dd-panel')?.classList.contains('active')) gotoRangeObject(currentDocPageRange());
+    return;
+  }
+  const total = G.parsed.docdata.length;
+  const pageCount = Math.max(1, Math.ceil(total / DOCDATA_ROWS_PER_PAGE));
+  G_DocPage = Math.min(Math.max(0, G_DocPage), pageCount - 1);
+  const start = G_DocPage * DOCDATA_ROWS_PER_PAGE;
+  renderDocDataRows(G.parsed.docdata.slice(start, start + DOCDATA_ROWS_PER_PAGE), start, total, pageCount);
+  if (document.getElementById('dd-panel')?.classList.contains('active')) gotoRangeObject(currentDocPageRange());
+}
+
+function renderDocDataRows(docs, start, total, pageCount) {
   const h = G.parsed.header;
   let html = '<table><tr><th>id</th><th>importance</th><th>doc_len</th><th>path</th></tr>';
-  for (const [i,d] of G.parsed.docdata.entries()) {
-    const off = h.docdata_off + i*256;  // 256B DocRec
+    html += `<tr><td colspan="4"><div class="pager">`
+      + `<button type="button" class="icon-btn" title="Previous page" onclick="setDocPage(${G_DocPage - 1})" ${G_DocPage <= 0 ? 'disabled' : ''}>‹</button>`
+      + `<button type="button" class="icon-btn" title="Next page" onclick="setDocPage(${G_DocPage + 1})" ${G_DocPage >= pageCount - 1 ? 'disabled' : ''}>›</button>`
+      + `<span class="num">${start + 1}-${start + docs.length}</span><span>of ${total} DocData rows</span>`
+      + `<span>page</span><input class="tool-input" type="number" min="1" max="${pageCount}" value="${G_DocPage + 1}" onchange="setDocPage(Number(this.value)-1)" title="DocData page"><span>/ ${pageCount}</span>`
+      + `</div></td></tr>`;
+  for (let i = 0; i < docs.length; i++) {
+    const d = docs[i];
+    const off = h.docdata_off + (start + i)*DOC_REC_SIZE;
     const fp  = d.path || '';
     const link = fp ? `<span class="spath" onclick="openEncodedFile('${encodeURIComponent(fp)}')" title="Open file">${esc(fp)}</span>`
                     : '<span style="color:#555">—</span>';
-    html += `<tr onclick="gotoRange(${off},${off+256})">` +
+    html += `<tr onclick="gotoRange(${off},${off+1024})">` +
             `<td class="mono num" style="font-size:10px">${d.doc_id}</td>` +
             `<td class="num">${d.importance}</td><td class="num">${d.doc_len}</td>` +
             `<td>${link}</td></tr>`;
@@ -641,10 +1447,33 @@ function renderDocData() {
   document.getElementById('dd-panel').innerHTML = html+'</table>';
 }
 
-function renderBlocks() {
+window.setDocPage = function(page) {
+  G_DocPage = Math.max(0, page|0);
+  renderDocData().then(() => gotoRangeObject(currentDocPageRange()))
+    .catch(e => setStatus('Failed to load DocData page: ' + e));
+};
+
+async function renderBlocks() {
   const h = G.parsed.header;
-  let html = '';
-  for (const blk of G.parsed.blocks) {
+  const total = G.summaryOnly ? Number(h.num_blocks || 0) : G.parsed.blocks.length;
+  const pageCount = Math.max(1, Math.ceil(total / INDEXBLOCKS_PER_PAGE));
+  G_BlockPage = Math.min(Math.max(0, G_BlockPage), pageCount - 1);
+  const start = G_BlockPage * INDEXBLOCKS_PER_PAGE;
+  const count = Math.min(INDEXBLOCKS_PER_PAGE, total - start);
+  const blocks = await loadPagedIndexBlockPage(start, count);
+  renderBlockRows(blocks, start, total, pageCount);
+  if (document.getElementById('blk-panel')?.classList.contains('active')) gotoRangeObject(currentBlockPageRange());
+}
+
+function renderBlockRows(blocks, start, total, pageCount) {
+  const h = G.parsed.header;
+  let html = `<div class="pager">`
+    + `<button type="button" class="icon-btn" title="Previous page" onclick="setBlockPage(${G_BlockPage - 1})" ${G_BlockPage <= 0 ? 'disabled' : ''}>‹</button>`
+    + `<button type="button" class="icon-btn" title="Next page" onclick="setBlockPage(${G_BlockPage + 1})" ${G_BlockPage >= pageCount - 1 ? 'disabled' : ''}>›</button>`
+    + `<span class="num">${start + 1}-${start + blocks.length}</span><span>of ${total} IndexBlocks</span>`
+    + `<span>page</span><input class="tool-input" type="number" min="1" max="${pageCount}" value="${G_BlockPage + 1}" onchange="setBlockPage(Number(this.value)-1)" title="IndexBlock page"><span>/ ${pageCount}</span>`
+    + `</div>`;
+  for (const blk of blocks) {
     const blkOff = h.blocks_off + blk.seq*4096;
     let badges = '';
     if (blk.has_more)        badges += `<span class="badge badge-more">HAS_MORE</span>`;
@@ -652,53 +1481,52 @@ function renderBlocks() {
 
     html += `<div class="bcard" id="bc${blk.seq}">` +
             `<div class="bcard-hdr" onclick="toggleBlock(${blk.seq})">` +
-            `<span class="key">PostingBlock</span> <span class="num">${blk.seq}</span>${badges}` +
+            `<span class="key">IndexBlock</span> <span class="num">${blk.seq}</span>${badges}` +
             `<span style="color:#555;font-size:11px;margin-left:auto">` +
-            `0x${blkOff.toString(16)}</span></div>` +
-            `<div class="bcard-body" id="bb${blk.seq}">`;
-
-    if (blk.terms.length > 0) {
-      if (blk.is_continuation)
-        html += `<div style="color:#5c8a3a;padding:4px 8px;font-size:11px">↳ continuation data + new terms below</div>`;
-      html += '<table><tr><th>Term</th><th>freq</th><th>Postings</th></tr>';
-      for (const t of blk.terms) {
-        const termStart = blkOff + 208 + t.data_off;
-        const termEnd   = blkOff + 208 + t.data_off + t.data_len;
-        let posts='';
-        for (const p of t.postings) {
-          const fp=G.pathOf(p.doc_id);
-          posts+=`<div class="posting">id=${p.doc_id} tf=${p.tf}${fp?' <span class="path">'+esc(fp)+'</span>':''}</div>`;
-        }
-        html += `<tr class="term-entry" data-term="${esc(t.key)}"` +
-                ` onclick="gotoRange(${termStart},${termEnd})">` +
-                `<td class="key mono">${esc(t.key)}` +
-                `${t.continuation_block_count>0?'<span class="badge badge-more">→cont</span>':''}</td>` +
-                `<td class="num">${t.freq}</td><td>${posts}</td></tr>`;
-      }
-      html += '</table>';
-    } else if (blk.is_continuation) {
-      html += `<div style="color:#888;padding:8px;font-size:11px">Continuation — raw posting bytes only, no new terms</div>`;
-    }
-    html += '</div></div>';
+            `0x${blkOff.toString(16)}</span></div></div>`;
   }
   document.getElementById('blk-panel').innerHTML = html;
 }
+
+
+window.setBlockPage = function(page) {
+  G_BlockPage = Math.max(0, page|0);
+  renderBlocks().then(() => gotoRangeObject(currentBlockPageRange()))
+    .catch(e => setStatus('Failed to load IndexBlock page: ' + e));
+};
 
 // ── filtering + document search ───────────────────────────────────────────────
 window.onTermFilter = function(q) {
   if (!G.bytes) return;
   G_TermFilter = (q || '').trim().toLowerCase();
+  G_HeadPage = 0;
   document.querySelectorAll('.term-entry').forEach(r => {
     r.style.display = (!G_TermFilter || (r.dataset.term||'').toLowerCase().includes(G_TermFilter)) ? '' : 'none';
   });
-  renderTermHeadersPreserveScroll();
+  renderHeadLeafTermsPreserveScroll();
 };
 
-window.runDocumentSearch = function() {
+window.runDocumentSearch = async function() {
   if (!G.bytes) return;
   const input = document.getElementById('doc-search');
   const q = (input?.value || '').trim();
   const out = document.getElementById('srch-out');
+  if (G.summaryOnly) {
+    if (!q) {
+      out.innerHTML = '<p class="srch-hint">Enter a query and press Enter.</p>';
+      switchTabByName('srch-panel');
+      return;
+    }
+    out.innerHTML = `<div class="search-summary">Paged search for "${esc(q)}"…</div>`;
+    switchTabByName('srch-panel');
+    try {
+      const res = await runPagedSearch(q);
+      renderSearchResults(q, res, true);
+    } catch (e) {
+      out.innerHTML = `<p class="srch-hint">Paged search failed: ${esc(e)}</p>`;
+    }
+    return;
+  }
   if (!q) {
     out.innerHTML = '<p class="srch-hint">Enter a query and press Enter.</p>';
     return;
@@ -712,13 +1540,18 @@ window.runDocumentSearch = function() {
     return;
   }
 
+  renderSearchResults(q, res, false);
+};
+
+function renderSearchResults(q, res, paged) {
+  const out = document.getElementById('srch-out');
   if (!Array.isArray(res) || res.length === 0) {
     out.innerHTML = `<div class="search-summary">No results for "${esc(q)}".</div>`;
     switchTabByName('srch-panel');
     return;
   }
 
-  let html = `<div class="search-summary">${res.length} result(s) for "${esc(q)}"</div>`;
+  let html = `<div class="search-summary">${res.length} result(s) for "${esc(q)}"${paged ? ' · paged range search' : ''}</div>`;
   for (const r of res) {
     const path = r.path || G.pathOf(r.doc_id) || String(r.doc_id);
     const name = fileNameOf(path) || String(r.doc_id);
@@ -731,30 +1564,42 @@ window.runDocumentSearch = function() {
   }
   out.innerHTML = html;
   switchTabByName('srch-panel');
-};
+}
 
 function switchTab(el) {
   document.querySelectorAll('.dtab').forEach(t=>t.classList.remove('active'));
   document.querySelectorAll('.panel').forEach(p=>p.classList.remove('active'));
   el.classList.add('active');
   document.getElementById(el.dataset.p).classList.add('active');
-  if (el.dataset.p === 'si-panel' && G.parsed) {
-    const h = G.parsed.header;
-    gotoRange(h.subindex_off, h.subindex_off + h.subindex_size);
-  }
+  syncHexForPanel(el.dataset.p);
 }
 function switchTabByName(id) {
   document.querySelectorAll('.dtab').forEach(t=>t.classList.toggle('active',t.dataset.p===id));
   document.querySelectorAll('.panel').forEach(p=>p.classList.toggle('active',p.id===id));
+  syncHexForPanel(id);
 }
 window.switchTab=switchTab;
 window.switchTabByName=switchTabByName;
+
+function syncHexForPanel(id) {
+  if (!G.parsed) return;
+  const h = G.parsed.header;
+  if (id === 'hdr-panel') gotoRange(0, 96);
+  else if (id === 'si-panel') {
+    const range = currentHeadPageRange();
+    if (range) gotoRangeObject(range);
+    else gotoRange(h.subindex_off, h.subindex_off + h.subindex_size);
+  }
+  else if (id === 'dd-panel') gotoRangeObject(currentDocPageRange());
+  else if (id === 'blk-panel') gotoRangeObject(currentBlockPageRange());
+}
 
 function setStatus(s){ document.getElementById('status').textContent=s; }
 
 // Path helper — looks up file path from DocData by doc_id string
 G.pathOf = function(docId) {
   if (!G.parsed) return '';
+  if (G.summaryOnly) return '';
   const s = String(docId);
   const d = G.parsed.docdata.find(d => String(d.doc_id) === s);
   return d ? (d.path||'') : '';
@@ -853,7 +1698,18 @@ function normalizePath(path) {
   if (absoluteDrive && parts.length) return parts[0] + '/' + parts.slice(1).join('/');
   return parts.join('/');
 }
-function esc(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+function visibleText(s) {
+  return String(s).replace(/[\u0000-\u001f\u007f]/g, ch => {
+    const code = ch.charCodeAt(0);
+    if (code === 31) return '·';
+    if (code === 0) return '\\0';
+    if (code === 9) return '\\t';
+    if (code === 10) return '\\n';
+    if (code === 13) return '\\r';
+    return '\\x' + code.toString(16).padStart(2, '0');
+  });
+}
+function esc(s){ return visibleText(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
 function htmlAttr(s){ return esc(s).replace(/'/g,'&#39;').replace(/"/g,'&quot;'); }
 function fileNameOf(path) {
   const p = String(path || '').replace(/\\/g, '/');

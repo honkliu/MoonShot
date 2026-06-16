@@ -3,9 +3,41 @@
 #include <stdexcept>
 #include <unicode/normalizer2.h>
 #include <unicode/unistr.h>
+#include <unicode/uchar.h>
 
 using namespace std;
 using namespace icu;
+
+static bool IsIndexableToken(const string& utf8)
+{
+    if (utf8.empty() || utf8.size() > 64)
+        return false;
+
+    for (unsigned char ch : utf8) {
+        if (ch < 0x20 || ch == 0x7f)
+            return false;
+    }
+
+    UErrorCode status = U_ZERO_ERROR;
+    UnicodeString u = UnicodeString::fromUTF8(StringPiece(utf8));
+    if (U_FAILURE(status))
+        return false;
+
+    for (int32_t i = 0; i < u.length();) {
+        UChar32 ch = u.char32At(i);
+        i += U16_LENGTH(ch);
+        UCharCategory cat = static_cast<UCharCategory>(u_charType(ch));
+        if (cat == U_CONTROL_CHAR ||
+            cat == U_FORMAT_CHAR ||
+            cat == U_PRIVATE_USE_CHAR ||
+            cat == U_SURROGATE ||
+            cat == U_UNASSIGNED) {
+            return false;
+        }
+    }
+
+    return true;
+}
 
 SmartTokenizer::SmartTokenizer(const Locale& locale)
     : m_Locale(locale)
@@ -53,7 +85,7 @@ vector<string> SmartTokenizer::Tokenize(const char* text)
             string utf8;
             word.toUTF8String(utf8);
 
-            if (!utf8.empty() && utf8.size() <= 64)
+            if (IsIndexableToken(utf8))
                 tokens.push_back(move(utf8));
         }
         start = end;

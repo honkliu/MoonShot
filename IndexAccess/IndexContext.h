@@ -17,6 +17,7 @@
 #include <string>
 #include <algorithm>
 #include <cstdint>
+#include <iostream>
 
 #include <cstdio>
 
@@ -80,15 +81,15 @@ public:
 
         auto br = IndexSerializer::BuildBlocksForContext(*m_Store);
 
-        size_t n = br.blocks.size();
+        size_t n = br.BBR_IndexBlocks.size();
         m_BlockTable.ResizeCache(PostingBlockCacheSlots(n));
 
         for (size_t i = 0; i < n; ++i)
-            m_BlockTable.InsertBlock(static_cast<uint32_t>(i), &br.blocks[i]);
+            m_BlockTable.InsertBlock(static_cast<uint32_t>(i), &br.BBR_IndexBlocks[i]);
 
-        m_BlockTable.SetTermHeaderTable(std::move(br.term_directory),
-                        std::move(br.term_header_blocks));
-        m_BlockTable.SetPageSkipData(std::move(br.pageskip));
+            m_BlockTable.SetPagedLeafTermBlocks(std::move(br.BBR_HeadTermEntries),
+            std::move(br.BBR_LeafTermPages));
+        m_BlockTable.SetPageSkipData(std::move(br.BBR_PageSkipList));
 
         m_Built = true;
         m_LoadedFromDisk = false;
@@ -156,6 +157,14 @@ public:
         if (fm->open(path))
             m_BlockTable.SetFileManager(std::move(fm));
 
+        uint64_t leaf_offset = 0, leaf_pages = 0;
+        PostingStore tmpLeaf;
+        IndexSerializer::Load(tmpLeaf, path, nullptr, nullptr, nullptr, nullptr, nullptr, &leaf_offset, &leaf_pages);
+        auto leafFm = make_shared<FileBlockManager>(sizeof(LeafTermPage), leaf_offset);
+        if (leafFm->open(path))
+            m_BlockTable.SetLeafTermFileManager(std::move(leafFm));
+        m_BlockTable.ReserveLeafTermPageMap(static_cast<uint32_t>(std::min<uint64_t>(leaf_pages, UINT32_MAX)));
+
         return true;
     }
 
@@ -164,26 +173,36 @@ public:
         if (m_IndexPath.empty()) return;
 
         m_Store = make_shared<PostingStore>();
-        std::vector<TermDirectoryEntry>          term_directory;
-        std::vector<TermHeaderBlock>             term_header_blocks;
+        std::vector<HeadTermEntry>               headTermEntries;
         std::vector<uint64_t>                    pageskip;
         uint64_t blocks_offset = 0;
         uint64_t num_blocks = 0;
+        uint64_t leaf_blocks_offset = 0;
+        uint64_t num_leaf_blocks = 0;
 
         if (!IndexSerializer::Load(*m_Store, m_IndexPath.c_str(),
-                                   &term_directory, &term_header_blocks,
-                                   &blocks_offset, &pageskip, &num_blocks))
+                       &headTermEntries, nullptr,
+                       &blocks_offset, &pageskip, &num_blocks,
+                       &leaf_blocks_offset, &num_leaf_blocks))
+        {
+            std::cerr << "Failed to load index: " << m_IndexPath
+                      << " (unsupported/corrupt format; rebuild with current moon.exe)\n";
             return;
+        }
 
         m_BlockTable.Reset(PostingBlockCacheSlots(num_blocks));
         m_BlockTable.ReserveBlockMap(static_cast<uint32_t>(std::min<uint64_t>(num_blocks, UINT32_MAX)));
-        m_BlockTable.SetTermHeaderTable(std::move(term_directory),
-                                        std::move(term_header_blocks));
+        m_BlockTable.SetHeadTermEntries(std::move(headTermEntries), static_cast<uint32_t>(std::min<uint64_t>(num_leaf_blocks, UINT32_MAX)));
         m_BlockTable.SetPageSkipData(std::move(pageskip));
 
         auto fm = make_shared<FileBlockManager>(sizeof(IndexBlock), blocks_offset);
         if (fm->open(m_IndexPath.c_str()))
             m_BlockTable.SetFileManager(std::move(fm));
+
+        auto leafFm = make_shared<FileBlockManager>(sizeof(LeafTermPage), leaf_blocks_offset);
+        if (leafFm->open(m_IndexPath.c_str()))
+            m_BlockTable.SetLeafTermFileManager(std::move(leafFm));
+        m_BlockTable.ReserveLeafTermPageMap(static_cast<uint32_t>(std::min<uint64_t>(num_leaf_blocks, UINT32_MAX)));
 
         m_Executor = IndexSearchExecutor(m_Store);
         m_Built    = true;
@@ -210,12 +229,9 @@ private:
 
     static uint32_t PostingBlockCacheSlots(uint64_t postingBlockCount)
     {
-        static constexpr uint64_t MIN_CACHE_BYTES = 64ull * 1024ull * 1024ull;
-        static constexpr uint64_t MAX_CACHE_BYTES = 1024ull * 1024ull * 1024ull;
-        uint64_t minSlots = MIN_CACHE_BYTES / sizeof(IndexBlock);
-        uint64_t maxSlots = MAX_CACHE_BYTES / sizeof(IndexBlock);
-        uint64_t wanted = std::max<uint64_t>(postingBlockCount, minSlots);
-        wanted = std::min<uint64_t>(wanted, maxSlots);
+        static constexpr uint64_t CACHE_BYTES = 100ull * 1024ull * 1024ull;
+        uint64_t maxSlots = std::max<uint64_t>(CACHE_BYTES / sizeof(IndexBlock), 1);
+        uint64_t wanted = std::min<uint64_t>(postingBlockCount ? postingBlockCount : maxSlots, maxSlots);
         return static_cast<uint32_t>(std::max<uint64_t>(wanted, 1));
     }
 

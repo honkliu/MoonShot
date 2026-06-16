@@ -1,9 +1,9 @@
 use std::collections::HashMap;
 
 #[derive(Clone, Debug)]
-pub struct PostingEntry {
-    pub doc_id: u64,
-    pub tf:     u32,
+pub struct IndexEntry {
+    pub ie_doc_id:          u64,
+    pub ie_term_frequency:  u32,
 }
 
 /*
@@ -13,7 +13,7 @@ pub struct PostingEntry {
 */
 #[derive(Clone, Debug, Default)]
 pub struct PostingList {
-    pub entries:    Vec<PostingEntry>,
+    pub entries:    Vec<IndexEntry>,
     bytes_cache:    Option<Vec<u8>>,
 }
 
@@ -39,9 +39,9 @@ impl PostingList {
         let mut out = Vec::with_capacity(self.entries.len() * 3);
         let mut prev = 0u64;
         for e in &self.entries {
-            vb_write(e.doc_id - prev, &mut out);
-            vb_write(e.tf as u64,    &mut out);
-            prev = e.doc_id;
+            vb_write(e.ie_doc_id - prev, &mut out);
+            vb_write(e.ie_term_frequency as u64, &mut out);
+            prev = e.ie_doc_id;
         }
         out
     }
@@ -74,9 +74,9 @@ impl PostingStore {
 
     pub fn add_posting(&mut self, stream_key: &str, doc_id: u64, tf: u32) {
         let pl = self.postings.entry(stream_key.to_string()).or_default();
-        match pl.entries.binary_search_by_key(&doc_id, |e| e.doc_id) {
-            Ok(i)  => pl.entries[i].tf += tf,
-            Err(i) => pl.entries.insert(i, PostingEntry { doc_id, tf }),
+        match pl.entries.binary_search_by_key(&doc_id, |e| e.ie_doc_id) {
+            Ok(i)  => pl.entries[i].ie_term_frequency += tf,
+            Err(i) => pl.entries.insert(i, IndexEntry { ie_doc_id: doc_id, ie_term_frequency: tf }),
         }
         pl.invalidate_bytes();
     }

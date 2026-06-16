@@ -8,9 +8,6 @@ pub const DATA_SIZE:          usize = PAGE_SIZE - IB_DATA_OFFSET;
 pub const IB_HEADER_HAS_MORE: u64   = 1u64 << 63;
 pub const CONT_MARKER:        u16   = 0xFFFF;
 
-/// Number of TermHeader records per Level-2 header block.
-pub const TERM_HEADERS_PER_BLOCK: usize = 32;
-
 #[derive(Clone)]
 pub struct IndexBlock {
     pub ib_header: u64,
@@ -40,46 +37,46 @@ impl BloomFilter {
 
 // ── Term lookup two-level structure ──────────────────────────────────────────
 //
-// Level-1  TermDirectoryEntry — sparse directory, memory resident.
-//   Sorted by first_term. Binary search finds the candidate TermHeaderBlock.
+// Level-1  HeadTermEntry — sparse head table, memory resident.
+//   Sorted by HTE_FirstTerm. Binary search finds the candidate LeafTermBlock.
 //
-// Level-2  TermHeaderBlock — fixed-size group of TermHeader records.
-//   Each TermHeader describes where posting bytes are stored; it never stores
-//   posting bytes directly.
+// Level-2  LeafTermBlock — fixed-size group of LeafTermEntry records.
+//   Each LeafTermEntry describes where index bytes are stored; it never stores
+//   index bytes directly.
 
-/// Level-1 directory entry.
+/// Level-1 head entry.
 #[derive(Debug, Clone)]
-pub struct TermDirectoryEntry {
-    pub first_term:           String,
-    pub term_header_block_id: u32,
+pub struct HeadTermEntry {
+    pub hte_first_term:          String,
+    pub hte_leaf_term_block_id:  u32,
 }
 
-/// Level-2 per-term posting descriptor (lives inside a TermHeaderBlock).
+/// Level-2 per-term index descriptor (lives inside a LeafTermBlock).
 #[derive(Debug, Clone)]
-pub struct TermHeader {
-    pub term:                     String,
-    pub doc_freq:                 u32,
-    pub posting_block_id:         u32,
-    pub posting_offset:           u32,
-    pub posting_length:           u32,
-    pub skip_list_offset:         u32,
-    pub continuation_block_count: u32,
-    pub flags:                    u32,
+pub struct LeafTermEntry {
+    pub lte_term:                       String,
+    pub lte_doc_freq:                   u32,
+    pub lte_index_block_id:             u32,
+    pub lte_index_offset:               u32,
+    pub lte_index_length:               u32,
+    pub lte_page_skip_offset:           u32,
+    pub lte_continuation_block_count:   u32,
+    pub lte_flags:                      u32,
 }
 
 #[derive(Debug, Clone, Default)]
-pub struct TermHeaderBlock {
-    pub headers: Vec<TermHeader>,
+pub struct LeafTermBlock {
+    pub ltb_entries: Vec<LeafTermEntry>,
 }
 
-// ── TermLocation (returned by find_term_data) ────────────────────────────────
-pub struct TermLocation {
-    pub posting_block_id:         u32,
-    pub posting_offset:           usize,
-    pub posting_length:           usize,
-    pub doc_freq:                 u32,
-    pub continuation_block_count: u32,
-    pub skip_list_offset:         u32,
+// ── IndexLocation (returned by find_term_data) ───────────────────────────────
+pub struct IndexLocation {
+    pub index_block_id:             u32,
+    pub index_offset:               usize,
+    pub index_length:               usize,
+    pub doc_freq:                   u32,
+    pub continuation_block_count:   u32,
+    pub page_skip_offset:           u32,
 }
 
 // ── BlockCache ───────────────────────────────────────────────────────────────
@@ -134,19 +131,19 @@ impl BlockCache {
 }
 
 // ── IndexBlockTable ──────────────────────────────────────────────────────────
-/// Posting block manager + two-level term header table.
+/// IndexBlock manager + two-level Head/Leaf term table.
 ///
 /// Lookup path:
 ///   BloomFilter.can_term_exist()              → reject obviously absent terms
-///   Level-1 binary search on term_directory   → term_header_block_id
-///   Level-2 binary search in TermHeaderBlock  → TermHeader
-///   get_block_by_seq(header.posting_block_id) → load posting block
+///   Level-1 binary search on head_term_entries → leaf term block id
+///   Level-2 binary search in LeafTermBlock     → LeafTermEntry
+///   get_block_by_seq(entry.lte_index_block_id) → load IndexBlock
 pub struct IndexBlockTable {
     cache:            RefCell<BlockCache>,
-    /// Level-1: directory sorted by first_term
-    term_directory:   Vec<TermDirectoryEntry>,
-    /// Level-2: fixed-size TermHeader blocks
-    term_header_blocks: Vec<TermHeaderBlock>,
+    /// Level-1: head table sorted by HTE_FirstTerm
+    head_term_entries: Vec<HeadTermEntry>,
+    /// Level-2: fixed-size LeafTermBlock entries
+    leaf_term_blocks:  Vec<LeafTermBlock>,
     page_skip_data:   Vec<u64>,
     bloom:            BloomFilter,
 }
@@ -155,8 +152,8 @@ impl IndexBlockTable {
     pub fn new(capacity: usize) -> Self {
         Self {
             cache:           RefCell::new(BlockCache::new(capacity)),
-            term_directory:    Vec::new(),
-            term_header_blocks: Vec::new(),
+            head_term_entries: Vec::new(),
+            leaf_term_blocks:  Vec::new(),
             page_skip_data:  Vec::new(),
             bloom:           BloomFilter,
         }
@@ -168,12 +165,12 @@ impl IndexBlockTable {
         self.cache.borrow_mut().insert(seq, block);
     }
 
-    pub fn set_term_header_table(&mut self,
-                                 dir:    Vec<TermDirectoryEntry>,
-                                 blocks: Vec<TermHeaderBlock>)
+    pub fn set_head_leaf_term_table(&mut self,
+                                    head:   Vec<HeadTermEntry>,
+                                    blocks: Vec<LeafTermBlock>)
     {
-        self.term_directory     = dir;
-        self.term_header_blocks = blocks;
+        self.head_term_entries = head;
+        self.leaf_term_blocks  = blocks;
     }
 
     pub fn set_page_skip_data(&mut self, data: Vec<u64>) { self.page_skip_data = data; }
@@ -186,35 +183,35 @@ impl IndexBlockTable {
 
     // ── read path ────────────────────────────────────────────────────────────
 
-    /// Two-level lookup through TermDirectory + TermHeaderBlock:
+    /// Two-level lookup through HeadTermEntry + LeafTermBlock:
     ///   Step 1 — BloomFilter check (placeholder).
-    ///   Step 2 — Level-1: binary search term_directory for last entry with
-    ///             first_term <= term.
-    ///   Step 3 — Level-2: binary search within that TermHeaderBlock for exact term.
-    pub fn find_term_data(&self, term: &str) -> Option<(TermLocation, Arc<IndexBlock>)> {
+    ///   Step 2 — Level-1: binary search head table for last entry with
+    ///             HTE_FirstTerm <= term.
+    ///   Step 3 — Level-2: binary search within that LeafTermBlock for exact term.
+    pub fn find_term_data(&self, term: &str) -> Option<(IndexLocation, Arc<IndexBlock>)> {
         if !self.bloom.can_term_exist(term) { return None; }
-        if self.term_directory.is_empty()   { return None; }
+        if self.head_term_entries.is_empty() { return None; }
 
-        // Level-1: find last dir entry whose first_term <= term
-        let pos = self.term_directory.partition_point(|e| e.first_term.as_str() <= term);
+        // Level-1: find last head entry whose HTE_FirstTerm <= term
+        let pos = self.head_term_entries.partition_point(|e| e.hte_first_term.as_str() <= term);
         if pos == 0 { return None; }
-        let block_idx = self.term_directory[pos - 1].term_header_block_id as usize;
-        if block_idx >= self.term_header_blocks.len() { return None; }
+        let block_idx = self.head_term_entries[pos - 1].hte_leaf_term_block_id as usize;
+        if block_idx >= self.leaf_term_blocks.len() { return None; }
 
-        // Level-2: binary search for exact term in the TermHeaderBlock
-        let blk = &self.term_header_blocks[block_idx].headers;
-        let ep  = blk.partition_point(|e| e.term.as_str() < term);
-        if ep >= blk.len() || blk[ep].term != term { return None; }
-        let header = &blk[ep];
+        // Level-2: binary search for exact term in the LeafTermBlock
+        let blk = &self.leaf_term_blocks[block_idx].ltb_entries;
+        let ep  = blk.partition_point(|e| e.lte_term.as_str() < term);
+        if ep >= blk.len() || blk[ep].lte_term != term { return None; }
+        let entry = &blk[ep];
 
-        let block = self.get_block_by_seq(header.posting_block_id)?;
-        Some((TermLocation {
-            posting_block_id:         header.posting_block_id,
-            posting_offset:           header.posting_offset as usize,
-            posting_length:           header.posting_length as usize,
-            doc_freq:                 header.doc_freq,
-            continuation_block_count: header.continuation_block_count,
-            skip_list_offset:         header.skip_list_offset,
+        let block = self.get_block_by_seq(entry.lte_index_block_id)?;
+        Some((IndexLocation {
+            index_block_id:             entry.lte_index_block_id,
+            index_offset:               entry.lte_index_offset as usize,
+            index_length:               entry.lte_index_length as usize,
+            doc_freq:                   entry.lte_doc_freq,
+            continuation_block_count:   entry.lte_continuation_block_count,
+            page_skip_offset:           entry.lte_page_skip_offset,
         }, block))
     }
 
@@ -222,12 +219,12 @@ impl IndexBlockTable {
         self.cache.borrow_mut().get(seq)
     }
 
-    pub fn term_directory(&self)      -> &[TermDirectoryEntry] { &self.term_directory }
-    pub fn term_header_blocks(&self)  -> &[TermHeaderBlock]    { &self.term_header_blocks }
+    pub fn head_term_entries(&self)   -> &[HeadTermEntry] { &self.head_term_entries }
+    pub fn leaf_term_blocks(&self)    -> &[LeafTermBlock] { &self.leaf_term_blocks }
     pub fn page_skip_data(&self)      -> &[u64]                { &self.page_skip_data }
 
-    /// Iterate all TermHeader records (flattened) — used by the WASM viewer.
-    pub fn all_headers(&self) -> impl Iterator<Item = &TermHeader> {
-        self.term_header_blocks.iter().flat_map(|blk| blk.headers.iter())
+    /// Iterate all LeafTermEntry records (flattened) — used by the WASM viewer.
+    pub fn all_leaf_term_entries(&self) -> impl Iterator<Item = &LeafTermEntry> {
+        self.leaf_term_blocks.iter().flat_map(|blk| blk.ltb_entries.iter())
     }
 }

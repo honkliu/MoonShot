@@ -1,34 +1,34 @@
 /*
- * IndexSerializer v5 — two-level TermHeaderTable format.
+ * IndexSerializer v7 — paged two-level Head/Leaf term table format.
  *
- * TermHeaderTable on disk:
+ * Head/Leaf term table on disk:
  *   [dir_count:4]
- *     per dir entry: [key_len:2][first_term:key_len][term_header_block_id:4]
- *   [block_count:4]
- *     per block: [entry_count:4]
- *       per entry: [key_len:2][term:key_len][doc_freq:4]
- *                  [posting_block_id:4][posting_offset:4][posting_length:4]
- *                  [skip_list_offset:4][continuation_block_count:4][flags:4]
+ *     per head entry: [key_len:2][HTE_FirstTerm:key_len][HTE_LeafTermBlockID:4]
+ *   [leaf_page_count:4]
+ *     per 4096-byte page: [entry_count:4]
+ *       per entry: [key_len:2][LTE_Term:key_len][LTE_DocFreq:4]
+ *                  [LTE_IndexBlockID:4][LTE_IndexOffset:4][LTE_IndexLength:4]
+ *                  [LTE_PageSkipOffset:4][LTE_ContinuationBlockCount:4][LTE_Flags:4]
  */
 
 use std::io::{Write, Read, BufWriter, BufReader};
 use std::fs::File;
 use crate::posting_store::PostingStore;
 use crate::block_table::{
-    IndexBlock, TermHeader, TermDirectoryEntry, TermHeaderBlock,
+    IndexBlock, LeafTermEntry, HeadTermEntry, LeafTermBlock,
     IB_DATA_OFFSET, IB_SKIP_SLOTS, DATA_SIZE, PAGE_SIZE,
-    IB_HEADER_HAS_MORE, CONT_MARKER, TERM_HEADERS_PER_BLOCK,
+    IB_HEADER_HAS_MORE, CONT_MARKER,
 };
 use crate::error::{RustBladeError, Result};
 
 const MAGIC:          &[u8; 8] = b"MOONSHOT";
-const FORMAT_VERSION: u32      = 5;
+const FORMAT_VERSION: u32      = 7;
 
 pub struct BlocksResult {
-    pub blocks:           Vec<IndexBlock>,
-    pub term_directory:   Vec<TermDirectoryEntry>,
-    pub term_header_blocks: Vec<TermHeaderBlock>,
-    pub pageskip:         Vec<u64>,
+    pub bbr_index_blocks:       Vec<IndexBlock>,
+    pub bbr_head_term_entries:  Vec<HeadTermEntry>,
+    pub bbr_leaf_term_blocks:   Vec<LeafTermBlock>,
+    pub bbr_page_skip_list:     Vec<u64>,
 }
 
 pub struct IndexSerializer;
@@ -45,22 +45,22 @@ impl IndexSerializer {
 
     pub fn encode(store: &mut PostingStore) -> Result<Vec<u8>> {
         let br = Self::build_blocks(store);
-        let term_header_table_buf = Self::encode_term_header_table(&br.term_directory, &br.term_header_blocks);
-        let pageskip_buf = Self::encode_pageskip(&br.pageskip);
+        let head_leaf_term_table_buf = Self::encode_head_leaf_term_table(&br.bbr_head_term_entries, &br.bbr_leaf_term_blocks);
+        let pageskip_buf = Self::encode_pageskip(&br.bbr_page_skip_list);
         let docdata_buf  = Self::encode_docdata(store);
 
-        let total_terms: usize = br.term_header_blocks.iter().map(|b| b.headers.len()).sum();
+        let total_terms: usize = br.bbr_leaf_term_blocks.iter().map(|b| b.ltb_entries.len()).sum();
 
         let hdr_size:     usize = 96;
         let si_off:       usize = hdr_size;
-        let si_size:      usize = term_header_table_buf.len();
+        let si_size:      usize = head_leaf_term_table_buf.len();
         let ps_off:       usize = si_off + si_size;
         let ps_size:      usize = pageskip_buf.len();
         let dd_off:       usize = ps_off + ps_size;
         let dd_size:      usize = docdata_buf.len();
         let raw_off:      usize = dd_off + dd_size;
         let blocks_off:   usize = ((raw_off + PAGE_SIZE - 1) / PAGE_SIZE) * PAGE_SIZE;
-        let total        = blocks_off + br.blocks.len() * PAGE_SIZE;
+        let total        = blocks_off + br.bbr_index_blocks.len() * PAGE_SIZE;
 
         let mut out = vec![0u8; total];
         out[0..8].copy_from_slice(MAGIC);
@@ -75,13 +75,13 @@ impl IndexSerializer {
         write_u64(&mut out, 64, dd_off              as u64);
         write_u64(&mut out, 72, dd_size             as u64);
         write_u64(&mut out, 80, blocks_off          as u64);
-        write_u64(&mut out, 88, br.blocks.len()     as u64);
+        write_u64(&mut out, 88, br.bbr_index_blocks.len() as u64);
 
-        out[si_off..si_off + si_size].copy_from_slice(&term_header_table_buf);
+        out[si_off..si_off + si_size].copy_from_slice(&head_leaf_term_table_buf);
         out[ps_off..ps_off + ps_size].copy_from_slice(&pageskip_buf);
         out[dd_off..dd_off + dd_size].copy_from_slice(&docdata_buf);
 
-        for (i, blk) in br.blocks.iter().enumerate() {
+        for (i, blk) in br.bbr_index_blocks.iter().enumerate() {
             let off = blocks_off + i * PAGE_SIZE;
             let dst = &mut out[off..off + PAGE_SIZE];
             dst[0..8].copy_from_slice(&blk.ib_header.to_le_bytes());
@@ -95,7 +95,7 @@ impl IndexSerializer {
     }
 
     pub fn load(store: &mut PostingStore, path: &str)
-        -> Result<(Vec<TermDirectoryEntry>, Vec<TermHeaderBlock>, Vec<IndexBlock>, Vec<u64>)>
+        -> Result<(Vec<HeadTermEntry>, Vec<LeafTermBlock>, Vec<IndexBlock>, Vec<u64>)>
     {
         let f = File::open(path)?;
         let mut r = BufReader::new(f);
@@ -105,7 +105,7 @@ impl IndexSerializer {
     }
 
     pub fn decode(store: &mut PostingStore, data: &[u8])
-        -> Result<(Vec<TermDirectoryEntry>, Vec<TermHeaderBlock>, Vec<IndexBlock>, Vec<u64>)>
+        -> Result<(Vec<HeadTermEntry>, Vec<LeafTermBlock>, Vec<IndexBlock>, Vec<u64>)>
     {
         if data.len() < 96 { return Err(RustBladeError::InvalidFormat); }
         if &data[0..8] != MAGIC { return Err(RustBladeError::InvalidFormat); }
@@ -120,16 +120,16 @@ impl IndexSerializer {
         let blk_off   = u64_at(data, 80) as usize;
         let num_blks  = u64_at(data, 88) as usize;
 
-        /* TermHeaderTable — two-level */
-        let mut dir:    Vec<TermDirectoryEntry> = Vec::new();
-        let mut blocks: Vec<TermHeaderBlock>    = Vec::new();
+        /* Head/Leaf term table — two-level */
+        let mut head: Vec<HeadTermEntry> = Vec::new();
+        let mut leaf_blocks: Vec<LeafTermBlock> = Vec::new();
 
         if si_off + si_size <= data.len() && si_size >= 4 {
             let mut p = si_off;
 
-            let dir_count = u32_at(data, p) as usize; p += 4;
-            dir.reserve(dir_count);
-            for _ in 0..dir_count {
+            let head_count = u32_at(data, p) as usize; p += 4;
+            head.reserve(head_count);
+            for _ in 0..head_count {
                 if p + 2 > data.len() { break; }
                 let kl = u16_at(data, p) as usize; p += 2;
                 if p + kl + 4 > data.len() { break; }
@@ -137,41 +137,44 @@ impl IndexSerializer {
                     .map_err(|_| RustBladeError::InvalidFormat)?.to_string();
                 p += kl;
                 let bidx = u32_at(data, p); p += 4;
-                dir.push(TermDirectoryEntry { first_term: first, term_header_block_id: bidx });
+                head.push(HeadTermEntry { hte_first_term: first, hte_leaf_term_block_id: bidx });
             }
 
             if p + 4 <= data.len() {
                 let blk_count = u32_at(data, p) as usize; p += 4;
-                blocks.resize_with(blk_count, TermHeaderBlock::default);
+                leaf_blocks.resize_with(blk_count, LeafTermBlock::default);
                 for b in 0..blk_count {
-                    if p + 4 > data.len() { break; }
-                    let entry_count = u32_at(data, p) as usize; p += 4;
-                    blocks[b].headers.reserve(entry_count);
+                    let page_end = (p + PAGE_SIZE).min(si_off + si_size).min(data.len());
+                    if p + 4 > page_end { break; }
+                    let mut q = p;
+                    let entry_count = u32_at(data, q) as usize; q += 4;
+                    leaf_blocks[b].ltb_entries.reserve(entry_count);
                     for _ in 0..entry_count {
-                        if p + 2 > data.len() { break; }
-                        let kl = u16_at(data, p) as usize; p += 2;
-                        if p + kl + 28 > data.len() { break; }
-                        let term = std::str::from_utf8(&data[p..p+kl])
+                        if q + 2 > page_end { break; }
+                        let kl = u16_at(data, q) as usize; q += 2;
+                        if q + kl + 28 > page_end { break; }
+                        let term = std::str::from_utf8(&data[q..q+kl])
                             .map_err(|_| RustBladeError::InvalidFormat)?.to_string();
-                        p += kl;
-                        let freq = u32_at(data, p); p += 4;
-                        let pbid = u32_at(data, p); p += 4;
-                        let poff = u32_at(data, p); p += 4;
-                        let plen = u32_at(data, p); p += 4;
-                        let skip = u32_at(data, p); p += 4;
-                        let cont = u32_at(data, p); p += 4;
-                        let flags = u32_at(data, p); p += 4;
-                        blocks[b].headers.push(TermHeader {
-                            term,
-                            doc_freq: freq,
-                            posting_block_id: pbid,
-                            posting_offset: poff,
-                            posting_length: plen,
-                            skip_list_offset: skip,
-                            continuation_block_count: cont,
-                            flags,
+                        q += kl;
+                        let freq = u32_at(data, q); q += 4;
+                        let pbid = u32_at(data, q); q += 4;
+                        let poff = u32_at(data, q); q += 4;
+                        let plen = u32_at(data, q); q += 4;
+                        let skip = u32_at(data, q); q += 4;
+                        let cont = u32_at(data, q); q += 4;
+                        let flags = u32_at(data, q); q += 4;
+                        leaf_blocks[b].ltb_entries.push(LeafTermEntry {
+                            lte_term: term,
+                            lte_doc_freq: freq,
+                            lte_index_block_id: pbid,
+                            lte_index_offset: poff,
+                            lte_index_length: plen,
+                            lte_page_skip_offset: skip,
+                            lte_continuation_block_count: cont,
+                            lte_flags: flags,
                         });
                     }
+                    p += PAGE_SIZE;
                 }
             }
         }
@@ -185,8 +188,8 @@ impl IndexSerializer {
         }
 
         /* DocData */
-        const DOC_REC: usize = 256;
-        const PMAX: usize = 232;
+        const DOC_REC: usize = 1024;
+        const PMAX: usize = 1000;
         if dd_off + dd_size <= data.len() {
             let n = dd_size / DOC_REC;
             for i in 0..n {
@@ -207,7 +210,7 @@ impl IndexSerializer {
         }
 
         /* Posting blocks */
-        let mut posting_blocks = Vec::with_capacity(num_blks);
+        let mut index_blocks = Vec::with_capacity(num_blks);
         for i in 0..num_blks {
             let off = blk_off + i * PAGE_SIZE;
             if off + PAGE_SIZE > data.len() { break; }
@@ -215,10 +218,10 @@ impl IndexSerializer {
             blk.ib_header = u64_at(data, off);
             for j in 0..IB_SKIP_SLOTS { blk.ib_skip[j] = u32_at(data, off + 8 + j * 4); }
             blk.ib_data.copy_from_slice(&data[off + IB_DATA_OFFSET..off + PAGE_SIZE]);
-            posting_blocks.push(blk);
+            index_blocks.push(blk);
         }
 
-        Ok((dir, blocks, posting_blocks, pageskip))
+        Ok((head, leaf_blocks, index_blocks, pageskip))
     }
 
     pub fn is_valid_index(path: &str) -> bool {
@@ -232,10 +235,10 @@ impl IndexSerializer {
     }
 
     pub fn build_blocks_pub(store: &PostingStore)
-        -> (Vec<IndexBlock>, Vec<TermDirectoryEntry>, Vec<TermHeaderBlock>, Vec<u64>)
+        -> (Vec<IndexBlock>, Vec<HeadTermEntry>, Vec<LeafTermBlock>, Vec<u64>)
     {
         let br = Self::build_blocks(store);
-        (br.blocks, br.term_directory, br.term_header_blocks, br.pageskip)
+        (br.bbr_index_blocks, br.bbr_head_term_entries, br.bbr_leaf_term_blocks, br.bbr_page_skip_list)
     }
 
     // ── Internal ─────────────────────────────────────────────────────────────
@@ -246,9 +249,9 @@ impl IndexSerializer {
         terms.sort_by_key(|(k, _)| k.as_str());
 
         let cap = DATA_SIZE;
-        let mut posting_blocks: Vec<IndexBlock>    = Vec::new();
-        let mut flat:           Vec<TermHeader> = Vec::new();
-        let mut pageskip:       Vec<u64>           = Vec::new();
+        let mut index_blocks: Vec<IndexBlock> = Vec::new();
+        let mut flat: Vec<LeafTermEntry> = Vec::new();
+        let mut pageskip: Vec<u64> = Vec::new();
         pageskip.push(u64::MAX); // offset 0 means no skip list
 
         let mut cur  = IndexBlock::default();
@@ -272,7 +275,7 @@ impl IndexSerializer {
             let mut src  = 0usize;
 
             if wptr >= cap {
-                flush(&mut posting_blocks, &mut cur, &mut wptr, &mut seq, false);
+                flush(&mut index_blocks, &mut cur, &mut wptr, &mut seq, false);
             }
 
             let data_offset = wptr;
@@ -283,22 +286,22 @@ impl IndexSerializer {
             wptr += data_here;
             src  += data_here;
 
-            flat.push(TermHeader {
-                term: key.to_string(),
-                doc_freq,
-                posting_block_id: seq,
-                posting_offset: data_offset as u32,
-                posting_length: data_here as u32,
-                skip_list_offset: 0,
-                continuation_block_count: 0,
-                flags: 0,
+            flat.push(LeafTermEntry {
+                lte_term: key.to_string(),
+                lte_doc_freq: doc_freq,
+                lte_index_block_id: seq,
+                lte_index_offset: data_offset as u32,
+                lte_index_length: data_here as u32,
+                lte_page_skip_offset: 0,
+                lte_continuation_block_count: 0,
+                lte_flags: 0,
             });
 
             if has_more {
-                flush(&mut posting_blocks, &mut cur, &mut wptr, &mut seq, true);
+                flush(&mut index_blocks, &mut cur, &mut wptr, &mut seq, true);
                 let skip_offset = pageskip.len() as u32;
                 pageskip.push(0u64);
-                flat.last_mut().unwrap().skip_list_offset = skip_offset;
+                flat.last_mut().unwrap().lte_page_skip_offset = skip_offset;
 
                 while src < total {
                     const CONT_HDR: usize = 4;
@@ -315,58 +318,75 @@ impl IndexSerializer {
                     cur.ib_data[wptr..wptr+cont_here].copy_from_slice(&bytes[src..src+cont_here]);
                     wptr += cont_here; src += cont_here;
 
-                    flat.last_mut().unwrap().continuation_block_count += 1;
+                    flat.last_mut().unwrap().lte_continuation_block_count += 1;
 
-                    flush(&mut posting_blocks, &mut cur, &mut wptr, &mut seq, more_cont);
+                    if more_cont { flush(&mut index_blocks, &mut cur, &mut wptr, &mut seq, true); }
                 }
                 pageskip.push(u64::MAX);
             }
         }
         if wptr > 0 {
-            flush(&mut posting_blocks, &mut cur, &mut wptr, &mut seq, false);
+            flush(&mut index_blocks, &mut cur, &mut wptr, &mut seq, false);
         }
 
-        let mut dir: Vec<TermDirectoryEntry> = Vec::new();
-        let mut header_blocks: Vec<TermHeaderBlock> = Vec::new();
-        for chunk in flat.chunks(TERM_HEADERS_PER_BLOCK) {
-            let block_id = header_blocks.len() as u32;
-            dir.push(TermDirectoryEntry {
-                first_term: chunk[0].term.clone(),
-                term_header_block_id: block_id,
-            });
-            header_blocks.push(TermHeaderBlock { headers: chunk.to_vec() });
+        let mut head: Vec<HeadTermEntry> = Vec::new();
+        let mut leaf_blocks: Vec<LeafTermBlock> = Vec::new();
+        let mut page_entries: Vec<LeafTermEntry> = Vec::new();
+        let mut page_bytes = 4usize;
+        for entry in flat {
+            let need = leaf_entry_size(&entry);
+            if !page_entries.is_empty() && page_bytes + need > PAGE_SIZE {
+                let block_id = leaf_blocks.len() as u32;
+                head.push(HeadTermEntry { hte_first_term: page_entries[0].lte_term.clone(), hte_leaf_term_block_id: block_id });
+                leaf_blocks.push(LeafTermBlock { ltb_entries: page_entries });
+                page_entries = Vec::new();
+                page_bytes = 4;
+            }
+            page_bytes += need;
+            page_entries.push(entry);
+        }
+        if !page_entries.is_empty() {
+            let block_id = leaf_blocks.len() as u32;
+            head.push(HeadTermEntry { hte_first_term: page_entries[0].lte_term.clone(), hte_leaf_term_block_id: block_id });
+            leaf_blocks.push(LeafTermBlock { ltb_entries: page_entries });
         }
 
-        BlocksResult { blocks: posting_blocks, term_directory: dir,
-                       term_header_blocks: header_blocks, pageskip }
+        BlocksResult {
+            bbr_index_blocks: index_blocks,
+            bbr_head_term_entries: head,
+            bbr_leaf_term_blocks: leaf_blocks,
+            bbr_page_skip_list: pageskip,
+        }
     }
 
-    fn encode_term_header_table(dir: &[TermDirectoryEntry], blocks: &[TermHeaderBlock]) -> Vec<u8> {
+    fn encode_head_leaf_term_table(head: &[HeadTermEntry], blocks: &[LeafTermBlock]) -> Vec<u8> {
         let mut out = Vec::new();
         let push_u16 = |out: &mut Vec<u8>, v: u16| { out.extend_from_slice(&v.to_le_bytes()); };
         let push_u32 = |out: &mut Vec<u8>, v: u32| { out.extend_from_slice(&v.to_le_bytes()); };
 
-        push_u32(&mut out, dir.len() as u32);
-        for d in dir {
-            push_u16(&mut out, d.first_term.len() as u16);
-            out.extend_from_slice(d.first_term.as_bytes());
-            push_u32(&mut out, d.term_header_block_id);
+        push_u32(&mut out, head.len() as u32);
+        for d in head {
+            push_u16(&mut out, d.hte_first_term.len() as u16);
+            out.extend_from_slice(d.hte_first_term.as_bytes());
+            push_u32(&mut out, d.hte_leaf_term_block_id);
         }
 
         push_u32(&mut out, blocks.len() as u32);
         for blk in blocks {
-            push_u32(&mut out, blk.headers.len() as u32);
-            for e in &blk.headers {
-                push_u16(&mut out, e.term.len() as u16);
-                out.extend_from_slice(e.term.as_bytes());
-                push_u32(&mut out, e.doc_freq);
-                push_u32(&mut out, e.posting_block_id);
-                push_u32(&mut out, e.posting_offset);
-                push_u32(&mut out, e.posting_length);
-                push_u32(&mut out, e.skip_list_offset);
-                push_u32(&mut out, e.continuation_block_count);
-                push_u32(&mut out, e.flags);
+            let page_start = out.len();
+            push_u32(&mut out, blk.ltb_entries.len() as u32);
+            for e in &blk.ltb_entries {
+                push_u16(&mut out, e.lte_term.len() as u16);
+                out.extend_from_slice(e.lte_term.as_bytes());
+                push_u32(&mut out, e.lte_doc_freq);
+                push_u32(&mut out, e.lte_index_block_id);
+                push_u32(&mut out, e.lte_index_offset);
+                push_u32(&mut out, e.lte_index_length);
+                push_u32(&mut out, e.lte_page_skip_offset);
+                push_u32(&mut out, e.lte_continuation_block_count);
+                push_u32(&mut out, e.lte_flags);
             }
+            out.resize(page_start + PAGE_SIZE, 0);
         }
         out
     }
@@ -380,7 +400,7 @@ impl IndexSerializer {
     }
 
     fn encode_docdata(store: &PostingStore) -> Vec<u8> {
-        const REC: usize = 256; const PMAX: usize = 232;
+        const REC: usize = 1024; const PMAX: usize = 1000;
         let mut out = Vec::new();
         for (doc_id, stats) in store.all_doc_stats() {
             let mut rec = [0u8; REC];
@@ -405,6 +425,10 @@ fn decode_last_docid(data: &[u8]) -> u64 {
         prev += delta;
     }
     prev
+}
+
+fn leaf_entry_size(entry: &LeafTermEntry) -> usize {
+    2 + entry.lte_term.len() + 7 * std::mem::size_of::<u32>()
 }
 
 fn vb_read(data: &[u8], start: usize) -> (u64, usize) {

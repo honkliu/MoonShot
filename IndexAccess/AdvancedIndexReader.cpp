@@ -13,28 +13,31 @@ void AdvancedIndexReader::Open(const char*      streamKey,
     m_DocFreq         = docFreq;   // fallback; overwritten below if term found
     m_PageSkipOffset  = 0;
     m_InitialBlockSeq = 0;
+    m_TotalContinuationBlocks = 0;
+    m_RemainingContinuationBlocks = 0;
 
-    uint32_t posting_block_id = 0, offset = 0, posting_length = 0, freq = 0;
-    uint32_t continuation_block_count = 0;
-    uint32_t skip_list_offset = 0;
+    uint32_t indexBlockID = 0, indexOffset = 0, indexLength = 0, freq = 0;
+    uint32_t continuationBlockCount = 0;
+    uint32_t pageSkipOffset = 0;
 
     bool found = m_BlockTable->FindTermData(streamKey,
-                                            &posting_block_id, &offset,
-                                            &posting_length,   &freq,
-                                            &continuation_block_count,
-                                            &skip_list_offset);
+                                            &indexBlockID, &indexOffset,
+                                            &indexLength,  &freq,
+                                            &continuationBlockCount,
+                                            &pageSkipOffset);
     if (found) {
-        /* Use doc_freq from TermHeader — correct after Load(), unlike PostingStore */
+        /* Use doc_freq from LeafTermEntry — correct after Load(), unlike PostingStore */
         m_DocFreq = freq;
 
-        IndexBlock* block = m_BlockTable->GetIndexBlock(posting_block_id, 1);
+        IndexBlock* block = m_BlockTable->GetIndexBlock(indexBlockID, 1);
         if (block) {
-            m_BlockSeqNumber  = posting_block_id;
-            m_InitialBlockSeq = posting_block_id;
-            m_PageSkipOffset  = skip_list_offset;
-            m_HasMore         = continuation_block_count > 0;
+            m_BlockSeqNumber  = indexBlockID;
+            m_InitialBlockSeq = indexBlockID;
+            m_PageSkipOffset  = pageSkipOffset;
+            m_TotalContinuationBlocks = continuationBlockCount;
+            m_RemainingContinuationBlocks = continuationBlockCount;
             m_IndexBlock      = std::shared_ptr<IndexBlock>(block, [](IndexBlock*){});
-            m_Decoder.OpenRaw(block->IB_Data + offset, posting_length, 0);
+            m_Decoder.OpenRaw(block->IB_Data + indexOffset, indexLength, 0);
         }
     }
 
@@ -49,8 +52,8 @@ void AdvancedIndexReader::GoNext()
             uint64_t lastDoc = m_Decoder.GetDocumentID();
             ++m_BlockSeqNumber;
             m_IndexBlock = std::shared_ptr<IndexBlock>(next, [](IndexBlock*){});
-            m_HasMore    = (next->IB_Header & IB_HEADER_HAS_MORE) != 0;
             OpenContinuation(next, lastDoc);
+            --m_RemainingContinuationBlocks;
         }
     }
     m_Decoder.GoNext();
@@ -76,7 +79,9 @@ void AdvancedIndexReader::GoUntil(uint64_t target, uint64_t /*limit*/)
                     uint64_t base_loc = skip[tgt_idx];
                     m_BlockSeqNumber  = target_block;
                     m_IndexBlock      = std::shared_ptr<IndexBlock>(blk, [](IndexBlock*){});
-                    m_HasMore         = (blk->IB_Header & IB_HEADER_HAS_MORE) != 0;
+                    m_RemainingContinuationBlocks = (tgt_idx <= m_TotalContinuationBlocks)
+                        ? (m_TotalContinuationBlocks - tgt_idx)
+                        : 0;
                     OpenContinuation(blk, base_loc);
                     m_Decoder.GoNext();
                     if (!m_Decoder.IsEnd()) {
@@ -98,8 +103,8 @@ void AdvancedIndexReader::GoUntil(uint64_t target, uint64_t /*limit*/)
         uint64_t lastDoc = m_Decoder.GetDocumentID();
         ++m_BlockSeqNumber;
         m_IndexBlock = std::shared_ptr<IndexBlock>(next, [](IndexBlock*){});
-        m_HasMore    = (next->IB_Header & IB_HEADER_HAS_MORE) != 0;
         OpenContinuation(next, lastDoc);
+        --m_RemainingContinuationBlocks;
         m_Decoder.GoNext();
         if (m_Decoder.IsEnd()) break;
     }
