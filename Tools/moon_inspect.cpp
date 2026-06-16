@@ -195,22 +195,25 @@ static Index parse_index(const char* path)
         uint32_t block_count = read_u32(ptr, end);
         index.header_blocks.resize(block_count);
         for (uint32_t block_index = 0; block_index < block_count && ptr < end; ++block_index) {
-            uint32_t entry_count = read_u32(ptr, end);
+            const uint8_t* page_start = ptr;
+            const uint8_t* page_end = std::min(page_start + PAGE_SIZE, end);
+            uint32_t entry_count = read_u32(ptr, page_end);
             index.header_blocks[block_index].LTB_Entries.reserve(entry_count);
-            for (uint32_t i = 0; i < entry_count && ptr < end; ++i) {
+            for (uint32_t i = 0; i < entry_count && ptr < page_end; ++i) {
                 LeafTermEntry header;
-                uint16_t len = read_u16(ptr, end);
-                header.LTE_Term = read_string(ptr, end, len);
-                header.LTE_DocFreq = read_u32(ptr, end);
-                header.LTE_IndexBlockID = read_u32(ptr, end);
-                header.LTE_IndexOffset = read_u32(ptr, end);
-                header.LTE_IndexLength = read_u32(ptr, end);
-                header.LTE_PageSkipOffset = read_u32(ptr, end);
-                header.LTE_ContinuationBlockCount = read_u32(ptr, end);
-                header.flags = read_u32(ptr, end);
+                uint16_t len = read_u16(ptr, page_end);
+                header.LTE_Term = read_string(ptr, page_end, len);
+                header.LTE_DocFreq = read_u32(ptr, page_end);
+                header.LTE_IndexBlockID = read_u32(ptr, page_end);
+                header.LTE_IndexOffset = read_u32(ptr, page_end);
+                header.LTE_IndexLength = read_u32(ptr, page_end);
+                header.LTE_PageSkipOffset = read_u32(ptr, page_end);
+                header.LTE_ContinuationBlockCount = read_u32(ptr, page_end);
+                header.flags = read_u32(ptr, page_end);
                 index.LTB_Entries.push_back(header);
                 index.header_blocks[block_index].LTB_Entries.push_back(std::move(header));
             }
+            ptr = page_start + PAGE_SIZE;
         }
     }
 
@@ -280,6 +283,10 @@ table{border-collapse:collapse;width:100%;margin-bottom:12px}th{background:#2525
 static void emit(std::ostream& out, const Index& index, const char* path)
 {
     const FileHdr& h = index.hdr;
+    std::unordered_map<uint64_t, const DocRec*> docs_by_id;
+    docs_by_id.reserve(index.docs.size());
+    for (const auto& doc : index.docs) docs_by_id.emplace(doc.IE_DocID, &doc);
+
     out << "<!DOCTYPE html><html><head><meta charset='utf-8'><title>moon_inspect</title><style>" << css() << "</style></head><body>";
     out << "<h1>moon_inspect <span class='dim'>" << esc(path) << "</span></h1>";
     out << "<div class='tabs'><button class='tab active' onclick=\"tab('header',this)\">Header</button><button class='tab' onclick=\"tab('terms',this)\">Term LTB_Entries</button><button class='tab' onclick=\"tab('docs',this)\">DocData</button><button class='tab' onclick=\"tab('blocks',this)\">IndexEntry Blocks</button></div>";
@@ -328,14 +335,21 @@ static void emit(std::ostream& out, const Index& index, const char* path)
         if (block.is_continuation) out << "<span class='badge cont'>continuation</span>";
         out << "<span class='dim'> " << block.terms.size() << " starting terms</span></div><div class='card-b'>";
         if (!block.terms.empty()) {
-            out << "<table><tr><th>Term</th><th>df</th><th>Off</th><th>Len</th><th>Sample IndexEntrys</th></tr>";
+            out << "<table><tr><th>Term</th><th>df</th><th>Off</th><th>Len</th><th>Decoded postings</th></tr>";
             for (const auto& view : block.terms) {
                 const LeafTermEntry& term = *view.header;
                 out << "<tr><td class='mono key'>" << esc(term.LTE_Term);
                 if (term.LTE_ContinuationBlockCount > 0) out << "<span class='badge more'>->" << term.LTE_ContinuationBlockCount << "</span>";
-                out << "</td><td class='num'>" << term.LTE_DocFreq << "</td><td class='num'>" << term.LTE_IndexOffset << "</td><td class='num'>" << term.LTE_IndexLength << "</td><td>";
-                for (const auto& IndexEntry : view.IndexEntrys) out << "<div class='IndexEntry'>doc=" << IndexEntry.IE_DocID << " tf=" << IndexEntry.IE_TermFrequency << "</div>";
-                out << "</td></tr>";
+                out << "</td><td class='num'>" << term.LTE_DocFreq << "</td><td class='num'>" << term.LTE_IndexOffset << "</td><td class='num'>" << term.LTE_IndexLength << "</td><td class='dim'>" << view.IndexEntrys.size() << " sample rows</td></tr>";
+                out << "<tr><td></td><td colspan='4'><table class='postings'><tr><th>DocID</th><th>TF</th><th>Path</th></tr>";
+                for (const auto& IndexEntry : view.IndexEntrys) {
+                    out << "<tr class='IndexEntry'><td class='mono num'>" << IndexEntry.IE_DocID << "</td><td class='num'>" << IndexEntry.IE_TermFrequency << "</td><td class='path'>";
+                    auto doc = docs_by_id.find(IndexEntry.IE_DocID);
+                    if (doc != docs_by_id.end()) out << esc(doc_path(*doc->second));
+                    else out << "<span class='dim'>DocData not loaded for this DocID</span>";
+                    out << "</td></tr>";
+                }
+                out << "</table></td></tr>";
             }
             out << "</table>";
         }
