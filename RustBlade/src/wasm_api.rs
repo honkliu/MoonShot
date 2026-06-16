@@ -290,7 +290,7 @@ pub fn search_index(data: &[u8], query: &str, streams: &str) -> String {
     if ctx.load_from_bytes(data).is_err() {
         return r#"{"error":"Failed to load index"}"#.to_string();
     }
-    let results = ctx.search(query, 20, streams);
+    let results = ctx.search(query, 0, streams);
     let mut out = String::from("[");
     for (i, r) in results.iter().enumerate() {
         if i > 0 { out.push(','); }

@@ -7,7 +7,7 @@ Usage:
     python3 serve.py ~/moon.idx         # auto-load idx at startup
     python3 serve.py ~/moon.idx 8080    # custom port
 """
-import sys, os, json, http.server, socketserver, urllib.parse, mimetypes
+import sys, os, json, struct, http.server, socketserver, urllib.parse, mimetypes
 
 idx_path = sys.argv[1] if len(sys.argv) > 1 else ''
 port     = int(sys.argv[2]) if len(sys.argv) > 2 else 8080
@@ -109,6 +109,50 @@ class MoonShotHandler(http.server.SimpleHTTPRequestHandler):
             self.send_header('Accept-Ranges', 'bytes')
             self.send_header('Content-Range', f'bytes {start}-{start + len(data) - 1}/{size}' if data else f'bytes */{size}')
             self.send_header('X-File-Size', str(size))
+            self.send_header('Content-Length', str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+            return
+
+        if parsed.path == '/doc-paths':
+            if not served_idx_abs or not os.path.isfile(served_idx_abs):
+                self.send_error(404, 'no configured idx')
+                return
+
+            query = urllib.parse.parse_qs(parsed.query)
+            raw_ids = query.get('ids', [''])[0]
+            try:
+                ids = [int(x) for x in raw_ids.split(',') if x.strip()]
+            except ValueError:
+                self.send_error(400, 'invalid ids')
+                return
+
+            try:
+                with open(served_idx_abs, 'rb') as f:
+                    header = f.read(96)
+                    if len(header) < 96 or header[:8] != b'MOONSHOT':
+                        self.send_error(400, 'invalid idx header')
+                        return
+                    num_docs = struct.unpack_from('<Q', header, 16)[0]
+                    docdata_off = struct.unpack_from('<Q', header, 56)[0]
+                    out = {}
+                    for doc_id in ids:
+                        if doc_id < 1 or doc_id > num_docs:
+                            continue
+                        f.seek(docdata_off + (doc_id - 1) * 1024)
+                        rec = f.read(1024)
+                        if len(rec) < 1024:
+                            continue
+                        path_len = min(struct.unpack_from('<H', rec, 16)[0], 999)
+                        path = rec[24:24 + path_len].decode('utf-8', errors='replace') if path_len else ''
+                        out[str(doc_id)] = path
+            except OSError as exc:
+                self.send_error(500, str(exc))
+                return
+
+            data = json.dumps(out).encode('utf-8')
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json; charset=utf-8')
             self.send_header('Content-Length', str(len(data)))
             self.end_headers()
             self.wfile.write(data)

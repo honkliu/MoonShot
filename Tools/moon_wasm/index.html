@@ -225,6 +225,7 @@ const HEAD_ROWS_PER_PAGE = 32;
 const DOCDATA_ROWS_PER_PAGE = 32;
 const INDEXBLOCKS_PER_PAGE = 32;
 const POSTING_ROWS_PER_PAGE = 32;
+const SEARCH_RESULTS_PER_PAGE = 20;
 const { default: init, parse_index_summary, parse_index, search_index } = await import(`./pkg/moon_wasm.js?${BUILD_STAMP}`);
 const wasmBytes = await fetch(`./pkg/moon_wasm_bg.wasm?${BUILD_STAMP}`, { cache: 'no-store' })
   .then(r => r.ok ? r.arrayBuffer() : Promise.reject(r.status));
@@ -327,7 +328,7 @@ function loadSummaryData(headerBytes, name, fileSize, reason) {
     normalizeParsedIndex(G.parsed);
     G.summaryOnly = true;
     G.summaryReason = reason || 'summary mode';
-    G.paged = { leafCache: new Map(), blockCache: new Map(), docCache: new Map() };
+    G.paged = { leafCache: new Map(), blockCache: new Map(), docCache: new Map(), docPromiseCache: new Map() };
     G.leafTermBlocksById = new Map();
     G_ExpandedTree = new Set();
     G_SelectedTreeNode = '';
@@ -511,6 +512,7 @@ async function loadPagedHeadDirectory() {
     leafCache: new Map(),
     blockCache: new Map(),
     docCache: new Map(),
+    docPromiseCache: new Map(),
     blockOwnerCache: new Map(),
     continuationOwnerCache: new Map(),
     ownerScanPage: 0,
@@ -633,18 +635,26 @@ async function loadDocRecordByOrdinal(ordinal) {
   const h = G.parsed.header;
   if (ordinal < 0 || ordinal >= h.num_docs) return null;
   if (G.paged?.docCache?.has(ordinal)) return G.paged.docCache.get(ordinal);
+  if (G.paged?.docPromiseCache?.has(ordinal)) return G.paged.docPromiseCache.get(ordinal);
   const off = h.docdata_off + ordinal * DOC_REC_SIZE;
-  const rec = await rangeRead(off, DOC_REC_SIZE);
-  const pathLen = Math.min(u16(rec, 16), 999);
-  const doc = {
-    doc_id: String(u64n(rec, 0)),
-    importance: f32(rec, 8),
-    doc_len: u32(rec, 12),
-    path: pathLen ? textAt(rec, 24, pathLen) : '',
-    byte_offset: off,
-  };
-  G.paged.docCache.set(ordinal, doc);
-  return doc;
+  const promise = rangeRead(off, DOC_REC_SIZE).then(rec => {
+    const pathLen = Math.min(u16(rec, 16), 999);
+    const doc = {
+      doc_id: String(u64n(rec, 0)),
+      importance: f32(rec, 8),
+      doc_len: u32(rec, 12),
+      path: pathLen ? textAt(rec, 24, pathLen) : '',
+      byte_offset: off,
+    };
+    G.paged.docCache.set(ordinal, doc);
+    G.paged.docPromiseCache?.delete(ordinal);
+    return doc;
+  }).catch(err => {
+    G.paged?.docPromiseCache?.delete(ordinal);
+    throw err;
+  });
+  G.paged?.docPromiseCache?.set(ordinal, promise);
+  return promise;
 }
 
 async function loadDocPage(startOrdinal, count) {
@@ -674,6 +684,45 @@ async function loadDocRecordById(docId) {
   if (!Number.isFinite(id) || id < 1) return null;
   // Current generated indexes assign dense 1-based doc IDs in docdata order.
   return loadDocRecordByOrdinal(id - 1);
+}
+
+async function loadDocPathsByIds(docIds) {
+  const ids = [...new Set(docIds.map(Number).filter(id => Number.isFinite(id) && id > 0))];
+  if (!ids.length) return new Map();
+
+  const result = new Map();
+  const missing = [];
+  for (const id of ids) {
+    const cached = G.paged?.docCache?.get(id - 1);
+    if (cached) result.set(String(id), cached.path || '');
+    else missing.push(id);
+  }
+
+  if (missing.length && G.summaryOnly && window.MOONSHOT_IDX) {
+    const response = await fetch(`/doc-paths?ids=${encodeURIComponent(missing.join(','))}&_=${BUILD_STAMP}-${Date.now()}`, { cache: 'no-store' });
+    if (response.ok) {
+      const paths = await response.json();
+      for (const id of missing) {
+        const path = paths[String(id)] || '';
+        const doc = {
+          doc_id: String(id),
+          importance: 0,
+          doc_len: 0,
+          path,
+          byte_offset: G.parsed.header.docdata_off + (id - 1) * DOC_REC_SIZE,
+        };
+        G.paged?.docCache?.set(id - 1, doc);
+        result.set(String(id), path);
+      }
+      return result;
+    }
+  }
+
+  await Promise.all(missing.map(async id => {
+    const doc = await loadDocRecordById(id);
+    result.set(String(id), doc?.path || '');
+  }));
+  return result;
 }
 
 function decodePostings(bytes, start, length, limit = 1000000) {
@@ -795,13 +844,8 @@ async function runPagedSearch(q) {
     const postings = await loadPagedPostings(e);
     for (const p of postings) scores.set(p.doc_id, (scores.get(p.doc_id) || 0) + p.tf);
   }
-  const ranked = [...scores.entries()].sort((a, b) => b[1] - a[1]).slice(0, 20);
-  const out = [];
-  for (const [docId, score] of ranked) {
-    const doc = await loadDocRecordById(docId);
-    out.push({ doc_id: String(docId), score, path: doc?.path || '' });
-  }
-  return out;
+  const ranked = [...scores.entries()].sort((a, b) => b[1] - a[1]);
+  return ranked.map(([docId, score]) => ({ doc_id: String(docId), score, path: '' }));
 }
 
 async function loadPagedPostings(e) {
@@ -868,6 +912,10 @@ let G_HeadPage = 0;
 let G_DocPage = 0;
 let G_BlockPage = 0;
 let G_PostingPages = new Map();
+let G_SearchPage = 0;
+let G_SearchQuery = '';
+let G_SearchResults = [];
+let G_SearchPaged = false;
 let G_HexAnchorRow = 0;
 
 function buildHex() {
@@ -1544,8 +1592,33 @@ function renderSearchResults(q, res, paged) {
     return;
   }
 
-  let html = `<div class="search-summary">${res.length} result(s) for "${esc(q)}"${paged ? ' · paged range search' : ''}</div>`;
-  for (const r of res) {
+  G_SearchQuery = q;
+  G_SearchResults = res;
+  G_SearchPaged = paged;
+  G_SearchPage = 0;
+  renderSearchPage();
+  switchTabByName('srch-panel');
+}
+
+async function renderSearchPage() {
+  const out = document.getElementById('srch-out');
+  const res = G_SearchResults;
+  const pageCount = Math.max(1, Math.ceil(res.length / SEARCH_RESULTS_PER_PAGE));
+  G_SearchPage = Math.min(Math.max(0, G_SearchPage), pageCount - 1);
+  const start = G_SearchPage * SEARCH_RESULTS_PER_PAGE;
+  const shown = res.slice(start, start + SEARCH_RESULTS_PER_PAGE);
+  if (G_SearchPaged) {
+    const paths = await loadDocPathsByIds(shown.filter(r => !r.path).map(r => r.doc_id));
+    for (const r of shown) if (!r.path) r.path = paths.get(String(r.doc_id)) || '';
+  }
+  let html = `<div class="search-summary">${res.length} result(s) for "${esc(G_SearchQuery)}"${G_SearchPaged ? ' · paged range search' : ''}`
+      + ` · showing ${start + 1}-${start + shown.length} of ${res.length}`
+      + `<div class="pager">`
+      + `<button type="button" class="icon-btn" title="Previous results" onclick="setSearchPage(${G_SearchPage - 1})" ${G_SearchPage <= 0 ? 'disabled' : ''}>‹</button>`
+      + `<button type="button" class="icon-btn" title="Next results" onclick="setSearchPage(${G_SearchPage + 1})" ${G_SearchPage >= pageCount - 1 ? 'disabled' : ''}>›</button>`
+      + `<span>page</span><input class="tool-input" type="number" min="1" max="${pageCount}" value="${G_SearchPage + 1}" onchange="setSearchPage(Number(this.value)-1)" title="Search result page"><span>/ ${pageCount}</span>`
+      + `</div></div>`;
+  for (const r of shown) {
     const path = r.path || G.pathOf(r.doc_id) || String(r.doc_id);
     const name = fileNameOf(path) || String(r.doc_id);
     const score = Number.isFinite(r.score) ? r.score.toFixed(4) : String(r.score ?? '');
@@ -1556,8 +1629,12 @@ function renderSearchResults(q, res, paged) {
          + `</div>`;
   }
   out.innerHTML = html;
-  switchTabByName('srch-panel');
 }
+
+window.setSearchPage = function(page) {
+  G_SearchPage = Math.max(0, page|0);
+  renderSearchPage().catch(e => setStatus('Failed to render search page: ' + e));
+};
 
 function switchTab(el) {
   document.querySelectorAll('.dtab').forEach(t=>t.classList.remove('active'));

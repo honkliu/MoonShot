@@ -31,10 +31,12 @@
 
 #ifdef _WIN32
 #  include <windows.h>
+#  include <conio.h>
 #else
 #  include <pwd.h>
 #  include <unistd.h>
 #  include <limits.h>
+#  include <termios.h>
 #endif
 
 #ifdef _WIN32
@@ -76,6 +78,28 @@ static char PathSep()
     return '\\';
 #else
     return '/';
+#endif
+}
+
+static char ReadSingleKey()
+{
+#ifdef _WIN32
+    return static_cast<char>(_getch());
+#else
+    termios oldAttrs{};
+    termios newAttrs{};
+    if (tcgetattr(STDIN_FILENO, &oldAttrs) != 0) {
+        char ch = 0;
+        std::cin.get(ch);
+        return ch;
+    }
+    newAttrs = oldAttrs;
+    newAttrs.c_lflag &= ~(ICANON | ECHO);
+    tcsetattr(STDIN_FILENO, TCSANOW, &newAttrs);
+    char ch = 0;
+    std::cin.get(ch);
+    tcsetattr(STDIN_FILENO, TCSANOW, &oldAttrs);
+    return ch;
 #endif
 }
 
@@ -631,7 +655,7 @@ static void Search(IndexContext& ctx, const std::string& query)
     }
 
     auto reader  = ctx.GetReader(tree);
-    auto results = ctx.GetExecutor()->Execute(reader, 20);
+    auto results = ctx.GetExecutor()->Execute(reader, 0);
     delete tree;
 
     if (results.empty()) {
@@ -639,9 +663,27 @@ static void Search(IndexContext& ctx, const std::string& query)
         return;
     }
 
-    for (auto& r : results) {
-        const std::string& path = ctx.GetStore()->GetDocPath(r.doc_id);
-        std::cout << (path.empty() ? "[unknown]" : path) << "\n";
+    constexpr size_t PAGE_SIZE_RESULTS = 20;
+    std::cout << results.size() << " result(s)\n";
+    for (size_t offset = 0; offset < results.size(); offset += PAGE_SIZE_RESULTS) {
+        const size_t end = std::min(offset + PAGE_SIZE_RESULTS, results.size());
+        if (results.size() > PAGE_SIZE_RESULTS) {
+            std::cout << "-- showing " << (offset + 1) << "-" << end
+                      << " of " << results.size() << " --\n";
+        }
+
+        for (size_t i = offset; i < end; ++i) {
+            const auto& r = results[i];
+            const std::string& path = ctx.GetStore()->GetDocPath(r.doc_id);
+            std::cout << (path.empty() ? "[unknown]" : path) << "\n";
+        }
+
+        if (end < results.size()) {
+            std::cout << "-- press any key for next page, q to stop --" << std::flush;
+            char ch = ReadSingleKey();
+            std::cout << "\n";
+            if (ch == 'q' || ch == 'Q') break;
+        }
     }
 }
 
