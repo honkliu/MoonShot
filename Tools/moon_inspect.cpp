@@ -10,7 +10,7 @@
 #include <vector>
 
 static const uint8_t MAGIC[8] = {'M','O','O','N','S','H','O','T'};
-static const uint32_t FORMAT_VERSION = 6;
+static const uint32_t FORMAT_VERSION = 7;
 static const int PAGE_SIZE = 4096;
 static const int IB_DATA_OFF = 8 + 50 * 4;
 static const int IB_DATA_LEN = PAGE_SIZE - IB_DATA_OFF;
@@ -29,7 +29,7 @@ struct FileHdr {
 };
 
 struct DocRec {
-    uint64_t doc_id;
+    uint64_t IE_DocID;
     float importance;
     uint32_t doc_len;
     uint16_t path_len;
@@ -47,7 +47,7 @@ struct HeadTermEntry {
 };
 
 struct LeafTermEntry {
-    std::string term;
+    std::string LTE_Term;
     uint32_t LTE_DocFreq = 0;
     uint32_t LTE_IndexBlockID = 0;
     uint32_t LTE_IndexOffset = 0;
@@ -58,7 +58,7 @@ struct LeafTermEntry {
 };
 
 struct LeafTermBlock { std::vector<LeafTermEntry> LTB_Entries; };
-struct IndexEntry { uint64_t doc_id; uint32_t tf; };
+struct IndexEntry { uint64_t IE_DocID; uint32_t IE_TermFrequency; };
 
 struct TermView {
     const LeafTermEntry* header = nullptr;
