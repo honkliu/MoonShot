@@ -47,6 +47,7 @@ Metawords are expressed with a colon prefix in the raw query.
 | `filetype:pdf`        | Alias for `type:`                           |
 | `norank:hello`        | Index "hello" but do NOT use it for ranking |
 | `-hello`              | Exclude documents containing "hello" (NOT)  |
+| `-site:example.com`   | Exclude documents whose URL/path contains `example.com` |
 
 ---
 
@@ -109,6 +110,8 @@ rust safety             → AND(rust, safety)
 rust OR go              → OR(rust, go)
 rust NOT unsafe         → NOT(base=rust, exclude=unsafe)
 -unsafe rust            → same as above
+rust -site:example.com  → rust AND NOT(site:example.com)
+rust - site:example.com → same as above; whitespace after `-` is accepted
 (rust OR go) safety     → AND( OR(rust,go), safety )
 ```
 

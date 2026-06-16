@@ -3,8 +3,10 @@
 
 #include "IndexReader.h"
 #include "Bm25Scorer.h"
+#include "Embeddings.h"
 
 #include <cinttypes>
+#include <algorithm>
 #include <memory>
 #include <print>
 #include <string>
@@ -69,6 +71,14 @@ public:
         float total = 0.0f;
         for (auto& c : m_Children)
             total += c->GetBM25Score(scorer, docLength);
+        return total;
+    }
+
+    float GetScore(const Bm25Scorer& scorer, uint32_t docLength) override
+    {
+        float total = 0.0f;
+        for (auto& c : m_Children)
+            total += c->GetScore(scorer, docLength);
         return total;
     }
 
@@ -206,6 +216,19 @@ public:
         return total;
     }
 
+    float GetScore(const Bm25Scorer& scorer, uint32_t docLength) override
+    {
+        uint64_t doc   = GetDocumentID();
+        float    total = 0.0f;
+
+        for (auto& c : m_Children) {
+            if (!c->IsEnd() && c->GetDocumentID() == doc)
+                total += c->GetScore(scorer, docLength);
+        }
+
+        return total;
+    }
+
     void GoNext() override
     {
         if (IsEnd())
@@ -266,6 +289,11 @@ public:
         return m_Base->GetBM25Score(scorer, docLength);
     }
 
+    float GetScore(const Bm25Scorer& scorer, uint32_t docLength) override
+    {
+        return m_Base->GetScore(scorer, docLength);
+    }
+
     void GoNext() override
     {
         m_Base->GoNext();
@@ -302,6 +330,47 @@ private:
             }
         }
     }
+};
+
+class VectorIndexReader : public IndexReader {
+public:
+    explicit VectorIndexReader(std::vector<VectorSearchResult> results)
+        : m_Results(std::move(results))
+    {
+        std::sort(m_Results.begin(), m_Results.end(), [](const auto& a, const auto& b) {
+            return a.doc_id < b.doc_id;
+        });
+    }
+
+    bool IsEnd() override { return m_Pos >= m_Results.size(); }
+
+    uint64_t GetDocumentID() override
+    {
+        return IsEnd() ? NO_MORE_DOCS : m_Results[m_Pos].doc_id;
+    }
+
+    float GetScore(const Bm25Scorer&, uint32_t) override
+    {
+        return IsEnd() ? 0.0f : m_Results[m_Pos].score;
+    }
+
+    void GoNext() override
+    {
+        if (!IsEnd()) ++m_Pos;
+    }
+
+    void GoUntil(uint64_t target, uint64_t limit = NO_MORE_DOCS) override
+    {
+        while (!IsEnd() && GetDocumentID() < target && GetDocumentID() < limit)
+            ++m_Pos;
+    }
+
+    void Close() override { m_Pos = m_Results.size(); }
+    void Open(const char*) override {}
+
+private:
+    std::vector<VectorSearchResult> m_Results;
+    size_t m_Pos = 0;
 };
 
 #endif

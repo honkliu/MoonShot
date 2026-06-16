@@ -34,7 +34,7 @@ public:
         while (!reader->IsEnd()) {
             uint64_t docId     = reader->GetDocumentID();
             uint32_t docLength = m_Store->GetDocLen(docId);
-            float    score     = reader->GetBM25Score(scorer, docLength)
+            float    score     = reader->GetScore(scorer, docLength)
                                + m_Store->GetDocImportance(docId);
 
             results.push_back({docId, score, ""});
@@ -93,7 +93,7 @@ private:
         while (!reader->IsEnd()) {
             uint64_t docId     = reader->GetDocumentID();
             uint32_t docLength = m_Store->GetDocLen(docId);
-            float    score     = reader->GetBM25Score(scorer, docLength)
+            float    score     = reader->GetScore(scorer, docLength)
                                + m_Store->GetDocImportance(docId);
 
             results.push_back({docId, score, ""});

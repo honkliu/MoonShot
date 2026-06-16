@@ -24,7 +24,7 @@ public:
         : m_Store(std::move(store))
     {}
 
-    void Write(std::vector<std::string>&& words,
+    void Write(const std::vector<std::string>& words,
                uint64_t                    documentId,
                const char*                 postingType) override
     {
@@ -70,6 +70,11 @@ public:
     void SetDocImportance(uint64_t doc_id, float score) override
     {
         m_Store->SetDocImportance(doc_id, score);
+    }
+
+    void SetDocVector(uint64_t doc_id, std::vector<float> vector) override
+    {
+        m_Store->SetDocVector(doc_id, std::move(vector));
     }
 
 private:

@@ -207,6 +207,24 @@ static int query_int(const std::unordered_map<std::string, std::string>& query,
     return static_cast<int>(value);
 }
 
+static std::vector<float> parse_vector_param(const std::string& value)
+{
+    std::vector<float> vector;
+    size_t start = 0;
+    while (start <= value.size()) {
+        size_t comma = value.find(',', start);
+        std::string part = value.substr(start, comma == std::string::npos ? std::string::npos : comma - start);
+        if (!part.empty()) {
+            char* end = nullptr;
+            float parsed = std::strtof(part.c_str(), &end);
+            if (end && *end == '\0') vector.push_back(parsed);
+        }
+        if (comma == std::string::npos) break;
+        start = comma + 1;
+    }
+    return vector;
+}
+
 static void close_socket(socket_t fd)
 {
 #ifdef _WIN32
@@ -265,6 +283,8 @@ public:
         out << "{\"status\":\"ok\",\"index\":\"" << json_escape(m_IndexPath) << "\""
             << ",\"documents\":" << m_Context.GetStore()->TotalDocs()
             << ",\"avg_doc_len\":" << m_Context.GetStore()->AvgDocLen()
+            << ",\"vector_count\":" << m_Context.GetStore()->VectorCount()
+            << ",\"vector_dim\":" << m_Context.GetStore()->VectorDimension()
             << "}";
         return out.str();
     }
@@ -283,6 +303,7 @@ public:
             : "AUTB";
         const int offset = query_int(params, "offset", 0, 0, 1000000000);
         const int limit = query_int(params, "limit", 20, 1, 1000);
+        const int efSearch = query_int(params, "efSearch", 200, 1, 1000000);
 
         const auto started = std::chrono::steady_clock::now();
 
@@ -326,6 +347,65 @@ public:
         return out.str();
     }
 
+    std::string vector_search_json(const std::unordered_map<std::string, std::string>& params)
+    {
+        const int offset = query_int(params, "offset", 0, 0, 1000000000);
+        const int limit = query_int(params, "limit", 20, 1, 1000);
+        const int efSearch = query_int(params, "efSearch", 200, 1, 1000000);
+        std::string queryText;
+        std::unique_ptr<EvalTree> tree;
+
+        auto vit = params.find("vector");
+        if (vit != params.end() && !vit->second.empty()) {
+            tree = std::make_unique<EvalTree>();
+            tree->vector_query = parse_vector_param(vit->second);
+        } else {
+            auto qit = params.find("q");
+            queryText = qit == params.end() ? "" : qit->second;
+            if (queryText.empty()) return "{\"error\":\"missing q or vector parameter\"}";
+            tree.reset(m_Context.GetCompiler()->Compile(queryText.c_str(), "V"));
+        }
+
+        if (!tree || !tree->HasVectorQuery()) return "{\"error\":\"empty query vector\"}";
+        tree->vector_ef_search = static_cast<size_t>(efSearch);
+
+        const auto started = std::chrono::steady_clock::now();
+        std::vector<SearchResult> results;
+        {
+            std::lock_guard<std::mutex> lock(m_QueryMutex);
+            auto reader = m_Context.GetReader(tree.get());
+            auto executor = std::unique_ptr<IndexSearchExecutor>(m_Context.GetExecutor());
+            results = executor->Execute(reader, 0);
+        }
+        const auto finished = std::chrono::steady_clock::now();
+        const double elapsed_ms = std::chrono::duration<double, std::milli>(finished - started).count();
+        const int total = static_cast<int>(std::min<size_t>(results.size(), static_cast<size_t>(INT32_MAX)));
+        const int begin = std::min(offset, total);
+        const int end = std::min(begin + limit, total);
+
+        std::ostringstream out;
+        out << "{\"query\":\"" << json_escape(queryText) << "\""
+            << ",\"vector_dim\":" << tree->vector_query.size()
+            << ",\"vector_count\":" << m_Context.GetStore()->VectorCount()
+            << ",\"efSearch\":" << efSearch
+            << ",\"total\":" << total
+            << ",\"offset\":" << begin
+            << ",\"limit\":" << limit
+            << ",\"elapsed_ms\":" << elapsed_ms
+            << ",\"results\":[";
+        for (int i = begin; i < end; ++i) {
+            if (i > begin) out << ',';
+            const auto& result = results[static_cast<size_t>(i)];
+            const std::string& path = m_Context.GetStore()->GetDocPath(result.doc_id);
+            out << "{\"rank\":" << (i + 1)
+                << ",\"doc_id\":" << result.doc_id
+                << ",\"score\":" << result.score
+                << ",\"path\":\"" << json_escape(path) << "\"}";
+        }
+        out << "]}";
+        return out.str();
+    }
+
 private:
     std::string m_IndexPath;
     IndexContext m_Context;
@@ -348,8 +428,13 @@ static std::string handle_request(SearchService& service, const ParsedRequest& r
         const int status = body.rfind("{\"error\"", 0) == 0 ? 400 : 200;
         return http_response(status, status == 200 ? "OK" : "Bad Request", body);
     }
+    if (request.path == "/vector-search") {
+        const auto body = service.vector_search_json(request.query);
+        const int status = body.rfind("{\"error\"", 0) == 0 ? 400 : 200;
+        return http_response(status, status == 200 ? "OK" : "Bad Request", body);
+    }
     if (request.path == "/" || request.path == "/help") {
-        return http_response(200, "OK", "{\"service\":\"shennong\",\"endpoints\":[\"/health\",\"/search?q=usage&offset=0&limit=20&streams=AUTB\"]}");
+        return http_response(200, "OK", "{\"service\":\"shennong\",\"endpoints\":[\"/health\",\"/search?q=usage&offset=0&limit=20&streams=AUTB\",\"/vector-search?q=usage&offset=0&limit=20\"]}");
     }
     return http_response(404, "Not Found", "{\"error\":\"not found\"}");
 }

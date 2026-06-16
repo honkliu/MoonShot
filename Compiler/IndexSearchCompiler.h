@@ -2,6 +2,7 @@
 #define INDEXSEARCHCOMPILER_H__
 
 #include "EvalExpression.h"
+#include "Embeddings.h"
 #include "Tokenizer.h"
 
 #include <memory>
@@ -37,11 +38,21 @@ public:
             return new EvalTree{};
 
         auto streams = ParseStreamSet(streamSet);
-        auto root    = ParseExpression(queryString, streams);
+        auto root    = streams.empty() ? nullptr : ParseExpression(queryString, streams);
 
         auto tree  = new EvalTree();
         tree->root = root;
+        if (HasVectorStream(streamSet))
+            tree->vector_query = CompileToVector(queryString);
         return tree;
+    }
+
+    std::vector<float> CompileToVector(const char* queryString,
+                                       size_t dim = 128)
+    {
+        if (!queryString || !*queryString)
+            return std::vector<float>(dim, 0.0f);
+        return BuildHashedEmbedding(m_Tokenizer->Tokenize(queryString), dim);
     }
 
 private:
@@ -56,6 +67,7 @@ private:
     std::vector<std::string> ParseStreamSet(const char* s)
     {
         std::vector<std::string> streams;
+        bool sawVectorOnlyCandidate = false;
 
         for (; *s; ++s) {
             switch (*s) {
@@ -64,14 +76,23 @@ private:
                 case 'T': streams.emplace_back("T"); break;
                 case 'B': streams.emplace_back("B"); break;
                 case 'M': streams.emplace_back("M"); break;
+                case 'V': case 'v': sawVectorOnlyCandidate = true; break;
                 default:  break;
             }
         }
 
-        if (streams.empty())
+        if (streams.empty() && !sawVectorOnlyCandidate)
             streams.emplace_back("T");
 
         return streams;
+    }
+
+    static bool HasVectorStream(const char* s)
+    {
+        if (!s) return false;
+        for (; *s; ++s)
+            if (*s == 'V' || *s == 'v') return true;
+        return false;
     }
 
     std::vector<std::string> StreamsForField(const std::string& field,
@@ -88,6 +109,11 @@ private:
     static bool IsOrToken(const std::string& token)
     {
         return token == "or" || token == "OR" || token == "Or" || token == "oR";
+    }
+
+    static bool IsNotToken(const std::string& token)
+    {
+        return token == "not" || token == "NOT" || token == "Not" || token == "nOT" || token == "-";
     }
 
     std::vector<std::string> SplitRawItems(const std::string& query)
@@ -116,12 +142,15 @@ private:
     void AddRawItem(const std::string& raw,
                     const std::vector<std::string>& defaultStreams,
                     std::vector<QueryTerm>& positive,
-                    std::vector<QueryTerm>& negative)
+                    std::vector<QueryTerm>& negative,
+                    bool forceExclude = false)
     {
-        if (raw.empty() || IsOrToken(raw)) return;
+        if (raw.empty() || IsOrToken(raw) || IsNotToken(raw)) return;
 
-        bool exclude = raw[0] == '-' && raw.size() > 1;
-        std::string item = exclude ? raw.substr(1) : raw;
+        bool hasMinusPrefix = raw[0] == '-' && raw.size() > 1;
+        bool exclude = hasMinusPrefix || forceExclude;
+        std::string item = hasMinusPrefix ? raw.substr(1) : raw;
+        if (item.empty()) return;
         std::vector<std::string> streams = defaultStreams;
 
         size_t colon = item.find(':');
@@ -193,6 +222,9 @@ private:
                 const std::vector<QueryTerm>& tokens)
     {
             std::shared_ptr<EvalNode> unigramBase;
+        if (tokens.empty()) {
+            return nullptr;
+        }
         if (tokens.size() == 1) {
                     unigramBase = MakeTermGroup(tokens[0]);
             } else {
@@ -234,6 +266,7 @@ private:
         std::vector<QueryTerm> positive;
         std::vector<QueryTerm> negative;
         bool sawAnyTerm = false;
+        bool nextItemIsNegative = false;
 
         for (const auto& raw : SplitRawItems(query)) {
             if (IsOrToken(raw)) {
@@ -243,8 +276,12 @@ private:
                     positive.clear();
                     negative.clear();
                 }
+                nextItemIsNegative = false;
+            } else if (IsNotToken(raw)) {
+                nextItemIsNegative = true;
             } else {
-                AddRawItem(raw, streams, positive, negative);
+                AddRawItem(raw, streams, positive, negative, nextItemIsNegative);
+                nextItemIsNegative = false;
                 sawAnyTerm = true;
             }
         }

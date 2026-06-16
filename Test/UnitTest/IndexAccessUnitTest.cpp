@@ -385,23 +385,28 @@ void TestEndToEnd()
     auto tokenizer    = new SmartTokenizer();
     auto index_writer = index_context->GetWriter();
 
-    uint64_t documentId = 1;
+    uint64_t documentId = index_context->AllocateDocumentID();
+    assert(documentId == 1);
+    const std::string doc1Body =
+        "The QUICK Brown Fox jumps over the lazy DOG! "
+        "Привет, МИР! Hello, WORLD! こんにちは这是一个人的世界! "
+        "I'm testing apostrophes: don't, can't, won't";
+    auto doc1BodyTokens = tokenizer->Tokenize(doc1Body.c_str());
+    auto doc1TitleTokens = tokenizer->Tokenize("Conf 2021");
     index_writer->Write(
-        tokenizer->Tokenize(
-            "The QUICK Brown Fox jumps over the lazy DOG! "
-            "Привет, МИР! Hello, WORLD! こんにちは这是一个人的世界! "
-            "I'm testing apostrophes: don't, can't, won't"),
+        doc1BodyTokens,
         documentId, "Body");
     index_writer->Write(
-        tokenizer->Tokenize("Conf 2021"),
+        doc1TitleTokens,
         documentId, "Title");
+    index_writer->SetDocVector(documentId,
+        BuildHashedEmbedding(tokenizer->Tokenize("quick brown fox lazy dog")));
 
-    index_writer->Write(
-        tokenizer->Tokenize("The lazy fox slept all morning"),
-        2u, "Body");
-    index_writer->Write(
-        tokenizer->Tokenize("Morning Fox 2021"),
-        2u, "Title");
+    Document doc2;
+    doc2.title = "Morning Fox 2021";
+    doc2.body = "The lazy fox slept all morning";
+    uint64_t doc2Id = index_context->AddDocument(doc2);
+    assert(doc2Id == 2);
 
     {
         /*
@@ -428,7 +433,20 @@ void TestEndToEnd()
     }
 
     {
-        std::cout << "  CompileToVector: null (not implemented)\n";
+        IndexSearchCompiler compiler;
+        std::unique_ptr<EvalTree> tree(compiler.Compile("fox lazy", "AUTBV"));
+        assert(tree != nullptr);
+        assert(tree->HasTextQuery());
+        assert(tree->HasVectorQuery());
+        assert(tree->vector_query.size() == 128);
+        auto reader = index_context->GetReader(tree.get());
+        auto executor = index_context->GetExecutor();
+        auto results = executor->Execute(reader, 10);
+        assert(!results.empty());
+        std::cout << "  Compile('fox lazy','AUTBV'): text + vector dim="
+              << tree->vector_query.size()
+              << ", results=" << results.size() << "\n";
+        delete executor;
     }
 
     delete index_context;

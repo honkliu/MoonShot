@@ -25,7 +25,7 @@ class IndexWriter
         * stream: "Title", "Body", "Anchor", "URL", "Meta"
         *         (or single-char abbreviations T, B, A, U, M)
         */
-        virtual void Write(std::vector<std::string>&& words,
+        virtual void Write(const std::vector<std::string>& words,
                            uint64_t                    documentId,
                            const char*                 postingType) {}
 
@@ -35,6 +35,9 @@ class IndexWriter
         * Typical source: PageRank, domain authority, or a learned model.
         */
         virtual void SetDocImportance(uint64_t /*doc_id*/, float /*score*/) {}
+
+        /* Attach a vector embedding for ANN/vector search. */
+        virtual void SetDocVector(uint64_t /*doc_id*/, std::vector<float> /*vector*/) {}
 
     protected:
         IndexWriter() = default;

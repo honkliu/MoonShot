@@ -25,6 +25,18 @@ using std::shared_ptr;
 using std::make_shared;
 using std::string;
 
+struct Document
+{
+    uint64_t    doc_id = 0;
+    std::string path;
+    std::string url;
+    std::string title;
+    std::string body;
+    std::string anchor;
+    std::string meta;
+    float       importance = 0.0f;
+};
+
 /*
 * IndexContext — central factory that owns BlockTable and PostingStore.
 *
@@ -71,6 +83,48 @@ public:
         return make_shared<AdvancedIndexWriter>(m_Store);
     }
 
+    uint64_t AllocateDocumentID() const
+    {
+        uint64_t maxId = 0;
+        for (const auto& [docId, _] : m_Store->AllDocStats())
+            maxId = std::max(maxId, docId);
+        return maxId + 1;
+    }
+
+    uint64_t AddDocument(const Document& doc)
+    {
+        const uint64_t docId = doc.doc_id ? doc.doc_id : AllocateDocumentID();
+        auto writer = GetWriter();
+
+        auto titleTokens = m_Tokenizer.Tokenize(doc.title.c_str());
+        const std::string url = doc.url.empty() ? doc.path : doc.url;
+        auto urlTokens = m_Tokenizer.Tokenize(url.c_str());
+        auto anchorTokens = m_Tokenizer.Tokenize(doc.anchor.c_str());
+        auto bodyTokens = m_Tokenizer.Tokenize(doc.body.c_str());
+        auto metaTokens = m_Tokenizer.Tokenize(doc.meta.c_str());
+
+        std::vector<std::string> embeddingTokens;
+        embeddingTokens.reserve(titleTokens.size() + urlTokens.size() + anchorTokens.size() + bodyTokens.size() + metaTokens.size());
+        embeddingTokens.insert(embeddingTokens.end(), titleTokens.begin(), titleTokens.end());
+        embeddingTokens.insert(embeddingTokens.end(), urlTokens.begin(), urlTokens.end());
+        embeddingTokens.insert(embeddingTokens.end(), anchorTokens.begin(), anchorTokens.end());
+        embeddingTokens.insert(embeddingTokens.end(), bodyTokens.begin(), bodyTokens.end());
+        embeddingTokens.insert(embeddingTokens.end(), metaTokens.begin(), metaTokens.end());
+
+        writer->Write(titleTokens, docId, "Title");
+        writer->Write(urlTokens, docId, "URL");
+        writer->Write(anchorTokens, docId, "Anchor");
+        writer->Write(bodyTokens, docId, "Body");
+        writer->Write(metaTokens, docId, "Meta");
+        writer->SetDocImportance(docId, doc.importance);
+        if (!embeddingTokens.empty())
+            writer->SetDocVector(docId, BuildHashedEmbedding(embeddingTokens));
+        if (!doc.path.empty())
+            m_Store->SetDocPath(docId, doc.path);
+
+        return docId;
+    }
+
     /*
     * Build() — delegates to IndexSerializer::BuildBlocksForContext so the
     * packing logic (continuation fix, PageSkipList) is in one place.
@@ -108,6 +162,17 @@ public:
         }
 
         EnsureBuilt();
+
+        if (evalTree->HasTextQuery() && evalTree->HasVectorQuery()) {
+            std::vector<shared_ptr<IndexReader>> children;
+            children.push_back(BuildIndexReader(evalTree->root));
+            children.push_back(BuildVectorIndexReader(evalTree->vector_query, evalTree->vector_ef_search));
+            return make_shared<OrIndexReader>(std::move(children));
+        }
+
+        if (evalTree->HasVectorQuery())
+            return BuildVectorIndexReader(evalTree->vector_query, evalTree->vector_ef_search);
+
         return BuildIndexReader(evalTree->root);
     }
 
@@ -135,6 +200,19 @@ public:
 
     PostingStore* GetStore() { return m_Store.get(); }
 
+    std::vector<float> CompileToVector(const char* queryString, size_t dim = 128)
+    {
+        return m_Compiler.CompileToVector(queryString, dim);
+    }
+
+    std::vector<VectorSearchResult> VectorSearch(const std::vector<float>& query,
+                                                 size_t topK = 20,
+                                                 VectorMetric metric = VectorMetric::Cosine,
+                                                 size_t efSearch = 200)
+    {
+        return m_Store->VectorSearch(query, topK, metric, efSearch);
+    }
+
     bool SaveIndex()
     {
         if (m_IndexPath.empty()) return false;
@@ -148,6 +226,8 @@ public:
 
         EnsureBuilt();
         if (!IndexSerializer::Save(*m_Store, path)) return false;
+        if (!m_Store->AllDocVectors().empty())
+            SaveVectorSidecar(VectorSidecarPath(path), m_Store->AllDocVectors());
 
         // Wire up FileBlockManager so cache misses reload from the .idx file.
         uint64_t blocks_offset = 0;
@@ -204,6 +284,8 @@ public:
         if (leafFm->open(m_IndexPath.c_str()))
             m_BlockTable.SetLeafTermFileManager(std::move(leafFm));
         m_BlockTable.ReserveLeafTermPageMap(static_cast<uint32_t>(std::min<uint64_t>(num_leaf_blocks, UINT32_MAX)));
+
+        LoadVectorSidecar(VectorSidecarPath(m_IndexPath), m_Store->MutableVectorIndex());
 
         m_Executor = IndexSearchExecutor(m_Store);
         m_Built    = true;
@@ -322,6 +404,18 @@ private:
             return empty;
         }
         }
+    }
+
+    shared_ptr<IndexReader> BuildVectorIndexReader(const std::vector<float>& queryVector,
+                                                   size_t efSearch = 200)
+    {
+        if (queryVector.empty() || m_Store->VectorCount() == 0) {
+            auto empty = make_shared<AdvancedIndexReader>();
+            return empty;
+        }
+
+        return make_shared<VectorIndexReader>(
+            m_Store->VectorSearch(queryVector, 0, VectorMetric::Cosine, efSearch));
     }
 };
 

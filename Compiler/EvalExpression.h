@@ -4,6 +4,7 @@
 #include <string>
 #include <vector>
 #include <memory>
+#include <cstddef>
 
 enum class NodeType { Term, And, Or, Not };
 
@@ -56,7 +57,12 @@ struct NotNode : EvalNode {
 class EvalTree {
 public:
     std::shared_ptr<EvalNode> root;
-    bool IsEmpty() const { return root == nullptr; }
+    std::vector<float> vector_query;
+    size_t vector_ef_search = 200;
+
+    bool HasTextQuery() const { return root != nullptr; }
+    bool HasVectorQuery() const { return !vector_query.empty(); }
+    bool IsEmpty() const { return !HasTextQuery() && !HasVectorQuery(); }
 };
 
 class EvalItem {};

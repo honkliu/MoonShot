@@ -22,6 +22,12 @@ class IndexReader
         virtual float GetBM25Score(const Bm25Scorer& /*scorer*/,
                                    uint32_t          /*doc_len*/) { return 0.0f; }
 
+        virtual float GetScore(const Bm25Scorer& scorer,
+                               uint32_t          doc_len)
+        {
+            return GetBM25Score(scorer, doc_len);
+        }
+
         virtual void Close() = 0;
         virtual void Open(const char* word) = 0;
 

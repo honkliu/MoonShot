@@ -1,6 +1,8 @@
 #ifndef POSTINGSTORE_H__
 #define POSTINGSTORE_H__
 
+#include "Embeddings.h"
+
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -180,6 +182,37 @@ public:
         return m_DocStats;
     }
 
+    bool SetDocVector(uint64_t doc_id, std::vector<float> vector)
+    {
+        if (!HasDoc(doc_id))
+            m_DocStats[doc_id];
+        return m_VectorIndex.Add(doc_id, std::move(vector));
+    }
+
+    const std::vector<float>* GetDocVector(uint64_t doc_id) const
+    {
+        return m_VectorIndex.Get(doc_id);
+    }
+
+    std::vector<VectorSearchResult> VectorSearch(const std::vector<float>& query,
+                                                 size_t topK = 20,
+                                                 VectorMetric metric = VectorMetric::Cosine,
+                                                 size_t efSearch = 200) const
+    {
+        return m_VectorIndex.Search(query, topK, metric, efSearch);
+    }
+
+    const std::unordered_map<uint64_t, std::vector<float>>& AllDocVectors() const
+    {
+        return m_VectorIndex.AllVectors();
+    }
+
+    FreshDiskAnnVectorIndex& MutableVectorIndex() { return m_VectorIndex; }
+    const FreshDiskAnnVectorIndex& GetVectorIndex() const { return m_VectorIndex; }
+
+    size_t VectorDimension() const { return m_VectorIndex.Dimension(); }
+    size_t VectorCount() const { return m_VectorIndex.Size(); }
+
     uint64_t TotalTerms() const { return m_TotalTerms; }
 
     uint64_t TotalPostingEntries() const { return m_PostingEntries; }
@@ -189,6 +222,7 @@ public:
 private:
     std::unordered_map<std::string, PostingList> m_Postings;
     std::unordered_map<uint64_t, DocStats>       m_DocStats;
+    FreshDiskAnnVectorIndex                      m_VectorIndex;
     uint64_t m_TotalTerms = 0;
     uint64_t m_PostingEntries = 0;
 };

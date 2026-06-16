@@ -324,8 +324,19 @@ static void Rebuild(const std::string& idxPath, const PathMap& pathMap)
             ++skipped;
             continue;
         }
-        writer->Write(tok.Tokenize(Stem(fp).c_str()), id, "Title");
-        writer->Write(tok.Tokenize(content.c_str()),  id, "Body");
+        auto titleTokens = tok.Tokenize(Stem(fp).c_str());
+        auto urlTokens = tok.Tokenize(fp.c_str());
+        auto bodyTokens = tok.Tokenize(content.c_str());
+        std::vector<std::string> embeddingTokens;
+        embeddingTokens.reserve(titleTokens.size() + urlTokens.size() + bodyTokens.size());
+        embeddingTokens.insert(embeddingTokens.end(), titleTokens.begin(), titleTokens.end());
+        embeddingTokens.insert(embeddingTokens.end(), urlTokens.begin(), urlTokens.end());
+        embeddingTokens.insert(embeddingTokens.end(), bodyTokens.begin(), bodyTokens.end());
+
+        writer->Write(titleTokens, id, "Title");
+        writer->Write(urlTokens,   id, "URL");
+        writer->Write(bodyTokens,  id, "Body");
+        writer->SetDocVector(id, BuildHashedEmbedding(embeddingTokens));
         // Path stored in DocData — no separate .meta file needed
         ctx.GetStore()->SetDocPath(id, fp);
         ++kept;
@@ -342,6 +353,7 @@ struct DocMeta {
     uint32_t    doc_len = 0;
     float       importance = 0.0f;
     std::string path;
+    std::vector<float> vector;
 };
 
 static void write_u16(std::vector<uint8_t>& out, uint16_t v) { auto* p = reinterpret_cast<uint8_t*>(&v); out.insert(out.end(), p, p + 2); }
@@ -639,6 +651,12 @@ static void SaveFromRuns(const std::string& idxPath,
     }
     if (!blocks.empty()) fwrite(blocks.data(), sizeof(IndexBlock), blocks.size(), f);
     fclose(f);
+
+    FreshDiskAnnVectorIndex vectors;
+    for (const auto& doc : docs)
+        if (!doc.vector.empty()) vectors.Add(doc.doc_id, doc.vector);
+    if (!vectors.Empty())
+        SaveVectorSidecar(VectorSidecarPath(idxPath), vectors.AllVectors());
 }
 
 // ─── search ──────────────────────────────────────────────────────────────────
@@ -795,12 +813,21 @@ int main(int argc, char* argv[])
                     if (content.empty()) continue;
                     uint64_t docId = nextDocId++;
                     auto title = tok.Tokenize(Stem(item.path).c_str());
+                    auto url = tok.Tokenize(item.path.c_str());
                     auto body = tok.Tokenize(content.c_str());
+                    std::vector<std::string> embeddingTokens;
+                    embeddingTokens.reserve(title.size() + url.size() + body.size());
+                    embeddingTokens.insert(embeddingTokens.end(), title.begin(), title.end());
+                    embeddingTokens.insert(embeddingTokens.end(), url.begin(), url.end());
+                    embeddingTokens.insert(embeddingTokens.end(), body.begin(), body.end());
+                    auto vector = BuildHashedEmbedding(embeddingTokens);
                     AdvancedIndexWriter writer(std::shared_ptr<PostingStore>(&store, [](PostingStore*){}));
-                    writer.Write(std::move(title), docId, "Title");
-                    writer.Write(std::move(body), docId, "Body");
+                    writer.Write(title, docId, "Title");
+                    writer.Write(url, docId, "URL");
+                    writer.Write(body, docId, "Body");
+                    writer.SetDocVector(docId, vector);
                     store.SetDocPath(docId, item.path);
-                    docs.push_back({docId, store.GetDocLen(docId), 0.0f, item.path});
+                    docs.push_back({docId, store.GetDocLen(docId), 0.0f, item.path, std::move(vector)});
                     ++readable;
                     ++runFiles;
                     runBytes += item.size;

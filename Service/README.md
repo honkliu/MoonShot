@@ -22,7 +22,7 @@ Supported parameters:
 
 | Parameter | Default | Meaning |
 |---|---:|---|
-| `--port <port>` | `9000` | TCP port for the gRPC server. The service listens on `0.0.0.0:<port>`. |
+| `--port <port>` | `9000` | TCP port for the HTTP server. The service listens on `0.0.0.0:<port>`. |
 | `--index <path>` | `~/moon.idx` | MoonShot index file loaded once during service startup. |
 
 Current executable target:
@@ -42,7 +42,7 @@ Startup should fail fast if:
 - `--port` is not a valid TCP port.
 - `--index` does not exist.
 - The index file cannot be loaded or has an unsupported format version.
-- The gRPC server cannot bind the requested port.
+- The HTTP server cannot bind the requested port.
 
 ## HTTP API
 
@@ -115,6 +115,51 @@ Response:
 ```
 
 The service computes the full ranked result set to return `total`, then emits only the requested page. It does not hardcode top-20 truncation.
+
+### `GET /vector-search`
+
+Searches the vector sidecar index, if present. Current implementation uses an exact flat vector scan over `moon.idx.v.index`; this is the compatibility layer before a future HNSW/IVF ANN implementation.
+
+Text query form:
+
+```bash
+curl "http://localhost:9000/vector-search?q=usage&offset=0&limit=20"
+```
+
+Explicit vector form:
+
+```bash
+curl "http://localhost:9000/vector-search?vector=0.1,0.2,0.3&offset=0&limit=20"
+```
+
+Response:
+
+```json
+{
+  "query": "usage",
+  "vector_dim": 128,
+  "vector_count": 19347,
+  "total": 19347,
+  "offset": 0,
+  "limit": 20,
+  "elapsed_ms": 3.2,
+  "results": [
+    { "rank": 1, "doc_id": 42, "score": 0.83, "path": "/home/bob/a.md" }
+  ]
+}
+```
+
+The vector sidecar path is:
+
+```text
+<index>.v.index
+```
+
+For the default index this is:
+
+```text
+~/moon.idx.v.index
+```
 
 ## Legacy gRPC Surface
 
@@ -204,6 +249,7 @@ Recommended behavior:
 - `/search` computes all matches and returns the total.
 - `/search` returns only the requested page using `offset` and `limit`.
 - Browser clients request the next page by increasing `offset`.
+- `/vector-search` follows the same `offset` / `limit` paging contract.
 
 ## Threading Model
 
@@ -234,28 +280,28 @@ Current implementation classes:
 ```cpp
 struct Options {
     uint16_t port = 9000;
-  std::string index_path = "~/moon.idx";
+    std::string index_path = "~/moon.idx";
 };
 
 class SearchService {
 public:
-  explicit SearchService(std::string index_path);
-  std::string health_json();
-  std::string search_json(const QueryParams& params);
+    explicit SearchService(std::string index_path);
+    std::string health_json();
+    std::string search_json(const QueryParams& params);
 
 private:
-  IndexContext index_;
-  std::mutex query_mutex_;
+    IndexContext index_;
+    std::mutex query_mutex_;
 };
 ```
 
-`IndexContext` must remain alive for the full lifetime of the gRPC service.
+`IndexContext` must remain alive for the full lifetime of the HTTP service.
 
 If `IndexContext` is not thread-safe for concurrent readers, protect query execution with a mutex first. Once verified, move to reader-per-query concurrency.
 
 ## Error Handling
 
-RPC status mapping:
+HTTP status mapping:
 
 | Condition | HTTP status |
 |---|---|
@@ -273,6 +319,7 @@ Startup errors should be printed to stderr and return a non-zero process exit co
 2. Add worker threads after `IndexContext` query concurrency is verified.
 3. Add `/file?path=...` if the browser client should open result files through this service.
 4. Optionally add `/search-stream` using NDJSON for progressive result streaming.
+5. Replace exact flat vector scan with HNSW/IVF once vector volume requires ANN latency.
 
 ## Example Usage
 
@@ -457,6 +504,9 @@ That keeps browser integration simple without giving up MoonShot's native search
 
 - Do not reload the index per query.
 - Do not hardcode top-20 truncation in the service.
-- Prefer server-streaming results for broad queries.
+- Use HTTP paging for browser clients; consider NDJSON streaming later for broad progressive result streams.
 - Keep `DocData.path` lookup server-side so clients receive usable paths directly.
 - Keep the browser/WASM viewer separate from this service. The viewer is an inspection/debug tool; `shennong` is the production-style query service.
+- `moon -name` writes URL/path tokens to the `U` stream so `site:` and `-site:` can work.
+- `moon -name` writes `moon.idx.v.index` when vectors are available.
+- Existing indexes built before this change do not contain URL stream tokens or vector sidecars. Re-run `moon -name <path>` to rebuild before testing `site:` / `-site:` or `/vector-search`.
