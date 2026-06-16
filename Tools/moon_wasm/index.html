@@ -1311,15 +1311,15 @@ function renderPostingRowsForLeaf(node, postings, depth) {
   if (!postings.length) {
     return `<tr class="tree-row"><td>${indent}</td><td colspan="4"><div class="posting" style="color:#888">No decoded postings.</div></td></tr>`;
   }
-  let html = `<tr class="tree-row"><td>${indent}</td><td><span class="tree-kind">IndexEntry rows</span></td><td><span class="tree-field">IE_DocID</span></td><td><span class="tree-field">IE_TermFrequency</span></td><td><span class="tree-field">DocData.path</span></td></tr>`;
+  let html = `<tr class="tree-row"><td>${indent}</td><td><span class="tree-field">IE_DocID</span></td><td><span class="tree-field">TF</span></td><td><span class="tree-field">path</span></td><td></td></tr>`;
   for (let i = 0; i < postings.length; i++) {
     const p = postings[i];
     html += `<tr class="tree-row" onclick="event.stopPropagation()">`
       + `<td>${indent}</td>`
-      + `<td><span class="tree-kind">IndexEntry</span></td>`
       + `<td class="mono num">${p.doc_id}</td>`
       + `<td class="num">${p.tf}</td>`
       + `<td class="path">${p.path ? esc(p.path) : ''}</td>`
+      + `<td></td>`
       + `</tr>`;
   }
   return html;
