@@ -36,7 +36,7 @@ struct Index {
     std::vector<LeafTermBlock> header_blocks;
     std::vector<LeafTermEntry> LTB_Entries;
     std::vector<uint64_t> pageskip;
-    std::vector<DocRecord> docs;
+    std::vector<DocDataEntry> docs;
     std::vector<BlockView> blocks;
     std::string error;
 };
@@ -133,9 +133,9 @@ static std::vector<IndexEntry> decode_IndexEntrys(const uint8_t* data, size_t si
     return IndexEntrys;
 }
 
-static std::string doc_path(const DocRecord& rec)
+static std::string doc_path(const DocDataEntry& entry)
 {
-    return DecodeDocPath(rec);
+    return DecodeDocPath(entry);
 }
 
 static Index parse_index(const char* path)
@@ -229,9 +229,9 @@ static Index parse_index(const char* path)
     }
 
     if (index.hdr.IFH_DocDataOffset + index.hdr.IFH_DocDataSize <= size) {
-        size_t count = static_cast<size_t>(index.hdr.IFH_DocDataSize / sizeof(DocRecord));
+        size_t count = static_cast<size_t>(index.hdr.IFH_DocDataSize / sizeof(DocDataEntry));
         index.docs.resize(count);
-        std::memcpy(index.docs.data(), data + index.hdr.IFH_DocDataOffset, count * sizeof(DocRecord));
+        std::memcpy(index.docs.data(), data + index.hdr.IFH_DocDataOffset, count * sizeof(DocDataEntry));
     }
 
     std::unordered_map<uint32_t, std::vector<const LeafTermEntry*>> terms_by_block;
@@ -288,9 +288,9 @@ table{border-collapse:collapse;width:100%;margin-bottom:12px}th{background:#2525
 static void emit(std::ostream& out, const Index& index, const char* path)
 {
     const IndexFileHeader& h = index.hdr;
-    std::unordered_map<uint64_t, const DocRecord*> docs_by_id;
+    std::unordered_map<uint64_t, const DocDataEntry*> docs_by_id;
     docs_by_id.reserve(index.docs.size());
-    for (const auto& doc : index.docs) docs_by_id.emplace(doc.DR_DocID, &doc);
+    for (const auto& doc : index.docs) docs_by_id.emplace(doc.DDE_DocID, &doc);
 
     out << "<!DOCTYPE html><html><head><meta charset='utf-8'><title>moon_inspect</title><style>" << css() << "</style></head><body>";
     out << "<h1>moon_inspect <span class='dim'>" << esc(path) << "</span></h1>";
@@ -330,7 +330,7 @@ static void emit(std::ostream& out, const Index& index, const char* path)
 
     out << "<div class='panel' id='docs'><table><tr><th>DocID</th><th>Importance</th><th>DocLen</th><th>Path</th></tr>";
     for (const auto& doc : index.docs) {
-        out << "<tr><td class='mono num'>" << doc.DR_DocID << "</td><td class='num'>" << DecodeFloat16(doc.DR_StaticRankHalf) << "</td><td class='num'>" << doc.DR_DocLength << "</td><td class='path'>" << esc(doc_path(doc)) << "</td></tr>";
+        out << "<tr><td class='mono num'>" << doc.DDE_DocID << "</td><td class='num'>" << DecodeFloat16(doc.DDE_StaticRankHalf) << "</td><td class='num'>" << doc.DDE_DocLength << "</td><td class='path'>" << esc(doc_path(doc)) << "</td></tr>";
     }
     out << "</table></div>";
 

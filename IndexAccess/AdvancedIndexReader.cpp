@@ -135,10 +135,10 @@ uint64_t AdvancedIndexReader::GetDocumentID() {
 uint32_t AdvancedIndexReader::GetTermFreq() {
     return IsEnd() ? 0u : m_Decoder.GetTermFrequency();
 }
-float AdvancedIndexReader::GetScore(const DocRecord* record) {
-    assert(record);
+float AdvancedIndexReader::GetScore(const DocDataEntry* entry) {
+    assert(entry);
     assert(m_Context);
-    const uint32_t docLength = record->DR_DocLength;
+    const uint32_t docLength = entry->DDE_DocLength;
     assert(docLength > 0);
 
     const float tf = static_cast<float>(GetTermFreq());

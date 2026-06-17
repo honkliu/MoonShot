@@ -508,9 +508,9 @@ void TestDiskPersistence()
         assert(engine2.GetStore()->TotalDocs() == 3 &&
                "Loaded doc count must match written doc count");
          assert(engine2.GetStore()->VectorCount() == 3 &&
-             "Loaded vector count must come from DocRecord vectors");
+             "Loaded vector count must come from DocDataEntry vectors");
          assert(engine2.GetStore()->GetDocVector(0) != nullptr &&
-             "DocRecord must preserve doc 0 embedding");
+             "DocDataEntry must preserve doc 0 embedding");
 
         /*
         * Run the same queries as the other tests to confirm results match.

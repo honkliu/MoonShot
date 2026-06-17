@@ -296,7 +296,7 @@ bool IndexSerializer::Save(const PostingStore& store, const char* path)
         std::memcpy(pageskip_buf.data(), br.BBR_PageSkipList.data(), pageskip_buf.size());
 
     /* ── Encode DocData ───────────────────────────────────────────────────*/
-    std::vector<DocRecord> docdata;
+    std::vector<DocDataEntry> docdata;
     uint64_t maxDocID = 0;
     for (const auto& [id, _] : store.AllDocStats())
         maxDocID = std::max(maxDocID, id);
@@ -304,29 +304,29 @@ bool IndexSerializer::Save(const PostingStore& store, const char* path)
         docdata.resize(static_cast<size_t>(maxDocID + 1));
 
     for (const auto& [id, ds] : store.AllDocStats()) {
-        DocRecord r{};
-        r.DR_DocID     = id;
-        r.DR_DocLength = ds.doc_len;
-        r.DR_StaticRankHalf = EncodeFloat16(ds.importance);
-        r.DR_QualityScoreHalf = EncodeFloat16(0.0f);
-        r.DR_FreshnessScoreHalf = EncodeFloat16(0.0f);
-        r.DR_ClickScoreHalf = EncodeFloat16(0.0f);
-        r.DR_EngagementScoreHalf = EncodeFloat16(0.0f);
+        DocDataEntry entry{};
+        entry.DDE_DocID     = id;
+        entry.DDE_DocLength = ds.doc_len;
+        entry.DDE_StaticRankHalf = EncodeFloat16(ds.importance);
+        entry.DDE_QualityScoreHalf = EncodeFloat16(0.0f);
+        entry.DDE_FreshnessScoreHalf = EncodeFloat16(0.0f);
+        entry.DDE_ClickScoreHalf = EncodeFloat16(0.0f);
+        entry.DDE_EngagementScoreHalf = EncodeFloat16(0.0f);
         // Doc vectors are stored in the in-memory vector index, not in DocStats.
-        // DR_VectorData is int8_t[512], quantized from float32.
+        // DDE_VectorData is int8_t[512], quantized from float32.
         if (const auto* docVector = store.GetDocVector(id);
             docVector && !docVector->empty() && docVector->size() <= DOC_VECTOR_STORAGE_MAX_DIM) {
-            r.DR_VectorDim = static_cast<uint16_t>(docVector->size());
-            r.DR_VectorFormat = 1;  // int8 quantized
+            entry.DDE_VectorDim = static_cast<uint16_t>(docVector->size());
+            entry.DDE_VectorFormat = 1;  // int8 quantized
             for (size_t i = 0; i < docVector->size(); ++i) {
                 // Quantize float32 to int8: clamp to [-128, 127]
                 const float val = (*docVector)[i];
                 const float clipped = std::max(-128.0f, std::min(127.0f, val * 128.0f));
-                r.DR_VectorData[i] = static_cast<int8_t>(std::round(clipped));
+                entry.DDE_VectorData[i] = static_cast<int8_t>(std::round(clipped));
             }
         }
-        r.DR_PathLength = EncodeDocPath(ds.path, r.DR_Path);
-        docdata[static_cast<size_t>(id)] = r;
+        entry.DDE_PathLength = EncodeDocPath(ds.path, entry.DDE_Path);
+        docdata[static_cast<size_t>(id)] = entry;
     }
 
     /* ── Compute file offsets ─────────────────────────────────────────────*/
@@ -460,23 +460,23 @@ bool IndexSerializer::Load(PostingStore&                           store,
         size_t n = static_cast<size_t>(hdr->IFH_DocDataSize / DOC_REC_SIZE);
         if (!seek_file(f, hdr->IFH_DocDataOffset))
             return false;
-        std::vector<DocRecord> recs(n);
-        if (n > 0) fread(recs.data(), DOC_REC_SIZE, n, f);
-        for (const auto& r : recs) {
-            if (r.DR_DocID >= n)
+        std::vector<DocDataEntry> entries(n);
+        if (n > 0) fread(entries.data(), DOC_REC_SIZE, n, f);
+        for (const auto& entry : entries) {
+            if (entry.DDE_DocID >= n)
                 continue;
-            store.AddDocTokens(r.DR_DocID, r.DR_DocLength);
-            store.SetDocImportance(r.DR_DocID, DecodeFloat16(r.DR_StaticRankHalf));
-            if (r.DR_VectorDim > 0 && r.DR_VectorDim <= DOC_VECTOR_STORAGE_MAX_DIM && r.DR_VectorFormat == 1) {
-                std::vector<float> vector(r.DR_VectorDim);
-                for (size_t i = 0; i < r.DR_VectorDim; ++i) {
+            store.AddDocTokens(entry.DDE_DocID, entry.DDE_DocLength);
+            store.SetDocImportance(entry.DDE_DocID, DecodeFloat16(entry.DDE_StaticRankHalf));
+            if (entry.DDE_VectorDim > 0 && entry.DDE_VectorDim <= DOC_VECTOR_STORAGE_MAX_DIM && entry.DDE_VectorFormat == 1) {
+                std::vector<float> vector(entry.DDE_VectorDim);
+                for (size_t i = 0; i < entry.DDE_VectorDim; ++i) {
                     // Dequantize int8 back to float32
-                    vector[i] = static_cast<float>(r.DR_VectorData[i]) / 128.0f;
+                    vector[i] = static_cast<float>(entry.DDE_VectorData[i]) / 128.0f;
                 }
-                store.SetDocVector(r.DR_DocID, std::move(vector));
+                store.SetDocVector(entry.DDE_DocID, std::move(vector));
             }
-            if (r.DR_PathLength > 0)
-                store.SetDocPath(r.DR_DocID, DecodeDocPath(r));
+            if (entry.DDE_PathLength > 0)
+                store.SetDocPath(entry.DDE_DocID, DecodeDocPath(entry));
         }
     }
 

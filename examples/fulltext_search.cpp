@@ -184,8 +184,8 @@ int main()
         while (!reader->IsEnd()) {
             uint64_t doc = reader->GetDocumentID();
             uint32_t tf  = reader->GetTermFreq();
-            const DocRecord* record = engine.GetDocRecord(doc);
-            float    score = reader->GetScore(record);
+            const DocDataEntry* entry = engine.GetDocDataEntry(doc);
+            float    score = reader->GetScore(entry);
             std::println("    doc={:<3}  tf={}  score={:.3f}", doc, tf, score);
             reader->GoNext();
         }

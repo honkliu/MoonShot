@@ -452,4 +452,10 @@ private:
     }
 };
 
+inline std::vector<float> BuildHashedEmbedding(const std::vector<std::string>& tokens)
+{
+    static const TFIDFSemanticEmbedding model(128);
+    return model.Embed(tokens);
+}
+
 #endif

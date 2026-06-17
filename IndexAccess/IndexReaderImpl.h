@@ -65,11 +65,11 @@ public:
         return total;
     }
 
-    float GetScore(const DocRecord* record) override
+    float GetScore(const DocDataEntry* entry) override
     {
         float total = 0.0f;
         for (auto& c : m_Children)
-            total += c->GetScore(record);
+            total += c->GetScore(entry);
         return total;
     }
 
@@ -193,14 +193,14 @@ public:
         return total;
     }
 
-    float GetScore(const DocRecord* record) override
+    float GetScore(const DocDataEntry* entry) override
     {
         uint64_t doc   = GetDocumentID();
         float    total = 0.0f;
 
         for (auto& c : m_Children) {
             if (!c->IsEnd() && c->GetDocumentID() == doc)
-                total += c->GetScore(record);
+                total += c->GetScore(entry);
         }
 
         return total;
@@ -260,9 +260,9 @@ public:
     uint64_t GetDocumentID() override { return m_Base->GetDocumentID(); }
     uint32_t GetTermFreq()   override { return m_Base->GetTermFreq(); }
 
-    float GetScore(const DocRecord* record) override
+    float GetScore(const DocDataEntry* entry) override
     {
-        return m_Base->GetScore(record);
+        return m_Base->GetScore(entry);
     }
 
     void GoNext() override
@@ -319,7 +319,7 @@ public:
         return IsEnd() ? NO_MORE_DOCS : m_Results[m_Pos].doc_id;
     }
 
-    float GetScore(const DocRecord*) override
+    float GetScore(const DocDataEntry*) override
     {
         return IsEnd() ? 0.0f : m_Results[m_Pos].score;
     }

@@ -65,45 +65,45 @@ struct IndexFileHeader {
 static_assert(sizeof(IndexFileHeader) == 96, "IndexFileHeader must be exactly 96 bytes");
 
 #pragma pack(push,1)
-struct DocRecord {
-    uint64_t DR_DocID;
-    uint64_t DR_SourceFlags;
-    uint64_t DR_LastModifiedEpochSeconds;
-    uint64_t DR_CreatedEpochSeconds;
+struct DocDataEntry {
+    uint64_t DDE_DocID;
+    uint64_t DDE_SourceFlags;
+    uint64_t DDE_LastModifiedEpochSeconds;
+    uint64_t DDE_CreatedEpochSeconds;
 
-    uint32_t DR_DocLength;
-    uint32_t DR_PolicyFlags;
-    uint32_t DR_VectorFlags;
+    uint32_t DDE_DocLength;
+    uint32_t DDE_PolicyFlags;
+    uint32_t DDE_VectorFlags;
 
-    uint16_t DR_StaticRankHalf;
-    uint16_t DR_QualityScoreHalf;
-    uint16_t DR_FreshnessScoreHalf;
-    uint16_t DR_ClickScoreHalf;
-    uint16_t DR_EngagementScoreHalf;
-    uint16_t DR_AuthorityScoreHalf;
-    uint16_t DR_SpamScoreHalf;
+    uint16_t DDE_StaticRankHalf;
+    uint16_t DDE_QualityScoreHalf;
+    uint16_t DDE_FreshnessScoreHalf;
+    uint16_t DDE_ClickScoreHalf;
+    uint16_t DDE_EngagementScoreHalf;
+    uint16_t DDE_AuthorityScoreHalf;
+    uint16_t DDE_SpamScoreHalf;
 
-    uint16_t DR_PathLength;
-    uint16_t DR_Language;
-    uint16_t DR_Locale;
-    uint16_t DR_ContentType;
+    uint16_t DDE_PathLength;
+    uint16_t DDE_Language;
+    uint16_t DDE_Locale;
+    uint16_t DDE_ContentType;
 
-    uint16_t DR_FeatureScoreHalf[16];
-    uint16_t DR_VectorDim;
-    uint16_t DR_VectorFormat;
-    uint8_t  DR_Reserved[154];
-    int8_t   DR_VectorData[DOC_VECTOR_STORAGE_MAX_DIM];  // 512-dim int8 vector
-    uint8_t  DR_Path[DOC_PATH_MAX];
+    uint16_t DDE_FeatureScoreHalf[16];
+    uint16_t DDE_VectorDim;
+    uint16_t DDE_VectorFormat;
+    uint8_t  DDE_Reserved[154];
+    int8_t   DDE_VectorData[DOC_VECTOR_STORAGE_MAX_DIM];
+    uint8_t  DDE_Path[DOC_PATH_MAX];
 };
 #pragma pack(pop)
-static_assert(sizeof(DocRecord) == DOC_REC_SIZE, "DocRecord must be exactly DOC_REC_SIZE bytes");
-static_assert(offsetof(DocRecord, DR_Path) == DOC_REC_SIZE - DOC_PATH_MAX, "DocRecord path must occupy the tail of the record");
-static_assert(offsetof(DocRecord, DR_VectorData) == 256, "DocRecord vector storage must start at byte 256");
-static_assert(sizeof(DocRecord::DR_VectorData) == 512, "DocRecord vector storage must be 512 bytes (int8[512])");
-static_assert(offsetof(DocRecord, DR_DocID) % 8 == 0, "DR_DocID must be 64-bit aligned");
-static_assert(offsetof(DocRecord, DR_SourceFlags) % 8 == 0, "DR_SourceFlags must be 64-bit aligned");
-static_assert(offsetof(DocRecord, DR_LastModifiedEpochSeconds) % 8 == 0, "DR_LastModifiedEpochSeconds must be 64-bit aligned");
-static_assert(offsetof(DocRecord, DR_CreatedEpochSeconds) % 8 == 0, "DR_CreatedEpochSeconds must be 64-bit aligned");
+static_assert(sizeof(DocDataEntry) == DOC_REC_SIZE, "DocDataEntry must be exactly DOC_REC_SIZE bytes");
+static_assert(offsetof(DocDataEntry, DDE_Path) == DOC_REC_SIZE - DOC_PATH_MAX, "DocDataEntry path must occupy the tail of the entry");
+static_assert(offsetof(DocDataEntry, DDE_VectorData) == 256, "DocDataEntry vector storage must start at byte 256");
+static_assert(sizeof(DocDataEntry::DDE_VectorData) == 512, "DocDataEntry vector storage must be 512 bytes (int8[512])");
+static_assert(offsetof(DocDataEntry, DDE_DocID) % 8 == 0, "DDE_DocID must be 64-bit aligned");
+static_assert(offsetof(DocDataEntry, DDE_SourceFlags) % 8 == 0, "DDE_SourceFlags must be 64-bit aligned");
+static_assert(offsetof(DocDataEntry, DDE_LastModifiedEpochSeconds) % 8 == 0, "DDE_LastModifiedEpochSeconds must be 64-bit aligned");
+static_assert(offsetof(DocDataEntry, DDE_CreatedEpochSeconds) % 8 == 0, "DDE_CreatedEpochSeconds must be 64-bit aligned");
 
 static inline uint16_t EncodeFloat16(float value)
 {
@@ -181,15 +181,15 @@ static inline uint16_t EncodeDocPath(std::string_view path, uint8_t* output)
     return static_cast<uint16_t>(rawBytes);
 }
 
-static inline std::string DecodeDocPath(const DocRecord& record)
+static inline std::string DecodeDocPath(const DocDataEntry& entry)
 {
-    const size_t byteCount = record.DR_PathLength;
+    const size_t byteCount = entry.DDE_PathLength;
     if (byteCount == 0 || byteCount > DOC_PATH_MAX)
         return {};
 
     return std::string(
-        reinterpret_cast<const char*>(record.DR_Path),
-        reinterpret_cast<const char*>(record.DR_Path + byteCount));
+        reinterpret_cast<const char*>(entry.DDE_Path),
+        reinterpret_cast<const char*>(entry.DDE_Path + byteCount));
 }
 
 struct IndexBlock {

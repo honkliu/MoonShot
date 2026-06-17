@@ -8,7 +8,7 @@
 #include <string>
 
 /*
- * Binary index file format (version 9).
+ * Binary index file format (version 10).
  *
  * Layout:
  *   [Header 96B]       magic, version, all section offsets
@@ -21,9 +21,11 @@
  *                          [LTE_IndexBlockID:4][LTE_IndexOffset:4][LTE_IndexLength:4]
  *                          [LTE_PageSkipOffset:4][LTE_ContinuationBlockCount:4][LTE_Flags:4]
  *   [PageSkipList]     flat uint64_t arrays — per-term base_doc_id per cont. block
- *   [DocData]          N × 1024B records
+ *   [DocData]          N x 1024B records
  *   [Padding]          to PAGE_SIZE
- *   [Blocks]           raw IndexBlock structs (IB_Data = packed posting bytes)
+ *   [Blocks]           raw IndexBlock structs
+ *                        IB_Data = packed varbyte pairs:
+ *                        doc_delta, tf, doc_delta, tf, ...
  */
 
 struct BuildBlocksResult {
@@ -39,6 +41,8 @@ public:
     using BlockResult = BuildBlocksResult;
 
     static bool Save(const PostingStore& store, const char* path);
+    static bool IsValidIndex(const char* path);
+    static BuildBlocksResult BuildBlocksForContext(const PostingStore& store);
 
     static bool Load(PostingStore&                           store,
                      const char*                            path,
@@ -66,4 +70,8 @@ public:
                              uint64_t blocks_offset,
                              uint8_t* blocks_out,
                              uint64_t blocks_bytes);
+
+};
+
+#endif
 

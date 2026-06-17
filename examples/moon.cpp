@@ -649,28 +649,28 @@ static void SaveFromRuns(const std::string& idxPath,
     std::vector<uint8_t> ps(pageskip.size() * 8);
     if (!pageskip.empty()) std::memcpy(ps.data(), pageskip.data(), ps.size());
 
-    std::vector<DocRecord> docdata(docs.size());
+    std::vector<DocDataEntry> docdata(docs.size());
     for (size_t i = 0; i < docs.size(); ++i) {
-        docdata[i].DR_DocID = docs[i].doc_id;
-        docdata[i].DR_StaticRankHalf = EncodeFloat16(docs[i].importance);
-        docdata[i].DR_DocLength = docs[i].doc_len;
+        docdata[i].DDE_DocID = docs[i].doc_id;
+        docdata[i].DDE_StaticRankHalf = EncodeFloat16(docs[i].importance);
+        docdata[i].DDE_DocLength = docs[i].doc_len;
         if (!docs[i].vector.empty() && docs[i].vector.size() <= DOC_VECTOR_STORAGE_MAX_DIM) {
-            docdata[i].DR_VectorDim = static_cast<uint16_t>(docs[i].vector.size());
-            docdata[i].DR_VectorFormat = 1;
+            docdata[i].DDE_VectorDim = static_cast<uint16_t>(docs[i].vector.size());
+            docdata[i].DDE_VectorFormat = 1;
             for (size_t j = 0; j < docs[i].vector.size(); ++j) {
                 // Quantize float32 to int8: clamp to [-128, 127]
                 const float val = docs[i].vector[j];
                 const float clipped = std::max(-128.0f, std::min(127.0f, val * 128.0f));
-                docdata[i].DR_VectorData[j] = static_cast<int8_t>(std::round(clipped));
+                docdata[i].DDE_VectorData[j] = static_cast<int8_t>(std::round(clipped));
             }
         }
-        docdata[i].DR_PathLength = EncodeDocPath(docs[i].path, docdata[i].DR_Path);
+        docdata[i].DDE_PathLength = EncodeDocPath(docs[i].path, docdata[i].DDE_Path);
     }
 
     uint64_t hdrSize = sizeof(IndexFileHeader);
     uint64_t siOff = hdrSize, siSize = si.size();
     uint64_t psOff = siOff + siSize, psSize = ps.size();
-    uint64_t ddOff = psOff + psSize, ddSize = docdata.size() * sizeof(DocRecord);
+    uint64_t ddOff = psOff + psSize, ddSize = docdata.size() * sizeof(DocDataEntry);
     uint64_t rawBlocks = ddOff + ddSize;
     uint64_t blkOff = PageAlignedBytes(rawBlocks);
 
@@ -690,7 +690,7 @@ static void SaveFromRuns(const std::string& idxPath,
     fwrite(&hdr, sizeof(hdr), 1, f);
     fwrite(si.data(), 1, si.size(), f);
     fwrite(ps.data(), 1, ps.size(), f);
-    if (!docdata.empty()) fwrite(docdata.data(), sizeof(DocRecord), docdata.size(), f);
+    if (!docdata.empty()) fwrite(docdata.data(), sizeof(DocDataEntry), docdata.size(), f);
     uint64_t pos = FileOffset(f);
     if (pos < blkOff) {
         std::vector<uint8_t> pad(static_cast<size_t>(blkOff - pos), 0);

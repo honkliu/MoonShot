@@ -19,7 +19,7 @@ class IndexReader
 
         virtual uint32_t GetTermFreq() { return 1u; }
 
-        virtual float GetScore(const DocRecord* /*record*/) { return 0.0f; }
+        virtual float GetScore(const DocDataEntry* /*entry*/) { return 0.0f; }
 
         virtual void Close() = 0;
 

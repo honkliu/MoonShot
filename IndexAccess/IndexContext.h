@@ -213,13 +213,13 @@ public:
 
     PostingStore* GetStore() { return m_Store.get(); }
 
-    const DocRecord* GetDocRecord(uint64_t docId) const
+    const DocDataEntry* GetDocDataEntry(uint64_t docId) const
     {
         if (!m_DocData || docId >= m_TotalDocs)
             return nullptr;
 
-        const auto* record = reinterpret_cast<const DocRecord*>(m_DocData + docId * DOC_REC_SIZE);
-        return record->DR_DocID == docId ? record : nullptr;
+        const auto* entry = reinterpret_cast<const DocDataEntry*>(m_DocData + docId * DOC_REC_SIZE);
+        return entry->DDE_DocID == docId ? entry : nullptr;
     }
 
     const IndexFileHeader& GetIndexFileHeader() const { return m_IndexFileHeader; }
@@ -283,6 +283,7 @@ public:
         }
 
         m_IndexFileHeader = li.ILI_Header;
+        m_IndexLayout = li;
         m_BlockTable.Reset(PostingBlockCacheSlots(li.ILI_NumBlocks));
         m_BlockTable.ReserveBlockMap(static_cast<uint32_t>(std::min<uint64_t>(li.ILI_NumBlocks, UINT32_MAX)));
         m_BlockTable.SetHeadTermEntries(std::move(li.ILI_HeadTermEntries), static_cast<uint32_t>(std::min<uint64_t>(li.ILI_NumLeafBlocks, UINT32_MAX)));
@@ -292,25 +293,21 @@ public:
         ClearLeafTermPagesOnly();
         ClearIndexBlocksOnly();
 
-        const uint64_t docdata_bytes     = li.ILI_Header.IFH_DocDataSize;
-        const uint64_t leaf_blocks_bytes = li.ILI_NumLeafBlocks * sizeof(LeafTermPage);
-        const uint64_t blocks_bytes      = li.ILI_NumBlocks      * sizeof(IndexBlock);
+        const uint64_t docdata_bytes = li.ILI_Header.IFH_DocDataSize;
 
-        if (!AllocatePinnedSection(docdata_bytes, m_DocDataBase, m_DocData, m_DocDataBytes)
-            || !AllocatePinnedSection(leaf_blocks_bytes, m_LeafTermPagesBase, m_LeafTermPages, m_LeafTermPagesBytes)
-            || !AllocatePinnedSection(blocks_bytes, m_IndexBlocksBase, m_IndexBlocks, m_IndexBlocksBytes))
+        if (!AllocatePinnedSection(docdata_bytes, m_DocDataBase, m_DocData, m_DocDataBytes))
         {
-            std::cerr << "Failed to allocate pinned index memory for: " << m_IndexPath << "\n";
+            std::cerr << "Failed to allocate pinned DocData memory for: " << m_IndexPath << "\n";
             ClearPinnedIndexData();
             return;
         }
 
         if (!IndexSerializer::ReadSections(m_IndexPath.c_str(),
-                                           li.ILI_DocDataOffset,     m_DocData,       docdata_bytes,
-                                           li.ILI_LeafBlocksOffset,  m_LeafTermPages, leaf_blocks_bytes,
-                                           li.ILI_BlocksOffset,      m_IndexBlocks,   blocks_bytes))
+                                           li.ILI_DocDataOffset, m_DocData, docdata_bytes,
+                                           0, nullptr, 0,
+                                           0, nullptr, 0))
         {
-            std::cerr << "Failed to read index sections for: " << m_IndexPath << "\n";
+            std::cerr << "Failed to read DocData for: " << m_IndexPath << "\n";
             ClearPinnedIndexData();
             return;
         }
@@ -318,22 +315,15 @@ public:
         m_DocDataPageCount        = m_DocDataBytes / PAGE_SIZE;
         m_TotalDocs               = std::min<uint64_t>(li.ILI_Header.IFH_NumDocuments, docdata_bytes / DOC_REC_SIZE);
         m_AvgDocLen               = li.ILI_Header.IFH_AvgDocLength > 0.0f ? li.ILI_Header.IFH_AvgDocLength : 1.0f;
-        m_LeafTermPageCountPinned = li.ILI_NumLeafBlocks;
-        m_IndexBlockCountPinned   = li.ILI_NumBlocks;
+        RefreshStoreFromLoadedDocData();
 
         auto fm = make_shared<FileBlockManager>(sizeof(IndexBlock), li.ILI_BlocksOffset);
-        if (m_IndexBlocks && m_IndexBlocksBytes >= li.ILI_NumBlocks * sizeof(IndexBlock)) {
-            if (fm->openMemory(m_IndexBlocks, li.ILI_NumBlocks * sizeof(IndexBlock)))
-                m_BlockTable.SetFileManager(std::move(fm));
-        } else if (fm->open(m_IndexPath.c_str())) {
+        if (fm->open(m_IndexPath.c_str())) {
             m_BlockTable.SetFileManager(std::move(fm));
         }
 
         auto leafFm = make_shared<FileBlockManager>(sizeof(LeafTermPage), li.ILI_LeafBlocksOffset);
-        if (m_LeafTermPages && m_LeafTermPagesBytes >= li.ILI_NumLeafBlocks * sizeof(LeafTermPage)) {
-            if (leafFm->openMemory(m_LeafTermPages, li.ILI_NumLeafBlocks * sizeof(LeafTermPage)))
-                m_BlockTable.SetLeafTermFileManager(std::move(leafFm));
-        } else if (leafFm->open(m_IndexPath.c_str())) {
+        if (leafFm->open(m_IndexPath.c_str())) {
             m_BlockTable.SetLeafTermFileManager(std::move(leafFm));
         }
         m_BlockTable.ReserveLeafTermPageMap(static_cast<uint32_t>(std::min<uint64_t>(li.ILI_NumLeafBlocks, UINT32_MAX)));
@@ -362,6 +352,7 @@ private:
     bool                         m_Built;
     bool                         m_LoadedFromDisk;
     IndexFileHeader              m_IndexFileHeader{};
+    IndexLayoutInfo              m_IndexLayout{};
     std::unique_ptr<uint8_t[]>   m_DocDataBase;
     uint8_t*                     m_DocData = nullptr;
     uint64_t                     m_DocDataBytes = 0;
@@ -429,6 +420,7 @@ private:
         ClearLeafTermPagesOnly();
         ClearIndexBlocksOnly();
         m_IndexFileHeader = {};
+        m_IndexLayout = {};
     }
 
     static uintptr_t AlignUp(uintptr_t value, uintptr_t alignment)
@@ -487,22 +479,22 @@ private:
 
         uint64_t totalLen = 0;
         for (const auto& [docId, stats] : m_Store->AllDocStats()) {
-            auto* rec = reinterpret_cast<DocRecord*>(m_DocData + docId * DOC_REC_SIZE);
-            rec->DR_DocID = docId;
-            rec->DR_StaticRankHalf = EncodeFloat16(stats.importance);
-            rec->DR_DocLength = stats.doc_len;
+            auto* entry = reinterpret_cast<DocDataEntry*>(m_DocData + docId * DOC_REC_SIZE);
+            entry->DDE_DocID = docId;
+            entry->DDE_StaticRankHalf = EncodeFloat16(stats.importance);
+            entry->DDE_DocLength = stats.doc_len;
             if (const auto* vector = m_Store->GetDocVector(docId);
                 vector && !vector->empty() && vector->size() <= DOC_VECTOR_STORAGE_MAX_DIM) {
-                rec->DR_VectorDim = static_cast<uint16_t>(vector->size());
-                rec->DR_VectorFormat = 1;
+                entry->DDE_VectorDim = static_cast<uint16_t>(vector->size());
+                entry->DDE_VectorFormat = 1;
                 for (size_t i = 0; i < vector->size(); ++i) {
                     // Quantize float32 to int8: clamp to [-128, 127]
                     const float val = (*vector)[i];
                     const float clipped = std::max(-128.0f, std::min(127.0f, val * 128.0f));
-                    rec->DR_VectorData[i] = static_cast<int8_t>(std::round(clipped));
+                    entry->DDE_VectorData[i] = static_cast<int8_t>(std::round(clipped));
                 }
             }
-            rec->DR_PathLength = EncodeDocPath(stats.path, rec->DR_Path);
+            entry->DDE_PathLength = EncodeDocPath(stats.path, entry->DDE_Path);
             totalLen += stats.doc_len;
         }
 
@@ -513,6 +505,35 @@ private:
         m_IndexFileHeader.IFH_Version = INDEX_FORMAT_VERSION;
         m_IndexFileHeader.IFH_NumDocuments = m_TotalDocs;
         m_IndexFileHeader.IFH_AvgDocLength = m_AvgDocLen;
+    }
+
+    void RefreshStoreFromLoadedDocData()
+    {
+        m_Store = make_shared<PostingStore>();
+        if (!m_DocData || m_TotalDocs == 0)
+            return;
+
+        for (uint64_t docId = 0; docId < m_TotalDocs; ++docId) {
+            const auto* entry = reinterpret_cast<const DocDataEntry*>(m_DocData + docId * DOC_REC_SIZE);
+            if (entry->DDE_DocID != docId)
+                continue;
+
+            m_Store->AddDocTokens(docId, entry->DDE_DocLength);
+            m_Store->SetDocImportance(docId, DecodeFloat16(entry->DDE_StaticRankHalf));
+
+            if (entry->DDE_VectorDim > 0
+                && entry->DDE_VectorDim <= DOC_VECTOR_STORAGE_MAX_DIM
+                && entry->DDE_VectorFormat == 1)
+            {
+                std::vector<float> vector(entry->DDE_VectorDim);
+                for (size_t i = 0; i < entry->DDE_VectorDim; ++i)
+                    vector[i] = static_cast<float>(entry->DDE_VectorData[i]) / 128.0f;
+                m_Store->SetDocVector(docId, std::move(vector));
+            }
+
+            if (entry->DDE_PathLength > 0)
+                m_Store->SetDocPath(docId, DecodeDocPath(*entry));
+        }
     }
 
     /*

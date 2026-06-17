@@ -76,7 +76,7 @@ class AdvancedIndexReader : public IndexReader
         * BM25 contribution of this term for the current document.
         * Uses the docFreq stored in the matching LeafTermEntry.
         */
-        float GetScore(const DocRecord* record) override;
+        float GetScore(const DocDataEntry* entry) override;
 
         void Close() override;
 

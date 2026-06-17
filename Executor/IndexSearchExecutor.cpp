@@ -20,10 +20,10 @@ std::vector<SearchResult> IndexSearchExecutor::Execute(std::shared_ptr<IndexRead
     while (!reader->IsEnd()) {
         uint64_t docId     = reader->GetDocumentID();
         assert(m_Context);
-        const DocRecord* record = m_Context->GetDocRecord(docId);
-        assert(record);
-        float    score     = reader->GetScore(record)
-                           + DecodeFloat16(record->DR_StaticRankHalf);
+        const DocDataEntry* entry = m_Context->GetDocDataEntry(docId);
+        assert(entry);
+        float    score     = reader->GetScore(entry)
+                   + DecodeFloat16(entry->DDE_StaticRankHalf);
 
         results.push_back({docId, score, ""});
         reader->GoNext();
@@ -66,10 +66,10 @@ std::vector<SearchResult> IndexSearchExecutor::CollectResults(
     while (!reader->IsEnd()) {
         uint64_t docId     = reader->GetDocumentID();
         assert(m_Context);
-        const DocRecord* record = m_Context->GetDocRecord(docId);
-        assert(record);
-        float    score     = reader->GetScore(record)
-                           + DecodeFloat16(record->DR_StaticRankHalf);
+        const DocDataEntry* entry = m_Context->GetDocDataEntry(docId);
+        assert(entry);
+        float    score     = reader->GetScore(entry)
+                   + DecodeFloat16(entry->DDE_StaticRankHalf);
 
         results.push_back({docId, score, ""});
         reader->GoNext();
