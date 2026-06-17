@@ -312,11 +312,14 @@ bool IndexSerializer::Save(const PostingStore& store, const char* path)
         r.DR_FreshnessScoreHalf = EncodeFloat16(0.0f);
         r.DR_ClickScoreHalf = EncodeFloat16(0.0f);
         r.DR_EngagementScoreHalf = EncodeFloat16(0.0f);
-        if (const auto* vector = store.GetDocVector(id); vector && vector->size() == DOC_VECTOR_DIM) {
-            r.DR_VectorDim = static_cast<uint16_t>(DOC_VECTOR_DIM);
+        if (const auto* vector = store.GetDocVector(id);
+            vector && !vector->empty() && vector->size() <= DOC_VECTOR_STORAGE_MAX_DIM) {
+            r.DR_VectorDim = static_cast<uint16_t>(vector->size());
             r.DR_VectorFormat = 1;
-            for (size_t i = 0; i < DOC_VECTOR_DIM; ++i)
-                r.DR_VectorHalf[i] = EncodeFloat16((*vector)[i]);
+            for (size_t i = 0; i < vector->size(); ++i) {
+                const uint16_t encoded = EncodeFloat16((*vector)[i]);
+                std::memcpy(&r.DR_VectorData[i * sizeof(uint16_t)], &encoded, sizeof(uint16_t));
+            }
         }
         r.DR_PathLength = EncodeDocPath(ds.path, r.DR_Path);
         docdata[static_cast<size_t>(id)] = r;
@@ -460,10 +463,13 @@ bool IndexSerializer::Load(PostingStore&                           store,
                 continue;
             store.AddDocTokens(r.DR_DocID, r.DR_DocLength);
             store.SetDocImportance(r.DR_DocID, DecodeFloat16(r.DR_StaticRankHalf));
-            if (r.DR_VectorDim == DOC_VECTOR_DIM && r.DR_VectorFormat == 1) {
-                std::vector<float> vector(DOC_VECTOR_DIM);
-                for (size_t i = 0; i < DOC_VECTOR_DIM; ++i)
-                    vector[i] = DecodeFloat16(r.DR_VectorHalf[i]);
+            if (r.DR_VectorDim > 0 && r.DR_VectorDim <= DOC_VECTOR_STORAGE_MAX_DIM && r.DR_VectorFormat == 1) {
+                std::vector<float> vector(r.DR_VectorDim);
+                for (size_t i = 0; i < r.DR_VectorDim; ++i) {
+                    uint16_t encoded = 0;
+                    std::memcpy(&encoded, &r.DR_VectorData[i * sizeof(uint16_t)], sizeof(uint16_t));
+                    vector[i] = DecodeFloat16(encoded);
+                }
                 store.SetDocVector(r.DR_DocID, std::move(vector));
             }
             if (r.DR_PathLength > 0)

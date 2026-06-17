@@ -3,6 +3,7 @@
 #include "IndexContext.h"
 
 #include <algorithm>
+#include <cassert>
 
 IndexSearchExecutor::IndexSearchExecutor(const IndexContext* context)
     : m_Context(context)
@@ -18,9 +19,11 @@ std::vector<SearchResult> IndexSearchExecutor::Execute(std::shared_ptr<IndexRead
 
     while (!reader->IsEnd()) {
         uint64_t docId     = reader->GetDocumentID();
-        const DocRecord* record = m_Context ? m_Context->GetDocRecord(docId) : nullptr;
+        assert(m_Context);
+        const DocRecord* record = m_Context->GetDocRecord(docId);
+        assert(record);
         float    score     = reader->GetScore(record)
-                           + (record ? DecodeFloat16(record->DR_StaticRankHalf) : 0.0f);
+                           + DecodeFloat16(record->DR_StaticRankHalf);
 
         results.push_back({docId, score, ""});
         reader->GoNext();
@@ -62,9 +65,11 @@ std::vector<SearchResult> IndexSearchExecutor::CollectResults(
 
     while (!reader->IsEnd()) {
         uint64_t docId     = reader->GetDocumentID();
-        const DocRecord* record = m_Context ? m_Context->GetDocRecord(docId) : nullptr;
+        assert(m_Context);
+        const DocRecord* record = m_Context->GetDocRecord(docId);
+        assert(record);
         float    score     = reader->GetScore(record)
-                           + (record ? DecodeFloat16(record->DR_StaticRankHalf) : 0.0f);
+                           + DecodeFloat16(record->DR_StaticRankHalf);
 
         results.push_back({docId, score, ""});
         reader->GoNext();

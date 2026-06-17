@@ -32,7 +32,8 @@ public:
     }
 
     EvalTree* Compile(const char* queryString,
-                      const char* streamSet = "AUT")
+                      const char* streamSet = "AUT",
+                      IEmbeddingModel* embeddingModel = nullptr)
     {
         if (!queryString || !*queryString)
             return new EvalTree{};
@@ -42,17 +43,20 @@ public:
 
         auto tree  = new EvalTree();
         tree->root = root;
-        if (HasVectorStream(streamSet))
-            tree->vector_query = CompileToVector(queryString);
+        if (HasVectorStream(streamSet)) {
+            assert(embeddingModel && "Query requires embedding model for vector generation. Pass IEmbeddingModel*!");
+            tree->vector_query = CompileToVector(queryString, embeddingModel);
+        }
         return tree;
     }
 
     std::vector<float> CompileToVector(const char* queryString,
-                                       size_t dim = 128)
+                                       IEmbeddingModel* model)
     {
+        assert(model && "Embedding model is required!");
         if (!queryString || !*queryString)
-            return std::vector<float>(dim, 0.0f);
-        return BuildHashedEmbedding(m_Tokenizer->Tokenize(queryString), dim);
+            return std::vector<float>(model->GetDimension(), 0.0f);
+        return model->Embed(m_Tokenizer->Tokenize(queryString));
     }
 
 private:

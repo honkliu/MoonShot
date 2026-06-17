@@ -654,11 +654,13 @@ static void SaveFromRuns(const std::string& idxPath,
         docdata[i].DR_DocID = docs[i].doc_id;
         docdata[i].DR_StaticRankHalf = EncodeFloat16(docs[i].importance);
         docdata[i].DR_DocLength = docs[i].doc_len;
-        if (docs[i].vector.size() == DOC_VECTOR_DIM) {
-            docdata[i].DR_VectorDim = static_cast<uint16_t>(DOC_VECTOR_DIM);
+        if (!docs[i].vector.empty() && docs[i].vector.size() <= DOC_VECTOR_STORAGE_MAX_DIM) {
+            docdata[i].DR_VectorDim = static_cast<uint16_t>(docs[i].vector.size());
             docdata[i].DR_VectorFormat = 1;
-            for (size_t j = 0; j < DOC_VECTOR_DIM; ++j)
-                docdata[i].DR_VectorHalf[j] = EncodeFloat16(docs[i].vector[j]);
+            for (size_t j = 0; j < docs[i].vector.size(); ++j) {
+                const uint16_t encoded = EncodeFloat16(docs[i].vector[j]);
+                std::memcpy(&docdata[i].DR_VectorData[j * sizeof(uint16_t)], &encoded, sizeof(uint16_t));
+            }
         }
         docdata[i].DR_PathLength = EncodeDocPath(docs[i].path, docdata[i].DR_Path);
     }

@@ -29,9 +29,11 @@ static constexpr int PAGE_SIZE  = 4096;
 static constexpr int NUMBLOCKS  = 50;
 static constexpr size_t DOC_REC_SIZE = 1024;
 static constexpr size_t DOC_VECTOR_DIM = 128;
-static constexpr size_t DOC_PATH_MAX = 512;
+static constexpr size_t DOC_VECTOR_STORAGE_BYTES = 512;
+static constexpr size_t DOC_VECTOR_STORAGE_MAX_DIM = DOC_VECTOR_STORAGE_BYTES / sizeof(uint16_t);
+static constexpr size_t DOC_PATH_MAX = 256;
 static constexpr uint8_t  INDEX_FILE_MAGIC[8] = {'M','O','O','N','S','H','O','T'};
-static constexpr uint32_t INDEX_FORMAT_VERSION = 9;
+static constexpr uint32_t INDEX_FORMAT_VERSION = 10;
 
 static constexpr uint64_t IB_HEADER_HAS_MORE = (1ULL << 63);
 static constexpr uint16_t BLOCK_CONTINUATION_MARKER = 0xFFFFu;
@@ -90,13 +92,15 @@ struct DocRecord {
     uint16_t DR_FeatureScoreHalf[16];
     uint16_t DR_VectorDim;
     uint16_t DR_VectorFormat;
-    uint16_t DR_VectorHalf[DOC_VECTOR_DIM];
     uint8_t  DR_Reserved[154];
+    uint8_t  DR_VectorData[DOC_VECTOR_STORAGE_BYTES];
     uint8_t  DR_Path[DOC_PATH_MAX];
 };
 #pragma pack(pop)
 static_assert(sizeof(DocRecord) == DOC_REC_SIZE, "DocRecord must be exactly DOC_REC_SIZE bytes");
 static_assert(offsetof(DocRecord, DR_Path) == DOC_REC_SIZE - DOC_PATH_MAX, "DocRecord path must occupy the tail of the record");
+static_assert(offsetof(DocRecord, DR_VectorData) == 256, "DocRecord vector storage must start at byte 256");
+static_assert(sizeof(DocRecord::DR_VectorData) == DOC_VECTOR_STORAGE_BYTES, "DocRecord vector storage must be 512 bytes");
 static_assert(offsetof(DocRecord, DR_DocID) % 8 == 0, "DR_DocID must be 64-bit aligned");
 static_assert(offsetof(DocRecord, DR_SourceFlags) % 8 == 0, "DR_SourceFlags must be 64-bit aligned");
 static_assert(offsetof(DocRecord, DR_LastModifiedEpochSeconds) % 8 == 0, "DR_LastModifiedEpochSeconds must be 64-bit aligned");

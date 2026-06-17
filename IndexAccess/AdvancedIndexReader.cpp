@@ -1,6 +1,7 @@
 #include "AdvancedIndexReader.h"
 #include "IndexContext.h"
 #include <algorithm>
+#include <cassert>
 #include <cstring>
 #include <cmath>
 
@@ -8,6 +9,10 @@ void AdvancedIndexReader::Open(const char*      streamKey,
                                 IndexBlockTable* blockTable,
                                 const IndexContext* context)
 {
+    assert(streamKey);
+    assert(blockTable);
+    assert(context);
+
     delete[] m_Word;
     m_Word = new char[std::strlen(streamKey) + 1];
     std::strcpy(m_Word, streamKey);
@@ -34,15 +39,14 @@ void AdvancedIndexReader::Open(const char*      streamKey,
         m_DocFreq = freq;
 
         IndexBlock* block = m_BlockTable->GetIndexBlock(indexBlockID, 1);
-        if (block) {
-            m_BlockSeqNumber  = indexBlockID;
-            m_InitialBlockSeq = indexBlockID;
-            m_PageSkipOffset  = pageSkipOffset;
-            m_TotalContinuationBlocks = continuationBlockCount;
-            m_RemainingContinuationBlocks = continuationBlockCount;
-            m_IndexBlock      = std::shared_ptr<IndexBlock>(block, [](IndexBlock*){});
-            m_Decoder.OpenRaw(block->IB_Data + indexOffset, indexLength, 0);
-        }
+        assert(block);
+        m_BlockSeqNumber  = indexBlockID;
+        m_InitialBlockSeq = indexBlockID;
+        m_PageSkipOffset  = pageSkipOffset;
+        m_TotalContinuationBlocks = continuationBlockCount;
+        m_RemainingContinuationBlocks = continuationBlockCount;
+        m_IndexBlock      = std::shared_ptr<IndexBlock>(block, [](IndexBlock*){});
+        m_Decoder.OpenRaw(block->IB_Data + indexOffset, indexLength, 0);
     }
 
     GoNext();
@@ -52,13 +56,12 @@ void AdvancedIndexReader::GoNext()
 {
     if (m_Decoder.IsEnd() && HasMoreBlocks()) {
         IndexBlock* next = m_BlockTable->GetIndexBlock(m_BlockSeqNumber + 1, 1);
-        if (next) {
-            uint64_t lastDoc = m_Decoder.GetDocumentID();
-            ++m_BlockSeqNumber;
-            m_IndexBlock = std::shared_ptr<IndexBlock>(next, [](IndexBlock*){});
-            OpenContinuation(next, lastDoc);
-            --m_RemainingContinuationBlocks;
-        }
+        assert(next);
+        uint64_t lastDoc = m_Decoder.GetDocumentID();
+        ++m_BlockSeqNumber;
+        m_IndexBlock = std::shared_ptr<IndexBlock>(next, [](IndexBlock*){});
+        OpenContinuation(next, lastDoc);
+        --m_RemainingContinuationBlocks;
     }
     m_Decoder.GoNext();
 }
@@ -79,19 +82,18 @@ void AdvancedIndexReader::GoUntil(uint64_t target, uint64_t /*limit*/)
                 /* Jump directly to the target block */
                 uint32_t target_block = m_InitialBlockSeq + tgt_idx;
                 IndexBlock* blk = m_BlockTable->GetIndexBlock(target_block, 1);
-                if (blk) {
-                    uint64_t base_loc = skip[tgt_idx];
-                    m_BlockSeqNumber  = target_block;
-                    m_IndexBlock      = std::shared_ptr<IndexBlock>(blk, [](IndexBlock*){});
-                    m_RemainingContinuationBlocks = (tgt_idx <= m_TotalContinuationBlocks)
-                        ? (m_TotalContinuationBlocks - tgt_idx)
-                        : 0;
-                    OpenContinuation(blk, base_loc);
-                    m_Decoder.GoNext();
-                    if (!m_Decoder.IsEnd()) {
-                        m_Decoder.GoUntil(target);
-                        if (!m_Decoder.IsEnd()) return;
-                    }
+                assert(blk);
+                uint64_t base_loc = skip[tgt_idx];
+                m_BlockSeqNumber  = target_block;
+                m_IndexBlock      = std::shared_ptr<IndexBlock>(blk, [](IndexBlock*){});
+                m_RemainingContinuationBlocks = (tgt_idx <= m_TotalContinuationBlocks)
+                    ? (m_TotalContinuationBlocks - tgt_idx)
+                    : 0;
+                OpenContinuation(blk, base_loc);
+                m_Decoder.GoNext();
+                if (!m_Decoder.IsEnd()) {
+                    m_Decoder.GoUntil(target);
+                    if (!m_Decoder.IsEnd()) return;
                 }
             }
         }
@@ -103,7 +105,7 @@ void AdvancedIndexReader::GoUntil(uint64_t target, uint64_t /*limit*/)
         if (!m_Decoder.IsEnd()) break;
         if (!HasMoreBlocks())   break;
         IndexBlock* next = m_BlockTable->GetIndexBlock(m_BlockSeqNumber + 1, 1);
-        if (!next) break;
+        assert(next);
         uint64_t lastDoc = m_Decoder.GetDocumentID();
         ++m_BlockSeqNumber;
         m_IndexBlock = std::shared_ptr<IndexBlock>(next, [](IndexBlock*){});
@@ -120,14 +122,10 @@ void AdvancedIndexReader::OpenContinuation(IndexBlock* blk, uint64_t lastDoc)
     const uint8_t* d = blk->IB_Data;
     uint16_t marker = 0;
     std::memcpy(&marker, d, 2);
-    if (marker == BLOCK_CONTINUATION_MARKER) {
-        uint16_t cont_len = 0;
-        std::memcpy(&cont_len, d + 2, 2);
-        m_Decoder.OpenRaw(d + 4, cont_len, lastDoc);
-    } else {
-        /* Fallback: entire IB_Data is continuation (old format blocks) */
-        m_Decoder.OpenRaw(d, sizeof(blk->IB_Data), lastDoc);
-    }
+    assert(marker == BLOCK_CONTINUATION_MARKER);
+    uint16_t cont_len = 0;
+    std::memcpy(&cont_len, d + 2, 2);
+    m_Decoder.OpenRaw(d + 4, cont_len, lastDoc);
 }
 
 bool AdvancedIndexReader::IsEnd()          { return m_Decoder.IsEnd(); }
@@ -138,7 +136,10 @@ uint32_t AdvancedIndexReader::GetTermFreq() {
     return IsEnd() ? 0u : m_Decoder.GetTermFrequency();
 }
 float AdvancedIndexReader::GetScore(const DocRecord* record) {
+    assert(record);
+    assert(m_Context);
     const uint32_t docLength = record->DR_DocLength;
+    assert(docLength > 0);
 
     const float tf = static_cast<float>(GetTermFreq());
     const float df = static_cast<float>(std::max(1u, m_DocFreq));
@@ -146,6 +147,8 @@ float AdvancedIndexReader::GetScore(const DocRecord* record) {
     const IndexFileHeader& header = m_Context->GetIndexFileHeader();
     const uint64_t documentCount = header.IFH_NumDocuments;
     const float averageDocLength = header.IFH_AvgDocLength;
+    assert(documentCount > 0);
+    assert(averageDocLength > 0.0f);
     const float totalDocs = static_cast<float>(documentCount);
 
     const float dl = static_cast<float>(std::max(1u, docLength));
@@ -156,7 +159,7 @@ float AdvancedIndexReader::GetScore(const DocRecord* record) {
     const float idf = std::max(0.0f,
         std::log((totalDocs - df + 0.5f) / (df + 0.5f) + 1.0f));
     const float tfNorm = tf * (K1 + 1.0f) /
-        (tf + K1 * (1.0f - B + B * dl / (averageDocLength > 0.0f ? averageDocLength : 1.0f)));
+        (tf + K1 * (1.0f - B + B * dl / averageDocLength));
 
     return idf * tfNorm;
 }

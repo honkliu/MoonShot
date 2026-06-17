@@ -64,6 +64,7 @@ public:
         , m_BlockTable(512)
         , m_Compiler(&m_Tokenizer)
         , m_Executor(this)
+        , m_EmbeddingModel(make_shared<TFIDFSemanticEmbedding>(128))
         , m_IndexPath(indexFile ? indexFile : "")
         , m_Built(false)
         , m_LoadedFromDisk(false)
@@ -128,7 +129,7 @@ public:
         writer->Write(metaTokens, docId, "Meta");
         writer->SetDocImportance(docId, doc.importance);
         if (!embeddingTokens.empty())
-            writer->SetDocVector(docId, BuildHashedEmbedding(embeddingTokens));
+            writer->SetDocVector(docId, m_EmbeddingModel->Embed(embeddingTokens));
         if (!doc.path.empty())
             m_Store->SetDocPath(docId, doc.path);
 
@@ -198,7 +199,7 @@ public:
                                       const char* streamSet = "AUT")
     {
         auto tree = std::unique_ptr<EvalTree>(
-                        m_Compiler.Compile(queryString, streamSet));
+                        m_Compiler.Compile(queryString, streamSet, m_EmbeddingModel.get()));
         return GetReader(tree.get());
     }
 
@@ -224,9 +225,9 @@ public:
 
     const IndexFileHeader& GetIndexFileHeader() const { return m_IndexFileHeader; }
 
-    std::vector<float> CompileToVector(const char* queryString, size_t dim = 128)
+    std::vector<float> CompileToVector(const char* queryString)
     {
-        return m_Compiler.CompileToVector(queryString, dim);
+        return m_Compiler.CompileToVector(queryString, m_EmbeddingModel.get());
     }
 
     std::vector<VectorSearchResult> VectorSearch(const std::vector<float>& query,
@@ -334,6 +335,7 @@ private:
     SmartTokenizer               m_Tokenizer;
     IndexSearchCompiler          m_Compiler;
     IndexSearchExecutor          m_Executor;
+    shared_ptr<IEmbeddingModel>  m_EmbeddingModel;
     std::string                  m_IndexPath;
     bool                         m_Built;
     bool                         m_LoadedFromDisk;
@@ -455,11 +457,14 @@ private:
             rec->DR_DocID = docId;
             rec->DR_StaticRankHalf = EncodeFloat16(stats.importance);
             rec->DR_DocLength = stats.doc_len;
-            if (const auto* vector = m_Store->GetDocVector(docId); vector && vector->size() == DOC_VECTOR_DIM) {
-                rec->DR_VectorDim = static_cast<uint16_t>(DOC_VECTOR_DIM);
+            if (const auto* vector = m_Store->GetDocVector(docId);
+                vector && !vector->empty() && vector->size() <= DOC_VECTOR_STORAGE_MAX_DIM) {
+                rec->DR_VectorDim = static_cast<uint16_t>(vector->size());
                 rec->DR_VectorFormat = 1;
-                for (size_t i = 0; i < DOC_VECTOR_DIM; ++i)
-                    rec->DR_VectorHalf[i] = EncodeFloat16((*vector)[i]);
+                for (size_t i = 0; i < vector->size(); ++i) {
+                    const uint16_t encoded = EncodeFloat16((*vector)[i]);
+                    std::memcpy(&rec->DR_VectorData[i * sizeof(uint16_t)], &encoded, sizeof(uint16_t));
+                }
             }
             rec->DR_PathLength = EncodeDocPath(stats.path, rec->DR_Path);
             totalLen += stats.doc_len;
