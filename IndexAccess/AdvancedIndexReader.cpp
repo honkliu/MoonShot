@@ -138,14 +138,18 @@ uint32_t AdvancedIndexReader::GetTermFreq() {
     return IsEnd() ? 0u : m_Decoder.GetTermFrequency();
 }
 float AdvancedIndexReader::GetScore(const DocRecord* record) {
-    const uint32_t docLength = record ? record->DR_DocLength : 1u;
+    const uint32_t docLength = record->DR_DocLength;
+
     const float tf = static_cast<float>(GetTermFreq());
     const float df = static_cast<float>(std::max(1u, m_DocFreq));
-    const IndexFileHeader& header = m_Context ? m_Context->GetIndexFileHeader() : IndexFileHeader{};
+
+    const IndexFileHeader& header = m_Context->GetIndexFileHeader();
     const uint64_t documentCount = header.IFH_NumDocuments;
     const float averageDocLength = header.IFH_AvgDocLength;
-    const float totalDocs = static_cast<float>(documentCount > 0 ? documentCount : 1);
+    const float totalDocs = static_cast<float>(documentCount);
+
     const float dl = static_cast<float>(std::max(1u, docLength));
+    
     static constexpr float K1 = 1.2f;
     static constexpr float B = 0.75f;
 
