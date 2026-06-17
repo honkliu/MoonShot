@@ -473,8 +473,8 @@ auto reader = engine.GetReader("rust");   // OrIsr across AUT streams
 while (!reader->IsEnd()) {
     uint64_t doc  = reader->GetDocumentID();
     uint32_t tf   = reader->GetTermFreq();
-    const DocRecord* record = engine.GetDocRecord(doc);
-    float    score = reader->GetScore(record);
+    const DocDataEntry* entry = engine.GetDocDataEntry(doc);
+    float    score = reader->GetScore(entry);
     printf("doc=%-4llu  tf=%u  score=%.3f\n", doc, tf, score);
     reader->GoNext();
 }

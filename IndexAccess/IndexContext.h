@@ -12,6 +12,7 @@
 #include "ConfigParameters.h"
 #include "Tokenizer.h"
 #include "Embeddings.h"
+#include "FileAccess.h"
 
 #include <memory>
 #include <string>
@@ -139,7 +140,7 @@ public:
 
     /*
     * Build() — delegates to IndexSerializer::BuildBlocksForContext so the
-    * packing logic (continuation fix, PageSkipList) is in one place.
+    * block packing logic is in one place.
     */
     void Build()
     {
@@ -157,7 +158,6 @@ public:
 
         m_BlockTable.SetPagedLeafTermBlocks(std::move(br.BBR_HeadTermEntries),
             std::move(br.BBR_LeafTermPages));
-        m_BlockTable.SetPageSkipData(std::move(br.BBR_PageSkipList));
 
         m_Built = true;
         m_LoadedFromDisk = false;
@@ -215,7 +215,7 @@ public:
 
     const DocDataEntry* GetDocDataEntry(uint64_t docId) const
     {
-        if (!m_DocData || docId >= m_TotalDocs)
+        if (!m_DocData || docId >= m_IndexFileHeader.IFH_NumDocuments)
             return nullptr;
 
         const auto* entry = reinterpret_cast<const DocDataEntry*>(m_DocData + docId * DOC_REC_SIZE);
@@ -252,18 +252,18 @@ public:
         if (!IndexSerializer::Save(*m_Store, path)) return false;
 
         // Wire up FileBlockManager so cache misses reload from the .idx file.
-        IndexLayoutInfo li;
-        if (!IndexSerializer::LoadLayout(path, li))
+        IndexFileHeader header{};
+        if (!ReadIndexHeader(path, header))
             return true;  // save succeeded; FileBlockManager wiring is best-effort
 
-        auto fm = make_shared<FileBlockManager>(sizeof(IndexBlock), li.ILI_BlocksOffset);
+        auto fm = make_shared<FileBlockManager>(sizeof(IndexBlock), header.IFH_IndexBlockOffset);
         if (fm->open(path))
             m_BlockTable.SetFileManager(std::move(fm));
 
-        auto leafFm = make_shared<FileBlockManager>(sizeof(LeafTermPage), li.ILI_LeafBlocksOffset);
+        auto leafFm = make_shared<FileBlockManager>(sizeof(LeafTermPage), header.IFH_LeafTermPageOffset);
         if (leafFm->open(path))
             m_BlockTable.SetLeafTermFileManager(std::move(leafFm));
-        m_BlockTable.ReserveLeafTermPageMap(static_cast<uint32_t>(std::min<uint64_t>(li.ILI_NumLeafBlocks, UINT32_MAX)));
+        m_BlockTable.ReserveLeafTermPageMap(static_cast<uint32_t>(std::min<uint64_t>(LeafTermPageCount(header), UINT32_MAX)));
 
         return true;
     }
@@ -274,59 +274,59 @@ public:
 
         ClearPinnedIndexData();
 
-        IndexLayoutInfo li;
-        if (!IndexSerializer::LoadLayout(m_IndexPath.c_str(), li))
+        if (!ReadIndexHeader(m_IndexPath.c_str(), m_IndexFileHeader))
         {
             std::cerr << "Failed to load index: " << m_IndexPath
                       << " (unsupported/corrupt format; rebuild with current moon.exe)\n";
+            ResetLoadedRuntimeState();
             return;
         }
 
-        m_IndexFileHeader = li.ILI_Header;
-        m_IndexLayout = li;
-        m_BlockTable.Reset(PostingBlockCacheSlots(li.ILI_NumBlocks));
-        m_BlockTable.ReserveBlockMap(static_cast<uint32_t>(std::min<uint64_t>(li.ILI_NumBlocks, UINT32_MAX)));
-        m_BlockTable.SetHeadTermEntries(std::move(li.ILI_HeadTermEntries), static_cast<uint32_t>(std::min<uint64_t>(li.ILI_NumLeafBlocks, UINT32_MAX)));
-        m_BlockTable.SetPageSkipData(std::move(li.ILI_PageSkipData));
+        std::vector<HeadTermEntry> headTermEntries;
+        if (!ReadHeadTermEntries(m_IndexPath.c_str(), m_IndexFileHeader, headTermEntries))
+        {
+            std::cerr << "Failed to read HeadTermEntry table for: " << m_IndexPath << "\n";
+            ResetLoadedRuntimeState();
+            return;
+        }
+
+        m_BlockTable.Reset(PostingBlockCacheSlots(IndexBlockCount(m_IndexFileHeader)));
+        m_BlockTable.ReserveBlockMap(static_cast<uint32_t>(std::min<uint64_t>(IndexBlockCount(m_IndexFileHeader), UINT32_MAX)));
+        m_BlockTable.SetHeadTermEntries(std::move(headTermEntries), static_cast<uint32_t>(std::min<uint64_t>(LeafTermPageCount(m_IndexFileHeader), UINT32_MAX)));
 
         ClearDocDataOnly();
-        ClearLeafTermPagesOnly();
-        ClearIndexBlocksOnly();
 
-        const uint64_t docdata_bytes = li.ILI_Header.IFH_DocDataSize;
+        const uint64_t docdata_bytes = m_IndexFileHeader.IFH_DocDataSize;
 
         if (!AllocatePinnedSection(docdata_bytes, m_DocDataBase, m_DocData, m_DocDataBytes))
         {
             std::cerr << "Failed to allocate pinned DocData memory for: " << m_IndexPath << "\n";
-            ClearPinnedIndexData();
+            ResetLoadedRuntimeState();
             return;
         }
 
-        if (!IndexSerializer::ReadSections(m_IndexPath.c_str(),
-                                           li.ILI_DocDataOffset, m_DocData, docdata_bytes,
-                                           0, nullptr, 0,
-                                           0, nullptr, 0))
+        FileAccess indexFile(m_IndexPath.c_str());
+        if (!indexFile.Init()
+            || !ReadExact(indexFile, m_IndexFileHeader.IFH_DocDataOffset, m_DocData, docdata_bytes))
         {
             std::cerr << "Failed to read DocData for: " << m_IndexPath << "\n";
-            ClearPinnedIndexData();
+            ResetLoadedRuntimeState();
             return;
         }
 
         m_DocDataPageCount        = m_DocDataBytes / PAGE_SIZE;
-        m_TotalDocs               = std::min<uint64_t>(li.ILI_Header.IFH_NumDocuments, docdata_bytes / DOC_REC_SIZE);
-        m_AvgDocLen               = li.ILI_Header.IFH_AvgDocLength > 0.0f ? li.ILI_Header.IFH_AvgDocLength : 1.0f;
         RefreshStoreFromLoadedDocData();
 
-        auto fm = make_shared<FileBlockManager>(sizeof(IndexBlock), li.ILI_BlocksOffset);
+        auto fm = make_shared<FileBlockManager>(sizeof(IndexBlock), m_IndexFileHeader.IFH_IndexBlockOffset);
         if (fm->open(m_IndexPath.c_str())) {
             m_BlockTable.SetFileManager(std::move(fm));
         }
 
-        auto leafFm = make_shared<FileBlockManager>(sizeof(LeafTermPage), li.ILI_LeafBlocksOffset);
+        auto leafFm = make_shared<FileBlockManager>(sizeof(LeafTermPage), m_IndexFileHeader.IFH_LeafTermPageOffset);
         if (leafFm->open(m_IndexPath.c_str())) {
             m_BlockTable.SetLeafTermFileManager(std::move(leafFm));
         }
-        m_BlockTable.ReserveLeafTermPageMap(static_cast<uint32_t>(std::min<uint64_t>(li.ILI_NumLeafBlocks, UINT32_MAX)));
+        m_BlockTable.ReserveLeafTermPageMap(static_cast<uint32_t>(std::min<uint64_t>(LeafTermPageCount(m_IndexFileHeader), UINT32_MAX)));
 
         m_Executor = IndexSearchExecutor(this);
         m_Built    = true;
@@ -352,21 +352,10 @@ private:
     bool                         m_Built;
     bool                         m_LoadedFromDisk;
     IndexFileHeader              m_IndexFileHeader{};
-    IndexLayoutInfo              m_IndexLayout{};
     std::unique_ptr<uint8_t[]>   m_DocDataBase;
     uint8_t*                     m_DocData = nullptr;
     uint64_t                     m_DocDataBytes = 0;
     uint64_t                     m_DocDataPageCount = 0;
-    std::unique_ptr<uint8_t[]>   m_LeafTermPagesBase;
-    uint8_t*                     m_LeafTermPages = nullptr;
-    uint64_t                     m_LeafTermPagesBytes = 0;
-    uint64_t                     m_LeafTermPageCountPinned = 0;
-    std::unique_ptr<uint8_t[]>   m_IndexBlocksBase;
-    uint8_t*                     m_IndexBlocks = nullptr;
-    uint64_t                     m_IndexBlocksBytes = 0;
-    uint64_t                     m_IndexBlockCountPinned = 0;
-    uint64_t                     m_TotalDocs = 0;
-    float                        m_AvgDocLen = 1.0f;
 
     static uint32_t PostingBlockCacheSlots(uint64_t postingBlockCount)
     {
@@ -390,37 +379,21 @@ private:
         m_DocData = nullptr;
         m_DocDataBytes = 0;
         m_DocDataPageCount = 0;
-        m_TotalDocs = 0;
-        m_AvgDocLen = 1.0f;
-    }
-
-    void ClearLeafTermPagesOnly()
-    {
-        if (m_LeafTermPages)
-            UnpinMemoryPages(m_LeafTermPages, static_cast<size_t>(m_LeafTermPagesBytes));
-        m_LeafTermPagesBase.reset();
-        m_LeafTermPages = nullptr;
-        m_LeafTermPagesBytes = 0;
-        m_LeafTermPageCountPinned = 0;
-    }
-
-    void ClearIndexBlocksOnly()
-    {
-        if (m_IndexBlocks)
-            UnpinMemoryPages(m_IndexBlocks, static_cast<size_t>(m_IndexBlocksBytes));
-        m_IndexBlocksBase.reset();
-        m_IndexBlocks = nullptr;
-        m_IndexBlocksBytes = 0;
-        m_IndexBlockCountPinned = 0;
     }
 
     void ClearPinnedIndexData()
     {
         ClearDocDataOnly();
-        ClearLeafTermPagesOnly();
-        ClearIndexBlocksOnly();
         m_IndexFileHeader = {};
-        m_IndexLayout = {};
+    }
+
+    void ResetLoadedRuntimeState()
+    {
+        ClearPinnedIndexData();
+        m_BlockTable.Reset(PostingBlockCacheSlots(0));
+        m_Executor = IndexSearchExecutor(this);
+        m_Built = false;
+        m_LoadedFromDisk = false;
     }
 
     static uintptr_t AlignUp(uintptr_t value, uintptr_t alignment)
@@ -431,6 +404,85 @@ private:
     static uint64_t PageAlignedBytes(uint64_t bytes)
     {
         return ((bytes + PAGE_SIZE - 1) / PAGE_SIZE) * PAGE_SIZE;
+    }
+
+    static bool ReadExact(FileAccess& file, uint64_t offset, void* buffer, uint64_t bytes)
+    {
+        if (bytes == 0)
+            return true;
+        if (!buffer || !file.SetPosition(offset))
+            return false;
+
+        uint8_t* output = static_cast<uint8_t*>(buffer);
+        uint64_t remaining = bytes;
+        while (remaining > 0) {
+            const int chunk = static_cast<int>(std::min<uint64_t>(remaining, 64ull * 1024ull * 1024ull));
+            const int read = file.GetData(output, chunk);
+            if (read <= 0)
+                return false;
+            output += read;
+            remaining -= static_cast<uint64_t>(read);
+        }
+        return true;
+    }
+
+    static uint64_t HeadTermEntryCount(const IndexFileHeader& header)
+    {
+        return header.IFH_HeadTermEntrySize / sizeof(HeadTermEntry);
+    }
+
+    static uint64_t LeafTermPageCount(const IndexFileHeader& header)
+    {
+        return header.IFH_LeafTermPageSize / sizeof(LeafTermPage);
+    }
+
+    static uint64_t IndexBlockCount(const IndexFileHeader& header)
+    {
+        return header.IFH_IndexBlockSize / sizeof(IndexBlock);
+    }
+
+    static bool ReadIndexHeader(const char* path, IndexFileHeader& header)
+    {
+        if (!path || !*path)
+            return false;
+
+        FileAccess file(path);
+        if (!file.Init())
+            return false;
+
+        header = {};
+        if (!ReadExact(file, 0, &header, sizeof(header))
+            || std::memcmp(header.IFH_Magic, INDEX_FILE_MAGIC, sizeof(INDEX_FILE_MAGIC)) != 0
+            || header.IFH_Version != INDEX_FORMAT_VERSION)
+        {
+            return false;
+        }
+
+        if (header.IFH_HeadTermEntrySize % sizeof(HeadTermEntry) != 0
+            || header.IFH_LeafTermPageSize % sizeof(LeafTermPage) != 0
+            || header.IFH_DocDataSize % DOC_REC_SIZE != 0
+            || header.IFH_IndexBlockSize % sizeof(IndexBlock) != 0)
+            return false;
+
+        return true;
+    }
+
+    static bool ReadHeadTermEntries(const char* path, const IndexFileHeader& header, std::vector<HeadTermEntry>& entries)
+    {
+        entries.clear();
+        const uint64_t bytes = header.IFH_HeadTermEntrySize;
+        if (bytes == 0)
+            return true;
+
+        FileAccess file(path);
+        if (!file.Init())
+            return false;
+
+        entries.resize(static_cast<size_t>(HeadTermEntryCount(header)));
+        if (!ReadExact(file, header.IFH_HeadTermEntryOffset, entries.data(), bytes))
+            return false;
+
+        return true;
     }
 
     bool AllocatePinnedSection(uint64_t logicalBytes,
@@ -499,21 +551,21 @@ private:
         }
 
         PinMemoryPages(m_DocData, static_cast<size_t>(pageBytes));
-        m_TotalDocs = maxDocId + 1;
-        m_AvgDocLen = m_TotalDocs ? static_cast<float>(totalLen) / static_cast<float>(m_TotalDocs) : 1.0f;
+        const uint64_t totalDocs = maxDocId + 1;
+        const float avgDocLen = totalDocs ? static_cast<float>(totalLen) / static_cast<float>(totalDocs) : 1.0f;
         std::memcpy(m_IndexFileHeader.IFH_Magic, INDEX_FILE_MAGIC, sizeof(INDEX_FILE_MAGIC));
         m_IndexFileHeader.IFH_Version = INDEX_FORMAT_VERSION;
-        m_IndexFileHeader.IFH_NumDocuments = m_TotalDocs;
-        m_IndexFileHeader.IFH_AvgDocLength = m_AvgDocLen;
+        m_IndexFileHeader.IFH_NumDocuments = totalDocs;
+        m_IndexFileHeader.IFH_AvgDocLength = avgDocLen;
     }
 
     void RefreshStoreFromLoadedDocData()
     {
         m_Store = make_shared<PostingStore>();
-        if (!m_DocData || m_TotalDocs == 0)
+        if (!m_DocData || m_IndexFileHeader.IFH_NumDocuments == 0)
             return;
 
-        for (uint64_t docId = 0; docId < m_TotalDocs; ++docId) {
+        for (uint64_t docId = 0; docId < m_IndexFileHeader.IFH_NumDocuments; ++docId) {
             const auto* entry = reinterpret_cast<const DocDataEntry*>(m_DocData + docId * DOC_REC_SIZE);
             if (entry->DDE_DocID != docId)
                 continue;

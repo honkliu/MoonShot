@@ -118,7 +118,7 @@ The service computes the full ranked result set to return `total`, then emits on
 
 ### `GET /vector-search`
 
-Searches document embeddings stored inside `DocData`. Each `DocRecord` carries a 128-dimensional half-precision vector payload (`DR_VectorHalf[128]`), loaded with the main index. No vector sidecar is required for vector payloads.
+Searches document embeddings stored inside `DocData`. Each `DocDataEntry` carries an int8 vector payload (`DDE_VectorData`) plus vector dimensions/format metadata, loaded with the main index. No vector sidecar is required for vector payloads.
 
 Text query form:
 
@@ -496,5 +496,5 @@ That keeps browser integration simple without giving up MoonShot's native search
 - Keep `DocData.path` lookup server-side so clients receive usable paths directly.
 - Keep the browser/WASM viewer separate from this service. The viewer is an inspection/debug tool; `shennong` is the production-style query service.
 - `moon -name` writes URL/path tokens to the `U` stream so `site:` and `-site:` can work.
-- `moon -name` writes document embeddings into `DocRecord::DR_VectorHalf`; there is no vector payload sidecar.
-- Existing indexes built before this change do not contain URL stream tokens or DocRecord embeddings. Re-run `moon -name <path>` to rebuild before testing `site:` / `-site:` or `/vector-search`.
+- `moon -name` writes document embeddings into `DocDataEntry::DDE_VectorData`; there is no vector payload sidecar.
+- Existing indexes built before this change do not contain URL stream tokens or DocDataEntry embeddings. Re-run `moon -name <path>` to rebuild before testing `site:` / `-site:` or `/vector-search`.

@@ -686,6 +686,58 @@ void TestBigram()
 
 } // namespace IndexAccessTests
 
+namespace IndexAccessTests {
+
+void TestContinuationPostings()
+{
+    IndexContext engine;
+    auto writer = engine.GetWriter();
+
+    constexpr uint32_t DOC_COUNT = 5000;
+    for (uint32_t docId = 0; docId < DOC_COUNT; ++docId) {
+        writer->Write(g_tokenizer.Tokenize("continuationterm"), docId, "Title");
+        writer->SetDocImportance(docId, 0.1f);
+    }
+
+    auto reader = engine.GetStreamReader("continuationtermT");
+    uint32_t seen = 0;
+    uint64_t expectedDoc = 0;
+    while (!reader->IsEnd()) {
+        assert(reader->GetDocumentID() == expectedDoc);
+        ++seen;
+        ++expectedDoc;
+        reader->GoNext();
+    }
+
+    assert(seen == DOC_COUNT && "Continuation postings must not stop at first block");
+    std::cout << "  continuation postings traversed: " << seen << "\n";
+}
+
+void TestHeadTermPrefixBoundary()
+{
+    IndexContext engine;
+    auto writer = engine.GetWriter();
+    const std::string prefix = "abcdefghijklmnopqrstuvwxyz";
+
+    writer->Write({prefix}, 0, "Title");
+    writer->SetDocImportance(0, 0.1f);
+
+    for (uint32_t i = 1; i <= 260; ++i) {
+        std::string token = prefix + "x" + std::to_string(i);
+        writer->Write({token}, i, "Title");
+        writer->SetDocImportance(i, 0.1f);
+    }
+
+    auto reader = engine.GetStreamReader((prefix + "T").c_str());
+    assert(!reader->IsEnd());
+    assert(reader->GetDocumentID() == 0);
+    reader->GoNext();
+    assert(reader->IsEnd());
+    std::cout << "  head prefix boundary term found doc 0\n";
+}
+
+} // namespace IndexAccessTests
+
 std::map<std::string, std::function<void()>> testRegistry = {
     {"TestBuildIndex",       IndexAccessTests::TestBuildIndex},
     {"TestSingleTermSearch", IndexAccessTests::TestSingleTermSearch},
@@ -699,4 +751,6 @@ std::map<std::string, std::function<void()>> testRegistry = {
     {"TestEndToEnd",         IndexAccessTests::TestEndToEnd},
     {"TestDiskPersistence",  IndexAccessTests::TestDiskPersistence},
     {"TestBigram",           IndexAccessTests::TestBigram},
+    {"TestContinuationPostings", IndexAccessTests::TestContinuationPostings},
+    {"TestHeadTermPrefixBoundary", IndexAccessTests::TestHeadTermPrefixBoundary},
 };

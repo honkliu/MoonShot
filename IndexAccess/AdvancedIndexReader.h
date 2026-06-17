@@ -26,7 +26,8 @@ class IndexContext;
 *
 * Multi-block spanning:
 *   GoNext() / GoUntil() use LTE_ContinuationBlockCount from the LeafTermEntry.
-*   This allows the tail of a continuation block to host unrelated term starts.
+*   Posting bytes store absolute VBC (docID, TF) pairs, so continuation blocks
+*   reopen without a base docID.
 *
 * Term frequency and BM25 score live HERE only.
 * Composite readers (And/Or/Not) aggregate but do not own TF or BM25.
@@ -86,7 +87,6 @@ class AdvancedIndexReader : public IndexReader
         uint32_t                    m_BlockSeqNumber  = 0;
         uint32_t                    m_InitialBlockSeq = 0;   // first block of this term
         uint32_t                    m_DocFreq         = 0;
-        uint32_t                    m_PageSkipOffset  = 0;   // 0 = no skip list
         uint32_t                    m_TotalContinuationBlocks = 0;
         uint32_t                    m_RemainingContinuationBlocks = 0;
         IndexBlockTable*            m_BlockTable      = nullptr;
@@ -96,7 +96,7 @@ class AdvancedIndexReader : public IndexReader
         bool HasMoreBlocks() const { return m_RemainingContinuationBlocks > 0; }
 
         /* Open decoder on a continuation block, reading cont_len from the block header. */
-        void OpenContinuation(IndexBlock* blk, uint64_t lastDoc);
+        void OpenContinuation(IndexBlock* blk);
 };
 
 #endif

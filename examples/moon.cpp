@@ -390,55 +390,43 @@ static void vb_write(uint64_t v, std::vector<uint8_t>& out)
     out.push_back(static_cast<uint8_t>(v));
 }
 
-static bool vb_read(const uint8_t* data, size_t length, size_t& offset, uint64_t& value)
-{
-    value = 0;
-
-    uint32_t shift = 0;
-    while (offset < length && shift < 64) {
-        const uint8_t byte = data[offset++];
-        value |= static_cast<uint64_t>(byte & 0x7fu) << shift;
-
-        if ((byte & 0x80u) == 0)
-            return true;
-
-        shift += 7;
-    }
-
-    return false;
-}
-
-static uint64_t DecodeLastDocID(const uint8_t* data, size_t length)
-{
-    size_t offset = 0;
-    uint64_t docID = 0;
-
-    while (offset < length) {
-        uint64_t docDelta = 0;
-        if (!vb_read(data, length, offset, docDelta))
-            return docID;
-
-        uint64_t termFrequency = 0;
-        if (!vb_read(data, length, offset, termFrequency))
-            return docID;
-
-        docID += docDelta;
-    }
-
-    return docID;
-}
-
 static std::vector<uint8_t> EncodePostings(const std::vector<IndexEntry>& entries)
 {
     std::vector<uint8_t> bytes;
     bytes.reserve(entries.size() * 3);
-    uint64_t prev = 0;
     for (const auto& e : entries) {
-        vb_write(e.IE_DocID - prev, bytes);
+        vb_write(e.IE_DocID, bytes);
         vb_write(e.IE_TermFrequency, bytes);
-        prev = e.IE_DocID;
     }
     return bytes;
+}
+
+static bool ReadVbcPairEnd(const uint8_t* data, size_t size, size_t& offset)
+{
+    auto readOne = [&]() -> bool {
+        while (offset < size) {
+            uint8_t byte = data[offset++];
+            if ((byte & 0x80u) == 0) return true;
+        }
+        return false;
+    };
+    return readOne() && readOne();
+}
+
+static size_t PostingPrefixBytes(const uint8_t* data, size_t size, size_t capacity)
+{
+    size_t cursor = 0;
+    size_t lastPairEnd = 0;
+    size_t limit = std::min(size, capacity);
+    while (cursor < limit) {
+        size_t before = cursor;
+        if (!ReadVbcPairEnd(data, size, cursor) || cursor > limit) {
+            cursor = before;
+            break;
+        }
+        lastPairEnd = cursor;
+    }
+    return lastPairEnd;
 }
 
 static void DumpRun(const PostingStore& store, const std::string& runPath)
@@ -492,8 +480,6 @@ private:
     }
 };
 
-struct HeadTermEntryOut { std::string HTE_FirstTerm; uint32_t HTE_LeafTermBlockID = 0; };
-
 class HeadLeafTermTableWriter {
 public:
     void add(const std::string& term,
@@ -501,11 +487,10 @@ public:
              uint32_t indexBlockID,
              uint32_t indexOffset,
              uint32_t indexLength,
-             uint32_t pageSkipOffset,
              uint32_t continuationBlockCount,
              uint32_t flags)
     {
-        size_t entryBytes = 2u + term.size() + 7u * sizeof(uint32_t);
+        size_t entryBytes = 2u + term.size() + 6u * sizeof(uint32_t);
         if (m_Count > 0 && m_Group.size() + entryBytes > PAGE_SIZE) flush();
 
         if (m_Count == 0) {
@@ -519,28 +504,20 @@ public:
         write_u32(m_Group, indexBlockID);
         write_u32(m_Group, indexOffset);
         write_u32(m_Group, indexLength);
-        write_u32(m_Group, pageSkipOffset);
         write_u32(m_Group, continuationBlockCount);
         write_u32(m_Group, flags);
         ++m_Count;
     }
 
-    std::vector<uint8_t> finish()
+    void finish()
     {
         flush();
-        std::vector<uint8_t> out;
-        write_u32(out, static_cast<uint32_t>(m_HeadTermEntries.size()));
-        for (const auto& d : m_HeadTermEntries) {
-            write_u16(out, static_cast<uint16_t>(d.HTE_FirstTerm.size()));
-            out.insert(out.end(), d.HTE_FirstTerm.begin(), d.HTE_FirstTerm.end());
-            write_u32(out, d.HTE_LeafTermBlockID);
-        }
-        write_u32(out, m_LeafTermBlockCount);
-        out.insert(out.end(), m_LeafTermPages.begin(), m_LeafTermPages.end());
-        return out;
     }
+
+    const std::vector<HeadTermEntry>& headEntries() const { return m_HeadTermEntries; }
+    const std::vector<uint8_t>& leafPages() const { return m_LeafTermPages; }
 private:
-    std::vector<HeadTermEntryOut> m_HeadTermEntries;
+    std::vector<HeadTermEntry> m_HeadTermEntries;
     std::vector<uint8_t> m_LeafTermPages;
     std::vector<uint8_t> m_Group;
     std::string m_FirstTerm;
@@ -550,7 +527,10 @@ private:
         if (m_Count == 0) return;
         std::memcpy(m_Group.data(), &m_Count, 4);
         if (m_Group.size() < PAGE_SIZE) m_Group.resize(PAGE_SIZE, 0);
-        m_HeadTermEntries.push_back({m_FirstTerm, m_LeafTermBlockCount++});
+        HeadTermEntry head{};
+        head.HTE_LeafTermBlockID = m_LeafTermBlockCount++;
+        head.SetFirstTerm(m_FirstTerm);
+        m_HeadTermEntries.push_back(head);
         m_LeafTermPages.insert(m_LeafTermPages.end(), m_Group.begin(), m_Group.end());
         m_Group.clear();
         m_FirstTerm.clear();
@@ -572,8 +552,6 @@ static void SaveFromRuns(const std::string& idxPath,
 
     constexpr size_t DATA_CAP = sizeof(IndexBlock::IB_Data);
     std::vector<IndexBlock> blocks;
-    std::vector<uint64_t> pageskip;
-    pageskip.push_back(UINT64_MAX);
     HeadLeafTermTableWriter leafTermWriter;
     IndexBlock cur{};
     size_t wptr = 0;
@@ -613,22 +591,23 @@ static void SaveFromRuns(const std::string& idxPath,
         uint32_t indexBlockID = seq;
         uint32_t indexOffset = static_cast<uint32_t>(wptr);
         size_t src = 0;
-        size_t first = std::min(bytes.size(), DATA_CAP - wptr);
+        size_t first = PostingPrefixBytes(bytes.data(), bytes.size(), DATA_CAP - wptr);
+        if (first == 0) {
+            flushBlock(false);
+            first = PostingPrefixBytes(bytes.data(), bytes.size(), DATA_CAP);
+            if (first == 0) continue;
+        }
         std::memcpy(cur.IB_Data + wptr, bytes.data(), first);
         wptr += first; src += first;
         uint32_t indexLength = static_cast<uint32_t>(first);
-        uint32_t pageSkipOffset = 0;
         uint32_t contCount = 0;
         if (src < bytes.size()) {
             flushBlock(true);
-            pageSkipOffset = static_cast<uint32_t>(pageskip.size());
-            pageskip.push_back(0);
             while (src < bytes.size()) {
                 constexpr size_t CONT_HDR = 4;
-                size_t take = std::min(bytes.size() - src, DATA_CAP - CONT_HDR);
+                size_t take = PostingPrefixBytes(bytes.data() + src, bytes.size() - src, DATA_CAP - CONT_HDR);
+                if (take == 0) break;
                 bool more = take < bytes.size() - src;
-                uint64_t baseDoc = DecodeLastDocID(bytes.data(), src);
-                pageskip.push_back(baseDoc);
                 uint16_t marker = BLOCK_CONTINUATION_MARKER;
                 uint16_t len = static_cast<uint16_t>(take);
                 std::memcpy(cur.IB_Data + wptr, &marker, 2); wptr += 2;
@@ -638,16 +617,13 @@ static void SaveFromRuns(const std::string& idxPath,
                 ++contCount;
                 if (more) flushBlock(true);
             }
-            pageskip.push_back(UINT64_MAX);
         }
-        leafTermWriter.add(term, static_cast<uint32_t>(compact.size()), indexBlockID, indexOffset, indexLength, pageSkipOffset, contCount, 0);
+        leafTermWriter.add(term, static_cast<uint32_t>(compact.size()), indexBlockID, indexOffset, indexLength, contCount, 0);
         ++totalTerms;
     }
     if (wptr > 0) flushBlock(false);
 
-    auto si = leafTermWriter.finish();
-    std::vector<uint8_t> ps(pageskip.size() * 8);
-    if (!pageskip.empty()) std::memcpy(ps.data(), pageskip.data(), ps.size());
+    leafTermWriter.finish();
 
     std::vector<DocDataEntry> docdata(docs.size());
     for (size_t i = 0; i < docs.size(); ++i) {
@@ -668,9 +644,11 @@ static void SaveFromRuns(const std::string& idxPath,
     }
 
     uint64_t hdrSize = sizeof(IndexFileHeader);
-    uint64_t siOff = hdrSize, siSize = si.size();
-    uint64_t psOff = siOff + siSize, psSize = ps.size();
-    uint64_t ddOff = psOff + psSize, ddSize = docdata.size() * sizeof(DocDataEntry);
+    uint64_t headOff = hdrSize;
+    uint64_t headSize = leafTermWriter.headEntries().size() * sizeof(HeadTermEntry);
+    uint64_t leafOff = headOff + headSize;
+    uint64_t leafSize = leafTermWriter.leafPages().size();
+    uint64_t ddOff = leafOff + leafSize, ddSize = docdata.size() * sizeof(DocDataEntry);
     uint64_t rawBlocks = ddOff + ddSize;
     uint64_t blkOff = PageAlignedBytes(rawBlocks);
 
@@ -681,15 +659,18 @@ static void SaveFromRuns(const std::string& idxPath,
     IndexFileHeader hdr{};
     std::memcpy(hdr.IFH_Magic, INDEX_FILE_MAGIC, 8);
     hdr.IFH_Version = INDEX_FORMAT_VERSION;
+    uint64_t totalDocLen = 0;
+    for (const auto& doc : docs) totalDocLen += doc.doc_len;
+    hdr.IFH_AvgDocLength = docs.empty() ? 1.0f : static_cast<float>(totalDocLen) / static_cast<float>(docs.size());
     hdr.IFH_NumDocuments = docs.size();
     hdr.IFH_NumTerms = totalTerms;
-    hdr.IFH_SubIndexOffset = siOff; hdr.IFH_SubIndexSize = siSize;
-    hdr.IFH_PageSkipOffset = psOff; hdr.IFH_PageSkipSize = psSize;
+    hdr.IFH_HeadTermEntryOffset = headOff; hdr.IFH_HeadTermEntrySize = headSize;
+    hdr.IFH_LeafTermPageOffset = leafOff; hdr.IFH_LeafTermPageSize = leafSize;
     hdr.IFH_DocDataOffset = ddOff; hdr.IFH_DocDataSize = ddSize;
-    hdr.IFH_BlocksOffset = blkOff; hdr.IFH_NumBlocks = blocks.size();
+    hdr.IFH_IndexBlockOffset = blkOff; hdr.IFH_IndexBlockSize = blocks.size() * sizeof(IndexBlock);
     fwrite(&hdr, sizeof(hdr), 1, f);
-    fwrite(si.data(), 1, si.size(), f);
-    fwrite(ps.data(), 1, ps.size(), f);
+    if (!leafTermWriter.headEntries().empty()) fwrite(leafTermWriter.headEntries().data(), sizeof(HeadTermEntry), leafTermWriter.headEntries().size(), f);
+    if (!leafTermWriter.leafPages().empty()) fwrite(leafTermWriter.leafPages().data(), 1, leafTermWriter.leafPages().size(), f);
     if (!docdata.empty()) fwrite(docdata.data(), sizeof(DocDataEntry), docdata.size(), f);
     uint64_t pos = FileOffset(f);
     if (pos < blkOff) {

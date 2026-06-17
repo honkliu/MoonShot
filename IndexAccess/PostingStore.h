@@ -21,7 +21,7 @@ struct IndexEntry {
 * Sorted array of entries for one (term+stream) key, e.g. "foxT".
 *
 * entries  — decoded form; used by the writer to accumulate postings.
-* bytes    — VarByte-delta-encoded form; used by TermIndexReader via
+* bytes    — VarByte-encoded absolute (docID, termFrequency) pairs; used by TermIndexReader via
 *             UnifiedDecoder::OpenRaw().  Computed lazily on first call to
 *             GetBytes() so encoding only runs once per posting list.
 */
@@ -64,11 +64,9 @@ private:
         bytes.clear();
         bytes.reserve(entries.size() * 3);
 
-        uint64_t prev = 0;
         for (const auto& e : entries) {
-            vb_write(e.IE_DocID - prev, bytes);
+            vb_write(e.IE_DocID, bytes);
             vb_write(e.IE_TermFrequency, bytes);
-            prev = e.IE_DocID;
         }
     }
 };

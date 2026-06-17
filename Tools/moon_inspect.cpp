@@ -35,7 +35,6 @@ struct Index {
     std::vector<HeadTermEntry> directory;
     std::vector<LeafTermBlock> header_blocks;
     std::vector<LeafTermEntry> LTB_Entries;
-    std::vector<uint64_t> pageskip;
     std::vector<DocDataEntry> docs;
     std::vector<BlockView> blocks;
     std::string error;
@@ -118,19 +117,17 @@ static uint64_t vb_read(const uint8_t* data, size_t size, size_t& pos)
     return value;
 }
 
-static std::vector<IndexEntry> decode_IndexEntrys(const uint8_t* data, size_t size)
+static std::vector<IndexEntry> decode_IndexEntries(const uint8_t* data, size_t size)
 {
-    std::vector<IndexEntry> IndexEntrys;
-    uint64_t previous = 0;
+    std::vector<IndexEntry> entries;
     size_t pos = 0;
-    while (pos < size && IndexEntrys.size() < 12) {
-        uint64_t delta = vb_read(data, size, pos);
+    while (pos < size && entries.size() < 12) {
+        uint64_t docId = vb_read(data, size, pos);
         if (pos >= size) break;
         uint64_t tf = vb_read(data, size, pos);
-        previous += delta;
-        IndexEntrys.push_back({previous, static_cast<uint32_t>(tf)});
+        entries.push_back({docId, static_cast<uint32_t>(tf)});
     }
-    return IndexEntrys;
+    return entries;
 }
 
 static std::string doc_path(const DocDataEntry& entry)
@@ -185,23 +182,21 @@ static Index parse_index(const char* path)
         return index;
     }
 
-    if (index.hdr.IFH_SubIndexOffset + index.hdr.IFH_SubIndexSize <= size) {
-        const uint8_t* ptr = data + index.hdr.IFH_SubIndexOffset;
-        const uint8_t* end = ptr + index.hdr.IFH_SubIndexSize;
-        uint32_t dir_count = read_u32(ptr, end);
-        index.directory.reserve(dir_count);
-        for (uint32_t i = 0; i < dir_count && ptr < end; ++i) {
-            uint16_t len = read_u16(ptr, end);
-            std::string first = read_string(ptr, end, len);
-            uint32_t block_id = read_u32(ptr, end);
-            index.directory.push_back({std::move(first), block_id});
-        }
+    if (index.hdr.IFH_HeadTermEntryOffset + index.hdr.IFH_HeadTermEntrySize <= size
+        && index.hdr.IFH_HeadTermEntrySize % sizeof(HeadTermEntry) == 0) {
+        size_t count = static_cast<size_t>(index.hdr.IFH_HeadTermEntrySize / sizeof(HeadTermEntry));
+        index.directory.resize(count);
+        std::memcpy(index.directory.data(), data + index.hdr.IFH_HeadTermEntryOffset, count * sizeof(HeadTermEntry));
+    }
 
-        uint32_t block_count = read_u32(ptr, end);
+    if (index.hdr.IFH_LeafTermPageOffset + index.hdr.IFH_LeafTermPageSize <= size
+        && index.hdr.IFH_LeafTermPageSize % sizeof(LeafTermPage) == 0) {
+        size_t block_count = static_cast<size_t>(index.hdr.IFH_LeafTermPageSize / sizeof(LeafTermPage));
         index.header_blocks.resize(block_count);
-        for (uint32_t block_index = 0; block_index < block_count && ptr < end; ++block_index) {
-            const uint8_t* page_start = ptr;
-            const uint8_t* page_end = std::min(page_start + PAGE_SIZE, end);
+        for (size_t block_index = 0; block_index < block_count; ++block_index) {
+            const uint8_t* page_start = data + index.hdr.IFH_LeafTermPageOffset + block_index * sizeof(LeafTermPage);
+            const uint8_t* page_end = page_start + PAGE_SIZE;
+            const uint8_t* ptr = page_start;
             uint32_t entry_count = read_u32(ptr, page_end);
             index.header_blocks[block_index].LTB_Entries.reserve(entry_count);
             for (uint32_t i = 0; i < entry_count && ptr < page_end; ++i) {
@@ -212,20 +207,12 @@ static Index parse_index(const char* path)
                 header.LTE_IndexBlockID = read_u32(ptr, page_end);
                 header.LTE_IndexOffset = read_u32(ptr, page_end);
                 header.LTE_IndexLength = read_u32(ptr, page_end);
-                header.LTE_PageSkipOffset = read_u32(ptr, page_end);
                 header.LTE_ContinuationBlockCount = read_u32(ptr, page_end);
                 header.LTE_Flags = read_u32(ptr, page_end);
                 index.LTB_Entries.push_back(header);
                 index.header_blocks[block_index].LTB_Entries.push_back(std::move(header));
             }
-            ptr = page_start + PAGE_SIZE;
         }
-    }
-
-    if (index.hdr.IFH_PageSkipOffset + index.hdr.IFH_PageSkipSize <= size) {
-        size_t count = static_cast<size_t>(index.hdr.IFH_PageSkipSize / sizeof(uint64_t));
-        index.pageskip.resize(count);
-        std::memcpy(index.pageskip.data(), data + index.hdr.IFH_PageSkipOffset, count * sizeof(uint64_t));
     }
 
     if (index.hdr.IFH_DocDataOffset + index.hdr.IFH_DocDataSize <= size) {
@@ -239,8 +226,9 @@ static Index parse_index(const char* path)
         terms_by_block[header.LTE_IndexBlockID].push_back(&header);
     }
 
-    for (uint64_t seq = 0; seq < index.hdr.IFH_NumBlocks; ++seq) {
-        uint64_t block_offset = index.hdr.IFH_BlocksOffset + seq * PAGE_SIZE;
+    const uint64_t indexBlockCount = index.hdr.IFH_IndexBlockSize / sizeof(IndexBlock);
+    for (uint64_t seq = 0; seq < indexBlockCount; ++seq) {
+        uint64_t block_offset = index.hdr.IFH_IndexBlockOffset + seq * PAGE_SIZE;
         if (block_offset + PAGE_SIZE > size) break;
 
         const uint8_t* block = data + block_offset;
@@ -262,7 +250,7 @@ static Index parse_index(const char* path)
                 size_t length = std::min<size_t>(header->LTE_IndexLength, INDEX_BLOCK_DATA_BYTES - header->LTE_IndexOffset);
                 TermView term;
                 term.header = header;
-                term.IndexEntrys = decode_IndexEntrys(ib_data + header->LTE_IndexOffset, length);
+                term.IndexEntrys = decode_IndexEntries(ib_data + header->LTE_IndexOffset, length);
                 view.terms.push_back(std::move(term));
             }
         }
@@ -305,24 +293,24 @@ static void emit(std::ostream& out, const Index& index, const char* path)
     kv("Documents", std::to_string(h.IFH_NumDocuments));
     kv("Average DocLength", std::to_string(h.IFH_AvgDocLength));
     kv("Terms", std::to_string(h.IFH_NumTerms));
-    kv("LeafTermEntryTable", std::format("0x{:016X} ({} B)", h.IFH_SubIndexOffset, h.IFH_SubIndexSize));
-    kv("PageSkipList", std::format("0x{:016X} ({} B)", h.IFH_PageSkipOffset, h.IFH_PageSkipSize));
+    kv("HeadTermEntry", std::format("0x{:016X} ({} B)", h.IFH_HeadTermEntryOffset, h.IFH_HeadTermEntrySize));
+    kv("LeafTermPage", std::format("0x{:016X} ({} B)", h.IFH_LeafTermPageOffset, h.IFH_LeafTermPageSize));
     kv("DocData", std::format("0x{:016X} ({} B)", h.IFH_DocDataOffset, h.IFH_DocDataSize));
-    kv("IndexEntry blocks", std::format("0x{:016X} count={}", h.IFH_BlocksOffset, h.IFH_NumBlocks));
+    kv("IndexEntry blocks", std::format("0x{:016X} ({} B)", h.IFH_IndexBlockOffset, h.IFH_IndexBlockSize));
     kv("File size", std::to_string(index.bytes.size()) + " B");
     out << "</div></div>";
 
     out << "<div class='panel' id='terms'><h3>Term Directory</h3><table><tr><th>HeaderBlk</th><th>First term</th></tr>";
     for (const auto& entry : index.directory) {
-        out << "<tr><td class='num'>" << entry.HTE_LeafTermBlockID << "</td><td class='mono key'>" << esc(entry.HTE_FirstTerm) << "</td></tr>";
+        out << "<tr><td class='num'>" << entry.HTE_LeafTermBlockID << "</td><td class='mono key'>" << esc(std::string(entry.FirstTerm())) << "</td></tr>";
     }
     out << "</table><h3>LeafTermBlocks</h3>";
     for (size_t block_id = 0; block_id < index.header_blocks.size(); ++block_id) {
         const auto& block = index.header_blocks[block_id];
         out << "<div class='card open'><div class='card-h'>LeafTermBlock <span class='num'>" << block_id << "</span> <span class='dim'>" << block.LTB_Entries.size() << " LTB_Entries</span></div><div class='card-b'>";
-        out << "<table><tr><th>Term</th><th>df</th><th>IndexEntryBlk</th><th>Off</th><th>Len</th><th>Cont</th><th>SkipOff</th></tr>";
+        out << "<table><tr><th>Term</th><th>df</th><th>IndexEntryBlk</th><th>Off</th><th>Len</th><th>Cont</th></tr>";
         for (const auto& term : block.LTB_Entries) {
-            out << "<tr onclick=\"showBlock(" << term.LTE_IndexBlockID << ")\"><td class='mono key'>" << esc(term.LTE_Term) << "</td><td class='num'>" << term.LTE_DocFreq << "</td><td class='num'>" << term.LTE_IndexBlockID << "</td><td class='num'>" << term.LTE_IndexOffset << "</td><td class='num'>" << term.LTE_IndexLength << "</td><td class='num'>" << term.LTE_ContinuationBlockCount << "</td><td class='num'>" << term.LTE_PageSkipOffset << "</td></tr>";
+            out << "<tr onclick=\"showBlock(" << term.LTE_IndexBlockID << ")\"><td class='mono key'>" << esc(term.LTE_Term) << "</td><td class='num'>" << term.LTE_DocFreq << "</td><td class='num'>" << term.LTE_IndexBlockID << "</td><td class='num'>" << term.LTE_IndexOffset << "</td><td class='num'>" << term.LTE_IndexLength << "</td><td class='num'>" << term.LTE_ContinuationBlockCount << "</td></tr>";
         }
         out << "</table></div></div>";
     }
