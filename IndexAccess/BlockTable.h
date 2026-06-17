@@ -29,8 +29,7 @@ static constexpr int PAGE_SIZE  = 4096;
 static constexpr int NUMBLOCKS  = 50;
 static constexpr size_t DOC_REC_SIZE = 1024;
 static constexpr size_t DOC_VECTOR_DIM = 128;
-static constexpr size_t DOC_VECTOR_STORAGE_BYTES = 512;
-static constexpr size_t DOC_VECTOR_STORAGE_MAX_DIM = DOC_VECTOR_STORAGE_BYTES / sizeof(uint16_t);
+static constexpr size_t DOC_VECTOR_STORAGE_MAX_DIM = 512;  // int8[512]
 static constexpr size_t DOC_PATH_MAX = 256;
 static constexpr uint8_t  INDEX_FILE_MAGIC[8] = {'M','O','O','N','S','H','O','T'};
 static constexpr uint32_t INDEX_FORMAT_VERSION = 10;
@@ -93,14 +92,14 @@ struct DocRecord {
     uint16_t DR_VectorDim;
     uint16_t DR_VectorFormat;
     uint8_t  DR_Reserved[154];
-    uint8_t  DR_VectorData[DOC_VECTOR_STORAGE_BYTES];
+    int8_t   DR_VectorData[DOC_VECTOR_STORAGE_MAX_DIM];  // 512-dim int8 vector
     uint8_t  DR_Path[DOC_PATH_MAX];
 };
 #pragma pack(pop)
 static_assert(sizeof(DocRecord) == DOC_REC_SIZE, "DocRecord must be exactly DOC_REC_SIZE bytes");
 static_assert(offsetof(DocRecord, DR_Path) == DOC_REC_SIZE - DOC_PATH_MAX, "DocRecord path must occupy the tail of the record");
 static_assert(offsetof(DocRecord, DR_VectorData) == 256, "DocRecord vector storage must start at byte 256");
-static_assert(sizeof(DocRecord::DR_VectorData) == DOC_VECTOR_STORAGE_BYTES, "DocRecord vector storage must be 512 bytes");
+static_assert(sizeof(DocRecord::DR_VectorData) == 512, "DocRecord vector storage must be 512 bytes (int8[512])");
 static_assert(offsetof(DocRecord, DR_DocID) % 8 == 0, "DR_DocID must be 64-bit aligned");
 static_assert(offsetof(DocRecord, DR_SourceFlags) % 8 == 0, "DR_SourceFlags must be 64-bit aligned");
 static_assert(offsetof(DocRecord, DR_LastModifiedEpochSeconds) % 8 == 0, "DR_LastModifiedEpochSeconds must be 64-bit aligned");
@@ -232,6 +231,19 @@ struct IndexFile {
     IndexBlock*      IF_DocSkipData;
     IndexBlock*      IF_Data;
     uint8_t*         IF_HeadLeafTermTable;
+};
+
+struct IndexLayoutInfo {
+    IndexFileHeader            ILI_Header{};
+    std::vector<HeadTermEntry> ILI_HeadTermEntries;
+    std::vector<uint64_t>      ILI_PageSkipData;
+    uint64_t ILI_BlocksOffset      = 0;
+    uint64_t ILI_NumBlocks         = 0;
+    uint64_t ILI_LeafBlocksOffset  = 0;
+    uint64_t ILI_NumLeafBlocks     = 0;
+    uint64_t ILI_DocDataOffset     = 0;
+    uint64_t ILI_DocDataSize       = 0;
+    uint64_t ILI_NumDocuments      = 0;
 };
 
 /*

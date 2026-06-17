@@ -658,8 +658,10 @@ static void SaveFromRuns(const std::string& idxPath,
             docdata[i].DR_VectorDim = static_cast<uint16_t>(docs[i].vector.size());
             docdata[i].DR_VectorFormat = 1;
             for (size_t j = 0; j < docs[i].vector.size(); ++j) {
-                const uint16_t encoded = EncodeFloat16(docs[i].vector[j]);
-                std::memcpy(&docdata[i].DR_VectorData[j * sizeof(uint16_t)], &encoded, sizeof(uint16_t));
+                // Quantize float32 to int8: clamp to [-128, 127]
+                const float val = docs[i].vector[j];
+                const float clipped = std::max(-128.0f, std::min(127.0f, val * 128.0f));
+                docdata[i].DR_VectorData[j] = static_cast<int8_t>(std::round(clipped));
             }
         }
         docdata[i].DR_PathLength = EncodeDocPath(docs[i].path, docdata[i].DR_Path);

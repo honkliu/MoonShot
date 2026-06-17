@@ -54,9 +54,16 @@ public:
                      uint64_t*                              num_documents_out = nullptr,
                      IndexFileHeader*                       header_out = nullptr);
 
-    static bool IsValidIndex(const char* path);
+    static bool LoadLayout(const char* path, IndexLayoutInfo& out);
 
-    static BlockResult BuildBlocksForContext(const PostingStore& store);
-};
+    static bool ReadSections(const char* path,
+                             uint64_t docdata_offset,
+                             uint8_t* docdata_out,
+                             uint64_t docdata_bytes,
+                             uint64_t leaf_blocks_offset,
+                             uint8_t* leaf_blocks_out,
+                             uint64_t leaf_blocks_bytes,
+                             uint64_t blocks_offset,
+                             uint8_t* blocks_out,
+                             uint64_t blocks_bytes);
 
-#endif

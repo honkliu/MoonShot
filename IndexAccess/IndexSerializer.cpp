@@ -312,13 +312,17 @@ bool IndexSerializer::Save(const PostingStore& store, const char* path)
         r.DR_FreshnessScoreHalf = EncodeFloat16(0.0f);
         r.DR_ClickScoreHalf = EncodeFloat16(0.0f);
         r.DR_EngagementScoreHalf = EncodeFloat16(0.0f);
-        if (const auto* vector = store.GetDocVector(id);
-            vector && !vector->empty() && vector->size() <= DOC_VECTOR_STORAGE_MAX_DIM) {
-            r.DR_VectorDim = static_cast<uint16_t>(vector->size());
-            r.DR_VectorFormat = 1;
-            for (size_t i = 0; i < vector->size(); ++i) {
-                const uint16_t encoded = EncodeFloat16((*vector)[i]);
-                std::memcpy(&r.DR_VectorData[i * sizeof(uint16_t)], &encoded, sizeof(uint16_t));
+        // Doc vectors are stored in the in-memory vector index, not in DocStats.
+        // DR_VectorData is int8_t[512], quantized from float32.
+        if (const auto* docVector = store.GetDocVector(id);
+            docVector && !docVector->empty() && docVector->size() <= DOC_VECTOR_STORAGE_MAX_DIM) {
+            r.DR_VectorDim = static_cast<uint16_t>(docVector->size());
+            r.DR_VectorFormat = 1;  // int8 quantized
+            for (size_t i = 0; i < docVector->size(); ++i) {
+                // Quantize float32 to int8: clamp to [-128, 127]
+                const float val = (*docVector)[i];
+                const float clipped = std::max(-128.0f, std::min(127.0f, val * 128.0f));
+                r.DR_VectorData[i] = static_cast<int8_t>(std::round(clipped));
             }
         }
         r.DR_PathLength = EncodeDocPath(ds.path, r.DR_Path);
@@ -389,18 +393,18 @@ bool IndexSerializer::Load(PostingStore&                           store,
     FILE* f = file.get();
     if (!f) return false;
 
-    IndexFileHeader hdr{};
-    if (fread(&hdr, sizeof(hdr), 1, f) != 1
-        || std::memcmp(hdr.IFH_Magic, INDEX_FILE_MAGIC, 8) != 0
-        || hdr.IFH_Version != INDEX_FORMAT_VERSION)
+    IndexFileHeader local_header{};
+    IndexFileHeader* hdr = header_out ? header_out : &local_header;
+    if (fread(hdr, sizeof(*hdr), 1, f) != 1
+        || std::memcmp(hdr->IFH_Magic, INDEX_FILE_MAGIC, 8) != 0
+        || hdr->IFH_Version != INDEX_FORMAT_VERSION)
     {
         return false;
     }
-    if (header_out) *header_out = hdr;
 
     /* ── Head/Leaf term table ─────────────────────────────────────────────*/
-    if ((headTermEntriesOut || leafTermPagesOut || leaf_blocks_offset_out || num_leaf_blocks_out) && hdr.IFH_SubIndexSize > 0) {
-        if (!seek_file(f, hdr.IFH_SubIndexOffset))
+    if ((headTermEntriesOut || leafTermPagesOut || leaf_blocks_offset_out || num_leaf_blocks_out) && hdr->IFH_SubIndexSize > 0) {
+        if (!seek_file(f, hdr->IFH_SubIndexOffset))
             return false;
 
         auto read_u16_file = [&]() -> uint16_t {
@@ -437,24 +441,24 @@ bool IndexSerializer::Load(PostingStore&                           store,
     }
 
     /* ── PageSkipList ─────────────────────────────────────────────────────*/
-    if (pageskip_out && hdr.IFH_PageSkipSize > 0) {
-        size_t n = static_cast<size_t>(hdr.IFH_PageSkipSize / 8);
+    if (pageskip_out && hdr->IFH_PageSkipSize > 0) {
+        size_t n = static_cast<size_t>(hdr->IFH_PageSkipSize / 8);
         pageskip_out->resize(n);
-        if (!seek_file(f, hdr.IFH_PageSkipOffset))
+        if (!seek_file(f, hdr->IFH_PageSkipOffset))
             return false;
         fread(pageskip_out->data(), 8, n, f);
     }
 
-    if (blocks_offset_out) *blocks_offset_out = hdr.IFH_BlocksOffset;
-    if (num_blocks_out)    *num_blocks_out    = hdr.IFH_NumBlocks;
-    if (docdata_offset_out) *docdata_offset_out = hdr.IFH_DocDataOffset;
-    if (docdata_size_out)   *docdata_size_out   = hdr.IFH_DocDataSize;
-    if (num_documents_out)  *num_documents_out  = hdr.IFH_NumDocuments;
+    if (blocks_offset_out) *blocks_offset_out = hdr->IFH_BlocksOffset;
+    if (num_blocks_out)    *num_blocks_out    = hdr->IFH_NumBlocks;
+    if (docdata_offset_out) *docdata_offset_out = hdr->IFH_DocDataOffset;
+    if (docdata_size_out)   *docdata_size_out   = hdr->IFH_DocDataSize;
+    if (num_documents_out)  *num_documents_out  = hdr->IFH_NumDocuments;
 
     /* ── DocData ──────────────────────────────────────────────────────────*/
     {
-        size_t n = static_cast<size_t>(hdr.IFH_DocDataSize / DOC_REC_SIZE);
-        if (!seek_file(f, hdr.IFH_DocDataOffset))
+        size_t n = static_cast<size_t>(hdr->IFH_DocDataSize / DOC_REC_SIZE);
+        if (!seek_file(f, hdr->IFH_DocDataOffset))
             return false;
         std::vector<DocRecord> recs(n);
         if (n > 0) fread(recs.data(), DOC_REC_SIZE, n, f);
@@ -466,9 +470,8 @@ bool IndexSerializer::Load(PostingStore&                           store,
             if (r.DR_VectorDim > 0 && r.DR_VectorDim <= DOC_VECTOR_STORAGE_MAX_DIM && r.DR_VectorFormat == 1) {
                 std::vector<float> vector(r.DR_VectorDim);
                 for (size_t i = 0; i < r.DR_VectorDim; ++i) {
-                    uint16_t encoded = 0;
-                    std::memcpy(&encoded, &r.DR_VectorData[i * sizeof(uint16_t)], sizeof(uint16_t));
-                    vector[i] = DecodeFloat16(encoded);
+                    // Dequantize int8 back to float32
+                    vector[i] = static_cast<float>(r.DR_VectorData[i]) / 128.0f;
                 }
                 store.SetDocVector(r.DR_DocID, std::move(vector));
             }
@@ -494,4 +497,99 @@ bool IndexSerializer::IsValidIndex(const char* path)
 BuildBlocksResult IndexSerializer::BuildBlocksForContext(const PostingStore& store)
 {
     return build_blocks(store);
+}
+
+bool IndexSerializer::LoadLayout(const char* path, IndexLayoutInfo& out)
+{
+    if (!path || !*path) return false;
+    FilePtr file = open_file(path, "rb");
+    FILE* f = file.get();
+    if (!f) return false;
+
+    out = {};
+    if (fread(&out.ILI_Header, sizeof(out.ILI_Header), 1, f) != 1
+        || std::memcmp(out.ILI_Header.IFH_Magic, INDEX_FILE_MAGIC, 8) != 0
+        || out.ILI_Header.IFH_Version != INDEX_FORMAT_VERSION)
+    {
+        return false;
+    }
+
+    const auto& hdr = out.ILI_Header;
+    if (hdr.IFH_SubIndexSize > 0) {
+        if (!seek_file(f, hdr.IFH_SubIndexOffset))
+            return false;
+
+        auto read_u16_file = [&]() -> uint16_t {
+            uint16_t v = 0; fread(&v, 2, 1, f); return v;
+        };
+        auto read_u32_file = [&]() -> uint32_t {
+            uint32_t v = 0; fread(&v, 4, 1, f); return v;
+        };
+        auto read_str_file = [&](size_t n) -> std::string {
+            std::string s(n, '\0');
+            if (n) fread(s.data(), 1, n, f);
+            return s;
+        };
+
+        uint32_t dir_count = read_u32_file();
+        out.ILI_HeadTermEntries.reserve(dir_count);
+        for (uint32_t i = 0; i < dir_count; ++i) {
+            uint16_t    kl    = read_u16_file();
+            std::string first = read_str_file(kl);
+            uint32_t    bidx  = read_u32_file();
+            out.ILI_HeadTermEntries.push_back({std::move(first), bidx});
+        }
+
+        uint32_t leaf_page_count = read_u32_file();
+        out.ILI_LeafBlocksOffset = file_pos(f);
+        out.ILI_NumLeafBlocks    = leaf_page_count;
+    }
+
+    if (hdr.IFH_PageSkipSize > 0) {
+        size_t n = static_cast<size_t>(hdr.IFH_PageSkipSize / 8);
+        out.ILI_PageSkipData.resize(n);
+        if (!seek_file(f, hdr.IFH_PageSkipOffset))
+            return false;
+        fread(out.ILI_PageSkipData.data(), 8, n, f);
+    }
+
+    out.ILI_BlocksOffset  = hdr.IFH_BlocksOffset;
+    out.ILI_NumBlocks     = hdr.IFH_NumBlocks;
+    out.ILI_DocDataOffset = hdr.IFH_DocDataOffset;
+    out.ILI_DocDataSize   = hdr.IFH_DocDataSize;
+    out.ILI_NumDocuments  = hdr.IFH_NumDocuments;
+    return true;
+}
+
+bool IndexSerializer::ReadSections(const char* path,
+                                   uint64_t docdata_offset,
+                                   uint8_t* docdata_out,
+                                   uint64_t docdata_bytes,
+                                   uint64_t leaf_blocks_offset,
+                                   uint8_t* leaf_blocks_out,
+                                   uint64_t leaf_blocks_bytes,
+                                   uint64_t blocks_offset,
+                                   uint8_t* blocks_out,
+                                   uint64_t blocks_bytes)
+{
+    if (!path || !*path) return false;
+    FilePtr file = open_file(path, "rb");
+    FILE* f = file.get();
+    if (!f) return false;
+
+    auto read_exact = [&](uint64_t offset, uint8_t* dst, uint64_t bytes) -> bool {
+        if (bytes == 0) return true;
+        if (!dst) return false;
+        if (!seek_file(f, offset)) return false;
+        return std::fread(dst, 1, static_cast<size_t>(bytes), f) == bytes;
+    };
+
+    if (!read_exact(docdata_offset, docdata_out, docdata_bytes))
+        return false;
+    if (!read_exact(leaf_blocks_offset, leaf_blocks_out, leaf_blocks_bytes))
+        return false;
+    if (!read_exact(blocks_offset, blocks_out, blocks_bytes))
+        return false;
+
+    return true;
 }

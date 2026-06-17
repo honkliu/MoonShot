@@ -17,10 +17,9 @@
 #include <string>
 #include <algorithm>
 #include <cstdint>
+#include <cstring>
 #include <iostream>
 #include <vector>
-
-#include <cstdio>
 
 using std::shared_ptr;
 using std::make_shared;
@@ -75,14 +74,14 @@ public:
 
     ~IndexContext()
     {
-        ClearDocData();
+        ClearPinnedIndexData();
     }
 
     shared_ptr<IndexWriter> GetWriter()
     {
         if (m_LoadedFromDisk) {
             m_Store = make_shared<PostingStore>();
-            ClearDocData();
+            ClearPinnedIndexData();
             m_BlockTable.Reset(PostingBlockCacheSlots(0));
             m_Executor = IndexSearchExecutor(this);
             m_Built = false;
@@ -253,21 +252,18 @@ public:
         if (!IndexSerializer::Save(*m_Store, path)) return false;
 
         // Wire up FileBlockManager so cache misses reload from the .idx file.
-        uint64_t blocks_offset = 0;
-        PostingStore tmp;
-        IndexSerializer::Load(tmp, path, nullptr, nullptr, &blocks_offset);
+        IndexLayoutInfo li;
+        if (!IndexSerializer::LoadLayout(path, li))
+            return true;  // save succeeded; FileBlockManager wiring is best-effort
 
-        auto fm = make_shared<FileBlockManager>(sizeof(IndexBlock), blocks_offset);
+        auto fm = make_shared<FileBlockManager>(sizeof(IndexBlock), li.ILI_BlocksOffset);
         if (fm->open(path))
             m_BlockTable.SetFileManager(std::move(fm));
 
-        uint64_t leaf_offset = 0, leaf_pages = 0;
-        PostingStore tmpLeaf;
-        IndexSerializer::Load(tmpLeaf, path, nullptr, nullptr, nullptr, nullptr, nullptr, &leaf_offset, &leaf_pages);
-        auto leafFm = make_shared<FileBlockManager>(sizeof(LeafTermPage), leaf_offset);
+        auto leafFm = make_shared<FileBlockManager>(sizeof(LeafTermPage), li.ILI_LeafBlocksOffset);
         if (leafFm->open(path))
             m_BlockTable.SetLeafTermFileManager(std::move(leafFm));
-        m_BlockTable.ReserveLeafTermPageMap(static_cast<uint32_t>(std::min<uint64_t>(leaf_pages, UINT32_MAX)));
+        m_BlockTable.ReserveLeafTermPageMap(static_cast<uint32_t>(std::min<uint64_t>(li.ILI_NumLeafBlocks, UINT32_MAX)));
 
         return true;
     }
@@ -276,46 +272,72 @@ public:
     {
         if (m_IndexPath.empty()) return;
 
-        m_Store = make_shared<PostingStore>();
-        ClearDocData();
-        std::vector<HeadTermEntry>               headTermEntries;
-        std::vector<uint64_t>                    pageskip;
-        uint64_t blocks_offset = 0;
-        uint64_t num_blocks = 0;
-        uint64_t leaf_blocks_offset = 0;
-        uint64_t num_leaf_blocks = 0;
-        uint64_t docdata_offset = 0;
-        uint64_t docdata_size = 0;
-        uint64_t num_documents = 0;
-        IndexFileHeader header{};
+        ClearPinnedIndexData();
 
-        if (!IndexSerializer::Load(*m_Store, m_IndexPath.c_str(),
-                       &headTermEntries, nullptr,
-                       &blocks_offset, &pageskip, &num_blocks,
-                   &leaf_blocks_offset, &num_leaf_blocks,
-                   &docdata_offset, &docdata_size, &num_documents,
-                   &header))
+        IndexLayoutInfo li;
+        if (!IndexSerializer::LoadLayout(m_IndexPath.c_str(), li))
         {
             std::cerr << "Failed to load index: " << m_IndexPath
                       << " (unsupported/corrupt format; rebuild with current moon.exe)\n";
             return;
         }
 
-        m_BlockTable.Reset(PostingBlockCacheSlots(num_blocks));
-        m_BlockTable.ReserveBlockMap(static_cast<uint32_t>(std::min<uint64_t>(num_blocks, UINT32_MAX)));
-        m_BlockTable.SetHeadTermEntries(std::move(headTermEntries), static_cast<uint32_t>(std::min<uint64_t>(num_leaf_blocks, UINT32_MAX)));
-        m_BlockTable.SetPageSkipData(std::move(pageskip));
+        m_IndexFileHeader = li.ILI_Header;
+        m_BlockTable.Reset(PostingBlockCacheSlots(li.ILI_NumBlocks));
+        m_BlockTable.ReserveBlockMap(static_cast<uint32_t>(std::min<uint64_t>(li.ILI_NumBlocks, UINT32_MAX)));
+        m_BlockTable.SetHeadTermEntries(std::move(li.ILI_HeadTermEntries), static_cast<uint32_t>(std::min<uint64_t>(li.ILI_NumLeafBlocks, UINT32_MAX)));
+        m_BlockTable.SetPageSkipData(std::move(li.ILI_PageSkipData));
 
-        auto fm = make_shared<FileBlockManager>(sizeof(IndexBlock), blocks_offset);
-        if (fm->open(m_IndexPath.c_str()))
+        ClearDocDataOnly();
+        ClearLeafTermPagesOnly();
+        ClearIndexBlocksOnly();
+
+        const uint64_t docdata_bytes     = li.ILI_Header.IFH_DocDataSize;
+        const uint64_t leaf_blocks_bytes = li.ILI_NumLeafBlocks * sizeof(LeafTermPage);
+        const uint64_t blocks_bytes      = li.ILI_NumBlocks      * sizeof(IndexBlock);
+
+        if (!AllocatePinnedSection(docdata_bytes, m_DocDataBase, m_DocData, m_DocDataBytes)
+            || !AllocatePinnedSection(leaf_blocks_bytes, m_LeafTermPagesBase, m_LeafTermPages, m_LeafTermPagesBytes)
+            || !AllocatePinnedSection(blocks_bytes, m_IndexBlocksBase, m_IndexBlocks, m_IndexBlocksBytes))
+        {
+            std::cerr << "Failed to allocate pinned index memory for: " << m_IndexPath << "\n";
+            ClearPinnedIndexData();
+            return;
+        }
+
+        if (!IndexSerializer::ReadSections(m_IndexPath.c_str(),
+                                           li.ILI_DocDataOffset,     m_DocData,       docdata_bytes,
+                                           li.ILI_LeafBlocksOffset,  m_LeafTermPages, leaf_blocks_bytes,
+                                           li.ILI_BlocksOffset,      m_IndexBlocks,   blocks_bytes))
+        {
+            std::cerr << "Failed to read index sections for: " << m_IndexPath << "\n";
+            ClearPinnedIndexData();
+            return;
+        }
+
+        m_DocDataPageCount        = m_DocDataBytes / PAGE_SIZE;
+        m_TotalDocs               = std::min<uint64_t>(li.ILI_Header.IFH_NumDocuments, docdata_bytes / DOC_REC_SIZE);
+        m_AvgDocLen               = li.ILI_Header.IFH_AvgDocLength > 0.0f ? li.ILI_Header.IFH_AvgDocLength : 1.0f;
+        m_LeafTermPageCountPinned = li.ILI_NumLeafBlocks;
+        m_IndexBlockCountPinned   = li.ILI_NumBlocks;
+
+        auto fm = make_shared<FileBlockManager>(sizeof(IndexBlock), li.ILI_BlocksOffset);
+        if (m_IndexBlocks && m_IndexBlocksBytes >= li.ILI_NumBlocks * sizeof(IndexBlock)) {
+            if (fm->openMemory(m_IndexBlocks, li.ILI_NumBlocks * sizeof(IndexBlock)))
+                m_BlockTable.SetFileManager(std::move(fm));
+        } else if (fm->open(m_IndexPath.c_str())) {
             m_BlockTable.SetFileManager(std::move(fm));
+        }
 
-        auto leafFm = make_shared<FileBlockManager>(sizeof(LeafTermPage), leaf_blocks_offset);
-        if (leafFm->open(m_IndexPath.c_str()))
+        auto leafFm = make_shared<FileBlockManager>(sizeof(LeafTermPage), li.ILI_LeafBlocksOffset);
+        if (m_LeafTermPages && m_LeafTermPagesBytes >= li.ILI_NumLeafBlocks * sizeof(LeafTermPage)) {
+            if (leafFm->openMemory(m_LeafTermPages, li.ILI_NumLeafBlocks * sizeof(LeafTermPage)))
+                m_BlockTable.SetLeafTermFileManager(std::move(leafFm));
+        } else if (leafFm->open(m_IndexPath.c_str())) {
             m_BlockTable.SetLeafTermFileManager(std::move(leafFm));
-        m_BlockTable.ReserveLeafTermPageMap(static_cast<uint32_t>(std::min<uint64_t>(num_leaf_blocks, UINT32_MAX)));
+        }
+        m_BlockTable.ReserveLeafTermPageMap(static_cast<uint32_t>(std::min<uint64_t>(li.ILI_NumLeafBlocks, UINT32_MAX)));
 
-        LoadPinnedDocData(header);
         m_Executor = IndexSearchExecutor(this);
         m_Built    = true;
         m_LoadedFromDisk = true;
@@ -344,6 +366,14 @@ private:
     uint8_t*                     m_DocData = nullptr;
     uint64_t                     m_DocDataBytes = 0;
     uint64_t                     m_DocDataPageCount = 0;
+    std::unique_ptr<uint8_t[]>   m_LeafTermPagesBase;
+    uint8_t*                     m_LeafTermPages = nullptr;
+    uint64_t                     m_LeafTermPagesBytes = 0;
+    uint64_t                     m_LeafTermPageCountPinned = 0;
+    std::unique_ptr<uint8_t[]>   m_IndexBlocksBase;
+    uint8_t*                     m_IndexBlocks = nullptr;
+    uint64_t                     m_IndexBlocksBytes = 0;
+    uint64_t                     m_IndexBlockCountPinned = 0;
     uint64_t                     m_TotalDocs = 0;
     float                        m_AvgDocLen = 1.0f;
 
@@ -361,7 +391,7 @@ private:
             Build();
     }
 
-    void ClearDocData()
+    void ClearDocDataOnly()
     {
         if (m_DocData)
             UnpinMemoryPages(m_DocData, static_cast<size_t>(m_DocDataBytes));
@@ -371,6 +401,33 @@ private:
         m_DocDataPageCount = 0;
         m_TotalDocs = 0;
         m_AvgDocLen = 1.0f;
+    }
+
+    void ClearLeafTermPagesOnly()
+    {
+        if (m_LeafTermPages)
+            UnpinMemoryPages(m_LeafTermPages, static_cast<size_t>(m_LeafTermPagesBytes));
+        m_LeafTermPagesBase.reset();
+        m_LeafTermPages = nullptr;
+        m_LeafTermPagesBytes = 0;
+        m_LeafTermPageCountPinned = 0;
+    }
+
+    void ClearIndexBlocksOnly()
+    {
+        if (m_IndexBlocks)
+            UnpinMemoryPages(m_IndexBlocks, static_cast<size_t>(m_IndexBlocksBytes));
+        m_IndexBlocksBase.reset();
+        m_IndexBlocks = nullptr;
+        m_IndexBlocksBytes = 0;
+        m_IndexBlockCountPinned = 0;
+    }
+
+    void ClearPinnedIndexData()
+    {
+        ClearDocDataOnly();
+        ClearLeafTermPagesOnly();
+        ClearIndexBlocksOnly();
         m_IndexFileHeader = {};
     }
 
@@ -384,52 +441,29 @@ private:
         return ((bytes + PAGE_SIZE - 1) / PAGE_SIZE) * PAGE_SIZE;
     }
 
-    static bool SeekFile(FILE* file, uint64_t offset)
+    bool AllocatePinnedSection(uint64_t logicalBytes,
+                               std::unique_ptr<uint8_t[]>& baseOut,
+                               uint8_t*& alignedOut,
+                               uint64_t& alignedBytesOut)
     {
-#if defined(_WIN32)
-        return _fseeki64(file, static_cast<__int64>(offset), SEEK_SET) == 0;
-#else
-        return std::fseek(file, static_cast<long>(offset), SEEK_SET) == 0;
-#endif
-    }
+        baseOut.reset();
+        alignedOut = nullptr;
+        alignedBytesOut = 0;
 
-    void LoadPinnedDocData(const IndexFileHeader& header)
-    {
-        ClearDocData();
+        if (logicalBytes == 0)
+            return true;
 
-        const uint64_t docDataBytes = header.IFH_DocDataSize;
-        const uint64_t docCount = header.IFH_NumDocuments;
-        if (docDataBytes == 0 || docCount == 0)
-            return;
-        if (docDataBytes % DOC_REC_SIZE != 0)
-            return;
+        const uint64_t pageBytes = PageAlignedBytes(logicalBytes);
+        std::unique_ptr<uint8_t[]> sectionBase(new uint8_t[static_cast<size_t>(pageBytes + PAGE_SIZE - 1)]{});
+        uint8_t* section = reinterpret_cast<uint8_t*>(
+            AlignUp(reinterpret_cast<uintptr_t>(sectionBase.get()), PAGE_SIZE));
+        if (!PinMemoryPages(section, static_cast<size_t>(pageBytes)))
+            return false;
 
-        const uint64_t docRecordCount = docDataBytes / DOC_REC_SIZE;
-        const uint64_t pageBytes = PageAlignedBytes(docDataBytes);
-
-        std::unique_ptr<uint8_t[]> docDataBase(new uint8_t[static_cast<size_t>(pageBytes + PAGE_SIZE - 1)]{});
-        uint8_t* docData = reinterpret_cast<uint8_t*>(
-            AlignUp(reinterpret_cast<uintptr_t>(docDataBase.get()), PAGE_SIZE));
-
-        std::unique_ptr<FILE, decltype(&std::fclose)> file(std::fopen(m_IndexPath.c_str(), "rb"), &std::fclose);
-        if (!file)
-            return;
-        if (!SeekFile(file.get(), header.IFH_DocDataOffset))
-            return;
-
-        const size_t bytesRead = std::fread(docData, 1, static_cast<size_t>(docDataBytes), file.get());
-        if (bytesRead != docDataBytes)
-            return;
-
-        m_DocDataBase = std::move(docDataBase);
-        m_DocData = docData;
-        m_DocDataBytes = pageBytes;
-        m_DocDataPageCount = pageBytes / PAGE_SIZE;
-        m_TotalDocs = std::min<uint64_t>(docCount, docRecordCount);
-        m_AvgDocLen = header.IFH_AvgDocLength > 0.0f ? header.IFH_AvgDocLength : 1.0f;
-        m_IndexFileHeader = header;
-
-        PinMemoryPages(m_DocData, static_cast<size_t>(pageBytes));
+        baseOut = std::move(sectionBase);
+        alignedOut = section;
+        alignedBytesOut = pageBytes;
+        return true;
     }
 
     void RefreshDocDataFromBuildState()
@@ -441,7 +475,7 @@ private:
         for (const auto& [docId, _] : m_Store->AllDocStats())
             maxDocId = std::max(maxDocId, docId);
 
-        ClearDocData();
+        ClearDocDataOnly();
         const uint64_t bytes = (maxDocId + 1) * DOC_REC_SIZE;
         static constexpr uintptr_t DOC_DATA_ALIGNMENT = 4096;
         const uint64_t pageBytes = PageAlignedBytes(bytes);
@@ -462,8 +496,10 @@ private:
                 rec->DR_VectorDim = static_cast<uint16_t>(vector->size());
                 rec->DR_VectorFormat = 1;
                 for (size_t i = 0; i < vector->size(); ++i) {
-                    const uint16_t encoded = EncodeFloat16((*vector)[i]);
-                    std::memcpy(&rec->DR_VectorData[i * sizeof(uint16_t)], &encoded, sizeof(uint16_t));
+                    // Quantize float32 to int8: clamp to [-128, 127]
+                    const float val = (*vector)[i];
+                    const float clipped = std::max(-128.0f, std::min(127.0f, val * 128.0f));
+                    rec->DR_VectorData[i] = static_cast<int8_t>(std::round(clipped));
                 }
             }
             rec->DR_PathLength = EncodeDocPath(stats.path, rec->DR_Path);
