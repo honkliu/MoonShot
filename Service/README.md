@@ -21,7 +21,7 @@ shennong --port 9000 --index ~/moon.idx
 Supported parameters:
 
 | Parameter | Default | Meaning |
-|---|---:|---|
+| :--- | ---: | :--- |
 | `--port <port>` | `9000` | TCP port for the HTTP server. The service listens on `0.0.0.0:<port>`. |
 | `--index <path>` | `~/moon.idx` | MoonShot index file loaded once during service startup. |
 
@@ -74,7 +74,7 @@ Searches the loaded index and returns one page of ranked results.
 Parameters:
 
 | Parameter | Default | Meaning |
-|---|---:|---|
+| :--- | ---: | :--- |
 | `q` | required | Query text. |
 | `offset` | `0` | Zero-based result offset. |
 | `limit` | `20` | Result page size, clamped to `1..1000`. |
@@ -167,7 +167,7 @@ service ShenNong {
 If gRPC is revived later, recommended first supported API:
 
 | RPC | Use |
-|---|---|
+| :--- | :--- |
 | `Query129(Question) returns (stream Answers)` | Primary search API. One query returns a stream of ranked results. |
 | `Query121(Question) returns (Answers)` | Optional compatibility API. Can return only the top result. |
 | `Query921` / `Query929` | Batch or interactive streaming queries. Implement after unary/server-streaming search works. |
@@ -177,7 +177,7 @@ If gRPC is revived later, recommended first supported API:
 `Answers` should map one search result:
 
 | Field | Source |
-|---|---|
+| :--- | :--- |
 | `DocID` | `SearchResult.doc_id` |
 | `AnswersID` | 1-based rank in the result stream |
 | `AnswerScore` | `SearchResult.score` |
@@ -254,7 +254,7 @@ DataThreads
 Suggested ownership:
 
 | Pool | Responsibility |
-|---|---|
+| :--- | :--- |
 | `QueueThreads` | Lightweight request admission, validation, cancellation bookkeeping. |
 | `QueryThreads` | Query compile + reader execution + ranking. |
 | `DataThreads` | Optional file or future remote data fetch work. Not needed for basic index search. |
@@ -292,7 +292,7 @@ If `IndexContext` is not thread-safe for concurrent readers, protect query execu
 HTTP status mapping:
 
 | Condition | HTTP status |
-|---|---|
+| :--- | :--- |
 | Empty query | `400 Bad Request` |
 | Query parse failure | `400 Bad Request` |
 | Index not loaded | Process startup failure |
@@ -435,7 +435,7 @@ Keep gRPC as an optional future native/internal API if high-throughput streaming
 ### Why gRPC Fits ShenNong
 
 | Requirement | gRPC fit |
-|---|---|
+| :--- | :--- |
 | Long-running local or internal service | Good. Native process listens on one port. |
 | Query returns many results | Good. Server-streaming maps directly to result streaming. |
 | C++ service implementation | Good. Existing gRPC C++ stack is already present. |
@@ -445,7 +445,7 @@ Keep gRPC as an optional future native/internal API if high-throughput streaming
 ### Downsides of gRPC
 
 | Issue | Impact |
-|---|---|
+| :--- | :--- |
 | Browser clients cannot call it directly without gRPC-Web or a proxy | Important if the main client is a browser. |
 | Heavier build/dependency chain than HTTP | Already present, but still operationally heavier. |
 | Manual testing needs grpcurl or a client stub | Slightly less convenient than curl. |

@@ -182,16 +182,14 @@ static Index parse_index(const char* path)
         return index;
     }
 
-    if (index.hdr.IFH_HeadTermEntryOffset + index.hdr.IFH_HeadTermEntrySize <= size
-        && index.hdr.IFH_HeadTermEntrySize % sizeof(HeadTermEntry) == 0) {
-        size_t count = static_cast<size_t>(index.hdr.IFH_HeadTermEntrySize / sizeof(HeadTermEntry));
+    if (index.hdr.IFH_HeadTermEntryOffset + index.hdr.IFH_HeadTermEntryCount * sizeof(HeadTermEntry) <= size) {
+        size_t count = static_cast<size_t>(index.hdr.IFH_HeadTermEntryCount);
         index.directory.resize(count);
         std::memcpy(index.directory.data(), data + index.hdr.IFH_HeadTermEntryOffset, count * sizeof(HeadTermEntry));
     }
 
-    if (index.hdr.IFH_LeafTermPageOffset + index.hdr.IFH_LeafTermPageSize <= size
-        && index.hdr.IFH_LeafTermPageSize % sizeof(LeafTermPage) == 0) {
-        size_t block_count = static_cast<size_t>(index.hdr.IFH_LeafTermPageSize / sizeof(LeafTermPage));
+    if (index.hdr.IFH_LeafTermPageOffset + index.hdr.IFH_LeafTermPageCount * sizeof(LeafTermPage) <= size) {
+        size_t block_count = static_cast<size_t>(index.hdr.IFH_LeafTermPageCount);
         index.header_blocks.resize(block_count);
         for (size_t block_index = 0; block_index < block_count; ++block_index) {
             const uint8_t* page_start = data + index.hdr.IFH_LeafTermPageOffset + block_index * sizeof(LeafTermPage);
@@ -215,8 +213,8 @@ static Index parse_index(const char* path)
         }
     }
 
-    if (index.hdr.IFH_DocDataOffset + index.hdr.IFH_DocDataSize <= size) {
-        size_t count = static_cast<size_t>(index.hdr.IFH_DocDataSize / sizeof(DocDataEntry));
+    if (index.hdr.IFH_DocDataOffset + index.hdr.IFH_NumDocuments * sizeof(DocDataEntry) <= size) {
+        size_t count = static_cast<size_t>(index.hdr.IFH_NumDocuments);
         index.docs.resize(count);
         std::memcpy(index.docs.data(), data + index.hdr.IFH_DocDataOffset, count * sizeof(DocDataEntry));
     }
@@ -226,7 +224,7 @@ static Index parse_index(const char* path)
         terms_by_block[header.LTE_IndexBlockID].push_back(&header);
     }
 
-    const uint64_t indexBlockCount = index.hdr.IFH_IndexBlockSize / sizeof(IndexBlock);
+    const uint64_t indexBlockCount = index.hdr.IFH_IndexBlockCount;
     for (uint64_t seq = 0; seq < indexBlockCount; ++seq) {
         uint64_t block_offset = index.hdr.IFH_IndexBlockOffset + seq * PAGE_SIZE;
         if (block_offset + PAGE_SIZE > size) break;
@@ -293,10 +291,10 @@ static void emit(std::ostream& out, const Index& index, const char* path)
     kv("Documents", std::to_string(h.IFH_NumDocuments));
     kv("Average DocLength", std::to_string(h.IFH_AvgDocLength));
     kv("Terms", std::to_string(h.IFH_NumTerms));
-    kv("HeadTermEntry", std::format("0x{:016X} ({} B)", h.IFH_HeadTermEntryOffset, h.IFH_HeadTermEntrySize));
-    kv("LeafTermPage", std::format("0x{:016X} ({} B)", h.IFH_LeafTermPageOffset, h.IFH_LeafTermPageSize));
-    kv("DocData", std::format("0x{:016X} ({} B)", h.IFH_DocDataOffset, h.IFH_DocDataSize));
-    kv("IndexEntry blocks", std::format("0x{:016X} ({} B)", h.IFH_IndexBlockOffset, h.IFH_IndexBlockSize));
+    kv("HeadTermEntry", std::format("0x{:016X} count={}", h.IFH_HeadTermEntryOffset, h.IFH_HeadTermEntryCount));
+    kv("LeafTermPage", std::format("0x{:016X} count={}", h.IFH_LeafTermPageOffset, h.IFH_LeafTermPageCount));
+    kv("DocData", std::format("0x{:016X} count={}", h.IFH_DocDataOffset, h.IFH_NumDocuments));
+    kv("IndexEntry blocks", std::format("0x{:016X} count={}", h.IFH_IndexBlockOffset, h.IFH_IndexBlockCount));
     kv("File size", std::to_string(index.bytes.size()) + " B");
     out << "</div></div>";
 

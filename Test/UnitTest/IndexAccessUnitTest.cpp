@@ -713,27 +713,27 @@ void TestContinuationPostings()
     std::cout << "  continuation postings traversed: " << seen << "\n";
 }
 
-void TestHeadTermPrefixBoundary()
+void TestHeadTermMaxKeyBoundary()
 {
     IndexContext engine;
     auto writer = engine.GetWriter();
-    const std::string prefix = "abcdefghijklmnopqrstuvwxyz";
+    const std::string maxToken(HEAD_TERM_KEY_MAX - 1, 'a');
+    const std::string tooLongToken(HEAD_TERM_KEY_MAX, 'b');
 
-    writer->Write({prefix}, 0, "Title");
+    writer->Write({maxToken}, 0, "Title");
     writer->SetDocImportance(0, 0.1f);
+    writer->Write({tooLongToken}, 1, "Title");
+    writer->SetDocImportance(1, 0.1f);
 
-    for (uint32_t i = 1; i <= 260; ++i) {
-        std::string token = prefix + "x" + std::to_string(i);
-        writer->Write({token}, i, "Title");
-        writer->SetDocImportance(i, 0.1f);
-    }
-
-    auto reader = engine.GetStreamReader((prefix + "T").c_str());
+    auto reader = engine.GetStreamReader((maxToken + "T").c_str());
     assert(!reader->IsEnd());
     assert(reader->GetDocumentID() == 0);
     reader->GoNext();
     assert(reader->IsEnd());
-    std::cout << "  head prefix boundary term found doc 0\n";
+
+    auto tooLongReader = engine.GetStreamReader((tooLongToken + "T").c_str());
+    assert(tooLongReader->IsEnd());
+    std::cout << "  max head key found; too-long key skipped\n";
 }
 
 } // namespace IndexAccessTests
@@ -752,5 +752,5 @@ std::map<std::string, std::function<void()>> testRegistry = {
     {"TestDiskPersistence",  IndexAccessTests::TestDiskPersistence},
     {"TestBigram",           IndexAccessTests::TestBigram},
     {"TestContinuationPostings", IndexAccessTests::TestContinuationPostings},
-    {"TestHeadTermPrefixBoundary", IndexAccessTests::TestHeadTermPrefixBoundary},
+    {"TestHeadTermMaxKeyBoundary", IndexAccessTests::TestHeadTermMaxKeyBoundary},
 };

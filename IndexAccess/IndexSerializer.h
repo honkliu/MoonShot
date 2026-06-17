@@ -11,9 +11,9 @@
  * Binary index file format (version 11).
  *
  * Layout:
- *   [Header 96B]       magic, version, all section offsets
- *   [HeadTermEntry]    fixed 32B records, count = IFH_HeadTermEntrySize / sizeof(HeadTermEntry)
- *   [LeafTermPage]     fixed 4096B pages, count = IFH_LeafTermPageSize / sizeof(LeafTermPage)
+ *   [Header 88B]       magic, version, fixed section offsets and counts
+ *   [HeadTermEntry]    fixed 32B records, count = IFH_HeadTermEntryCount
+ *   [LeafTermPage]     fixed 4096B pages, count = IFH_LeafTermPageCount
  *                          each page: [entry_count:4] then per entry:
  *                          [key_len:2][LTE_Term:key_len][LTE_DocFreq:4]
  *                          [LTE_IndexBlockID:4][LTE_IndexOffset:4][LTE_IndexLength:4]

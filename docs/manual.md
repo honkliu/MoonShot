@@ -235,12 +235,15 @@ engine.LoadIndex("other.bin");   // replaces current in-memory state
 The binary format is described in full in `docs/index-design.md`.
 It uses:
 
-- A 64-byte file header with magic bytes `"MOONSHOT"`, version, and
-  section offsets.
-- A DocData section: 16 bytes per document (id, importance, length).
-- A TermDict section: sorted term keys with per-term posting offsets.
-- A Postings section: VarByte-delta-encoded `(docID, tf)` pairs packed
-  end-to-end.
+- An 88-byte file header with magic bytes `"MOONSHOT"`, version, fixed
+    section offsets, and fixed-region counts.
+- A fixed `HeadTermEntry` section: 32-byte entries, count stored in
+    `IFH_HeadTermEntryCount`.
+- A fixed `LeafTermPage` section: 4096-byte pages, count stored in
+    `IFH_LeafTermPageCount`.
+- A DocData section: fixed 1024-byte `DocDataEntry` records.
+- An IndexBlock section: fixed 4096-byte posting blocks containing VBC-encoded
+    absolute `(docID, tf)` pairs.
 
 The format is forward-compatible; future versions add new sections
 without breaking readers of older files.
@@ -523,29 +526,27 @@ auto results = exec->Execute(engine.GetReader(&tree), 10);
 
 ## 14. Index file format
 
-The binary index file written by `IndexSerializer::Save` has four
-contiguous sections.
+The binary index file written by `IndexSerializer::Save` has fixed-size regions
+described by `IndexFileHeader` offsets and sizes.
 
 ```text
 Offset    Section          Contents
 ────────────────────────────────────────────────────────────────
-0         File Header      64 bytes — magic, version, num_docs,
-                           num_terms, section offsets
-N₁        DocData          num_docs × 16 bytes
-                           { doc_id:u64, importance:f32, doc_len:u32 }
-N₂        TermDict         num_terms × variable
-                           { key_len:u16, key[key_len], doc_freq:u32,
-                             data_offset:u64, data_len:u32 }
-N₃        Postings         packed VarByte streams
-                           { delta_docid:varint, tf:varint } × N
+0         File Header      88 bytes — magic, version, num_docs,
+                           num_terms, section offsets/counts
+N₁        HeadTermEntry    fixed 32-byte entries
+N₂        LeafTermPage     fixed 4096-byte pages
+N₃        DocData          fixed 1024-byte DocDataEntry records
+N₄        IndexBlock       fixed 4096-byte posting blocks
+                                                     { docID:varint, tf:varint } × N
 ```
 
 **Magic bytes:** `4D 4F 4F 4E 53 48 4F 54` ("MOONSHOT")
 
-**Posting encoding:** Each posting list is stored as delta-compressed
-`(doc_id_delta, tf)` pairs using VarByte encoding.  Doc IDs are sorted
-ascending; delta = current_id − previous_id.  This compresses typical
-posting lists to 2–4 bytes per entry.
+**Posting encoding:** Each posting list is stored as VBC-encoded absolute
+`(docID, tf)` pairs. Doc IDs are sorted ascending. Writers split posting blocks
+only between complete `(docID, tf)` pairs so each block payload is independently
+decodable.
 
 **Validate before loading:**
 

@@ -68,12 +68,11 @@ badB:  (1, 24),  (3, 123),  (9, 32),  (17, 7),  …
 DocIDs are sorted ascending.  Because DocIDs encode importance, traversal
 from the front automatically yields the highest-quality documents.
 
-### 2.2 Wire Encoding — VarByte Delta Compression
+### 2.2 Wire Encoding — VarByte Absolute Pairs
 
 Storing raw 8-byte DocIDs is wasteful.  We store:
 
-- **DocID**: delta from the previous DocID (so the first entry stores the raw
-  DocID; subsequent entries store the gap).
+- **DocID**: the absolute document ID.
 - **TF**: raw unsigned integer.
 
 Both values are encoded with **Variable-Byte (VBC)** encoding:
@@ -84,30 +83,30 @@ Low 7 bits of each byte carry payload.
 High bit = 1 means "more bytes follow"; 0 means "last byte".
 ```
 
-Example for the entry `(DocID=1, TF=24)` as the first entry:
+Example for the entry `(DocID=1, TF=24)`:
 
 ```
-DocID delta = 1:   encoded as  0x01          (1 byte)
+DocID      = 1:    encoded as  0x01          (1 byte)
 TF         = 24:   encoded as  0x18          (1 byte)
 ```
 
 Example for the next entry `(DocID=3, TF=123)`:
 
 ```
-DocID delta = 3-1 = 2:   encoded as  0x02
-TF          = 123:        encoded as  0x7B
+DocID       = 3:     encoded as  0x03
+TF          = 123:   encoded as  0x7B
 ```
 
 Full posting `badB: (1,24),(3,123),(9,32)` encodes to:
 
 ```
-01 18 02 7B 06 20
+01 18 03 7B 09 20
 │  │  │  │  │  └─ TF=32
-│  │  │  │  └──── delta=9-3=6
+│  │  │  │  └──── DocID=9
 │  │  │  └─────── TF=123
-│  │  └────────── delta=3-1=2
+│  │  └────────── DocID=3
 │  └───────────── TF=24
-└──────────────── delta=1-0=1 (first entry, no previous)
+└──────────────── DocID=1
 ```
 
 Average compression: 2–4 bytes per (DocID, TF) pair vs 12 bytes raw (≈3–6×).
@@ -120,7 +119,7 @@ occurrence.  Position lists are stored **after** TF in the same VBC stream:
 ```
 (DocID=1, TF=3, positions=[4, 17, 42])
 
-Encoding:  delta(DocID)  TF  delta(pos[0])  delta(pos[1])  delta(pos[2])
+Encoding:  DocID  TF  delta(pos[0])  delta(pos[1])  delta(pos[2])
 ```
 
 Position data roughly doubles posting-list size.  It is stored in a separate

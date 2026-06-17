@@ -54,16 +54,15 @@ struct IndexFileHeader {
     uint64_t IFH_NumDocuments;
     uint64_t IFH_NumTerms;
     uint64_t IFH_HeadTermEntryOffset;
-    uint64_t IFH_HeadTermEntrySize;
+    uint64_t IFH_HeadTermEntryCount;
     uint64_t IFH_LeafTermPageOffset;
-    uint64_t IFH_LeafTermPageSize;
+    uint64_t IFH_LeafTermPageCount;
     uint64_t IFH_DocDataOffset;
-    uint64_t IFH_DocDataSize;
     uint64_t IFH_IndexBlockOffset;
-    uint64_t IFH_IndexBlockSize;
+    uint64_t IFH_IndexBlockCount;
 };
 #pragma pack(pop)
-static_assert(sizeof(IndexFileHeader) == 96, "IndexFileHeader must be exactly 96 bytes");
+static_assert(sizeof(IndexFileHeader) == 88, "IndexFileHeader must be exactly 88 bytes");
 
 #pragma pack(push,1)
 struct DocDataEntry {
@@ -542,15 +541,15 @@ class IndexBlockTable
         void SetDecodedHeadLeafTermTable(std::vector<HeadTermEntry> dir,
                          std::vector<LeafTermBlock> blocks)
         {
-            m_HeadTermEntries = std::move(dir);
+            SetHeadTermEntries(dir.data(), static_cast<uint32_t>(dir.size()), static_cast<uint32_t>(blocks.size()));
             SetDecodedLeafTermBlocks(std::move(blocks));
         }
 
         void SetPagedLeafTermBlocks(std::vector<HeadTermEntry> head,
                                     std::vector<LeafTermPage> pages)
         {
-            m_HeadTermEntries = std::move(head);
             m_LeafTermPageCount = static_cast<uint32_t>(pages.size());
+            SetHeadTermEntries(head.data(), static_cast<uint32_t>(head.size()), m_LeafTermPageCount);
             m_LeafTermBlockCache.ReservePageMap(m_LeafTermPageCount);
             for (uint32_t i = 0; i < m_LeafTermPageCount; ++i) {
                 void* addr = nullptr;
@@ -561,11 +560,22 @@ class IndexBlockTable
             }
         }
 
-        void SetHeadTermEntries(std::vector<HeadTermEntry> head, uint32_t leafPageCount)
+        void SetHeadTermEntries(std::unique_ptr<HeadTermEntry[]> head, uint32_t headCount, uint32_t leafPageCount)
         {
             m_HeadTermEntries = std::move(head);
+            m_HeadTermEntryCount = headCount;
             m_LeafTermPageCount = leafPageCount;
             m_LeafTermBlockCache.ReservePageMap(leafPageCount);
+        }
+
+        void SetHeadTermEntries(const HeadTermEntry* head, uint32_t headCount, uint32_t leafPageCount)
+        {
+            std::unique_ptr<HeadTermEntry[]> entries;
+            if (headCount > 0) {
+                entries.reset(new HeadTermEntry[headCount]);
+                std::memcpy(entries.get(), head, static_cast<size_t>(headCount) * sizeof(HeadTermEntry));
+            }
+            SetHeadTermEntries(std::move(entries), headCount, leafPageCount);
         }
 
         /*
@@ -586,81 +596,33 @@ class IndexBlockTable
         {
             /* Step 1: BloomFilter */
             if (!m_BloomFilter.CanTermExist(term, std::strlen(term))) return false;
-            if (m_HeadTermEntries.empty()) return false;
+            if (!m_HeadTermEntries || m_HeadTermEntryCount == 0) return false;
+            if (std::strlen(term) > HEAD_TERM_KEY_MAX) return false;
 
             /* Step 2: Level-1 — find LeafTermBlock whose first term <= term */
             const std::string_view termText(term);
-            auto it = std::upper_bound(m_HeadTermEntries.begin(), m_HeadTermEntries.end(), termText,
+            const HeadTermEntry* begin = m_HeadTermEntries.get();
+            const HeadTermEntry* end = begin + m_HeadTermEntryCount;
+            auto it = std::upper_bound(begin, end, termText,
                 [](std::string_view t, const HeadTermEntry& e) { return t < e.FirstTerm(); });
-            if (it == m_HeadTermEntries.begin()) return false;
+            if (it == begin) return false;
             --it;
-            const auto loadPage = [&](uint32_t block_idx, LeafTermBlock& decoded) -> bool {
-                if (block_idx >= m_LeafTermPageCount) return false;
-                return LoadLeafTermBlock(block_idx, decoded);
-            };
 
-            const auto findInDecodedPage = [&](const LeafTermBlock& decoded) -> const LeafTermEntry* {
-                const auto& blk = decoded.LTB_Entries;
-                auto it2 = std::lower_bound(blk.begin(), blk.end(), term,
-                    [](const LeafTermEntry& e, const char* t) { return e.LTE_Term < t; });
-                if (it2 == blk.end() || it2->LTE_Term != term) return nullptr;
-                thread_local LeafTermEntry found;
-                found = *it2;
-                return &found;
-            };
-
-            const auto pageMayContain = [&](const LeafTermBlock& decoded) -> bool {
-                if (decoded.LTB_Entries.empty()) return false;
-                return decoded.LTB_Entries.front().LTE_Term <= term && term <= decoded.LTB_Entries.back().LTE_Term;
-            };
-
-            const int32_t startPage = static_cast<int32_t>(it->HTE_LeafTermBlockID);
-
+            uint32_t block_idx = it->HTE_LeafTermBlockID;
+            if (block_idx >= m_LeafTermPageCount) return false;
             LeafTermBlock decoded;
-            if (loadPage(static_cast<uint32_t>(startPage), decoded)) {
-                if (const LeafTermEntry* found = findInDecodedPage(decoded)) {
-                    *indexBlockIDOut = found->LTE_IndexBlockID;
-                    *indexOffsetOut  = found->LTE_IndexOffset;
-                    *indexLengthOut  = found->LTE_IndexLength;
-                    *docFreqOut      = found->LTE_DocFreq;
-                    if (continuationBlockCountOut) *continuationBlockCountOut = found->LTE_ContinuationBlockCount;
-                    return true;
-                }
-            }
+            if (!LoadLeafTermBlock(block_idx, decoded)) return false;
+            const auto& blk = decoded.LTB_Entries;
+            auto it2 = std::lower_bound(blk.begin(), blk.end(), term,
+                [](const LeafTermEntry& e, const char* t) { return e.LTE_Term < t; });
+            if (it2 == blk.end() || it2->LTE_Term != term) return false;
 
-            for (int32_t page = startPage - 1; page >= 0; --page) {
-                LeafTermBlock leftDecoded;
-                if (!loadPage(static_cast<uint32_t>(page), leftDecoded) || leftDecoded.LTB_Entries.empty()) break;
-                if (term > leftDecoded.LTB_Entries.back().LTE_Term) break;
-                if (pageMayContain(leftDecoded)) {
-                    if (const LeafTermEntry* found = findInDecodedPage(leftDecoded)) {
-                        *indexBlockIDOut = found->LTE_IndexBlockID;
-                        *indexOffsetOut  = found->LTE_IndexOffset;
-                        *indexLengthOut  = found->LTE_IndexLength;
-                        *docFreqOut      = found->LTE_DocFreq;
-                        if (continuationBlockCountOut) *continuationBlockCountOut = found->LTE_ContinuationBlockCount;
-                        return true;
-                    }
-                }
-            }
-
-            for (uint32_t page = static_cast<uint32_t>(startPage + 1); page < m_LeafTermPageCount; ++page) {
-                LeafTermBlock rightDecoded;
-                if (!loadPage(page, rightDecoded) || rightDecoded.LTB_Entries.empty()) break;
-                if (term < rightDecoded.LTB_Entries.front().LTE_Term) break;
-                if (pageMayContain(rightDecoded)) {
-                    if (const LeafTermEntry* found = findInDecodedPage(rightDecoded)) {
-                        *indexBlockIDOut = found->LTE_IndexBlockID;
-                        *indexOffsetOut  = found->LTE_IndexOffset;
-                        *indexLengthOut  = found->LTE_IndexLength;
-                        *docFreqOut      = found->LTE_DocFreq;
-                        if (continuationBlockCountOut) *continuationBlockCountOut = found->LTE_ContinuationBlockCount;
-                        return true;
-                    }
-                }
-            }
-
-            return false;
+            *indexBlockIDOut = it2->LTE_IndexBlockID;
+            *indexOffsetOut  = it2->LTE_IndexOffset;
+            *indexLengthOut  = it2->LTE_IndexLength;
+            *docFreqOut      = it2->LTE_DocFreq;
+            if (continuationBlockCountOut) *continuationBlockCountOut = it2->LTE_ContinuationBlockCount;
+            return true;
         }
 
         IndexBlock* GetIndexBlock(uint32_t block_seq, uint32_t)
@@ -688,11 +650,10 @@ class IndexBlockTable
             m_LeafTermFileManager.reset();
             m_IndexBlockCache.resize(cache_capacity);
             m_LeafTermBlockCache.resize(static_cast<uint32_t>(std::max<uint64_t>(LEAF_TERM_CACHE_BYTES / sizeof(LeafCacheSlot), 1)));
-            m_HeadTermEntries.clear();
+            m_HeadTermEntries.reset();
+            m_HeadTermEntryCount = 0;
             m_LeafTermPageCount = 0;
         }
-
-        const std::vector<HeadTermEntry>&  GetHeadTermEntries() const { return m_HeadTermEntries; }
 
     private:
         std::shared_ptr<FileBlockManager>        m_FileManager;
@@ -703,7 +664,8 @@ class IndexBlockTable
         BloomFilter                              m_BloomFilter;
 
         /* Level-1: fixed directory — (HTE_FirstTerm → HTE_LeafTermBlockID), sorted by HTE_FirstTerm */
-        std::vector<HeadTermEntry>               m_HeadTermEntries;
+        std::unique_ptr<HeadTermEntry[]>         m_HeadTermEntries;
+        uint32_t                                 m_HeadTermEntryCount = 0;
 
         uint32_t                                 m_LeafTermPageCount = 0;
 
@@ -775,7 +737,10 @@ class IndexBlockTable
                 }
                 pages.push_back(page);
             }
-            SetPagedLeafTermBlocks(std::move(m_HeadTermEntries), std::move(pages));
+            std::vector<HeadTermEntry> headEntries;
+            if (m_HeadTermEntries && m_HeadTermEntryCount > 0)
+                headEntries.assign(m_HeadTermEntries.get(), m_HeadTermEntries.get() + m_HeadTermEntryCount);
+            SetPagedLeafTermBlocks(std::move(headEntries), std::move(pages));
         }
 };
 

@@ -146,6 +146,8 @@ static BuildBlocksResult build_blocks(const PostingStore& store)
 
     for (const auto& [key_ptr, pl] : terms) {
         const std::string& key   = *key_ptr;
+        if (key.size() > HEAD_TERM_KEY_MAX)
+            continue;
         const auto&        bytes = pl->GetBytes();
         if (bytes.empty()) continue;
 
@@ -251,11 +253,11 @@ bool IndexSerializer::Save(const PostingStore& store, const char* path)
     /* ── Encode Head/Leaf term table (paged two-level) ────────────────────
      *
      * Format:
-     *   [HeadTermEntry x (IFH_HeadTermEntrySize / sizeof(HeadTermEntry))]  // fixed 32B
-     *   [LeafTermPage x (IFH_LeafTermPageSize / sizeof(LeafTermPage))]     // fixed 4096B
+    *   [HeadTermEntry x IFH_HeadTermEntryCount]  // fixed 32B
+    *   [LeafTermPage x IFH_LeafTermPageCount]    // fixed 4096B
      */
-    const uint64_t headTermEntryBytes = br.BBR_HeadTermEntries.size() * sizeof(HeadTermEntry);
-    const uint64_t leafTermPageBytes = br.BBR_LeafTermPages.size() * sizeof(LeafTermPage);
+    const uint64_t headTermEntryCount = br.BBR_HeadTermEntries.size();
+    const uint64_t leafTermPageCount = br.BBR_LeafTermPages.size();
 
     /* ── Encode DocData ───────────────────────────────────────────────────*/
     std::vector<DocDataEntry> docdata;
@@ -294,8 +296,8 @@ bool IndexSerializer::Save(const PostingStore& store, const char* path)
     /* ── Compute file offsets ─────────────────────────────────────────────*/
     const uint64_t HDR_SIZE  = sizeof(IndexFileHeader);
     uint64_t head_off        = HDR_SIZE;
-    uint64_t leaf_off        = head_off + headTermEntryBytes;
-    uint64_t dd_off          = leaf_off + leafTermPageBytes;
+    uint64_t leaf_off        = head_off + headTermEntryCount * sizeof(HeadTermEntry);
+    uint64_t dd_off          = leaf_off + leafTermPageCount * sizeof(LeafTermPage);
     uint64_t dd_size         = docdata.size() * DOC_REC_SIZE;
     uint64_t raw_blk_off     = dd_off + dd_size;
     uint64_t blk_off         = page_aligned_bytes(raw_blk_off);
@@ -310,10 +312,10 @@ bool IndexSerializer::Save(const PostingStore& store, const char* path)
     hdr.IFH_AvgDocLength  = store.AvgDocLen();
     hdr.IFH_NumDocuments = static_cast<uint64_t>(docdata.size());
     hdr.IFH_NumTerms     = br.BBR_TotalTerms;
-    hdr.IFH_HeadTermEntryOffset = head_off; hdr.IFH_HeadTermEntrySize = headTermEntryBytes;
-    hdr.IFH_LeafTermPageOffset  = leaf_off; hdr.IFH_LeafTermPageSize  = leafTermPageBytes;
-    hdr.IFH_DocDataOffset   = dd_off;   hdr.IFH_DocDataSize  = dd_size;
-    hdr.IFH_IndexBlockOffset = blk_off; hdr.IFH_IndexBlockSize = br.BBR_IndexBlocks.size() * sizeof(IndexBlock);
+    hdr.IFH_HeadTermEntryOffset = head_off; hdr.IFH_HeadTermEntryCount = headTermEntryCount;
+    hdr.IFH_LeafTermPageOffset  = leaf_off; hdr.IFH_LeafTermPageCount  = leafTermPageCount;
+    hdr.IFH_DocDataOffset = dd_off;
+    hdr.IFH_IndexBlockOffset = blk_off; hdr.IFH_IndexBlockCount = br.BBR_IndexBlocks.size();
     fwrite(&hdr, sizeof(hdr), 1, f);
 
     if (!br.BBR_HeadTermEntries.empty())
@@ -364,10 +366,8 @@ bool IndexSerializer::Load(PostingStore&                           store,
     }
 
     /* ── Head/Leaf term table ─────────────────────────────────────────────*/
-    if (headTermEntriesOut && hdr->IFH_HeadTermEntrySize > 0) {
-        if (hdr->IFH_HeadTermEntrySize % sizeof(HeadTermEntry) != 0)
-            return false;
-        const size_t count = static_cast<size_t>(hdr->IFH_HeadTermEntrySize / sizeof(HeadTermEntry));
+    if (headTermEntriesOut && hdr->IFH_HeadTermEntryCount > 0) {
+        const size_t count = static_cast<size_t>(hdr->IFH_HeadTermEntryCount);
         headTermEntriesOut->resize(count);
         if (!seek_file(f, hdr->IFH_HeadTermEntryOffset))
             return false;
@@ -376,11 +376,9 @@ bool IndexSerializer::Load(PostingStore&                           store,
     }
 
     if (leaf_blocks_offset_out) *leaf_blocks_offset_out = hdr->IFH_LeafTermPageOffset;
-    if (num_leaf_blocks_out) *num_leaf_blocks_out = hdr->IFH_LeafTermPageSize / sizeof(LeafTermPage);
-    if (leafTermPagesOut && hdr->IFH_LeafTermPageSize > 0) {
-        if (hdr->IFH_LeafTermPageSize % sizeof(LeafTermPage) != 0)
-            return false;
-        const size_t count = static_cast<size_t>(hdr->IFH_LeafTermPageSize / sizeof(LeafTermPage));
+    if (num_leaf_blocks_out) *num_leaf_blocks_out = hdr->IFH_LeafTermPageCount;
+    if (leafTermPagesOut && hdr->IFH_LeafTermPageCount > 0) {
+        const size_t count = static_cast<size_t>(hdr->IFH_LeafTermPageCount);
         leafTermPagesOut->resize(count);
         if (!seek_file(f, hdr->IFH_LeafTermPageOffset))
             return false;
@@ -389,14 +387,14 @@ bool IndexSerializer::Load(PostingStore&                           store,
     }
 
     if (blocks_offset_out) *blocks_offset_out = hdr->IFH_IndexBlockOffset;
-    if (num_blocks_out)    *num_blocks_out    = hdr->IFH_IndexBlockSize / sizeof(IndexBlock);
+    if (num_blocks_out)    *num_blocks_out    = hdr->IFH_IndexBlockCount;
     if (docdata_offset_out) *docdata_offset_out = hdr->IFH_DocDataOffset;
-    if (docdata_size_out)   *docdata_size_out   = hdr->IFH_DocDataSize;
+    if (docdata_size_out)   *docdata_size_out   = hdr->IFH_NumDocuments * DOC_REC_SIZE;
     if (num_documents_out)  *num_documents_out  = hdr->IFH_NumDocuments;
 
     /* ── DocData ──────────────────────────────────────────────────────────*/
     {
-        size_t n = static_cast<size_t>(hdr->IFH_DocDataSize / DOC_REC_SIZE);
+        size_t n = static_cast<size_t>(hdr->IFH_NumDocuments);
         if (!seek_file(f, hdr->IFH_DocDataOffset))
             return false;
         std::vector<DocDataEntry> entries(n);
