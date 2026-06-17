@@ -6,6 +6,7 @@
 #include <thread>
 #include <vector>
 #include <cstdint>
+#include <cstddef>
 #include <cstring>
 #include <string>
 #include <algorithm>
@@ -26,9 +27,167 @@
 
 static constexpr int PAGE_SIZE  = 4096;
 static constexpr int NUMBLOCKS  = 50;
+static constexpr size_t DOC_REC_SIZE = 1024;
+static constexpr size_t DOC_VECTOR_DIM = 128;
+static constexpr size_t DOC_PATH_MAX = 512;
+static constexpr uint8_t  INDEX_FILE_MAGIC[8] = {'M','O','O','N','S','H','O','T'};
+static constexpr uint32_t INDEX_FORMAT_VERSION = 9;
 
 static constexpr uint64_t IB_HEADER_HAS_MORE = (1ULL << 63);
+static constexpr uint16_t BLOCK_CONTINUATION_MARKER = 0xFFFFu;
 static constexpr uint64_t LEAF_TERM_CACHE_BYTES = 100ull * 1024ull * 1024ull;
+
+/*
+* Physical index file structures.
+*
+* Keep these together. They define the bytes on disk or the decoded view of
+* those bytes: file header, DocData records, posting pages, and the two-level
+* Head/Leaf term directory.
+*/
+#pragma pack(push,1)
+struct IndexFileHeader {
+    uint8_t  IFH_Magic[8];
+    uint32_t IFH_Version;
+    float    IFH_AvgDocLength;
+    uint64_t IFH_NumDocuments;
+    uint64_t IFH_NumTerms;
+    uint64_t IFH_SubIndexOffset;
+    uint64_t IFH_SubIndexSize;
+    uint64_t IFH_PageSkipOffset;
+    uint64_t IFH_PageSkipSize;
+    uint64_t IFH_DocDataOffset;
+    uint64_t IFH_DocDataSize;
+    uint64_t IFH_BlocksOffset;
+    uint64_t IFH_NumBlocks;
+};
+#pragma pack(pop)
+static_assert(sizeof(IndexFileHeader) == 96, "IndexFileHeader must be exactly 96 bytes");
+
+#pragma pack(push,1)
+struct DocRecord {
+    uint64_t DR_DocID;
+    uint64_t DR_SourceFlags;
+    uint64_t DR_LastModifiedEpochSeconds;
+    uint64_t DR_CreatedEpochSeconds;
+
+    uint32_t DR_DocLength;
+    uint32_t DR_PolicyFlags;
+    uint32_t DR_VectorFlags;
+
+    uint16_t DR_StaticRankHalf;
+    uint16_t DR_QualityScoreHalf;
+    uint16_t DR_FreshnessScoreHalf;
+    uint16_t DR_ClickScoreHalf;
+    uint16_t DR_EngagementScoreHalf;
+    uint16_t DR_AuthorityScoreHalf;
+    uint16_t DR_SpamScoreHalf;
+
+    uint16_t DR_PathLength;
+    uint16_t DR_Language;
+    uint16_t DR_Locale;
+    uint16_t DR_ContentType;
+
+    uint16_t DR_FeatureScoreHalf[16];
+    uint16_t DR_VectorDim;
+    uint16_t DR_VectorFormat;
+    uint16_t DR_VectorHalf[DOC_VECTOR_DIM];
+    uint8_t  DR_Reserved[154];
+    uint8_t  DR_Path[DOC_PATH_MAX];
+};
+#pragma pack(pop)
+static_assert(sizeof(DocRecord) == DOC_REC_SIZE, "DocRecord must be exactly DOC_REC_SIZE bytes");
+static_assert(offsetof(DocRecord, DR_Path) == DOC_REC_SIZE - DOC_PATH_MAX, "DocRecord path must occupy the tail of the record");
+static_assert(offsetof(DocRecord, DR_DocID) % 8 == 0, "DR_DocID must be 64-bit aligned");
+static_assert(offsetof(DocRecord, DR_SourceFlags) % 8 == 0, "DR_SourceFlags must be 64-bit aligned");
+static_assert(offsetof(DocRecord, DR_LastModifiedEpochSeconds) % 8 == 0, "DR_LastModifiedEpochSeconds must be 64-bit aligned");
+static_assert(offsetof(DocRecord, DR_CreatedEpochSeconds) % 8 == 0, "DR_CreatedEpochSeconds must be 64-bit aligned");
+
+static inline uint16_t EncodeFloat16(float value)
+{
+    uint32_t bits = 0;
+    std::memcpy(&bits, &value, sizeof(bits));
+
+    const uint16_t sign = static_cast<uint16_t>((bits >> 16) & 0x8000u);
+    const uint32_t exponent = (bits >> 23) & 0xffu;
+    uint32_t mantissa = bits & 0x7fffffu;
+
+    if (exponent == 0xffu)
+        return static_cast<uint16_t>(sign | (mantissa ? 0x7e00u : 0x7c00u));
+
+    int32_t halfExponent = static_cast<int32_t>(exponent) - 127 + 15;
+    if (halfExponent >= 31)
+        return static_cast<uint16_t>(sign | 0x7c00u);
+
+    if (halfExponent <= 0) {
+        if (halfExponent < -10)
+            return sign;
+
+        mantissa |= 0x800000u;
+        const uint32_t shift = static_cast<uint32_t>(14 - halfExponent);
+        uint16_t halfMantissa = static_cast<uint16_t>(mantissa >> shift);
+        if ((mantissa >> (shift - 1)) & 1u)
+            ++halfMantissa;
+        return static_cast<uint16_t>(sign | halfMantissa);
+    }
+
+    uint16_t half = static_cast<uint16_t>(sign | (static_cast<uint16_t>(halfExponent) << 10) | (mantissa >> 13));
+    if (mantissa & 0x1000u)
+        ++half;
+    return half;
+}
+
+static inline float DecodeFloat16(uint16_t value)
+{
+    const uint32_t sign = static_cast<uint32_t>(value & 0x8000u) << 16;
+    uint32_t exponent = (value >> 10) & 0x1fu;
+    uint32_t mantissa = value & 0x03ffu;
+    uint32_t bits = 0;
+
+    if (exponent == 0) {
+        if (mantissa == 0) {
+            bits = sign;
+        } else {
+            int32_t normalizedExponent = -14;
+            while ((mantissa & 0x0400u) == 0) {
+                mantissa <<= 1;
+                --normalizedExponent;
+            }
+            mantissa &= 0x03ffu;
+            bits = sign
+                 | (static_cast<uint32_t>(normalizedExponent + 127) << 23)
+                 | (mantissa << 13);
+        }
+    } else if (exponent == 0x1fu) {
+        bits = sign | 0x7f800000u | (mantissa << 13);
+    } else {
+        bits = sign | ((exponent - 15 + 127) << 23) | (mantissa << 13);
+    }
+
+    float result = 0.0f;
+    std::memcpy(&result, &bits, sizeof(result));
+    return result;
+}
+
+static inline uint16_t EncodeDocPath(std::string_view path, uint8_t* output)
+{
+    if (!output || path.empty())
+        return 0;
+
+    const size_t rawBytes = std::min(path.size(), DOC_PATH_MAX);
+    std::memcpy(output, path.data(), rawBytes);
+    return static_cast<uint16_t>(rawBytes);
+}
+
+static inline std::string DecodeDocPath(const DocRecord& record)
+{
+    const size_t byteCount = record.DR_PathLength;
+    if (byteCount == 0 || byteCount > DOC_PATH_MAX)
+        return {};
+
+    return std::string(
+        reinterpret_cast<const char*>(record.DR_Path),
+        reinterpret_cast<const char*>(record.DR_Path + byteCount));
+}
 
 struct IndexBlock {
     uint64_t IB_Header;
@@ -39,12 +198,36 @@ struct IndexBlock {
 };
 static_assert(sizeof(IndexBlock) == PAGE_SIZE, "IndexBlock must be exactly PAGE_SIZE bytes");
 
+struct LeafTermEntry {
+    std::string LTE_Term;
+    uint32_t    LTE_DocFreq                 = 0;
+    uint32_t    LTE_IndexBlockID            = 0;
+    uint32_t    LTE_IndexOffset             = 0;
+    uint32_t    LTE_IndexLength             = 0;
+    uint32_t    LTE_PageSkipOffset          = 0;
+    uint32_t    LTE_ContinuationBlockCount  = 0;
+    uint32_t    LTE_Flags                   = 0;
+};
+
+struct LeafTermBlock {
+    std::vector<LeafTermEntry> LTB_Entries;
+};
+
+struct HeadTermEntry {
+    std::string HTE_FirstTerm;
+    uint32_t    HTE_LeafTermBlockID = 0;
+};
+
+struct LeafTermPage {
+    uint8_t LTP_Data[PAGE_SIZE] = {};
+};
+
 struct IndexFile {
-    uint64_t *          IF_Header;
-    struct IndexBlock   *IF_DocData;
-    struct IndexBlock   *IF_DocSkipData;
-    struct IndexBlock   *IF_Data;
-    struct IndexBlock   *IF_TermToBlock;
+    IndexFileHeader* IF_Header;
+    uint8_t*         IF_DocData;
+    IndexBlock*      IF_DocSkipData;
+    IndexBlock*      IF_Data;
+    uint8_t*         IF_HeadLeafTermTable;
 };
 
 /*
@@ -218,45 +401,6 @@ class BlockCache {
         }
 };
 
-
-/*
-* Term lookup structure.
-*
-* Level 1  HeadTermEntry — sparse directory, always memory resident.
-*   Sorted by the first term in each LeafTermBlock.
-*   Binary search maps a term to the only candidate LeafTermBlock.
-*
-* Level 2  LeafTermBlock — fixed-size group of LeafTermEntry records.
-*   Each LeafTermEntry describes where a term's compressed index bytes live.
-*   It never stores posting bytes directly.
-*
-* Posting blocks are separate raw byte pages managed by GetIndexBlock().
-*/
-
-struct LeafTermEntry {
-    std::string LTE_Term;
-    uint32_t    LTE_DocFreq                 = 0;
-    uint32_t    LTE_IndexBlockID            = 0;
-    uint32_t    LTE_IndexOffset             = 0;
-    uint32_t    LTE_IndexLength             = 0;
-    uint32_t    LTE_PageSkipOffset          = 0;
-    uint32_t    LTE_ContinuationBlockCount  = 0;
-    uint32_t    LTE_Flags                   = 0;
-};
-
-struct LeafTermBlock {
-    std::vector<LeafTermEntry> LTB_Entries;
-};
-
-struct HeadTermEntry {
-    std::string HTE_FirstTerm;
-    uint32_t    HTE_LeafTermBlockID = 0;
-};
-
-struct LeafTermPage {
-    uint8_t LTP_Data[PAGE_SIZE] = {};
-};
-
 struct LeafCacheSlot {
     RWSpinLock  LCS_lock;
     uint32_t    LCS_PageID  = UINT32_MAX;
@@ -356,11 +500,6 @@ private:
         uint32_t v = m_Hand; m_Hand = (m_Hand + 1) % m_Capacity; return v;
     }
 };
-
-
-/* ── Continuation block marker ──────────────────────────────────────────────*/
-static constexpr uint16_t BLOCK_CONTINUATION_MARKER = 0xFFFFu;
-
 /* ── IndexBlockTable ─────────────────────────────────────────────────────────
  * Posting block manager + two-level head/leaf term table.
  *

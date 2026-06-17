@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <iostream>
+#include <vector>
 
 #include <cstdio>
 
@@ -27,7 +28,7 @@ using std::string;
 
 struct Document
 {
-    uint64_t    doc_id = 0;
+    uint64_t    doc_id = UINT64_MAX;
     std::string path;
     std::string url;
     std::string title;
@@ -62,7 +63,7 @@ public:
         , m_Params(make_shared<ConfigParameters>())
         , m_BlockTable(512)
         , m_Compiler(&m_Tokenizer)
-        , m_Executor(m_Store)
+        , m_Executor(this)
         , m_IndexPath(indexFile ? indexFile : "")
         , m_Built(false)
         , m_LoadedFromDisk(false)
@@ -71,12 +72,18 @@ public:
             LoadIndex();
     }
 
+    ~IndexContext()
+    {
+        ClearDocData();
+    }
+
     shared_ptr<IndexWriter> GetWriter()
     {
         if (m_LoadedFromDisk) {
             m_Store = make_shared<PostingStore>();
+            ClearDocData();
             m_BlockTable.Reset(PostingBlockCacheSlots(0));
-            m_Executor = IndexSearchExecutor(m_Store);
+            m_Executor = IndexSearchExecutor(this);
             m_Built = false;
             m_LoadedFromDisk = false;
         }
@@ -85,6 +92,9 @@ public:
 
     uint64_t AllocateDocumentID() const
     {
+        if (m_Store->AllDocStats().empty())
+            return 0;
+
         uint64_t maxId = 0;
         for (const auto& [docId, _] : m_Store->AllDocStats())
             maxId = std::max(maxId, docId);
@@ -93,7 +103,7 @@ public:
 
     uint64_t AddDocument(const Document& doc)
     {
-        const uint64_t docId = doc.doc_id ? doc.doc_id : AllocateDocumentID();
+        const uint64_t docId = doc.doc_id == UINT64_MAX ? AllocateDocumentID() : doc.doc_id;
         auto writer = GetWriter();
 
         auto titleTokens = m_Tokenizer.Tokenize(doc.title.c_str());
@@ -122,6 +132,8 @@ public:
         if (!doc.path.empty())
             m_Store->SetDocPath(docId, doc.path);
 
+        RefreshDocDataFromBuildState();
+
         return docId;
     }
 
@@ -133,6 +145,7 @@ public:
     {
         if (m_Built) return;
 
+        RefreshDocDataFromBuildState();
         auto br = IndexSerializer::BuildBlocksForContext(*m_Store);
 
         size_t n = br.BBR_IndexBlocks.size();
@@ -178,7 +191,7 @@ public:
 
     Tokenizer*           GetTokenizer() { return &m_Tokenizer; }
     IndexSearchCompiler* GetCompiler()  { return &m_Compiler; }
-    IndexSearchExecutor* GetExecutor()  { return new IndexSearchExecutor(m_Store); }
+    IndexSearchExecutor* GetExecutor()  { return new IndexSearchExecutor(this); }
 
     /* Compile query string and return an ISR tree ready for traversal. */
     shared_ptr<IndexReader> GetReader(const char* queryString,
@@ -194,11 +207,22 @@ public:
     {
         EnsureBuilt();
         auto reader = make_shared<AdvancedIndexReader>();
-        reader->Open(streamKey, &m_BlockTable, m_Store->DocFreq(streamKey));
+        reader->Open(streamKey, &m_BlockTable, this);
         return reader;
     }
 
     PostingStore* GetStore() { return m_Store.get(); }
+
+    const DocRecord* GetDocRecord(uint64_t docId) const
+    {
+        if (!m_DocData || docId >= m_TotalDocs)
+            return nullptr;
+
+        const auto* record = reinterpret_cast<const DocRecord*>(m_DocData + docId * DOC_REC_SIZE);
+        return record->DR_DocID == docId ? record : nullptr;
+    }
+
+    const IndexFileHeader& GetIndexFileHeader() const { return m_IndexFileHeader; }
 
     std::vector<float> CompileToVector(const char* queryString, size_t dim = 128)
     {
@@ -226,8 +250,6 @@ public:
 
         EnsureBuilt();
         if (!IndexSerializer::Save(*m_Store, path)) return false;
-        if (!m_Store->AllDocVectors().empty())
-            SaveVectorSidecar(VectorSidecarPath(path), m_Store->AllDocVectors());
 
         // Wire up FileBlockManager so cache misses reload from the .idx file.
         uint64_t blocks_offset = 0;
@@ -254,17 +276,24 @@ public:
         if (m_IndexPath.empty()) return;
 
         m_Store = make_shared<PostingStore>();
+        ClearDocData();
         std::vector<HeadTermEntry>               headTermEntries;
         std::vector<uint64_t>                    pageskip;
         uint64_t blocks_offset = 0;
         uint64_t num_blocks = 0;
         uint64_t leaf_blocks_offset = 0;
         uint64_t num_leaf_blocks = 0;
+        uint64_t docdata_offset = 0;
+        uint64_t docdata_size = 0;
+        uint64_t num_documents = 0;
+        IndexFileHeader header{};
 
         if (!IndexSerializer::Load(*m_Store, m_IndexPath.c_str(),
                        &headTermEntries, nullptr,
                        &blocks_offset, &pageskip, &num_blocks,
-                       &leaf_blocks_offset, &num_leaf_blocks))
+                   &leaf_blocks_offset, &num_leaf_blocks,
+                   &docdata_offset, &docdata_size, &num_documents,
+                   &header))
         {
             std::cerr << "Failed to load index: " << m_IndexPath
                       << " (unsupported/corrupt format; rebuild with current moon.exe)\n";
@@ -285,9 +314,8 @@ public:
             m_BlockTable.SetLeafTermFileManager(std::move(leafFm));
         m_BlockTable.ReserveLeafTermPageMap(static_cast<uint32_t>(std::min<uint64_t>(num_leaf_blocks, UINT32_MAX)));
 
-        LoadVectorSidecar(VectorSidecarPath(m_IndexPath), m_Store->MutableVectorIndex());
-
-        m_Executor = IndexSearchExecutor(m_Store);
+        LoadPinnedDocData(header);
+        m_Executor = IndexSearchExecutor(this);
         m_Built    = true;
         m_LoadedFromDisk = true;
     }
@@ -309,6 +337,13 @@ private:
     std::string                  m_IndexPath;
     bool                         m_Built;
     bool                         m_LoadedFromDisk;
+    IndexFileHeader              m_IndexFileHeader{};
+    std::unique_ptr<uint8_t[]>   m_DocDataBase;
+    uint8_t*                     m_DocData = nullptr;
+    uint64_t                     m_DocDataBytes = 0;
+    uint64_t                     m_DocDataPageCount = 0;
+    uint64_t                     m_TotalDocs = 0;
+    float                        m_AvgDocLen = 1.0f;
 
     static uint32_t PostingBlockCacheSlots(uint64_t postingBlockCount)
     {
@@ -322,6 +357,121 @@ private:
     {
         if (!m_Built)
             Build();
+    }
+
+    void ClearDocData()
+    {
+        if (m_DocData)
+            UnpinMemoryPages(m_DocData, static_cast<size_t>(m_DocDataBytes));
+        m_DocDataBase.reset();
+        m_DocData = nullptr;
+        m_DocDataBytes = 0;
+        m_DocDataPageCount = 0;
+        m_TotalDocs = 0;
+        m_AvgDocLen = 1.0f;
+        m_IndexFileHeader = {};
+    }
+
+    static uintptr_t AlignUp(uintptr_t value, uintptr_t alignment)
+    {
+        return (value + alignment - 1) & ~(alignment - 1);
+    }
+
+    static uint64_t PageAlignedBytes(uint64_t bytes)
+    {
+        return ((bytes + PAGE_SIZE - 1) / PAGE_SIZE) * PAGE_SIZE;
+    }
+
+    static bool SeekFile(FILE* file, uint64_t offset)
+    {
+#if defined(_WIN32)
+        return _fseeki64(file, static_cast<__int64>(offset), SEEK_SET) == 0;
+#else
+        return std::fseek(file, static_cast<long>(offset), SEEK_SET) == 0;
+#endif
+    }
+
+    void LoadPinnedDocData(const IndexFileHeader& header)
+    {
+        ClearDocData();
+
+        const uint64_t docDataBytes = header.IFH_DocDataSize;
+        const uint64_t docCount = header.IFH_NumDocuments;
+        if (docDataBytes == 0 || docCount == 0)
+            return;
+        if (docDataBytes % DOC_REC_SIZE != 0)
+            return;
+
+        const uint64_t docRecordCount = docDataBytes / DOC_REC_SIZE;
+        const uint64_t pageBytes = PageAlignedBytes(docDataBytes);
+
+        std::unique_ptr<uint8_t[]> docDataBase(new uint8_t[static_cast<size_t>(pageBytes + PAGE_SIZE - 1)]{});
+        uint8_t* docData = reinterpret_cast<uint8_t*>(
+            AlignUp(reinterpret_cast<uintptr_t>(docDataBase.get()), PAGE_SIZE));
+
+        std::unique_ptr<FILE, decltype(&std::fclose)> file(std::fopen(m_IndexPath.c_str(), "rb"), &std::fclose);
+        if (!file)
+            return;
+        if (!SeekFile(file.get(), header.IFH_DocDataOffset))
+            return;
+
+        const size_t bytesRead = std::fread(docData, 1, static_cast<size_t>(docDataBytes), file.get());
+        if (bytesRead != docDataBytes)
+            return;
+
+        m_DocDataBase = std::move(docDataBase);
+        m_DocData = docData;
+        m_DocDataBytes = pageBytes;
+        m_DocDataPageCount = pageBytes / PAGE_SIZE;
+        m_TotalDocs = std::min<uint64_t>(docCount, docRecordCount);
+        m_AvgDocLen = header.IFH_AvgDocLength > 0.0f ? header.IFH_AvgDocLength : 1.0f;
+        m_IndexFileHeader = header;
+
+        PinMemoryPages(m_DocData, static_cast<size_t>(pageBytes));
+    }
+
+    void RefreshDocDataFromBuildState()
+    {
+        if (!m_Store || m_Store->AllDocStats().empty())
+            return;
+
+        uint64_t maxDocId = 0;
+        for (const auto& [docId, _] : m_Store->AllDocStats())
+            maxDocId = std::max(maxDocId, docId);
+
+        ClearDocData();
+        const uint64_t bytes = (maxDocId + 1) * DOC_REC_SIZE;
+        static constexpr uintptr_t DOC_DATA_ALIGNMENT = 4096;
+        const uint64_t pageBytes = PageAlignedBytes(bytes);
+        m_DocDataPageCount = pageBytes / PAGE_SIZE;
+        m_DocDataBase.reset(new uint8_t[static_cast<size_t>(pageBytes + DOC_DATA_ALIGNMENT - 1)]{});
+        m_DocData = reinterpret_cast<uint8_t*>(
+            AlignUp(reinterpret_cast<uintptr_t>(m_DocDataBase.get()), DOC_DATA_ALIGNMENT));
+        m_DocDataBytes = pageBytes;
+
+        uint64_t totalLen = 0;
+        for (const auto& [docId, stats] : m_Store->AllDocStats()) {
+            auto* rec = reinterpret_cast<DocRecord*>(m_DocData + docId * DOC_REC_SIZE);
+            rec->DR_DocID = docId;
+            rec->DR_StaticRankHalf = EncodeFloat16(stats.importance);
+            rec->DR_DocLength = stats.doc_len;
+            if (const auto* vector = m_Store->GetDocVector(docId); vector && vector->size() == DOC_VECTOR_DIM) {
+                rec->DR_VectorDim = static_cast<uint16_t>(DOC_VECTOR_DIM);
+                rec->DR_VectorFormat = 1;
+                for (size_t i = 0; i < DOC_VECTOR_DIM; ++i)
+                    rec->DR_VectorHalf[i] = EncodeFloat16((*vector)[i]);
+            }
+            rec->DR_PathLength = EncodeDocPath(stats.path, rec->DR_Path);
+            totalLen += stats.doc_len;
+        }
+
+        PinMemoryPages(m_DocData, static_cast<size_t>(pageBytes));
+        m_TotalDocs = maxDocId + 1;
+        m_AvgDocLen = m_TotalDocs ? static_cast<float>(totalLen) / static_cast<float>(m_TotalDocs) : 1.0f;
+        std::memcpy(m_IndexFileHeader.IFH_Magic, INDEX_FILE_MAGIC, sizeof(INDEX_FILE_MAGIC));
+        m_IndexFileHeader.IFH_Version = INDEX_FORMAT_VERSION;
+        m_IndexFileHeader.IFH_NumDocuments = m_TotalDocs;
+        m_IndexFileHeader.IFH_AvgDocLength = m_AvgDocLen;
     }
 
     /*
@@ -351,7 +501,7 @@ private:
 
             reader->Open(termNode->stream_key.c_str(),
                          &m_BlockTable,
-                         m_Store->DocFreq(termNode->stream_key));
+                         this);
             return reader;
         }
 

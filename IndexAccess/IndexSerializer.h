@@ -8,7 +8,7 @@
 #include <string>
 
 /*
- * Binary index file format (version 7).
+ * Binary index file format (version 9).
  *
  * Layout:
  *   [Header 96B]       magic, version, all section offsets
@@ -48,7 +48,11 @@ public:
                      std::vector<uint64_t>*                 pageskip_out = nullptr,
                      uint64_t*                              num_blocks_out = nullptr,
                      uint64_t*                              leaf_blocks_offset_out = nullptr,
-                     uint64_t*                              num_leaf_blocks_out = nullptr);
+                     uint64_t*                              num_leaf_blocks_out = nullptr,
+                     uint64_t*                              docdata_offset_out = nullptr,
+                     uint64_t*                              docdata_size_out = nullptr,
+                     uint64_t*                              num_documents_out = nullptr,
+                     IndexFileHeader*                       header_out = nullptr);
 
     static bool IsValidIndex(const char* path);
 

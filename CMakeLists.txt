@@ -116,7 +116,6 @@ install(FILES
     IndexAccess/HashFunctions.h
     IndexAccess/MemOperation.h
     IndexAccess/IndexSerializer.h
-    IndexAccess/Bm25Scorer.h
     IndexAccess/SearchResult.h
     IndexAccess/UnifiedDecoder.h
     DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/moonshot)

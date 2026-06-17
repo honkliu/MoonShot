@@ -353,7 +353,8 @@ Matching DocIDs
     ▼  DocData.read(DocID × 64)
 ImportanceScore + DocumentLength
     │
-    ▼  Bm25Scorer.score(tf, doc_len, doc_freq) + ImportanceScore
+    ▼  AdvancedIndexReader::GetScore(DocRecord*)
+BM25(tf, DocRecord.DR_DocLength, doc_freq) + StaticRank
 Final score per doc
     │
     ▼  Top-K heap

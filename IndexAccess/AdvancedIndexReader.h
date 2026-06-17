@@ -9,7 +9,6 @@
 #include "BlockTable.h"
 #include "IndexReader.h"
 #include "UnifiedDecoder.h"
-#include "Bm25Scorer.h"
 
 class IndexContext;
 
@@ -20,7 +19,7 @@ class IndexContext;
 * UnifiedDecoder, identical to REF's ISRWord backed by a PageManager.
 *
 * Lifecycle (mirrors ISRCreatorDocShard::CreateWordIsr):
-*   reader->Open(streamKey, blockTable, docFreq)
+*   reader->Open(streamKey, blockTable)
 *       ← look up streamKey in blockTable
 *       ← if found: open UnifiedDecoder on the first block, GoNext() once
 *       ← if not found: reader stays at IsEnd
@@ -46,13 +45,10 @@ class AdvancedIndexReader : public IndexReader
         * Primary open: called by IndexContext::BuildIndexReader for each
         * leaf TermNode in the EvalTree.
         * blockTable — the IndexContext-owned BlockTable.
-        * docFreq    — document frequency for BM25 IDF computation.
         */
-        void Open(const char*     streamKey,
-                  IndexBlockTable* blockTable,
-                  uint32_t         docFreq);
-
-        void Open(const char* word) override {} /* not used — Open(key,table,freq) required */
+        void Open(const char*      streamKey,
+              IndexBlockTable* blockTable,
+              const IndexContext* context);
 
         void SetDebug(const char* label, int depth = 0) override
         {
@@ -78,9 +74,9 @@ class AdvancedIndexReader : public IndexReader
 
         /*
         * BM25 contribution of this term for the current document.
-        * Uses the docFreq supplied at Open() time.
+        * Uses the docFreq stored in the matching LeafTermEntry.
         */
-        float GetBM25Score(const Bm25Scorer& scorer, uint32_t docLength) override;
+        float GetScore(const DocRecord* record) override;
 
         void Close() override;
 
@@ -94,6 +90,7 @@ class AdvancedIndexReader : public IndexReader
         uint32_t                    m_TotalContinuationBlocks = 0;
         uint32_t                    m_RemainingContinuationBlocks = 0;
         IndexBlockTable*            m_BlockTable      = nullptr;
+        const IndexContext*         m_Context         = nullptr;
         UnifiedDecoder              m_Decoder;
 
         bool HasMoreBlocks() const { return m_RemainingContinuationBlocks > 0; }

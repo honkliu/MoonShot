@@ -20,6 +20,7 @@
 #include <fstream>
 #include <iostream>
 #include <map>
+#include <memory>
 #include <sstream>
 #include <string>
 #include <unordered_map>
@@ -79,6 +80,27 @@ static char PathSep()
 #else
     return '/';
 #endif
+}
+
+using FilePtr = std::unique_ptr<FILE, decltype(&std::fclose)>;
+
+static FilePtr OpenFile(const std::string& path, const char* mode)
+{
+    return FilePtr(std::fopen(path.c_str(), mode), &std::fclose);
+}
+
+static uint64_t FileOffset(FILE* file)
+{
+#if defined(_WIN32)
+    return static_cast<uint64_t>(_ftelli64(file));
+#else
+    return static_cast<uint64_t>(std::ftell(file));
+#endif
+}
+
+static uint64_t PageAlignedBytes(uint64_t bytes)
+{
+    return ((bytes + PAGE_SIZE - 1) / PAGE_SIZE) * PAGE_SIZE;
 }
 
 static char ReadSingleKey()
@@ -155,7 +177,7 @@ static PathMap LoadPathMap(const std::string& idxPath, uint64_t& max_id)
     for (const auto& [id, ds] : tmp.AllDocStats()) {
         if (!ds.path.empty()) {
             m[ds.path] = id;
-            max_id = std::max(max_id, id);
+            max_id = std::max(max_id, id + 1);
         }
     }
     return m;
@@ -368,18 +390,42 @@ static void vb_write(uint64_t v, std::vector<uint8_t>& out)
     out.push_back(static_cast<uint8_t>(v));
 }
 
-static uint64_t decode_last_docid_bytes(const uint8_t* data, size_t len)
+static bool vb_read(const uint8_t* data, size_t length, size_t& offset, uint64_t& value)
 {
-    size_t pos = 0;
-    uint64_t prev = 0;
-    while (pos < len) {
-        uint64_t delta = 0; uint8_t shift = 0, b = 0;
-        do { if (pos >= len) return prev; b = data[pos++]; delta |= uint64_t(b & 0x7fu) << shift; shift += 7; } while (b & 0x80u);
-        uint64_t tf = 0; shift = 0;
-        do { if (pos >= len) return prev; b = data[pos++]; tf |= uint64_t(b & 0x7fu) << shift; shift += 7; } while (b & 0x80u);
-        prev += delta;
+    value = 0;
+
+    uint32_t shift = 0;
+    while (offset < length && shift < 64) {
+        const uint8_t byte = data[offset++];
+        value |= static_cast<uint64_t>(byte & 0x7fu) << shift;
+
+        if ((byte & 0x80u) == 0)
+            return true;
+
+        shift += 7;
     }
-    return prev;
+
+    return false;
+}
+
+static uint64_t DecodeLastDocID(const uint8_t* data, size_t length)
+{
+    size_t offset = 0;
+    uint64_t docID = 0;
+
+    while (offset < length) {
+        uint64_t docDelta = 0;
+        if (!vb_read(data, length, offset, docDelta))
+            return docID;
+
+        uint64_t termFrequency = 0;
+        if (!vb_read(data, length, offset, termFrequency))
+            return docID;
+
+        docID += docDelta;
+    }
+
+    return docID;
 }
 
 static std::vector<uint8_t> EncodePostings(const std::vector<IndexEntry>& entries)
@@ -397,8 +443,10 @@ static std::vector<uint8_t> EncodePostings(const std::vector<IndexEntry>& entrie
 
 static void DumpRun(const PostingStore& store, const std::string& runPath)
 {
-    FILE* f = fopen(runPath.c_str(), "wb");
+    FilePtr file = OpenFile(runPath, "wb");
+    FILE* f = file.get();
     if (!f) throw std::runtime_error("Cannot write run: " + runPath);
+
     std::vector<std::pair<const std::string*, const PostingList*>> terms;
     terms.reserve(store.AllPostings().size());
     for (const auto& [term, posting] : store.AllPostings()) terms.push_back({&term, &posting});
@@ -413,7 +461,6 @@ static void DumpRun(const PostingStore& store, const std::string& runPath)
     }
     uint32_t zero = 0;
     fwrite(&zero, 4, 1, f);
-    fclose(f);
 }
 
 class RunReader {
@@ -430,7 +477,11 @@ private:
     std::vector<IndexEntry> m_Entries;
     void readNext() {
         uint32_t len = 0;
-        if (!m_File.read(reinterpret_cast<char*>(&len), 4) || len == 0) { m_Valid = false; return; }
+        if (!m_File.read(reinterpret_cast<char*>(&len), 4) || len == 0) {
+            m_Valid = false;
+            return;
+        }
+
         m_Term.assign(len, '\0');
         m_File.read(m_Term.data(), len);
         uint32_t count = 0;
@@ -576,7 +627,7 @@ static void SaveFromRuns(const std::string& idxPath,
                 constexpr size_t CONT_HDR = 4;
                 size_t take = std::min(bytes.size() - src, DATA_CAP - CONT_HDR);
                 bool more = take < bytes.size() - src;
-                uint64_t baseDoc = decode_last_docid_bytes(bytes.data(), src);
+                uint64_t baseDoc = DecodeLastDocID(bytes.data(), src);
                 pageskip.push_back(baseDoc);
                 uint16_t marker = BLOCK_CONTINUATION_MARKER;
                 uint16_t len = static_cast<uint16_t>(take);
@@ -598,65 +649,51 @@ static void SaveFromRuns(const std::string& idxPath,
     std::vector<uint8_t> ps(pageskip.size() * 8);
     if (!pageskip.empty()) std::memcpy(ps.data(), pageskip.data(), ps.size());
 
-    constexpr size_t DOC_REC = 1024;
-    constexpr size_t DOC_PATH = 1000;
-    std::vector<uint8_t> docdata(docs.size() * DOC_REC, 0);
+    std::vector<DocRecord> docdata(docs.size());
     for (size_t i = 0; i < docs.size(); ++i) {
-        uint8_t* rec = docdata.data() + i * DOC_REC;
-        std::memcpy(rec, &docs[i].doc_id, 8);
-        std::memcpy(rec + 8, &docs[i].importance, 4);
-        std::memcpy(rec + 12, &docs[i].doc_len, 4);
-        uint16_t plen = static_cast<uint16_t>(std::min(docs[i].path.size(), DOC_PATH - 1));
-        std::memcpy(rec + 16, &plen, 2);
-        if (plen) std::memcpy(rec + 24, docs[i].path.data(), plen);
+        docdata[i].DR_DocID = docs[i].doc_id;
+        docdata[i].DR_StaticRankHalf = EncodeFloat16(docs[i].importance);
+        docdata[i].DR_DocLength = docs[i].doc_len;
+        if (docs[i].vector.size() == DOC_VECTOR_DIM) {
+            docdata[i].DR_VectorDim = static_cast<uint16_t>(DOC_VECTOR_DIM);
+            docdata[i].DR_VectorFormat = 1;
+            for (size_t j = 0; j < DOC_VECTOR_DIM; ++j)
+                docdata[i].DR_VectorHalf[j] = EncodeFloat16(docs[i].vector[j]);
+        }
+        docdata[i].DR_PathLength = EncodeDocPath(docs[i].path, docdata[i].DR_Path);
     }
 
-#pragma pack(push,1)
-    struct Hdr {
-        uint8_t magic[8]; uint32_t version, reserved;
-        uint64_t num_documents, num_terms;
-        uint64_t subindex_off, subindex_size;
-        uint64_t pageskip_off, pageskip_size;
-        uint64_t docdata_off, docdata_size;
-        uint64_t blocks_off, num_blocks;
-    };
-#pragma pack(pop)
-    static const uint8_t MAGIC[8] = {'M','O','O','N','S','H','O','T'};
-    uint64_t hdrSize = sizeof(Hdr);
+    uint64_t hdrSize = sizeof(IndexFileHeader);
     uint64_t siOff = hdrSize, siSize = si.size();
     uint64_t psOff = siOff + siSize, psSize = ps.size();
-    uint64_t ddOff = psOff + psSize, ddSize = docdata.size();
+    uint64_t ddOff = psOff + psSize, ddSize = docdata.size() * sizeof(DocRecord);
     uint64_t rawBlocks = ddOff + ddSize;
-    uint64_t blkOff = ((rawBlocks + PAGE_SIZE - 1) / PAGE_SIZE) * PAGE_SIZE;
+    uint64_t blkOff = PageAlignedBytes(rawBlocks);
 
-    FILE* f = fopen(idxPath.c_str(), "wb");
+    FilePtr file = OpenFile(idxPath, "wb");
+    FILE* f = file.get();
     if (!f) throw std::runtime_error("Cannot write index: " + idxPath);
-    Hdr hdr{};
-    std::memcpy(hdr.magic, MAGIC, 8);
-    hdr.version = 7;
-    hdr.num_documents = docs.size();
-    hdr.num_terms = totalTerms;
-    hdr.subindex_off = siOff; hdr.subindex_size = siSize;
-    hdr.pageskip_off = psOff; hdr.pageskip_size = psSize;
-    hdr.docdata_off = ddOff; hdr.docdata_size = ddSize;
-    hdr.blocks_off = blkOff; hdr.num_blocks = blocks.size();
+
+    IndexFileHeader hdr{};
+    std::memcpy(hdr.IFH_Magic, INDEX_FILE_MAGIC, 8);
+    hdr.IFH_Version = INDEX_FORMAT_VERSION;
+    hdr.IFH_NumDocuments = docs.size();
+    hdr.IFH_NumTerms = totalTerms;
+    hdr.IFH_SubIndexOffset = siOff; hdr.IFH_SubIndexSize = siSize;
+    hdr.IFH_PageSkipOffset = psOff; hdr.IFH_PageSkipSize = psSize;
+    hdr.IFH_DocDataOffset = ddOff; hdr.IFH_DocDataSize = ddSize;
+    hdr.IFH_BlocksOffset = blkOff; hdr.IFH_NumBlocks = blocks.size();
     fwrite(&hdr, sizeof(hdr), 1, f);
     fwrite(si.data(), 1, si.size(), f);
     fwrite(ps.data(), 1, ps.size(), f);
-    if (!docdata.empty()) fwrite(docdata.data(), 1, docdata.size(), f);
-    uint64_t pos = static_cast<uint64_t>(ftell(f));
+    if (!docdata.empty()) fwrite(docdata.data(), sizeof(DocRecord), docdata.size(), f);
+    uint64_t pos = FileOffset(f);
     if (pos < blkOff) {
         std::vector<uint8_t> pad(static_cast<size_t>(blkOff - pos), 0);
         fwrite(pad.data(), 1, pad.size(), f);
     }
     if (!blocks.empty()) fwrite(blocks.data(), sizeof(IndexBlock), blocks.size(), f);
-    fclose(f);
 
-    FreshDiskAnnVectorIndex vectors;
-    for (const auto& doc : docs)
-        if (!doc.vector.empty()) vectors.Add(doc.doc_id, doc.vector);
-    if (!vectors.Empty())
-        SaveVectorSidecar(VectorSidecarPath(idxPath), vectors.AllVectors());
 }
 
 // ─── search ──────────────────────────────────────────────────────────────────
@@ -779,7 +816,7 @@ int main(int argc, char* argv[])
 
             std::vector<std::string> runs;
             std::vector<DocMeta> docs;
-            uint64_t nextDocId = 1;
+            uint64_t nextDocId = 0;
             size_t batch = 0;
             std::vector<FileItem> pending;
             uintmax_t pendingBytes = 0;
@@ -871,7 +908,7 @@ int main(int argc, char* argv[])
                 if (pathMap.count(file.path)) {
                     ++existing;
                 } else {
-                    pathMap[file.path] = ++max_id;
+                    pathMap[file.path] = max_id++;
                     ++added;
                 }
             }

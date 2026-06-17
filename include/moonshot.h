@@ -25,7 +25,6 @@
 #include "IndexReaderImpl.h"        /* TermIndexReader / AndIndexReader / OrIndexReader / NotIndexReader */
 #include "PostingStore.h"           /* in-memory posting store              */
 #include "SearchResult.h"           /* { doc_id, score, snippet }           */
-#include "Bm25Scorer.h"             /* Okapi BM25 scorer                    */
 
 /*
 * Tokenisation

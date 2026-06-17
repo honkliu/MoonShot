@@ -5,7 +5,7 @@
 #include <print>
 #include <string>
 
-class Bm25Scorer;
+#include "BlockTable.h"
 
 class IndexReader
 {
@@ -19,17 +19,9 @@ class IndexReader
 
         virtual uint32_t GetTermFreq() { return 1u; }
 
-        virtual float GetBM25Score(const Bm25Scorer& /*scorer*/,
-                                   uint32_t          /*doc_len*/) { return 0.0f; }
-
-        virtual float GetScore(const Bm25Scorer& scorer,
-                               uint32_t          doc_len)
-        {
-            return GetBM25Score(scorer, doc_len);
-        }
+        virtual float GetScore(const DocRecord* /*record*/) { return 0.0f; }
 
         virtual void Close() = 0;
-        virtual void Open(const char* word) = 0;
 
         /*
         * Enable debug tracing.  label appears in every printed line so the

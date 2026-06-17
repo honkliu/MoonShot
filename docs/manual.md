@@ -38,7 +38,6 @@ MoonShot/
 │   ├── IndexContext.h          ← engine factory (owns PostingStore)
 │   ├── AdvancedIndexWriter.h   ← writes tokens into PostingStore
 │   ├── IsrImpl.h               ← TermIsr / AndIsr / OrIsr / NotIsr
-│   ├── Bm25Scorer.h            ← Okapi BM25
 │   ├── BlockTable.h            ← block cache (clock eviction)
 │   ├── ElementFilter.h/cpp     ← bloom filter (MurmurHash3)
 │   ├── HashFunctions.h/cpp     ← MurmurHash3 implementation
@@ -470,15 +469,13 @@ directly:
 
 ```cpp
 auto reader = engine.GetReader("rust");   // OrIsr across AUT streams
-Bm25Scorer scorer(engine.GetStore()->TotalDocs(),
-                  engine.GetStore()->AvgDocLen());
 
 while (!reader->IsEnd()) {
     uint64_t doc  = reader->GetDocumentID();
     uint32_t tf   = reader->GetTermFreq();
-    uint32_t dl   = engine.GetStore()->GetDocLen(doc);
-    float    bm25 = reader->GetBM25Score(scorer, dl);
-    printf("doc=%-4llu  tf=%u  bm25=%.3f\n", doc, tf, bm25);
+    const DocRecord* record = engine.GetDocRecord(doc);
+    float    score = reader->GetScore(record);
+    printf("doc=%-4llu  tf=%u  score=%.3f\n", doc, tf, score);
     reader->GoNext();
 }
 ```
@@ -513,7 +510,6 @@ auto results = exec->Execute(engine.GetReader(&tree), 10);
 | `IsrImpl.h` | `TermIsr`, `AndIsr`, `OrIsr`, `NotIsr` |
 | `PostingStore.h` | `PostingStore`, `PostingList`, `PostingEntry`, `DocStats` |
 | `IndexReader.h` | `IndexReader` — ISR base interface |
-| `Bm25Scorer.h` | `Bm25Scorer` |
 | `SearchResult.h` | `SearchResult` |
 | `Tokenizer.h` | `Tokenizer`, `SmartTokenizer`, `SimpleTokenizer` |
 | `BlockTable.h` | `BlockCache`, `TermToBlock`, `RWSpinLock`, `IndexBlock` |

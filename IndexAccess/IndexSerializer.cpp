@@ -1,5 +1,5 @@
 /*
- * IndexSerializer — v7 paged Head/Leaf term table format.
+ * IndexSerializer — v8 paged Head/Leaf term table format.
  *
  * Block IB_Data: raw posting bytes only (no key/doc_freq/data_len headers).
  * Head/Leaf term table: two-level term metadata structure.
@@ -17,31 +17,76 @@
 #include <string>
 #include <algorithm>
 #include <cassert>
-
-static const uint8_t  MAGIC[8]       = {'M','O','O','N','S','H','O','T'};
-static const uint32_t FORMAT_VERSION = 7;
+#include <memory>
 
 /* ── helpers ─────────────────────────────────────────────────────────────── */
 
-static uint64_t file_pos(FILE* f) { return static_cast<uint64_t>(ftell(f)); }
+using FilePtr = std::unique_ptr<FILE, decltype(&std::fclose)>;
 
-static uint64_t decode_last_docid(const uint8_t* data, size_t len)
+static FilePtr open_file(const char* path, const char* mode)
 {
-    size_t   pos  = 0;
-    uint64_t prev = 0;
-    while (pos < len) {
-        uint64_t delta = 0; uint8_t shift = 0, b;
-        do { if (pos >= len) goto done;
-             b = data[pos++]; delta |= uint64_t(b & 0x7fu) << shift; shift += 7;
-        } while (b & 0x80u);
-        uint64_t tf = 0; shift = 0;
-        do { if (pos >= len) goto done;
-             b = data[pos++]; tf |= uint64_t(b & 0x7fu) << shift; shift += 7;
-        } while (b & 0x80u);
-        prev += delta;
+    return FilePtr(std::fopen(path, mode), &std::fclose);
+}
+
+static bool seek_file(FILE* file, uint64_t offset)
+{
+#if defined(_WIN32)
+    return _fseeki64(file, static_cast<__int64>(offset), SEEK_SET) == 0;
+#else
+    return std::fseek(file, static_cast<long>(offset), SEEK_SET) == 0;
+#endif
+}
+
+static uint64_t file_pos(FILE* file)
+{
+#if defined(_WIN32)
+    return static_cast<uint64_t>(_ftelli64(file));
+#else
+    return static_cast<uint64_t>(std::ftell(file));
+#endif
+}
+
+static uint64_t page_aligned_bytes(uint64_t bytes)
+{
+    return ((bytes + PAGE_SIZE - 1) / PAGE_SIZE) * PAGE_SIZE;
+}
+
+static bool read_varint(const uint8_t* data, size_t length, size_t& offset, uint64_t& value)
+{
+    value = 0;
+
+    uint32_t shift = 0;
+    while (offset < length && shift < 64) {
+        const uint8_t byte = data[offset++];
+        value |= static_cast<uint64_t>(byte & 0x7fu) << shift;
+
+        if ((byte & 0x80u) == 0)
+            return true;
+
+        shift += 7;
     }
-done:
-    return prev;
+
+    return false;
+}
+
+static uint64_t decode_last_docid(const uint8_t* data, size_t length)
+{
+    size_t offset = 0;
+    uint64_t docID = 0;
+
+    while (offset < length) {
+        uint64_t docDelta = 0;
+        if (!read_varint(data, length, offset, docDelta))
+            return docID;
+
+        uint64_t termFrequency = 0;
+        if (!read_varint(data, length, offset, termFrequency))
+            return docID;
+
+        docID += docDelta;
+    }
+
+    return docID;
 }
 
 static size_t leaf_entry_bytes(const LeafTermEntry& e)
@@ -251,38 +296,34 @@ bool IndexSerializer::Save(const PostingStore& store, const char* path)
         std::memcpy(pageskip_buf.data(), br.BBR_PageSkipList.data(), pageskip_buf.size());
 
     /* ── Encode DocData ───────────────────────────────────────────────────*/
-    static constexpr size_t DOC_REC_SIZE = 1024;
-    static constexpr size_t DOC_PATH_MAX = 1000;
-#pragma pack(push,1)
-    struct DocRec { uint64_t doc_id; float importance; uint32_t doc_len;
-                    uint16_t path_len; uint8_t _pad[6]; char path[DOC_PATH_MAX]; };
-#pragma pack(pop)
-    static_assert(sizeof(DocRec) == DOC_REC_SIZE, "");
-    std::vector<DocRec> docdata;
-    docdata.reserve(store.AllDocStats().size());
+    std::vector<DocRecord> docdata;
+    uint64_t maxDocID = 0;
+    for (const auto& [id, _] : store.AllDocStats())
+        maxDocID = std::max(maxDocID, id);
+    if (!store.AllDocStats().empty())
+        docdata.resize(static_cast<size_t>(maxDocID + 1));
+
     for (const auto& [id, ds] : store.AllDocStats()) {
-        DocRec r{};
-        r.doc_id     = id;
-        r.importance = ds.importance;
-        r.doc_len    = ds.doc_len;
-        size_t plen  = std::min(ds.path.size(), DOC_PATH_MAX - 1);
-        r.path_len   = static_cast<uint16_t>(plen);
-        if (plen) std::memcpy(r.path, ds.path.c_str(), plen);
-        docdata.push_back(r);
+        DocRecord r{};
+        r.DR_DocID     = id;
+        r.DR_DocLength = ds.doc_len;
+        r.DR_StaticRankHalf = EncodeFloat16(ds.importance);
+        r.DR_QualityScoreHalf = EncodeFloat16(0.0f);
+        r.DR_FreshnessScoreHalf = EncodeFloat16(0.0f);
+        r.DR_ClickScoreHalf = EncodeFloat16(0.0f);
+        r.DR_EngagementScoreHalf = EncodeFloat16(0.0f);
+        if (const auto* vector = store.GetDocVector(id); vector && vector->size() == DOC_VECTOR_DIM) {
+            r.DR_VectorDim = static_cast<uint16_t>(DOC_VECTOR_DIM);
+            r.DR_VectorFormat = 1;
+            for (size_t i = 0; i < DOC_VECTOR_DIM; ++i)
+                r.DR_VectorHalf[i] = EncodeFloat16((*vector)[i]);
+        }
+        r.DR_PathLength = EncodeDocPath(ds.path, r.DR_Path);
+        docdata[static_cast<size_t>(id)] = r;
     }
 
     /* ── Compute file offsets ─────────────────────────────────────────────*/
-#pragma pack(push,1)
-    struct Hdr {
-        uint8_t  magic[8]; uint32_t version, reserved;
-        uint64_t num_documents, num_terms;
-        uint64_t subindex_off, subindex_size;
-        uint64_t pageskip_off, pageskip_size;
-        uint64_t docdata_off,  docdata_size;
-        uint64_t blocks_off,   num_blocks;
-    };
-#pragma pack(pop)
-    const uint64_t HDR_SIZE  = sizeof(Hdr);
+    const uint64_t HDR_SIZE  = sizeof(IndexFileHeader);
     uint64_t si_off          = HDR_SIZE;
     uint64_t si_size         = head_leaf_table_buf.size();
     uint64_t ps_off          = si_off + si_size;
@@ -290,20 +331,22 @@ bool IndexSerializer::Save(const PostingStore& store, const char* path)
     uint64_t dd_off          = ps_off + ps_size;
     uint64_t dd_size         = docdata.size() * DOC_REC_SIZE;
     uint64_t raw_blk_off     = dd_off + dd_size;
-    uint64_t blk_off         = ((raw_blk_off + PAGE_SIZE - 1) / PAGE_SIZE) * PAGE_SIZE;
+    uint64_t blk_off         = page_aligned_bytes(raw_blk_off);
 
-    FILE* f = fopen(path, "wb");
+    FilePtr file = open_file(path, "wb");
+    FILE* f = file.get();
     if (!f) return false;
 
-    Hdr hdr{};
-    std::memcpy(hdr.magic, MAGIC, 8);
-    hdr.version       = FORMAT_VERSION;
-    hdr.num_documents = static_cast<uint64_t>(docdata.size());
-    hdr.num_terms     = br.BBR_TotalTerms;
-    hdr.subindex_off  = si_off;   hdr.subindex_size = si_size;
-    hdr.pageskip_off  = ps_off;   hdr.pageskip_size = ps_size;
-    hdr.docdata_off   = dd_off;   hdr.docdata_size  = dd_size;
-    hdr.blocks_off    = blk_off;  hdr.num_blocks    = br.BBR_IndexBlocks.size();
+    IndexFileHeader hdr{};
+    std::memcpy(hdr.IFH_Magic, INDEX_FILE_MAGIC, 8);
+    hdr.IFH_Version       = INDEX_FORMAT_VERSION;
+    hdr.IFH_AvgDocLength  = store.AvgDocLen();
+    hdr.IFH_NumDocuments = static_cast<uint64_t>(docdata.size());
+    hdr.IFH_NumTerms     = br.BBR_TotalTerms;
+    hdr.IFH_SubIndexOffset  = si_off;   hdr.IFH_SubIndexSize = si_size;
+    hdr.IFH_PageSkipOffset  = ps_off;   hdr.IFH_PageSkipSize = ps_size;
+    hdr.IFH_DocDataOffset   = dd_off;   hdr.IFH_DocDataSize  = dd_size;
+    hdr.IFH_BlocksOffset    = blk_off;  hdr.IFH_NumBlocks    = br.BBR_IndexBlocks.size();
     fwrite(&hdr, sizeof(hdr), 1, f);
 
     fwrite(head_leaf_table_buf.data(), 1, head_leaf_table_buf.size(), f);
@@ -319,7 +362,6 @@ bool IndexSerializer::Save(const PostingStore& store, const char* path)
     for (const auto& b : br.BBR_IndexBlocks)
         fwrite(&b, sizeof(IndexBlock), 1, f);
 
-    fclose(f);
     return true;
 }
 
@@ -333,32 +375,30 @@ bool IndexSerializer::Load(PostingStore&                           store,
                            std::vector<uint64_t>*                 pageskip_out,
                            uint64_t*                              num_blocks_out,
                            uint64_t*                              leaf_blocks_offset_out,
-                           uint64_t*                              num_leaf_blocks_out)
+                           uint64_t*                              num_leaf_blocks_out,
+                           uint64_t*                              docdata_offset_out,
+                           uint64_t*                              docdata_size_out,
+                           uint64_t*                              num_documents_out,
+                           IndexFileHeader*                       header_out)
 {
     if (!path || !*path) return false;
-    FILE* f = fopen(path, "rb");
+    FilePtr file = open_file(path, "rb");
+    FILE* f = file.get();
     if (!f) return false;
 
-#pragma pack(push,1)
-    struct Hdr {
-        uint8_t  magic[8]; uint32_t version, reserved;
-        uint64_t num_documents, num_terms;
-        uint64_t subindex_off, subindex_size;
-        uint64_t pageskip_off, pageskip_size;
-        uint64_t docdata_off,  docdata_size;
-        uint64_t blocks_off,   num_blocks;
-    };
-#pragma pack(pop)
-
-    Hdr hdr{};
+    IndexFileHeader hdr{};
     if (fread(&hdr, sizeof(hdr), 1, f) != 1
-        || std::memcmp(hdr.magic, MAGIC, 8) != 0
-        || hdr.version != FORMAT_VERSION)
-    { fclose(f); return false; }
+        || std::memcmp(hdr.IFH_Magic, INDEX_FILE_MAGIC, 8) != 0
+        || hdr.IFH_Version != INDEX_FORMAT_VERSION)
+    {
+        return false;
+    }
+    if (header_out) *header_out = hdr;
 
     /* ── Head/Leaf term table ─────────────────────────────────────────────*/
-    if ((headTermEntriesOut || leafTermPagesOut || leaf_blocks_offset_out || num_leaf_blocks_out) && hdr.subindex_size > 0) {
-        fseek(f, static_cast<long>(hdr.subindex_off), SEEK_SET);
+    if ((headTermEntriesOut || leafTermPagesOut || leaf_blocks_offset_out || num_leaf_blocks_out) && hdr.IFH_SubIndexSize > 0) {
+        if (!seek_file(f, hdr.IFH_SubIndexOffset))
+            return false;
 
         auto read_u16_file = [&]() -> uint16_t {
             uint16_t v = 0; fread(&v, 2, 1, f); return v;
@@ -384,7 +424,7 @@ bool IndexSerializer::Load(PostingStore&                           store,
 
         /* Level-2 leaf pages — only read into memory when explicitly requested. */
         uint32_t leaf_page_count = read_u32_file();
-        uint64_t leaf_pages_offset = static_cast<uint64_t>(ftell(f));
+        uint64_t leaf_pages_offset = file_pos(f);
         if (leaf_blocks_offset_out) *leaf_blocks_offset_out = leaf_pages_offset;
         if (num_leaf_blocks_out) *num_leaf_blocks_out = leaf_page_count;
         if (leafTermPagesOut && leaf_page_count > 0) {
@@ -394,50 +434,55 @@ bool IndexSerializer::Load(PostingStore&                           store,
     }
 
     /* ── PageSkipList ─────────────────────────────────────────────────────*/
-    if (pageskip_out && hdr.pageskip_size > 0) {
-        size_t n = static_cast<size_t>(hdr.pageskip_size / 8);
+    if (pageskip_out && hdr.IFH_PageSkipSize > 0) {
+        size_t n = static_cast<size_t>(hdr.IFH_PageSkipSize / 8);
         pageskip_out->resize(n);
-        fseek(f, static_cast<long>(hdr.pageskip_off), SEEK_SET);
+        if (!seek_file(f, hdr.IFH_PageSkipOffset))
+            return false;
         fread(pageskip_out->data(), 8, n, f);
     }
 
-    if (blocks_offset_out) *blocks_offset_out = hdr.blocks_off;
-    if (num_blocks_out)    *num_blocks_out    = hdr.num_blocks;
+    if (blocks_offset_out) *blocks_offset_out = hdr.IFH_BlocksOffset;
+    if (num_blocks_out)    *num_blocks_out    = hdr.IFH_NumBlocks;
+    if (docdata_offset_out) *docdata_offset_out = hdr.IFH_DocDataOffset;
+    if (docdata_size_out)   *docdata_size_out   = hdr.IFH_DocDataSize;
+    if (num_documents_out)  *num_documents_out  = hdr.IFH_NumDocuments;
 
     /* ── DocData ──────────────────────────────────────────────────────────*/
     {
-        static constexpr size_t REC = 1024, PMAX = 1000;
-#pragma pack(push,1)
-        struct DocRec { uint64_t doc_id; float importance; uint32_t doc_len;
-                        uint16_t path_len; uint8_t _pad[6]; char path[PMAX]; };
-#pragma pack(pop)
-        static_assert(sizeof(DocRec) == REC, "");
-        size_t n = static_cast<size_t>(hdr.docdata_size / REC);
-        std::vector<DocRec> recs(n);
-        fseek(f, static_cast<long>(hdr.docdata_off), SEEK_SET);
-        if (n > 0) fread(recs.data(), REC, n, f);
+        size_t n = static_cast<size_t>(hdr.IFH_DocDataSize / DOC_REC_SIZE);
+        if (!seek_file(f, hdr.IFH_DocDataOffset))
+            return false;
+        std::vector<DocRecord> recs(n);
+        if (n > 0) fread(recs.data(), DOC_REC_SIZE, n, f);
         for (const auto& r : recs) {
-            store.AddDocTokens(r.doc_id, r.doc_len);
-            store.SetDocImportance(r.doc_id, r.importance);
-            if (r.path_len > 0)
-                store.SetDocPath(r.doc_id,
-                    std::string(r.path, std::min<size_t>(r.path_len, PMAX - 1)));
+            if (r.DR_DocID >= n)
+                continue;
+            store.AddDocTokens(r.DR_DocID, r.DR_DocLength);
+            store.SetDocImportance(r.DR_DocID, DecodeFloat16(r.DR_StaticRankHalf));
+            if (r.DR_VectorDim == DOC_VECTOR_DIM && r.DR_VectorFormat == 1) {
+                std::vector<float> vector(DOC_VECTOR_DIM);
+                for (size_t i = 0; i < DOC_VECTOR_DIM; ++i)
+                    vector[i] = DecodeFloat16(r.DR_VectorHalf[i]);
+                store.SetDocVector(r.DR_DocID, std::move(vector));
+            }
+            if (r.DR_PathLength > 0)
+                store.SetDocPath(r.DR_DocID, DecodeDocPath(r));
         }
     }
 
-    fclose(f);
     return true;
 }
 
 bool IndexSerializer::IsValidIndex(const char* path)
 {
     if (!path || !*path) return false;
-    FILE* f = fopen(path, "rb");
+    FilePtr file = open_file(path, "rb");
+    FILE* f = file.get();
     if (!f) return false;
     uint8_t magic[8] = {};
     fread(magic, 1, 8, f);
-    fclose(f);
-    return std::memcmp(magic, MAGIC, 8) == 0;
+    return std::memcmp(magic, INDEX_FILE_MAGIC, 8) == 0;
 }
 
 BuildBlocksResult IndexSerializer::BuildBlocksForContext(const PostingStore& store)

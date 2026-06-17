@@ -11,7 +11,6 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
-#include <fstream>
 #include <limits>
 #include <queue>
 #include <string>
@@ -31,11 +30,6 @@ struct VectorSearchResult {
     uint64_t doc_id = 0;
     float score = 0.0f;
 };
-
-inline std::string VectorSidecarPath(const std::string& indexPath)
-{
-    return indexPath + ".v.index";
-}
 
 inline float DotProduct(const std::vector<float>& a, const std::vector<float>& b)
 {
@@ -88,11 +82,12 @@ inline float VectorScore(const std::vector<float>& query,
 
 class FreshDiskAnnVectorIndex {
 public:
+    using NodeID = uint64_t;
+
     struct Node {
-        uint64_t doc_id = 0;
         std::vector<float> vector;
         size_t level = 0;
-        std::vector<std::vector<size_t>> neighbors;
+        std::vector<std::vector<NodeID>> neighbors;
     };
 
     explicit FreshDiskAnnVectorIndex(size_t maxNeighbors = 32,
@@ -105,59 +100,57 @@ public:
     {
         m_Dim = 0;
         m_Nodes.clear();
-        m_DocToNode.clear();
         m_EntryPoint = npos();
         m_MaxLevel = 0;
     }
 
     bool Add(uint64_t docId, std::vector<float> vector)
     {
-        if (docId == 0 || vector.empty()) return false;
+        if (vector.empty()) return false;
         if (m_Dim == 0) m_Dim = vector.size();
         if (vector.size() != m_Dim) return false;
 
-        auto existing = m_DocToNode.find(docId);
-        if (existing != m_DocToNode.end()) {
-            m_Nodes[existing->second].vector = std::move(vector);
+        if (docId < m_Nodes.size()) {
+            m_Nodes[static_cast<size_t>(docId)].vector = std::move(vector);
             return true;
         }
+        if (docId != m_Nodes.size())
+            return false;
 
         Node node;
-        node.doc_id = docId;
         node.vector = std::move(vector);
         node.level = RandomLevel(docId);
         node.neighbors.resize(node.level + 1);
 
-        const size_t newIndex = m_Nodes.size();
+        const NodeID newNodeID = docId;
         m_Nodes.push_back(std::move(node));
-        m_DocToNode[docId] = newIndex;
 
         if (m_EntryPoint == npos()) {
-            m_EntryPoint = newIndex;
-            m_MaxLevel = m_Nodes[newIndex].level;
+            m_EntryPoint = newNodeID;
+            m_MaxLevel = m_Nodes[static_cast<size_t>(newNodeID)].level;
             return true;
         }
 
-        size_t entry = m_EntryPoint;
-        for (int level = static_cast<int>(m_MaxLevel); level > static_cast<int>(m_Nodes[newIndex].level); --level)
-            entry = GreedySearchLayer(m_Nodes[newIndex].vector, entry, static_cast<size_t>(level));
+        NodeID entry = m_EntryPoint;
+        for (int level = static_cast<int>(m_MaxLevel); level > static_cast<int>(m_Nodes[static_cast<size_t>(newNodeID)].level); --level)
+            entry = GreedySearchLayer(m_Nodes[static_cast<size_t>(newNodeID)].vector, entry, static_cast<size_t>(level));
 
-        const size_t top = std::min(m_MaxLevel, m_Nodes[newIndex].level);
+        const size_t top = std::min(m_MaxLevel, m_Nodes[static_cast<size_t>(newNodeID)].level);
         for (int level = static_cast<int>(top); level >= 0; --level) {
-            auto candidates = SearchLayer(m_Nodes[newIndex].vector, entry, m_EfConstruction, static_cast<size_t>(level));
+            auto candidates = SearchLayer(m_Nodes[static_cast<size_t>(newNodeID)].vector, entry, m_EfConstruction, static_cast<size_t>(level));
             auto selected = SelectNeighbors(candidates, m_MaxNeighbors);
-            m_Nodes[newIndex].neighbors[static_cast<size_t>(level)] = selected;
+            m_Nodes[static_cast<size_t>(newNodeID)].neighbors[static_cast<size_t>(level)] = selected;
 
-            for (size_t neighbor : selected)
-                LinkBack(neighbor, newIndex, static_cast<size_t>(level));
+            for (NodeID neighbor : selected)
+                LinkBack(neighbor, newNodeID, static_cast<size_t>(level));
 
             if (!candidates.empty())
                 entry = candidates.front().second;
         }
 
-        if (m_Nodes[newIndex].level > m_MaxLevel) {
-            m_EntryPoint = newIndex;
-            m_MaxLevel = m_Nodes[newIndex].level;
+        if (m_Nodes[static_cast<size_t>(newNodeID)].level > m_MaxLevel) {
+            m_EntryPoint = newNodeID;
+            m_MaxLevel = m_Nodes[static_cast<size_t>(newNodeID)].level;
         }
 
         return true;
@@ -165,8 +158,7 @@ public:
 
     const std::vector<float>* Get(uint64_t docId) const
     {
-        auto it = m_DocToNode.find(docId);
-        return it == m_DocToNode.end() ? nullptr : &m_Nodes[it->second].vector;
+        return docId < m_Nodes.size() ? &m_Nodes[static_cast<size_t>(docId)].vector : nullptr;
     }
 
     std::vector<VectorSearchResult> Search(const std::vector<float>& query,
@@ -177,7 +169,7 @@ public:
         std::vector<VectorSearchResult> results;
         if (query.empty() || m_Nodes.empty() || (m_Dim != 0 && query.size() != m_Dim)) return results;
 
-        size_t entry = m_EntryPoint;
+        NodeID entry = m_EntryPoint;
         for (int level = static_cast<int>(m_MaxLevel); level > 0; --level)
             entry = GreedySearchLayer(query, entry, static_cast<size_t>(level), metric);
 
@@ -185,17 +177,17 @@ public:
         auto candidates = SearchLayer(query, entry, std::max(efSearch, wanted), 0, metric);
 
         if (topK == 0 && candidates.size() < m_Nodes.size()) {
-            std::unordered_set<size_t> seen;
+            std::unordered_set<NodeID> seen;
             for (const auto& c : candidates) seen.insert(c.second);
             for (size_t i = 0; i < m_Nodes.size(); ++i)
-                if (!seen.count(i))
-                    candidates.push_back({VectorScore(query, m_Nodes[i].vector, metric), i});
+                if (!seen.count(static_cast<NodeID>(i)))
+                    candidates.push_back({VectorScore(query, m_Nodes[i].vector, metric), static_cast<NodeID>(i)});
         }
 
         results.reserve(candidates.size());
         for (const auto& candidate : candidates)
-            results.push_back({m_Nodes[candidate.second].doc_id,
-                               VectorScore(query, m_Nodes[candidate.second].vector, metric)});
+            results.push_back({candidate.second,
+                               VectorScore(query, m_Nodes[static_cast<size_t>(candidate.second)].vector, metric)});
 
         std::sort(results.begin(), results.end(), [](const auto& a, const auto& b) {
             if (a.score != b.score) return a.score > b.score;
@@ -217,8 +209,8 @@ public:
     {
         m_VectorView.clear();
         m_VectorView.reserve(m_Nodes.size());
-        for (const auto& node : m_Nodes)
-            m_VectorView.emplace(node.doc_id, node.vector);
+        for (size_t nodeID = 0; nodeID < m_Nodes.size(); ++nodeID)
+            m_VectorView.emplace(static_cast<uint64_t>(nodeID), m_Nodes[nodeID].vector);
         return m_VectorView;
     }
 
@@ -226,22 +218,19 @@ public:
                    size_t maxNeighbors,
                    size_t efConstruction,
                    std::vector<Node> nodes,
-                   size_t entryPoint,
+                   NodeID entryPoint,
                    size_t maxLevel)
     {
         m_Dim = dim;
         m_MaxNeighbors = std::max<size_t>(maxNeighbors, 2);
         m_EfConstruction = std::max<size_t>(efConstruction, m_MaxNeighbors);
         m_Nodes = std::move(nodes);
-        m_DocToNode.clear();
-        for (size_t i = 0; i < m_Nodes.size(); ++i)
-            m_DocToNode[m_Nodes[i].doc_id] = i;
         m_EntryPoint = entryPoint < m_Nodes.size() ? entryPoint : (m_Nodes.empty() ? npos() : 0);
         m_MaxLevel = maxLevel;
     }
 
 private:
-    static size_t npos() { return std::numeric_limits<size_t>::max(); }
+    static NodeID npos() { return std::numeric_limits<NodeID>::max(); }
 
     size_t RandomLevel(uint64_t docId) const
     {
@@ -254,23 +243,23 @@ private:
         return level;
     }
 
-    float Score(size_t nodeIndex, const std::vector<float>& query, VectorMetric metric = VectorMetric::Cosine) const
+    float Score(NodeID nodeID, const std::vector<float>& query, VectorMetric metric = VectorMetric::Cosine) const
     {
-        return VectorScore(query, m_Nodes[nodeIndex].vector, metric);
+        return VectorScore(query, m_Nodes[static_cast<size_t>(nodeID)].vector, metric);
     }
 
-    size_t GreedySearchLayer(const std::vector<float>& query,
-                             size_t entry,
+    NodeID GreedySearchLayer(const std::vector<float>& query,
+                             NodeID entry,
                              size_t level,
                              VectorMetric metric = VectorMetric::Cosine) const
     {
         bool changed = true;
-        size_t best = entry;
+        NodeID best = entry;
         float bestScore = Score(best, query, metric);
         while (changed) {
             changed = false;
-            if (level >= m_Nodes[best].neighbors.size()) break;
-            for (size_t neighbor : m_Nodes[best].neighbors[level]) {
+            if (level >= m_Nodes[static_cast<size_t>(best)].neighbors.size()) break;
+            for (NodeID neighbor : m_Nodes[static_cast<size_t>(best)].neighbors[level]) {
                 float score = Score(neighbor, query, metric);
                 if (score > bestScore) {
                     best = neighbor;
@@ -282,18 +271,18 @@ private:
         return best;
     }
 
-    std::vector<std::pair<float, size_t>> SearchLayer(const std::vector<float>& query,
-                                                      size_t entry,
+    std::vector<std::pair<float, NodeID>> SearchLayer(const std::vector<float>& query,
+                                                      NodeID entry,
                                                       size_t ef,
                                                       size_t level,
                                                       VectorMetric metric = VectorMetric::Cosine) const
     {
-        using Candidate = std::pair<float, size_t>;
+        using Candidate = std::pair<float, NodeID>;
         auto bestFirst = [](const Candidate& a, const Candidate& b) { return a.first < b.first; };
         auto worstFirst = [](const Candidate& a, const Candidate& b) { return a.first > b.first; };
         std::priority_queue<Candidate, std::vector<Candidate>, decltype(bestFirst)> candidates(bestFirst);
         std::priority_queue<Candidate, std::vector<Candidate>, decltype(worstFirst)> results(worstFirst);
-        std::unordered_set<size_t> visited;
+        std::unordered_set<NodeID> visited;
 
         float entryScore = Score(entry, query, metric);
         candidates.push({entryScore, entry});
@@ -305,8 +294,8 @@ private:
             candidates.pop();
             if (!results.empty() && current.first < results.top().first)
                 break;
-            if (level >= m_Nodes[current.second].neighbors.size()) continue;
-            for (size_t neighbor : m_Nodes[current.second].neighbors[level]) {
+            if (level >= m_Nodes[static_cast<size_t>(current.second)].neighbors.size()) continue;
+            for (NodeID neighbor : m_Nodes[static_cast<size_t>(current.second)].neighbors[level]) {
                 if (!visited.insert(neighbor).second) continue;
                 float score = Score(neighbor, query, metric);
                 if (results.size() < ef || score > results.top().first) {
@@ -329,15 +318,15 @@ private:
         return out;
     }
 
-    std::vector<size_t> SelectNeighbors(const std::vector<std::pair<float, size_t>>& candidates,
+    std::vector<NodeID> SelectNeighbors(const std::vector<std::pair<float, NodeID>>& candidates,
                                         size_t maxNeighbors) const
     {
-        std::vector<std::pair<float, size_t>> sorted = candidates;
+        std::vector<std::pair<float, NodeID>> sorted = candidates;
         std::sort(sorted.begin(), sorted.end(), [](const auto& a, const auto& b) {
             if (a.first != b.first) return a.first > b.first;
             return a.second < b.second;
         });
-        std::vector<size_t> out;
+        std::vector<NodeID> out;
         for (const auto& candidate : sorted) {
             if (out.size() >= maxNeighbors) break;
             out.push_back(candidate.second);
@@ -345,18 +334,19 @@ private:
         return out;
     }
 
-    void LinkBack(size_t node, size_t neighbor, size_t level)
+    void LinkBack(NodeID node, NodeID neighbor, size_t level)
     {
-        while (m_Nodes[node].neighbors.size() <= level)
-            m_Nodes[node].neighbors.emplace_back();
-        auto& links = m_Nodes[node].neighbors[level];
+        auto& nodeRecord = m_Nodes[static_cast<size_t>(node)];
+        while (nodeRecord.neighbors.size() <= level)
+            nodeRecord.neighbors.emplace_back();
+        auto& links = nodeRecord.neighbors[level];
         if (std::find(links.begin(), links.end(), neighbor) == links.end())
             links.push_back(neighbor);
         if (links.size() > m_MaxNeighbors) {
-            const auto& query = m_Nodes[node].vector;
-            std::sort(links.begin(), links.end(), [&](size_t a, size_t b) {
-                float sa = VectorScore(query, m_Nodes[a].vector);
-                float sb = VectorScore(query, m_Nodes[b].vector);
+            const auto& query = nodeRecord.vector;
+            std::sort(links.begin(), links.end(), [&](NodeID a, NodeID b) {
+                float sa = VectorScore(query, m_Nodes[static_cast<size_t>(a)].vector);
+                float sb = VectorScore(query, m_Nodes[static_cast<size_t>(b)].vector);
                 if (sa != sb) return sa > sb;
                 return a < b;
             });
@@ -368,8 +358,7 @@ private:
     size_t m_MaxNeighbors = 32;
     size_t m_EfConstruction = 200;
     std::vector<Node> m_Nodes;
-    std::unordered_map<uint64_t, size_t> m_DocToNode;
-    size_t m_EntryPoint = npos();
+    NodeID m_EntryPoint = npos();
     size_t m_MaxLevel = 0;
     mutable std::unordered_map<uint64_t, std::vector<float>> m_VectorView;
 };
@@ -404,126 +393,6 @@ inline std::vector<float> BuildHashedEmbedding(const std::vector<std::string>& t
         for (float& value : vector) value /= norm;
     }
     return vector;
-}
-
-inline bool SaveVectorSidecar(const std::string& vectorPath,
-                              const std::unordered_map<uint64_t, std::vector<float>>& vectors)
-{
-    FreshDiskAnnVectorIndex index;
-    std::vector<std::pair<uint64_t, std::vector<float>>> ordered(vectors.begin(), vectors.end());
-    std::sort(ordered.begin(), ordered.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
-    for (auto& [docId, vector] : ordered)
-        index.Add(docId, std::move(vector));
-
-    std::ofstream out(vectorPath, std::ios::binary);
-    if (!out) return false;
-
-    uint8_t magic[8] = {'M','O','O','N','H','N','S','W'};
-    uint32_t version = 2;
-    uint32_t dim = static_cast<uint32_t>(index.Dimension());
-    uint32_t maxNeighbors = static_cast<uint32_t>(index.MaxNeighbors());
-    uint32_t efConstruction = static_cast<uint32_t>(index.EfConstruction());
-    uint64_t count = static_cast<uint64_t>(index.Nodes().size());
-    uint64_t entryPoint = 0;
-    uint32_t maxLevel = static_cast<uint32_t>(index.MaxLevel());
-
-    out.write(reinterpret_cast<const char*>(magic), sizeof(magic));
-    out.write(reinterpret_cast<const char*>(&version), sizeof(version));
-    out.write(reinterpret_cast<const char*>(&dim), sizeof(dim));
-    out.write(reinterpret_cast<const char*>(&maxNeighbors), sizeof(maxNeighbors));
-    out.write(reinterpret_cast<const char*>(&efConstruction), sizeof(efConstruction));
-    out.write(reinterpret_cast<const char*>(&count), sizeof(count));
-    out.write(reinterpret_cast<const char*>(&entryPoint), sizeof(entryPoint));
-    out.write(reinterpret_cast<const char*>(&maxLevel), sizeof(maxLevel));
-
-    for (const auto& node : index.Nodes()) {
-        uint64_t docId = node.doc_id;
-        uint32_t level = static_cast<uint32_t>(node.level);
-        out.write(reinterpret_cast<const char*>(&docId), sizeof(docId));
-        out.write(reinterpret_cast<const char*>(&level), sizeof(level));
-        out.write(reinterpret_cast<const char*>(node.vector.data()), static_cast<std::streamsize>(dim * sizeof(float)));
-        for (uint32_t l = 0; l <= level; ++l) {
-            uint32_t links = l < node.neighbors.size() ? static_cast<uint32_t>(node.neighbors[l].size()) : 0;
-            out.write(reinterpret_cast<const char*>(&links), sizeof(links));
-            for (size_t neighbor : node.neighbors[l]) {
-                uint64_t n = static_cast<uint64_t>(neighbor);
-                out.write(reinterpret_cast<const char*>(&n), sizeof(n));
-            }
-        }
-    }
-    return static_cast<bool>(out);
-}
-
-inline bool LoadVectorSidecar(const std::string& vectorPath, FreshDiskAnnVectorIndex& index)
-{
-    std::ifstream in(vectorPath, std::ios::binary);
-    if (!in) return false;
-
-    uint8_t magic[8] = {};
-    in.read(reinterpret_cast<char*>(magic), sizeof(magic));
-    const uint8_t hnswMagic[8] = {'M','O','O','N','H','N','S','W'};
-    const uint8_t flatMagic[8] = {'M','O','O','N','V','E','C','1'};
-
-    if (std::memcmp(magic, hnswMagic, sizeof(hnswMagic)) == 0) {
-        uint32_t version = 0, dim = 0, maxNeighbors = 0, efConstruction = 0, maxLevel = 0;
-        uint64_t count = 0, entryPoint = 0;
-        in.read(reinterpret_cast<char*>(&version), sizeof(version));
-        in.read(reinterpret_cast<char*>(&dim), sizeof(dim));
-        in.read(reinterpret_cast<char*>(&maxNeighbors), sizeof(maxNeighbors));
-        in.read(reinterpret_cast<char*>(&efConstruction), sizeof(efConstruction));
-        in.read(reinterpret_cast<char*>(&count), sizeof(count));
-        in.read(reinterpret_cast<char*>(&entryPoint), sizeof(entryPoint));
-        in.read(reinterpret_cast<char*>(&maxLevel), sizeof(maxLevel));
-        if (!in || version != 2 || dim == 0) return false;
-
-        std::vector<FreshDiskAnnVectorIndex::Node> nodes;
-        nodes.resize(static_cast<size_t>(count));
-        for (uint64_t i = 0; i < count; ++i) {
-            uint64_t docId = 0;
-            uint32_t level = 0;
-            in.read(reinterpret_cast<char*>(&docId), sizeof(docId));
-            in.read(reinterpret_cast<char*>(&level), sizeof(level));
-            nodes[static_cast<size_t>(i)].doc_id = docId;
-            nodes[static_cast<size_t>(i)].level = level;
-            nodes[static_cast<size_t>(i)].vector.resize(dim);
-            nodes[static_cast<size_t>(i)].neighbors.resize(static_cast<size_t>(level) + 1);
-            in.read(reinterpret_cast<char*>(nodes[static_cast<size_t>(i)].vector.data()), static_cast<std::streamsize>(dim * sizeof(float)));
-            for (uint32_t l = 0; l <= level; ++l) {
-                uint32_t links = 0;
-                in.read(reinterpret_cast<char*>(&links), sizeof(links));
-                nodes[static_cast<size_t>(i)].neighbors[l].resize(links);
-                for (uint32_t j = 0; j < links; ++j) {
-                    uint64_t n = 0;
-                    in.read(reinterpret_cast<char*>(&n), sizeof(n));
-                    nodes[static_cast<size_t>(i)].neighbors[l][j] = static_cast<size_t>(n);
-                }
-            }
-            if (!in) return false;
-        }
-        index.LoadNodes(dim, maxNeighbors, efConstruction, std::move(nodes), static_cast<size_t>(entryPoint), maxLevel);
-        return true;
-    }
-
-    if (std::memcmp(magic, flatMagic, sizeof(flatMagic)) == 0) {
-        uint32_t version = 0, dim = 0;
-        uint64_t count = 0;
-        in.read(reinterpret_cast<char*>(&version), sizeof(version));
-        in.read(reinterpret_cast<char*>(&dim), sizeof(dim));
-        in.read(reinterpret_cast<char*>(&count), sizeof(count));
-        if (!in || version != 1 || dim == 0) return false;
-        index.Clear();
-        for (uint64_t i = 0; i < count; ++i) {
-            uint64_t docId = 0;
-            std::vector<float> vector(dim);
-            in.read(reinterpret_cast<char*>(&docId), sizeof(docId));
-            in.read(reinterpret_cast<char*>(vector.data()), static_cast<std::streamsize>(dim * sizeof(float)));
-            if (!in) return false;
-            index.Add(docId, std::move(vector));
-        }
-        return true;
-    }
-
-    return false;
 }
 
 #endif

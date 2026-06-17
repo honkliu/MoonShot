@@ -2,7 +2,6 @@
 #define INDEXREADERIMPL_H__
 
 #include "IndexReader.h"
-#include "Bm25Scorer.h"
 #include "Embeddings.h"
 
 #include <cinttypes>
@@ -66,19 +65,11 @@ public:
         return total;
     }
 
-    float GetBM25Score(const Bm25Scorer& scorer, uint32_t docLength) override
+    float GetScore(const DocRecord* record) override
     {
         float total = 0.0f;
         for (auto& c : m_Children)
-            total += c->GetBM25Score(scorer, docLength);
-        return total;
-    }
-
-    float GetScore(const Bm25Scorer& scorer, uint32_t docLength) override
-    {
-        float total = 0.0f;
-        for (auto& c : m_Children)
-            total += c->GetScore(scorer, docLength);
+            total += c->GetScore(record);
         return total;
     }
 
@@ -106,7 +97,6 @@ public:
     }
 
     void Close() override { for (auto& c : m_Children) c->Close(); }
-    void Open(const char*) override {}
 
 private:
     std::vector<std::shared_ptr<IndexReader>> m_Children;
@@ -203,27 +193,14 @@ public:
         return total;
     }
 
-    float GetBM25Score(const Bm25Scorer& scorer, uint32_t docLength) override
+    float GetScore(const DocRecord* record) override
     {
         uint64_t doc   = GetDocumentID();
         float    total = 0.0f;
 
         for (auto& c : m_Children) {
             if (!c->IsEnd() && c->GetDocumentID() == doc)
-                total += c->GetBM25Score(scorer, docLength);
-        }
-
-        return total;
-    }
-
-    float GetScore(const Bm25Scorer& scorer, uint32_t docLength) override
-    {
-        uint64_t doc   = GetDocumentID();
-        float    total = 0.0f;
-
-        for (auto& c : m_Children) {
-            if (!c->IsEnd() && c->GetDocumentID() == doc)
-                total += c->GetScore(scorer, docLength);
+                total += c->GetScore(record);
         }
 
         return total;
@@ -251,7 +228,6 @@ public:
     }
 
     void Close() override { for (auto& c : m_Children) c->Close(); }
-    void Open(const char*) override {}
 
 private:
     std::vector<std::shared_ptr<IndexReader>> m_Children;
@@ -284,14 +260,9 @@ public:
     uint64_t GetDocumentID() override { return m_Base->GetDocumentID(); }
     uint32_t GetTermFreq()   override { return m_Base->GetTermFreq(); }
 
-    float GetBM25Score(const Bm25Scorer& scorer, uint32_t docLength) override
+    float GetScore(const DocRecord* record) override
     {
-        return m_Base->GetBM25Score(scorer, docLength);
-    }
-
-    float GetScore(const Bm25Scorer& scorer, uint32_t docLength) override
-    {
-        return m_Base->GetScore(scorer, docLength);
+        return m_Base->GetScore(record);
     }
 
     void GoNext() override
@@ -307,7 +278,6 @@ public:
     }
 
     void Close() override { m_Base->Close(); m_Exclude->Close(); }
-    void Open(const char*) override {}
 
 private:
     std::shared_ptr<IndexReader> m_Base;
@@ -349,7 +319,7 @@ public:
         return IsEnd() ? NO_MORE_DOCS : m_Results[m_Pos].doc_id;
     }
 
-    float GetScore(const Bm25Scorer&, uint32_t) override
+    float GetScore(const DocRecord*) override
     {
         return IsEnd() ? 0.0f : m_Results[m_Pos].score;
     }
@@ -366,7 +336,6 @@ public:
     }
 
     void Close() override { m_Pos = m_Results.size(); }
-    void Open(const char*) override {}
 
 private:
     std::vector<VectorSearchResult> m_Results;

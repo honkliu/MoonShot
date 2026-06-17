@@ -180,15 +180,13 @@ int main()
     std::println("\n=== Low-level ISR iteration ===");
     {
         auto reader = engine.GetReader("rust", "AUT");
-        Bm25Scorer scorer(engine.GetStore()->TotalDocs(),
-                          engine.GetStore()->AvgDocLen());
         std::println("  Posting list for \"rust\" (across AUT streams):");
         while (!reader->IsEnd()) {
             uint64_t doc = reader->GetDocumentID();
             uint32_t tf  = reader->GetTermFreq();
-            uint32_t dl  = engine.GetStore()->GetDocLen(doc);
-            float    bm  = reader->GetBM25Score(scorer, dl);
-            std::println("    doc={:<3}  tf={}  bm25={:.3f}", doc, tf, bm);
+            const DocRecord* record = engine.GetDocRecord(doc);
+            float    score = reader->GetScore(record);
+            std::println("    doc={:<3}  tf={}  score={:.3f}", doc, tf, score);
             reader->GoNext();
         }
     }

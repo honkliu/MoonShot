@@ -52,7 +52,7 @@ static void AssertNotContains(const std::vector<SearchResult>& r,
 
 /*
 * Shared corpus of 5 movie documents (Title + Body, two streams each).
-* DocIDs are ordered by descending importance (1 is most important).
+* DocIDs are ordered by descending importance (0 is most important).
 */
 static IndexContext* g_ctx = nullptr;
 
@@ -65,19 +65,19 @@ static void BuildSharedIndex()
 
     struct Doc { uint64_t id; const char* title; const char* body; float importance; };
     static const Doc docs[] = {
-        {1, "Good Morning Vietnam",
+        {0, "Good Morning Vietnam",
             "Robin Williams plays a radio DJ stationed in Vietnam during the brutal war",
             0.9f},
-        {2, "Apocalypse Now",
+        {1, "Apocalypse Now",
             "A soldier journeys through Vietnam and Cambodia on a mission to find a rogue colonel seeking power",
             0.8f},
-        {3, "Platoon",
+        {2, "Platoon",
             "A young soldier in Vietnam faces moral conflict between two rival sergeants during a savage war",
             0.7f},
-        {4, "Good Will Hunting",
+        {3, "Good Will Hunting",
             "A janitor at MIT hides his extraordinary mathematical genius until a therapist helps him",
             0.6f},
-        {5, "The Deer Hunter",
+        {4, "The Deer Hunter",
             "Pennsylvania steelworkers go to Vietnam and face the trauma of captivity and Russian roulette",
             0.5f},
     };
@@ -133,12 +133,12 @@ void TestSingleTermSearch()
 
     PrintResults(results, "vietnam/AUT");
 
-    AssertContains(results, 1, "vietnam AUT");
+    AssertContains(results, 0, "vietnam AUT");
     /*
-    * Docs 2,3,5 have "vietnam" in their bodies but NOT in title/anchor/url,
+    * Docs 1,2,4 have "vietnam" in their bodies but NOT in title/anchor/url,
     * so they are absent from an AUT-only search.
     */
-    AssertNotContains(results, 4, "vietnam AUT");
+    AssertNotContains(results, 3, "vietnam AUT");
     assert(!results.empty());
 
     delete compiler; delete tree;
@@ -159,8 +159,8 @@ void TestAndSearch()
 
     PrintResults(results, "good morning/AUT");
 
-    AssertContains(results, 1, "good morning");
-    AssertNotContains(results, 4, "good morning AND");
+    AssertContains(results, 0, "good morning");
+    AssertNotContains(results, 3, "good morning AND");
 
     delete compiler; delete tree;
 }
@@ -180,8 +180,8 @@ void TestOrSearch()
 
     PrintResults(results, "morning OR apocalypse");
 
-    AssertContains(results, 1, "OR morning");
-    AssertContains(results, 2, "OR apocalypse");
+    AssertContains(results, 0, "OR morning");
+    AssertContains(results, 1, "OR apocalypse");
 
     delete compiler; delete tree;
 }
@@ -201,8 +201,8 @@ void TestNotSearch()
 
     PrintResults(results, "good -hunting");
 
-    AssertContains   (results, 1, "NOT: doc1 present");
-    AssertNotContains(results, 4, "NOT: doc4 excluded");
+    AssertContains   (results, 0, "NOT: doc0 present");
+    AssertNotContains(results, 3, "NOT: doc3 excluded");
 
     delete compiler; delete tree;
 }
@@ -240,7 +240,7 @@ void TestFieldConstraint()
         auto reader   = g_ctx->GetReader(tree);
         auto results  = executor_raw->Execute(reader, 10);
         PrintResults(results, "body:vietnam");
-        AssertContains(results, 5, "body:vietnam doc5");
+        AssertContains(results, 4, "body:vietnam doc4");
         delete compiler; delete tree;
     }
 }
@@ -321,7 +321,7 @@ void TestMultiPhase()
     BuildSharedIndex();
 
     /*
-    * "roulette" only appears in doc 5's body, not in any title.
+    * "roulette" only appears in doc 4's body, not in any title.
     */
     auto compiler = new IndexSearchCompiler();
     auto executor = g_ctx->GetExecutor();
@@ -335,7 +335,7 @@ void TestMultiPhase()
     auto rdr2   = g_ctx->GetReader(tree2);
     auto phase2 = executor->Execute(rdr2, 10);
     std::cout << "  Phase 2 (AUTB) 'roulette': " << phase2.size() << " results\n";
-    AssertContains(phase2, 5, "roulette body phase2");
+    AssertContains(phase2, 4, "roulette body phase2");
 
     auto tree_p1 = compiler->Compile("roulette", "AUT");
     auto tree_p2 = compiler->Compile("roulette", "AUTB");
@@ -343,7 +343,7 @@ void TestMultiPhase()
     auto rdr_p2  = g_ctx->GetReader(tree_p2);
     auto phased  = executor->ExecutePhased(rdr_p1, rdr_p2, 10, 1);
     PrintResults(phased, "ExecutePhased 'roulette'");
-    AssertContains(phased, 5, "roulette phased");
+    AssertContains(phased, 4, "roulette phased");
 
     delete compiler;
     delete tree1; delete tree2; delete tree_p1; delete tree_p2;
@@ -358,10 +358,10 @@ void TestDocImportance()
     auto writer = ctx->GetWriter();
 
     const char* same_text = "identical body content with fox and quick terms";
-    writer->Write(g_tokenizer.Tokenize(same_text), 99,  "Body");
-    writer->Write(g_tokenizer.Tokenize(same_text), 100, "Body");
-    writer->SetDocImportance(99,  2.0f);
-    writer->SetDocImportance(100, 0.1f);
+    writer->Write(g_tokenizer.Tokenize(same_text), 0, "Body");
+    writer->Write(g_tokenizer.Tokenize(same_text), 1, "Body");
+    writer->SetDocImportance(0, 2.0f);
+    writer->SetDocImportance(1, 0.1f);
 
     auto compiler = new IndexSearchCompiler();
     auto tree     = compiler->Compile("fox", "B");
@@ -371,7 +371,7 @@ void TestDocImportance()
 
     PrintResults(results, "importance tiebreak");
     assert(results.size() == 2);
-    assert(results[0].doc_id == 99 && "doc 99 must rank first");
+    assert(results[0].doc_id == 0 && "doc 0 must rank first");
 
     delete ctx; delete compiler; delete tree;
 }
@@ -386,7 +386,7 @@ void TestEndToEnd()
     auto index_writer = index_context->GetWriter();
 
     uint64_t documentId = index_context->AllocateDocumentID();
-    assert(documentId == 1);
+    assert(documentId == 0);
     const std::string doc1Body =
         "The QUICK Brown Fox jumps over the lazy DOG! "
         "Привет, МИР! Hello, WORLD! こんにちは这是一个人的世界! "
@@ -406,7 +406,7 @@ void TestEndToEnd()
     doc2.title = "Morning Fox 2021";
     doc2.body = "The lazy fox slept all morning";
     uint64_t doc2Id = index_context->AddDocument(doc2);
-    assert(doc2Id == 2);
+    assert(doc2Id == 1);
 
     {
         /*
@@ -469,17 +469,20 @@ void TestDiskPersistence()
         IndexContext engine("", INDEX_FILE);
         auto writer = engine.GetWriter();
 
-        writer->Write(g_tokenizer.Tokenize("Rust systems programming language"), 1, "Title");
-        writer->Write(g_tokenizer.Tokenize("Ownership model prevents data races at compile time"), 1, "Body");
-        writer->SetDocImportance(1, 0.9f);
+        writer->Write(g_tokenizer.Tokenize("Rust systems programming language"), 0, "Title");
+        writer->Write(g_tokenizer.Tokenize("Ownership model prevents data races at compile time"), 0, "Body");
+        writer->SetDocImportance(0, 0.9f);
+        writer->SetDocVector(0, BuildHashedEmbedding(g_tokenizer.Tokenize("rust systems programming")));
 
-        writer->Write(g_tokenizer.Tokenize("Python machine learning"),            2, "Title");
-        writer->Write(g_tokenizer.Tokenize("Python is used for data science and AI research"), 2, "Body");
-        writer->SetDocImportance(2, 0.7f);
+        writer->Write(g_tokenizer.Tokenize("Python machine learning"),            1, "Title");
+        writer->Write(g_tokenizer.Tokenize("Python is used for data science and AI research"), 1, "Body");
+        writer->SetDocImportance(1, 0.7f);
+        writer->SetDocVector(1, BuildHashedEmbedding(g_tokenizer.Tokenize("python machine learning")));
 
-        writer->Write(g_tokenizer.Tokenize("Go concurrency goroutines"),          3, "Title");
-        writer->Write(g_tokenizer.Tokenize("Go makes concurrent programming easy with goroutines"), 3, "Body");
-        writer->SetDocImportance(3, 0.6f);
+        writer->Write(g_tokenizer.Tokenize("Go concurrency goroutines"),          2, "Title");
+        writer->Write(g_tokenizer.Tokenize("Go makes concurrent programming easy with goroutines"), 2, "Body");
+        writer->SetDocImportance(2, 0.6f);
+        writer->SetDocVector(2, BuildHashedEmbedding(g_tokenizer.Tokenize("go concurrency goroutines")));
 
         std::cout << "  Written " << engine.GetStore()->TotalDocs()
                   << " docs to memory\n";
@@ -504,6 +507,10 @@ void TestDiskPersistence()
 
         assert(engine2.GetStore()->TotalDocs() == 3 &&
                "Loaded doc count must match written doc count");
+         assert(engine2.GetStore()->VectorCount() == 3 &&
+             "Loaded vector count must come from DocRecord vectors");
+         assert(engine2.GetStore()->GetDocVector(0) != nullptr &&
+             "DocRecord must preserve doc 0 embedding");
 
         /*
         * Run the same queries as the other tests to confirm results match.
@@ -511,32 +518,32 @@ void TestDiskPersistence()
         IndexSearchCompiler compiler;
         auto exec = engine2.GetExecutor();
 
-        // 1. Single term — should find doc 1 ("rust" in title)
+        // 1. Single term — should find doc 0 ("rust" in title)
         {
             auto tree    = std::unique_ptr<EvalTree>(compiler.Compile("rust", "AUTB"));
             auto results = exec->Execute(engine2.GetReader(tree.get()), 5);
             std::cout << "  search(rust): " << results.size() << " result(s)\n";
-            AssertContains(results, 1, "disk: rust");
+            AssertContains(results, 0, "disk: rust");
         }
 
-        // 2. AND query — "python machine" must find doc 2
+        // 2. AND query — "python machine" must find doc 1
         {
             auto tree    = std::unique_ptr<EvalTree>(compiler.Compile("python machine", "AUTB"));
             auto results = exec->Execute(engine2.GetReader(tree.get()), 5);
             std::cout << "  search(python machine): " << results.size() << " result(s)\n";
-            AssertContains(results, 2, "disk: python machine");
+            AssertContains(results, 1, "disk: python machine");
         }
 
-        // 3. OR query — "rust OR go" should return docs 1 and 3
+        // 3. OR query — "rust OR go" should return docs 0 and 2
         {
             auto tree    = std::unique_ptr<EvalTree>(compiler.Compile("rust OR go", "AUTB"));
             auto results = exec->Execute(engine2.GetReader(tree.get()), 5);
             std::cout << "  search(rust OR go): " << results.size() << " result(s)\n";
-            AssertContains(results, 1, "disk: rust OR go doc1");
-            AssertContains(results, 3, "disk: rust OR go doc3");
+            AssertContains(results, 0, "disk: rust OR go doc0");
+            AssertContains(results, 2, "disk: rust OR go doc2");
         }
 
-        // 4. Importance preserved — doc 1 has highest importance; verify score order
+        // 4. Importance preserved — doc 0 has highest importance; verify score order
         {
             auto tree    = std::unique_ptr<EvalTree>(compiler.Compile("programming", "AUTB"));
             auto results = exec->Execute(engine2.GetReader(tree.get()), 5);
@@ -552,7 +559,7 @@ void TestDiskPersistence()
     {
         IndexContext engine3("", INDEX_FILE);
         auto writer = engine3.GetWriter();
-        writer->Write(g_tokenizer.Tokenize("New document after overwrite"), 99, "Body");
+        writer->Write(g_tokenizer.Tokenize("New document after overwrite"), 0, "Body");
         engine3.SaveIndex();
 
         IndexContext engine4("", INDEX_FILE);
@@ -580,18 +587,18 @@ void TestBigram()
     auto           writer = engine.GetWriter();
 
     /*
-    * Doc 1: "good morning vietnam" — bigrams: good·morning, morning·vietnam
-    * Doc 2: "bad morning london"   — bigrams: bad·morning,  morning·london
-    * Doc 3: "good night vietnam"   — bigrams: good·night,   night·vietnam
+    * Doc 0: "good morning vietnam" — bigrams: good·morning, morning·vietnam
+    * Doc 1: "bad morning london"   — bigrams: bad·morning,  morning·london
+    * Doc 2: "good night vietnam"   — bigrams: good·night,   night·vietnam
     */
-    writer->Write(tok.Tokenize("good morning vietnam"), 1, "Title");
-    writer->SetDocImportance(1, 0.9f);
+    writer->Write(tok.Tokenize("good morning vietnam"), 0, "Title");
+    writer->SetDocImportance(0, 0.9f);
 
-    writer->Write(tok.Tokenize("bad morning london"),   2, "Title");
-    writer->SetDocImportance(2, 0.7f);
+    writer->Write(tok.Tokenize("bad morning london"),   1, "Title");
+    writer->SetDocImportance(1, 0.7f);
 
-    writer->Write(tok.Tokenize("good night vietnam"),   3, "Title");
-    writer->SetDocImportance(3, 0.6f);
+    writer->Write(tok.Tokenize("good night vietnam"),   2, "Title");
+    writer->SetDocImportance(2, 0.6f);
 
     auto* store = engine.GetStore();
 
@@ -618,9 +625,9 @@ void TestBigram()
 
     /*
     * "good morning" on Title.
-    * Doc 1 matches bigram good_morningT → scored by both OR arms → highest score.
-    * Doc 2 has "morning" but not "good" → excluded by AND arm.
-    * Doc 3 has "good" but not "morning" → excluded by AND arm.
+    * Doc 0 matches bigram good_morningT → scored by both OR arms → highest score.
+    * Doc 1 has "morning" but not "good" → excluded by AND arm.
+    * Doc 2 has "good" but not "morning" → excluded by AND arm.
     */
     {
         auto tree    = std::unique_ptr<EvalTree>(compiler.Compile("good morning", "T"));
@@ -630,14 +637,14 @@ void TestBigram()
         for (auto& r : results)
             std::cout << "    doc=" << r.doc_id << "  score=" << r.score << "\n";
 
-        AssertContains   (results, 1, "bigram: doc1 matches good morning");
-        AssertNotContains(results, 2, "bigram: doc2 has no good");
-        AssertNotContains(results, 3, "bigram: doc3 has no morning");
+        AssertContains   (results, 0, "bigram: doc0 matches good morning");
+        AssertNotContains(results, 1, "bigram: doc1 has no good");
+        AssertNotContains(results, 2, "bigram: doc2 has no morning");
     }
 
     /*
     * "morning vietnam" on Title.
-    * Doc 1 matches bigram morning_vietnamT → highest score.
+    * Doc 0 matches bigram morning_vietnamT → highest score.
     */
     {
         auto tree    = std::unique_ptr<EvalTree>(compiler.Compile("morning vietnam", "T"));
@@ -647,9 +654,9 @@ void TestBigram()
         for (auto& r : results)
             std::cout << "    doc=" << r.doc_id << "  score=" << r.score << "\n";
 
-        AssertContains   (results, 1, "bigram: doc1 matches morning vietnam");
-        AssertNotContains(results, 2, "bigram: doc2 has no vietnam");
-        AssertNotContains(results, 3, "bigram: doc3 has no morning");
+        AssertContains   (results, 0, "bigram: doc0 matches morning vietnam");
+        AssertNotContains(results, 1, "bigram: doc1 has no vietnam");
+        AssertNotContains(results, 2, "bigram: doc2 has no morning");
     }
 
     /*

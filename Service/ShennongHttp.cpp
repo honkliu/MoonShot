@@ -280,9 +280,10 @@ public:
     std::string health_json()
     {
         std::ostringstream out;
+        const IndexFileHeader& header = m_Context.GetIndexFileHeader();
         out << "{\"status\":\"ok\",\"index\":\"" << json_escape(m_IndexPath) << "\""
-            << ",\"documents\":" << m_Context.GetStore()->TotalDocs()
-            << ",\"avg_doc_len\":" << m_Context.GetStore()->AvgDocLen()
+            << ",\"documents\":" << header.IFH_NumDocuments
+            << ",\"avg_doc_len\":" << header.IFH_AvgDocLength
             << ",\"vector_count\":" << m_Context.GetStore()->VectorCount()
             << ",\"vector_dim\":" << m_Context.GetStore()->VectorDimension()
             << "}";

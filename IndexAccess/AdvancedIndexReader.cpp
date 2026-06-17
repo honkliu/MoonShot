@@ -1,16 +1,20 @@
 #include "AdvancedIndexReader.h"
+#include "IndexContext.h"
+#include <algorithm>
 #include <cstring>
+#include <cmath>
 
 void AdvancedIndexReader::Open(const char*      streamKey,
                                 IndexBlockTable* blockTable,
-                                uint32_t         docFreq)
+                                const IndexContext* context)
 {
     delete[] m_Word;
     m_Word = new char[std::strlen(streamKey) + 1];
     std::strcpy(m_Word, streamKey);
 
     m_BlockTable      = blockTable;
-    m_DocFreq         = docFreq;   // fallback; overwritten below if term found
+    m_Context         = context;
+    m_DocFreq         = 0;
     m_PageSkipOffset  = 0;
     m_InitialBlockSeq = 0;
     m_TotalContinuationBlocks = 0;
@@ -133,8 +137,24 @@ uint64_t AdvancedIndexReader::GetDocumentID() {
 uint32_t AdvancedIndexReader::GetTermFreq() {
     return IsEnd() ? 0u : m_Decoder.GetTermFrequency();
 }
-float AdvancedIndexReader::GetBM25Score(const Bm25Scorer& scorer, uint32_t docLength) {
-    return scorer.Score(GetTermFreq(), docLength, m_DocFreq);
+float AdvancedIndexReader::GetScore(const DocRecord* record) {
+    const uint32_t docLength = record ? record->DR_DocLength : 1u;
+    const float tf = static_cast<float>(GetTermFreq());
+    const float df = static_cast<float>(std::max(1u, m_DocFreq));
+    const IndexFileHeader& header = m_Context ? m_Context->GetIndexFileHeader() : IndexFileHeader{};
+    const uint64_t documentCount = header.IFH_NumDocuments;
+    const float averageDocLength = header.IFH_AvgDocLength;
+    const float totalDocs = static_cast<float>(documentCount > 0 ? documentCount : 1);
+    const float dl = static_cast<float>(std::max(1u, docLength));
+    static constexpr float K1 = 1.2f;
+    static constexpr float B = 0.75f;
+
+    const float idf = std::max(0.0f,
+        std::log((totalDocs - df + 0.5f) / (df + 0.5f) + 1.0f));
+    const float tfNorm = tf * (K1 + 1.0f) /
+        (tf + K1 * (1.0f - B + B * dl / (averageDocLength > 0.0f ? averageDocLength : 1.0f)));
+
+    return idf * tfNorm;
 }
 void AdvancedIndexReader::Close() {
     m_IndexBlock.reset();

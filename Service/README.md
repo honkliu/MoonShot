@@ -118,7 +118,7 @@ The service computes the full ranked result set to return `total`, then emits on
 
 ### `GET /vector-search`
 
-Searches the vector sidecar index, if present. Current implementation uses an exact flat vector scan over `moon.idx.v.index`; this is the compatibility layer before a future HNSW/IVF ANN implementation.
+Searches document embeddings stored inside `DocData`. Each `DocRecord` carries a 128-dimensional half-precision vector payload (`DR_VectorHalf[128]`), loaded with the main index. No vector sidecar is required for vector payloads.
 
 Text query form:
 
@@ -147,18 +147,6 @@ Response:
     { "rank": 1, "doc_id": 42, "score": 0.83, "path": "/home/bob/a.md" }
   ]
 }
-```
-
-The vector sidecar path is:
-
-```text
-<index>.v.index
-```
-
-For the default index this is:
-
-```text
-~/moon.idx.v.index
 ```
 
 ## Legacy gRPC Surface
@@ -508,5 +496,5 @@ That keeps browser integration simple without giving up MoonShot's native search
 - Keep `DocData.path` lookup server-side so clients receive usable paths directly.
 - Keep the browser/WASM viewer separate from this service. The viewer is an inspection/debug tool; `shennong` is the production-style query service.
 - `moon -name` writes URL/path tokens to the `U` stream so `site:` and `-site:` can work.
-- `moon -name` writes `moon.idx.v.index` when vectors are available.
-- Existing indexes built before this change do not contain URL stream tokens or vector sidecars. Re-run `moon -name <path>` to rebuild before testing `site:` / `-site:` or `/vector-search`.
+- `moon -name` writes document embeddings into `DocRecord::DR_VectorHalf`; there is no vector payload sidecar.
+- Existing indexes built before this change do not contain URL stream tokens or DocRecord embeddings. Re-run `moon -name <path>` to rebuild before testing `site:` / `-site:` or `/vector-search`.
