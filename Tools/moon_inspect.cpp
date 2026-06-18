@@ -200,24 +200,26 @@ static Index parse_index(const char* path)
         for (size_t block_index = 0; block_index < block_count; ++block_index) {
             const uint8_t* page_start = data + index.hdr.IFH_LeafTermBlockOffset + block_index * sizeof(LeafTermBlock);
             const uint8_t* page_end = page_start + PAGE_SIZE;
-            const uint8_t* ptr = page_start;
-            if (ptr + sizeof(uint32_t) > page_end) {
-                index.error = "Corrupt leaf term page: missing entry count";
-                return index;
-            }
-            uint32_t entry_count = read_u32(ptr, page_end);
-            if (entry_count > LEAF_TERM_ENTRY_MAX) {
-                index.error = "Corrupt leaf term page: too many entries";
-                return index;
-            }
+            auto directory_value = [&](size_t slot) {
+                uint16_t value = 0;
+                std::memcpy(&value, page_start + slot * sizeof(uint16_t), sizeof(value));
+                return value;
+            };
+
+            uint32_t entry_count = directory_value(LEAF_TERM_DIRECTORY_COUNT - 1);
             auto& page = index.leaf_pages[block_index];
             page.reserve(entry_count);
             for (uint32_t i = 0; i < entry_count; ++i) {
-                if (ptr + sizeof(LeafTermEntry) > page_end) {
+                const uint16_t entry_offset = directory_value(i);
+                if (entry_offset < LEAF_TERM_DATA_OFFSET
+                    || entry_offset > PAGE_SIZE
+                    || PAGE_SIZE - entry_offset < sizeof(LeafTermEntry))
+                {
                     index.error = "Corrupt leaf term page: missing entry header";
                     return index;
                 }
 
+                const uint8_t* ptr = page_start + entry_offset;
                 const LeafTermEntry* header = reinterpret_cast<const LeafTermEntry*>(ptr);
                 if (header->LTE_TermLength > HEAD_TERM_KEY_MAX
                     || ptr + sizeof(LeafTermEntry) + header->LTE_TermLength > page_end)
@@ -226,7 +228,6 @@ static Index parse_index(const char* path)
                     return index;
                 }
 
-                ptr += sizeof(LeafTermEntry) + header->LTE_TermLength;
                 page.push_back(header);
                 index.leaf_entries.push_back(header);
             }

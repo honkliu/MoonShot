@@ -138,7 +138,7 @@ static BuildBlocksResult build_blocks(const PostingStore& store)
                                 uint32_t indexLength,
                                 uint32_t continuationBlockCount,
                                 uint32_t flags) {
-        const uint16_t termLength = static_cast<uint16_t>(term.size());
+        const uint8_t termLength = static_cast<uint8_t>(term.size());
         const size_t entryBytes = sizeof(LeafTermEntry) + termLength;
         if (leafEntryCount > 0 && leafWriteOffset + entryBytes > PAGE_SIZE)
             flush_leaf_block();

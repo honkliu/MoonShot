@@ -505,7 +505,7 @@ public:
         header.LTE_IndexLength = indexLength;
         header.LTE_ContinuationBlockCount = continuationBlockCount;
         header.LTE_Flags = flags;
-        header.LTE_TermLength = static_cast<uint16_t>(term.size());
+        header.LTE_TermLength = static_cast<uint8_t>(term.size());
         const uint8_t* headerBytes = reinterpret_cast<const uint8_t*>(&header);
         m_Group.insert(m_Group.end(), headerBytes, headerBytes + sizeof(LeafTermEntry));
         m_Group.insert(m_Group.end(), term.begin(), term.end());

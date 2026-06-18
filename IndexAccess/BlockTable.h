@@ -33,8 +33,8 @@ static constexpr size_t DOC_VECTOR_DIM = 128;
 static constexpr size_t DOC_VECTOR_STORAGE_MAX_DIM = 512;  // int8[512]
 static constexpr size_t DOC_PATH_MAX = 256;
 static constexpr size_t HEAD_TERM_KEY_MAX = 26;
-static constexpr size_t LEAF_TERM_ENTRY_MIN_BYTES = 6 * sizeof(uint32_t) + sizeof(uint16_t);
-static constexpr size_t LEAF_TERM_ENTRY_MAX = (PAGE_SIZE - sizeof(uint32_t)) / LEAF_TERM_ENTRY_MIN_BYTES;
+static constexpr size_t LEAF_TERM_DIRECTORY_COUNT = 96;
+static constexpr size_t LEAF_TERM_DATA_OFFSET = LEAF_TERM_DIRECTORY_COUNT * sizeof(uint16_t);
 static constexpr uint8_t  INDEX_FILE_MAGIC[8] = {'M','O','O','N','S','H','O','T'};
 static constexpr uint32_t INDEX_FORMAT_VERSION = 12;
 
@@ -113,7 +113,7 @@ struct LeafTermEntry {
     uint32_t    LTE_IndexLength             = 0;
     uint32_t    LTE_ContinuationBlockCount  = 0;
     uint32_t    LTE_Flags                   = 0;
-    uint16_t    LTE_TermLength              = 0;
+    uint8_t     LTE_TermLength              = 0;
     char        LTE_Term[0];
 };
 #pragma pack(pop)
@@ -124,8 +124,15 @@ struct alignas(16) HeadTermEntry {
     char     HTE_FirstTerm[HEAD_TERM_KEY_MAX] = {};
 };
 
+/*
+* LeafTermBlock is one 4096-byte page.
+* LTB_Directory[0..94] stores LeafTermEntry offsets from the block base.
+* LTB_Directory[95] stores the number of entries in this block.
+* LTB_Data stores packed LeafTermEntry records followed by their term bytes.
+*/
 struct LeafTermBlock {
-    uint8_t LTB_Data[PAGE_SIZE] = {};
+    uint16_t LTB_Directory[LEAF_TERM_DIRECTORY_COUNT] = {};
+    uint8_t  LTB_Data[PAGE_SIZE - LEAF_TERM_DATA_OFFSET] = {};
 };
 
 /*
@@ -206,7 +213,7 @@ static inline void UnpinMemoryPages(void* address, size_t bytes)
  * Lookup path:
  *   BloomFilter.CanTermExist()                  → reject obviously absent terms
  *   Level-1 binary search on m_HeadTermEntries  → LeafTermBlockID
- *   Level-2 scan in encoded leaf block entries → LeafTermEntry
+ *   Level-2 binary search on LeafTermBlock offsets → LeafTermEntry
  *   GetBlock(Index, entry.LTE_IndexBlockID)     → posting block
  *   Decoder opens at IB_Data + entry.LTE_IndexOffset
  */
@@ -228,7 +235,7 @@ class IndexBlockTable
         };
 
     public:
-        explicit IndexBlockTable(uint32_t = 0) = default;
+        explicit IndexBlockTable(uint32_t = 0) {}
 
         void SetHeadTermEntries(std::unique_ptr<HeadTermEntry[]> head, uint32_t headCount)
         {
@@ -242,7 +249,7 @@ class IndexBlockTable
         * Step 1 — BloomFilter check (placeholder, always passes).
         * Step 2 — Level-1: binary search m_HeadTermEntries for the leaf block whose
         *           HTE_FirstTerm <= term.
-        * Step 3 — Level-2: scan encoded entries inside the leaf block for exact term.
+        * Step 3 — Level-2: binary search directory offsets inside the leaf block.
         * Step 4 — Fill out-params from the LeafTermEntry and return true.
         */
         bool FindTermData(const char* term,
@@ -270,36 +277,32 @@ class IndexBlockTable
             uint32_t blockID = it->HTE_LeafTermBlockID;
             if (!m_LeafTermPool.BCP_Pages || blockID >= m_LeafTermPool.BCP_BlockCount) return false;
             const LeafTermBlock* block = static_cast<const LeafTermBlock*>(m_LeafTermPool.BCP_Pages) + blockID;
-            const uint8_t* ptr = block->LTB_Data;
-            const uint8_t* end = block->LTB_Data + sizeof(block->LTB_Data);
+            const uint8_t* blockBase = reinterpret_cast<const uint8_t*>(block);
+            const uint32_t entryCount = block->LTB_Directory[LEAF_TERM_DIRECTORY_COUNT - 1];
 
-            if (ptr + sizeof(uint32_t) > end) return false;
-            uint32_t entryCount = 0;
-            std::memcpy(&entryCount, ptr, sizeof(entryCount));
-            ptr += sizeof(entryCount);
-            if (entryCount > LEAF_TERM_ENTRY_MAX) return false;
-
-            for (uint32_t entryIndex = 0; entryIndex < entryCount; ++entryIndex) {
-                if (ptr + sizeof(LeafTermEntry) > end) return false;
-                const LeafTermEntry* entry = reinterpret_cast<const LeafTermEntry*>(ptr);
-                if (entry->LTE_TermLength > HEAD_TERM_KEY_MAX) return false;
-                ptr += sizeof(LeafTermEntry) + entry->LTE_TermLength;
-                if (ptr > end) return false;
-
+            uint32_t left = 0;
+            uint32_t right = entryCount;
+            while (left < right) {
+                const uint32_t mid = left + (right - left) / 2;
+                const LeafTermEntry* entry = reinterpret_cast<const LeafTermEntry*>(blockBase + block->LTB_Directory[mid]);
                 const std::string_view entryTerm(entry->LTE_Term, entry->LTE_TermLength);
-
-                if (entryTerm == termText) {
-                    *docFreqOut = entry->LTE_DocFreq;
-                    *indexBlockIDOut = entry->LTE_IndexBlockID;
-                    *indexOffsetOut = entry->LTE_IndexOffset;
-                    *indexLengthOut = entry->LTE_IndexLength;
-                    if (continuationBlockCountOut) *continuationBlockCountOut = entry->LTE_ContinuationBlockCount;
-                    return true;
-                }
-
-                if (entryTerm > termText) return false;
+                if (entryTerm < termText)
+                    left = mid + 1;
+                else
+                    right = mid;
             }
-            return false;
+
+            if (left == entryCount) return false;
+            const LeafTermEntry* entry = reinterpret_cast<const LeafTermEntry*>(blockBase + block->LTB_Directory[left]);
+            const std::string_view entryTerm(entry->LTE_Term, entry->LTE_TermLength);
+            if (entryTerm != termText) return false;
+
+            *docFreqOut = entry->LTE_DocFreq;
+            *indexBlockIDOut = entry->LTE_IndexBlockID;
+            *indexOffsetOut = entry->LTE_IndexOffset;
+            *indexLengthOut = entry->LTE_IndexLength;
+            if (continuationBlockCountOut) *continuationBlockCountOut = entry->LTE_ContinuationBlockCount;
+            return true;
         }
 
         void* GetBlock(BlockKind kind, uint32_t block_seq)
