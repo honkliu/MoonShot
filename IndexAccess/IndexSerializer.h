@@ -13,8 +13,8 @@
  * Layout:
  *   [Header 88B]       magic, version, fixed section offsets and counts
  *   [HeadTermEntry]    fixed 32B records, count = IFH_HeadTermEntryCount
- *   [LeafTermPage]     fixed 4096B pages, count = IFH_LeafTermPageCount
- *                          each page: [entry_count:4] then per entry:
+ *   [LeafTermBlock]    fixed 4096B blocks, count = IFH_LeafTermBlockCount
+ *                          each block: [entry_count:4] then per entry:
  *                          [key_len:2][LTE_Term:key_len][LTE_DocFreq:4]
  *                          [LTE_IndexBlockID:4][LTE_IndexOffset:4][LTE_IndexLength:4]
  *                          [LTE_ContinuationBlockCount:4][LTE_Flags:4]
@@ -28,7 +28,7 @@
 struct BuildBlocksResult {
     std::vector<IndexBlock>          BBR_IndexBlocks;
     std::vector<HeadTermEntry>       BBR_HeadTermEntries;
-    std::vector<LeafTermPage>        BBR_LeafTermPages;
+    std::vector<LeafTermBlock>       BBR_LeafTermBlocks;
     uint64_t                         BBR_TotalTerms = 0;
 };
 
@@ -43,7 +43,7 @@ public:
     static bool Load(PostingStore&                           store,
                      const char*                            path,
                      std::vector<HeadTermEntry>*             headTermEntriesOut,
-                     std::vector<LeafTermPage>*              leafTermPagesOut,
+                     std::vector<LeafTermBlock>*             leafTermBlocksOut,
                      uint64_t*                              blocks_offset_out,
                      uint64_t*                              num_blocks_out = nullptr,
                      uint64_t*                              leaf_blocks_offset_out = nullptr,

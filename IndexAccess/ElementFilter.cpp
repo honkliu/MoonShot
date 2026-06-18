@@ -14,7 +14,7 @@ ElementFilter::ElementFilter(int size, void * memory)
         auto pages = size / Constants::PAGE_SIZE;
         auto extra = (size % Constants::PAGE_SIZE) > 0 ? 1 : 0;
         pages += extra;
-        m_FilterSpace = (unsigned char *)PinedMemAlloc(pages * Constants::PAGE_SIZE);
+        m_FilterSpace = (unsigned char *)PinnedMemAlloc(pages * Constants::PAGE_SIZE);
     } else {
         m_FilterSpace = (unsigned char *)memory;
     }
@@ -22,7 +22,7 @@ ElementFilter::ElementFilter(int size, void * memory)
 
 ElementFilter::~ElementFilter()
 {
-    PinedMemFree((void *)m_FilterSpace);
+    PinnedMemFree((void *)m_FilterSpace);
 }
 
 void ElementFilter::AddElement(const char *elt)

@@ -19,7 +19,7 @@
 
 static std::map<void *, uint64_t> gPointerMap;  
 
-void * PinedMemAlloc(uint64_t size)
+void * PinnedMemAlloc(uint64_t size)
 {
 #ifdef _WIN32
     // Reserve and commit memory
@@ -40,11 +40,13 @@ void * PinedMemAlloc(uint64_t size)
     */
     rlimit res_limit; 
     auto success = getrlimit(RLIMIT_MEMLOCK, &res_limit);
-    if(success == -1) {
+    if (success == -1) {
         return 0;
     }
     res_limit.rlim_cur += size;
-    setrlimit(RLIMIT_MEMLOCK, &res_limit);
+    if (setrlimit(RLIMIT_MEMLOCK, &res_limit) == -1) {
+        return 0;
+    }
     /*
     * 1. Reserve
     * Map the memory to an area, without any device/file related.
@@ -61,17 +63,23 @@ void * PinedMemAlloc(uint64_t size)
     /*
     * 2. Commit
     */
-    auto ret = mprotect(memAddress, size, PROT_READ | PROT_WRITE);
+    if (mprotect(memAddress, size, PROT_READ | PROT_WRITE) == -1) {
+        munmap(memAddress, size);
+        return 0;
+    }
     /*
     * 3. Lock
     */
-    mlock(memAddress, size);
+    if (mlock(memAddress, size) == -1) {
+        munmap(memAddress, size);
+        return 0;
+    }
     gPointerMap.insert(std::make_pair(memAddress, size));
     return memAddress; 
 #endif
 }
 
-void PinedMemFree(void *ptr)
+void PinnedMemFree(void *ptr)
 {
     auto pointer_pair = gPointerMap.find(ptr);
     if (pointer_pair == gPointerMap.end()) return;

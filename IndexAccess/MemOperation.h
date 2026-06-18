@@ -9,8 +9,8 @@
 #include <stdio.h>
 #include <stdint.h>
 
-void * PinedMemAlloc(uint64_t size);
-void PinedMemFree(void *ptr);
+void * PinnedMemAlloc(uint64_t size);
+void PinnedMemFree(void *ptr);
 
 #endif
 

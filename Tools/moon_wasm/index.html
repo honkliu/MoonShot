@@ -498,7 +498,7 @@ async function loadPagedHeadDirectory() {
     });
   }
   const leafCountOffset = h.subindex_off + p;
-  const leafPageCount = p + 4 <= prefix.length ? u32(prefix, p) : 0;
+  const leafTermBlockCount = p + 4 <= prefix.length ? u32(prefix, p) : 0;
   p += 4;
   const leafBase = leafCountOffset + 4;
   for (const d of head) {
@@ -508,7 +508,7 @@ async function loadPagedHeadDirectory() {
   G.parsed.head_leaf_term_table.leaf_blocks = [];
   G.paged = {
     leafBase,
-    leafPageCount,
+    leafTermBlockCount,
     leafCache: new Map(),
     blockCache: new Map(),
     docCache: new Map(),
@@ -573,13 +573,13 @@ function cacheLeafOwners(block) {
 
 async function ensureBlockOwnersUpTo(maxSeq) {
   if (!G.summaryOnly || !G.paged || G.paged.ownerScanDone) return;
-  while (G.paged.ownerScanPage < G.paged.leafPageCount) {
+  while (G.paged.ownerScanPage < G.paged.leafTermBlockCount) {
     const pageId = G.paged.ownerScanPage++;
     const block = await loadPagedLeafBlock(pageId);
     const first = block.entries[0]?.lte_index_block_id ?? 0;
     if (first > maxSeq) break;
   }
-  if (G.paged.ownerScanPage >= G.paged.leafPageCount) G.paged.ownerScanDone = true;
+  if (G.paged.ownerScanPage >= G.paged.leafTermBlockCount) G.paged.ownerScanDone = true;
 }
 
 async function loadPagedIndexBlock(seq) {
@@ -1202,7 +1202,7 @@ function renderHeadLeafTerms() {
   const h = G.parsed.header;
 
   let html = '<div class="term-explorer">';
-  html += summaryModeNotice('Expand a HeadTermEntry to fetch only its 4KB LeafTermPage.');
+  html += summaryModeNotice('Expand a HeadTermEntry to fetch only its 4KB LeafTermBlock.');
   html += `<div class="term-toolbar">`
       + `Head/Leaf term table @ 0x${h.subindex_off.toString(16)} (${h.subindex_size} bytes). `
        + `Use + to expand physical layout nodes; click any row to highlight its on-disk bytes.</div>`;

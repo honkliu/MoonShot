@@ -515,10 +515,10 @@ public:
     }
 
     const std::vector<HeadTermEntry>& headEntries() const { return m_HeadTermEntries; }
-    const std::vector<LeafTermPage>& leafPages() const { return m_LeafTermPages; }
+    const std::vector<LeafTermBlock>& leafTermBlocks() const { return m_LeafTermBlocks; }
 private:
     std::vector<HeadTermEntry> m_HeadTermEntries;
-    std::vector<LeafTermPage> m_LeafTermPages;
+    std::vector<LeafTermBlock> m_LeafTermBlocks;
     std::vector<uint8_t> m_Group;
     std::string m_FirstTerm;
     uint32_t m_Count = 0;
@@ -531,9 +531,9 @@ private:
         head.HTE_LeafTermBlockID = m_LeafTermBlockCount++;
         head.SetFirstTerm(m_FirstTerm);
         m_HeadTermEntries.push_back(head);
-        LeafTermPage page{};
-        std::memcpy(page.LTP_Data, m_Group.data(), sizeof(page.LTP_Data));
-        m_LeafTermPages.push_back(page);
+        LeafTermBlock block{};
+        std::memcpy(block.LTB_Data, m_Group.data(), sizeof(block.LTB_Data));
+        m_LeafTermBlocks.push_back(block);
         m_Group.clear();
         m_FirstTerm.clear();
         m_Count = 0;
@@ -650,8 +650,8 @@ static void SaveFromRuns(const std::string& idxPath,
     uint64_t headOff = hdrSize;
     uint64_t headCount = leafTermWriter.headEntries().size();
     uint64_t leafOff = headOff + headCount * sizeof(HeadTermEntry);
-    uint64_t leafCount = leafTermWriter.leafPages().size();
-    uint64_t ddOff = leafOff + leafCount * sizeof(LeafTermPage);
+    uint64_t leafCount = leafTermWriter.leafTermBlocks().size();
+    uint64_t ddOff = leafOff + leafCount * sizeof(LeafTermBlock);
     uint64_t ddSize = docdata.size() * sizeof(DocDataEntry);
     uint64_t rawBlocks = ddOff + ddSize;
     uint64_t blkOff = PageAlignedBytes(rawBlocks);
@@ -669,12 +669,12 @@ static void SaveFromRuns(const std::string& idxPath,
     hdr.IFH_NumDocuments = docs.size();
     hdr.IFH_NumTerms = totalTerms;
     hdr.IFH_HeadTermEntryOffset = headOff; hdr.IFH_HeadTermEntryCount = headCount;
-    hdr.IFH_LeafTermPageOffset = leafOff; hdr.IFH_LeafTermPageCount = leafCount;
+    hdr.IFH_LeafTermBlockOffset = leafOff; hdr.IFH_LeafTermBlockCount = leafCount;
     hdr.IFH_DocDataOffset = ddOff;
     hdr.IFH_IndexBlockOffset = blkOff; hdr.IFH_IndexBlockCount = blocks.size();
     fwrite(&hdr, sizeof(hdr), 1, f);
     if (!leafTermWriter.headEntries().empty()) fwrite(leafTermWriter.headEntries().data(), sizeof(HeadTermEntry), leafTermWriter.headEntries().size(), f);
-    if (!leafTermWriter.leafPages().empty()) fwrite(leafTermWriter.leafPages().data(), sizeof(LeafTermPage), leafTermWriter.leafPages().size(), f);
+    if (!leafTermWriter.leafTermBlocks().empty()) fwrite(leafTermWriter.leafTermBlocks().data(), sizeof(LeafTermBlock), leafTermWriter.leafTermBlocks().size(), f);
     if (!docdata.empty()) fwrite(docdata.data(), sizeof(DocDataEntry), docdata.size(), f);
     uint64_t pos = FileOffset(f);
     if (pos < blkOff) {
