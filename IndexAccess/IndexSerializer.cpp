@@ -51,11 +51,6 @@ static uint64_t page_aligned_bytes(uint64_t bytes)
     return ((bytes + PAGE_SIZE - 1) / PAGE_SIZE) * PAGE_SIZE;
 }
 
-static size_t leaf_entry_bytes(const LeafTermEntry& e)
-{
-    return 6u * sizeof(uint32_t) + 2u + e.LTE_Term.size();
-}
-
 static bool read_vbc_pair_end(const uint8_t* data, size_t size, size_t& offset)
 {
     auto read_one = [&]() -> bool {
@@ -83,26 +78,6 @@ static size_t posting_prefix_bytes(const uint8_t* data, size_t size, size_t capa
         lastPairEnd = cursor;
     }
     return lastPairEnd;
-}
-
-static void encode_leaf_block(const std::vector<LeafTermEntry>& entries, LeafTermBlock& block)
-{
-    block = LeafTermBlock{};
-    uint8_t* ptr = block.LTB_Data;
-    auto write_u16 = [&](uint16_t v) { std::memcpy(ptr, &v, 2); ptr += 2; };
-    auto write_u32 = [&](uint32_t v) { std::memcpy(ptr, &v, 4); ptr += 4; };
-
-    write_u32(static_cast<uint32_t>(entries.size()));
-    for (const auto& e : entries) {
-        write_u32(e.LTE_DocFreq);
-        write_u32(e.LTE_IndexBlockID);
-        write_u32(e.LTE_IndexOffset);
-        write_u32(e.LTE_IndexLength);
-        write_u32(e.LTE_ContinuationBlockCount);
-        write_u32(e.LTE_Flags);
-        write_u16(static_cast<uint16_t>(e.LTE_Term.size()));
-        std::memcpy(ptr, e.LTE_Term.data(), e.LTE_Term.size()); ptr += e.LTE_Term.size();
-    }
 }
 
 /* ─────────────────────────────────────────────────────────────────────────
@@ -134,9 +109,59 @@ static BuildBlocksResult build_blocks(const PostingStore& store)
     size_t     wptr  = 0;
     uint32_t   seq   = 0;
 
-    /* Flat sorted LeafTermEntry list built during packing, distributed into two levels later. */
-    std::vector<LeafTermEntry> flat;
-    flat.reserve(terms.size());
+    LeafTermBlock leafBlock{};
+    size_t leafWriteOffset = sizeof(uint32_t);
+    uint32_t leafEntryCount = 0;
+    char firstLeafTerm[HEAD_TERM_KEY_MAX] = {};
+    uint16_t firstLeafTermLength = 0;
+
+    auto flush_leaf_block = [&]() {
+        if (leafEntryCount == 0) return;
+        std::memcpy(leafBlock.LTB_Data, &leafEntryCount, sizeof(leafEntryCount));
+        HeadTermEntry head{};
+        head.HTE_LeafTermBlockID = static_cast<uint32_t>(res.BBR_LeafTermBlocks.size());
+        head.HTE_FirstTermLength = firstLeafTermLength;
+        std::memcpy(head.HTE_FirstTerm, firstLeafTerm, head.HTE_FirstTermLength);
+        res.BBR_HeadTermEntries.push_back(head);
+        res.BBR_LeafTermBlocks.push_back(leafBlock);
+        leafBlock = LeafTermBlock{};
+        leafWriteOffset = sizeof(uint32_t);
+        leafEntryCount = 0;
+        firstLeafTermLength = 0;
+        std::memset(firstLeafTerm, 0, sizeof(firstLeafTerm));
+    };
+
+    auto write_leaf_entry = [&](const std::string& term,
+                                uint32_t docFreq,
+                                uint32_t indexBlockID,
+                                uint32_t indexOffset,
+                                uint32_t indexLength,
+                                uint32_t continuationBlockCount,
+                                uint32_t flags) {
+        const uint16_t termLength = static_cast<uint16_t>(term.size());
+        const size_t entryBytes = sizeof(LeafTermEntry) + termLength;
+        if (leafEntryCount > 0 && leafWriteOffset + entryBytes > PAGE_SIZE)
+            flush_leaf_block();
+
+        if (leafEntryCount == 0) {
+            firstLeafTermLength = termLength;
+            std::memcpy(firstLeafTerm, term.data(), termLength);
+        }
+
+        LeafTermEntry* entry = reinterpret_cast<LeafTermEntry*>(leafBlock.LTB_Data + leafWriteOffset);
+        entry->LTE_DocFreq = docFreq;
+        entry->LTE_IndexBlockID = indexBlockID;
+        entry->LTE_IndexOffset = indexOffset;
+        entry->LTE_IndexLength = indexLength;
+        entry->LTE_ContinuationBlockCount = continuationBlockCount;
+        entry->LTE_Flags = flags;
+        entry->LTE_TermLength = termLength;
+        std::memcpy(entry->LTE_Term, term.data(), termLength);
+        leafWriteOffset += entryBytes;
+        ++leafEntryCount;
+        ++res.BBR_TotalTerms;
+    };
+
     auto flush = [&](bool has_more) {
         cur.IB_Header = static_cast<uint64_t>(seq);
         if (has_more) cur.IB_Header |= IB_HEADER_HAS_MORE;
@@ -166,19 +191,12 @@ static BuildBlocksResult build_blocks(const PostingStore& store)
         }
         bool   has_more    = (data_here < remaining);
 
+        const uint32_t indexBlockID = seq;
         std::memcpy(cur.IB_Data + wptr, src, data_here);
         wptr      += data_here;
         src       += data_here;
         remaining -= data_here;
-
-        flat.push_back({
-            doc_freq,
-            seq,
-            static_cast<uint32_t>(data_offset),
-            static_cast<uint32_t>(data_here),
-            0u,
-            0u,
-            key});
+        uint32_t continuationBlockCount = 0;
 
         if (has_more) {
             flush(true);
@@ -197,48 +215,23 @@ static BuildBlocksResult build_blocks(const PostingStore& store)
                 src       += cont_here;
                 remaining -= cont_here;
 
-                ++flat.back().LTE_ContinuationBlockCount;
+                ++continuationBlockCount;
 
                 if (more_cont) flush(true);
             }
         }
+
+        write_leaf_entry(key,
+                         doc_freq,
+                         indexBlockID,
+                         static_cast<uint32_t>(data_offset),
+                         static_cast<uint32_t>(data_here),
+                         continuationBlockCount,
+                         0u);
     }
 
     if (wptr > 0) flush(false);
-
-    /* ── Build paged Head/Leaf term table ─────────────────────────────────
-    * LeafTermBlocks are physical 4096-byte blocks. Entries never cross blocks.
-     */
-    std::vector<LeafTermEntry> pageEntries;
-    size_t pageBytes = sizeof(uint32_t); // entry_count
-    for (auto& entry : flat) {
-        size_t need = leaf_entry_bytes(entry);
-        if (!pageEntries.empty() && pageBytes + need > PAGE_SIZE) {
-            LeafTermBlock block{};
-            encode_leaf_block(pageEntries, block);
-            HeadTermEntry head{};
-            head.HTE_LeafTermBlockID = static_cast<uint32_t>(res.BBR_LeafTermBlocks.size());
-            head.SetFirstTerm(pageEntries.front().LTE_Term);
-            res.BBR_HeadTermEntries.push_back(head);
-            res.BBR_LeafTermBlocks.push_back(block);
-            pageEntries.clear();
-            pageBytes = sizeof(uint32_t);
-        }
-
-        pageBytes += need;
-        pageEntries.push_back(std::move(entry));
-    }
-    if (!pageEntries.empty()) {
-        LeafTermBlock block{};
-        encode_leaf_block(pageEntries, block);
-        HeadTermEntry head{};
-        head.HTE_LeafTermBlockID = static_cast<uint32_t>(res.BBR_LeafTermBlocks.size());
-        head.SetFirstTerm(pageEntries.front().LTE_Term);
-        res.BBR_HeadTermEntries.push_back(head);
-        res.BBR_LeafTermBlocks.push_back(block);
-    }
-
-    res.BBR_TotalTerms = flat.size();
+    flush_leaf_block();
 
     return res;
 }

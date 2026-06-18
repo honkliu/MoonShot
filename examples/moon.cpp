@@ -490,7 +490,7 @@ public:
              uint32_t continuationBlockCount,
              uint32_t flags)
     {
-        size_t entryBytes = 2u + term.size() + 6u * sizeof(uint32_t);
+        size_t entryBytes = sizeof(LeafTermEntry) + term.size();
         if (m_Count > 0 && m_Group.size() + entryBytes > PAGE_SIZE) flush();
 
         if (m_Count == 0) {
@@ -498,14 +498,17 @@ public:
             m_Group.clear();
             write_u32(m_Group, 0); // entry_count placeholder
         }
-        write_u16(m_Group, static_cast<uint16_t>(term.size()));
+        LeafTermEntry header{};
+        header.LTE_DocFreq = docFreq;
+        header.LTE_IndexBlockID = indexBlockID;
+        header.LTE_IndexOffset = indexOffset;
+        header.LTE_IndexLength = indexLength;
+        header.LTE_ContinuationBlockCount = continuationBlockCount;
+        header.LTE_Flags = flags;
+        header.LTE_TermLength = static_cast<uint16_t>(term.size());
+        const uint8_t* headerBytes = reinterpret_cast<const uint8_t*>(&header);
+        m_Group.insert(m_Group.end(), headerBytes, headerBytes + sizeof(LeafTermEntry));
         m_Group.insert(m_Group.end(), term.begin(), term.end());
-        write_u32(m_Group, docFreq);
-        write_u32(m_Group, indexBlockID);
-        write_u32(m_Group, indexOffset);
-        write_u32(m_Group, indexLength);
-        write_u32(m_Group, continuationBlockCount);
-        write_u32(m_Group, flags);
         ++m_Count;
     }
 
@@ -529,7 +532,8 @@ private:
         if (m_Group.size() < PAGE_SIZE) m_Group.resize(PAGE_SIZE, 0);
         HeadTermEntry head{};
         head.HTE_LeafTermBlockID = m_LeafTermBlockCount++;
-        head.SetFirstTerm(m_FirstTerm);
+        head.HTE_FirstTermLength = static_cast<uint16_t>(m_FirstTerm.size());
+        std::memcpy(head.HTE_FirstTerm, m_FirstTerm.data(), head.HTE_FirstTermLength);
         m_HeadTermEntries.push_back(head);
         LeafTermBlock block{};
         std::memcpy(block.LTB_Data, m_Group.data(), sizeof(block.LTB_Data));

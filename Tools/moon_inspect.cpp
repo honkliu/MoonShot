@@ -33,8 +33,8 @@ struct Index {
     IndexFileHeader hdr{};
     std::vector<uint8_t> bytes;
     std::vector<HeadTermEntry> directory;
-    std::vector<std::vector<LeafTermEntry>> leaf_pages;
-    std::vector<LeafTermEntry> leaf_entries;
+    std::vector<std::vector<const LeafTermEntry*>> leaf_pages;
+    std::vector<const LeafTermEntry*> leaf_entries;
     std::vector<DocDataEntry> docs;
     std::vector<BlockView> blocks;
     std::string error;
@@ -93,14 +93,6 @@ static uint32_t read_u32(const uint8_t*& ptr, const uint8_t* end)
     uint32_t value = 0;
     std::memcpy(&value, ptr, 4);
     ptr += 4;
-    return value;
-}
-
-static std::string read_string(const uint8_t*& ptr, const uint8_t* end, size_t size)
-{
-    if (ptr + size > end) return {};
-    std::string value(reinterpret_cast<const char*>(ptr), size);
-    ptr += size;
     return value;
 }
 
@@ -221,25 +213,22 @@ static Index parse_index(const char* path)
             auto& page = index.leaf_pages[block_index];
             page.reserve(entry_count);
             for (uint32_t i = 0; i < entry_count; ++i) {
-                if (ptr + sizeof(uint16_t) > page_end) {
-                    index.error = "Corrupt leaf term page: missing term length";
+                if (ptr + sizeof(LeafTermEntry) > page_end) {
+                    index.error = "Corrupt leaf term page: missing entry header";
                     return index;
                 }
-                LeafTermEntry header;
-                uint16_t len = read_u16(ptr, page_end);
-                if (len > HEAD_TERM_KEY_MAX || ptr + len + 6 * sizeof(uint32_t) > page_end) {
+
+                const LeafTermEntry* header = reinterpret_cast<const LeafTermEntry*>(ptr);
+                if (header->LTE_TermLength > HEAD_TERM_KEY_MAX
+                    || ptr + sizeof(LeafTermEntry) + header->LTE_TermLength > page_end)
+                {
                     index.error = "Corrupt leaf term page: bad entry length";
                     return index;
                 }
-                header.LTE_Term = read_string(ptr, page_end, len);
-                header.LTE_DocFreq = read_u32(ptr, page_end);
-                header.LTE_IndexBlockID = read_u32(ptr, page_end);
-                header.LTE_IndexOffset = read_u32(ptr, page_end);
-                header.LTE_IndexLength = read_u32(ptr, page_end);
-                header.LTE_ContinuationBlockCount = read_u32(ptr, page_end);
-                header.LTE_Flags = read_u32(ptr, page_end);
+
+                ptr += sizeof(LeafTermEntry) + header->LTE_TermLength;
                 page.push_back(header);
-                index.leaf_entries.push_back(std::move(header));
+                index.leaf_entries.push_back(header);
             }
             if (page.size() != entry_count) {
                 index.error = "Corrupt leaf term page: truncated entries";
@@ -255,8 +244,8 @@ static Index parse_index(const char* path)
     }
 
     std::unordered_map<uint32_t, std::vector<const LeafTermEntry*>> terms_by_block;
-    for (const auto& header : index.leaf_entries) {
-        terms_by_block[header.LTE_IndexBlockID].push_back(&header);
+    for (const LeafTermEntry* header : index.leaf_entries) {
+        terms_by_block[header->LTE_IndexBlockID].push_back(header);
     }
 
     const uint64_t indexBlockCount = index.hdr.IFH_IndexBlockCount;
@@ -337,15 +326,15 @@ static void emit(std::ostream& out, const Index& index, const char* path)
 
     out << "<div class='panel' id='terms'><h3>Term Directory</h3><table><tr><th>Leaf block</th><th>First term</th></tr>";
     for (const auto& entry : index.directory) {
-        out << "<tr><td class='num'>" << entry.HTE_LeafTermBlockID << "</td><td class='mono key'>" << esc(std::string(entry.FirstTerm())) << "</td></tr>";
+        out << "<tr><td class='num'>" << entry.HTE_LeafTermBlockID << "</td><td class='mono key'>" << esc(std::string(entry.HTE_FirstTerm, entry.HTE_FirstTermLength)) << "</td></tr>";
     }
     out << "</table><h3>LeafTermBlocks</h3>";
     for (size_t page_id = 0; page_id < index.leaf_pages.size(); ++page_id) {
         const auto& page = index.leaf_pages[page_id];
         out << "<div class='card open'><div class='card-h'>LeafTermBlock <span class='num'>" << page_id << "</span> <span class='dim'>" << page.size() << " entries</span></div><div class='card-b'>";
         out << "<table><tr><th>Term</th><th>df</th><th>IndexEntryBlk</th><th>Off</th><th>Len</th><th>Cont</th></tr>";
-        for (const auto& term : page) {
-            out << "<tr onclick=\"showBlock(" << term.LTE_IndexBlockID << ")\"><td class='mono key'>" << esc(term.LTE_Term) << "</td><td class='num'>" << term.LTE_DocFreq << "</td><td class='num'>" << term.LTE_IndexBlockID << "</td><td class='num'>" << term.LTE_IndexOffset << "</td><td class='num'>" << term.LTE_IndexLength << "</td><td class='num'>" << term.LTE_ContinuationBlockCount << "</td></tr>";
+        for (const LeafTermEntry* term : page) {
+            out << "<tr onclick=\"showBlock(" << term->LTE_IndexBlockID << ")\"><td class='mono key'>" << esc(std::string(term->LTE_Term, term->LTE_TermLength)) << "</td><td class='num'>" << term->LTE_DocFreq << "</td><td class='num'>" << term->LTE_IndexBlockID << "</td><td class='num'>" << term->LTE_IndexOffset << "</td><td class='num'>" << term->LTE_IndexLength << "</td><td class='num'>" << term->LTE_ContinuationBlockCount << "</td></tr>";
         }
         out << "</table></div></div>";
     }
@@ -367,7 +356,7 @@ static void emit(std::ostream& out, const Index& index, const char* path)
             out << "<table><tr><th>Term</th><th>df</th><th>Off</th><th>Len</th><th>Decoded postings</th></tr>";
             for (const auto& view : block.terms) {
                 const LeafTermEntry& term = *view.header;
-                out << "<tr><td class='mono key'>" << esc(term.LTE_Term);
+                out << "<tr><td class='mono key'>" << esc(std::string(term.LTE_Term, term.LTE_TermLength));
                 if (term.LTE_ContinuationBlockCount > 0) out << "<span class='badge more'>->" << term.LTE_ContinuationBlockCount << "</span>";
                 out << "</td><td class='num'>" << term.LTE_DocFreq << "</td><td class='num'>" << term.LTE_IndexOffset << "</td><td class='num'>" << term.LTE_IndexLength << "</td><td class='dim'>" << view.IndexEntrys.size() << " sample rows</td></tr>";
                 out << "<tr><td></td><td colspan='4'><table class='postings'><tr><th>DocID</th><th>TF</th><th>Path</th></tr>";

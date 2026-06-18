@@ -105,6 +105,7 @@ struct IndexBlock {
     uint8_t  IB_Data[PAGE_SIZE - static_cast<int>(sizeof(uint64_t))];
 };
 
+#pragma pack(push,1)
 struct LeafTermEntry {
     uint32_t    LTE_DocFreq                 = 0;
     uint32_t    LTE_IndexBlockID            = 0;
@@ -112,32 +113,15 @@ struct LeafTermEntry {
     uint32_t    LTE_IndexLength             = 0;
     uint32_t    LTE_ContinuationBlockCount  = 0;
     uint32_t    LTE_Flags                   = 0;
-    std::string LTE_Term;
+    uint16_t    LTE_TermLength              = 0;
+    char        LTE_Term[0];
 };
+#pragma pack(pop)
 
 struct alignas(16) HeadTermEntry {
     uint32_t HTE_LeafTermBlockID = 0;
     uint16_t HTE_FirstTermLength = 0;
     char     HTE_FirstTerm[HEAD_TERM_KEY_MAX] = {};
-
-    std::string_view FirstTerm() const
-    {
-        return std::string_view(HTE_FirstTerm, HTE_FirstTermLength);
-    }
-
-    void SetFirstTerm(std::string_view term)
-    {
-        assert(term.size() <= HEAD_TERM_KEY_MAX);
-        if (term.size() > HEAD_TERM_KEY_MAX) {
-            HTE_FirstTermLength = 0;
-            std::memset(HTE_FirstTerm, 0, sizeof(HTE_FirstTerm));
-            return;
-        }
-        HTE_FirstTermLength = static_cast<uint16_t>(term.size());
-        std::memset(HTE_FirstTerm, 0, sizeof(HTE_FirstTerm));
-        if (!term.empty())
-            std::memcpy(HTE_FirstTerm, term.data(), term.size());
-    }
 };
 
 struct LeafTermBlock {
@@ -279,7 +263,7 @@ class IndexBlockTable
             const HeadTermEntry* begin = m_HeadTermEntries.get();
             const HeadTermEntry* end = begin + m_HeadTermEntryCount;
             auto it = std::upper_bound(begin, end, termText,
-                [](std::string_view t, const HeadTermEntry& e) { return t < e.FirstTerm(); });
+                [](std::string_view t, const HeadTermEntry& e) { return t < std::string_view(e.HTE_FirstTerm, e.HTE_FirstTermLength); });
             if (it == begin) return false;
             --it;
 
@@ -296,29 +280,20 @@ class IndexBlockTable
             if (entryCount > LEAF_TERM_ENTRY_MAX) return false;
 
             for (uint32_t entryIndex = 0; entryIndex < entryCount; ++entryIndex) {
-                if (ptr + 6 * sizeof(uint32_t) + sizeof(uint16_t) > end) return false;
-                const uint32_t docFreq = *reinterpret_cast<const uint32_t*>(ptr); ptr += sizeof(uint32_t);
-                const uint32_t indexBlockID = *reinterpret_cast<const uint32_t*>(ptr); ptr += sizeof(uint32_t);
-                const uint32_t indexOffset = *reinterpret_cast<const uint32_t*>(ptr); ptr += sizeof(uint32_t);
-                const uint32_t indexLength = *reinterpret_cast<const uint32_t*>(ptr); ptr += sizeof(uint32_t);
-                const uint32_t continuationBlockCount = *reinterpret_cast<const uint32_t*>(ptr); ptr += sizeof(uint32_t);
-                ptr += sizeof(uint32_t);
+                if (ptr + sizeof(LeafTermEntry) > end) return false;
+                const LeafTermEntry* entry = reinterpret_cast<const LeafTermEntry*>(ptr);
+                if (entry->LTE_TermLength > HEAD_TERM_KEY_MAX) return false;
+                ptr += sizeof(LeafTermEntry) + entry->LTE_TermLength;
+                if (ptr > end) return false;
 
-                if (ptr + sizeof(uint16_t) > end) return false;
-                const uint16_t entryTermLength = *reinterpret_cast<const uint16_t*>(ptr);
-                ptr += sizeof(entryTermLength);
-                if (entryTermLength > HEAD_TERM_KEY_MAX) return false;
-                if (ptr + entryTermLength > end) return false;
-
-                const std::string_view entryTerm(reinterpret_cast<const char*>(ptr), entryTermLength);
-                ptr += entryTermLength;
+                const std::string_view entryTerm(entry->LTE_Term, entry->LTE_TermLength);
 
                 if (entryTerm == termText) {
-                    *docFreqOut = docFreq;
-                    *indexBlockIDOut = indexBlockID;
-                    *indexOffsetOut = indexOffset;
-                    *indexLengthOut = indexLength;
-                    if (continuationBlockCountOut) *continuationBlockCountOut = continuationBlockCount;
+                    *docFreqOut = entry->LTE_DocFreq;
+                    *indexBlockIDOut = entry->LTE_IndexBlockID;
+                    *indexOffsetOut = entry->LTE_IndexOffset;
+                    *indexLengthOut = entry->LTE_IndexLength;
+                    if (continuationBlockCountOut) *continuationBlockCountOut = entry->LTE_ContinuationBlockCount;
                     return true;
                 }
 

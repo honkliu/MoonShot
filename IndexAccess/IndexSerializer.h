@@ -8,16 +8,14 @@
 #include <string>
 
 /*
- * Binary index file format (version 11).
+ * Binary index file format (version 12).
  *
  * Layout:
  *   [Header 88B]       magic, version, fixed section offsets and counts
  *   [HeadTermEntry]    fixed 32B records, count = IFH_HeadTermEntryCount
  *   [LeafTermBlock]    fixed 4096B blocks, count = IFH_LeafTermBlockCount
  *                          each block: [entry_count:4] then per entry:
- *                          [LTE_DocFreq:4][LTE_IndexBlockID:4][LTE_IndexOffset:4]
- *                          [LTE_IndexLength:4][LTE_ContinuationBlockCount:4][LTE_Flags:4]
- *                          [key_len:2][LTE_Term:key_len]
+ *                          [LeafTermEntry header][LTE_Term bytes]
  *   [DocData]          N x 1024B records
  *   [Padding]          to PAGE_SIZE
  *   [Blocks]           raw IndexBlock structs
