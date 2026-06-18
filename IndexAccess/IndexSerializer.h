@@ -15,9 +15,9 @@
  *   [HeadTermEntry]    fixed 32B records, count = IFH_HeadTermEntryCount
  *   [LeafTermBlock]    fixed 4096B blocks, count = IFH_LeafTermBlockCount
  *                          each block: [entry_count:4] then per entry:
- *                          [key_len:2][LTE_Term:key_len][LTE_DocFreq:4]
- *                          [LTE_IndexBlockID:4][LTE_IndexOffset:4][LTE_IndexLength:4]
- *                          [LTE_ContinuationBlockCount:4][LTE_Flags:4]
+ *                          [LTE_DocFreq:4][LTE_IndexBlockID:4][LTE_IndexOffset:4]
+ *                          [LTE_IndexLength:4][LTE_ContinuationBlockCount:4][LTE_Flags:4]
+ *                          [key_len:2][LTE_Term:key_len]
  *   [DocData]          N x 1024B records
  *   [Padding]          to PAGE_SIZE
  *   [Blocks]           raw IndexBlock structs

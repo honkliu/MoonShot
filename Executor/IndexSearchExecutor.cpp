@@ -23,7 +23,7 @@ std::vector<SearchResult> IndexSearchExecutor::Execute(std::shared_ptr<IndexRead
         const DocDataEntry* entry = m_Context->GetDocDataEntry(docId);
         assert(entry);
         float    score     = reader->GetScore(entry)
-                   + DecodeFloat16(entry->DDE_StaticRankHalf);
+                   + entry->DDE_StaticRank;
 
         results.push_back({docId, score, ""});
         reader->GoNext();
@@ -69,7 +69,7 @@ std::vector<SearchResult> IndexSearchExecutor::CollectResults(
         const DocDataEntry* entry = m_Context->GetDocDataEntry(docId);
         assert(entry);
         float    score     = reader->GetScore(entry)
-                   + DecodeFloat16(entry->DDE_StaticRankHalf);
+                   + entry->DDE_StaticRank;
 
         results.push_back({docId, score, ""});
         reader->GoNext();

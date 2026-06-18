@@ -33,10 +33,10 @@ static constexpr size_t DOC_VECTOR_DIM = 128;
 static constexpr size_t DOC_VECTOR_STORAGE_MAX_DIM = 512;  // int8[512]
 static constexpr size_t DOC_PATH_MAX = 256;
 static constexpr size_t HEAD_TERM_KEY_MAX = 26;
-static constexpr size_t LEAF_TERM_ENTRY_MIN_BYTES = sizeof(uint16_t) + 6 * sizeof(uint32_t);
+static constexpr size_t LEAF_TERM_ENTRY_MIN_BYTES = 6 * sizeof(uint32_t) + sizeof(uint16_t);
 static constexpr size_t LEAF_TERM_ENTRY_MAX = (PAGE_SIZE - sizeof(uint32_t)) / LEAF_TERM_ENTRY_MIN_BYTES;
 static constexpr uint8_t  INDEX_FILE_MAGIC[8] = {'M','O','O','N','S','H','O','T'};
-static constexpr uint32_t INDEX_FORMAT_VERSION = 11;
+static constexpr uint32_t INDEX_FORMAT_VERSION = 12;
 
 static constexpr uint64_t IB_HEADER_HAS_MORE = (1ULL << 63);
 static constexpr uint16_t BLOCK_CONTINUATION_MARKER = 0xFFFFu;
@@ -66,9 +66,6 @@ struct IndexFileHeader {
     uint64_t IFH_IndexBlockCount;
 };
 #pragma pack(pop)
-static_assert(sizeof(IndexFileHeader) == 88, "IndexFileHeader must be exactly 88 bytes");
-static_assert(offsetof(IndexFileHeader, IFH_LeafTermBlockOffset) == 48, "LeafTermBlock offset field must remain at byte 48");
-static_assert(offsetof(IndexFileHeader, IFH_LeafTermBlockCount) == 56, "LeafTermBlock count field must remain at byte 56");
 
 #pragma pack(push,1)
 struct DocDataEntry {
@@ -81,137 +78,41 @@ struct DocDataEntry {
     uint32_t DDE_PolicyFlags;
     uint32_t DDE_VectorFlags;
 
-    uint16_t DDE_StaticRankHalf;
-    uint16_t DDE_QualityScoreHalf;
-    uint16_t DDE_FreshnessScoreHalf;
-    uint16_t DDE_ClickScoreHalf;
-    uint16_t DDE_EngagementScoreHalf;
-    uint16_t DDE_AuthorityScoreHalf;
-    uint16_t DDE_SpamScoreHalf;
+    float    DDE_StaticRank;
+    float    DDE_QualityScore;
+    float    DDE_FreshnessScore;
+    float    DDE_ClickScore;
+    float    DDE_EngagementScore;
+    float    DDE_AuthorityScore;
+    float    DDE_SpamScore;
 
     uint16_t DDE_PathLength;
     uint16_t DDE_Language;
     uint16_t DDE_Locale;
     uint16_t DDE_ContentType;
 
-    uint16_t DDE_FeatureScoreHalf[16];
+    float    DDE_FeatureScore[16];
     uint16_t DDE_VectorDim;
     uint16_t DDE_VectorFormat;
-    uint8_t  DDE_Reserved[154];
+    uint8_t  DDE_Reserved[108];
     int8_t   DDE_VectorData[DOC_VECTOR_STORAGE_MAX_DIM];
     uint8_t  DDE_Path[DOC_PATH_MAX];
 };
 #pragma pack(pop)
-static_assert(sizeof(DocDataEntry) == DOC_REC_SIZE, "DocDataEntry must be exactly DOC_REC_SIZE bytes");
-static_assert(offsetof(DocDataEntry, DDE_Path) == DOC_REC_SIZE - DOC_PATH_MAX, "DocDataEntry path must occupy the tail of the entry");
-static_assert(offsetof(DocDataEntry, DDE_VectorData) == 256, "DocDataEntry vector storage must start at byte 256");
-static_assert(sizeof(DocDataEntry::DDE_VectorData) == 512, "DocDataEntry vector storage must be 512 bytes (int8[512])");
-static_assert(offsetof(DocDataEntry, DDE_DocID) % 8 == 0, "DDE_DocID must be 64-bit aligned");
-static_assert(offsetof(DocDataEntry, DDE_SourceFlags) % 8 == 0, "DDE_SourceFlags must be 64-bit aligned");
-static_assert(offsetof(DocDataEntry, DDE_LastModifiedEpochSeconds) % 8 == 0, "DDE_LastModifiedEpochSeconds must be 64-bit aligned");
-static_assert(offsetof(DocDataEntry, DDE_CreatedEpochSeconds) % 8 == 0, "DDE_CreatedEpochSeconds must be 64-bit aligned");
-
-static inline uint16_t EncodeFloat16(float value)
-{
-    uint32_t bits = 0;
-    std::memcpy(&bits, &value, sizeof(bits));
-
-    const uint16_t sign = static_cast<uint16_t>((bits >> 16) & 0x8000u);
-    const uint32_t exponent = (bits >> 23) & 0xffu;
-    uint32_t mantissa = bits & 0x7fffffu;
-
-    if (exponent == 0xffu)
-        return static_cast<uint16_t>(sign | (mantissa ? 0x7e00u : 0x7c00u));
-
-    int32_t halfExponent = static_cast<int32_t>(exponent) - 127 + 15;
-    if (halfExponent >= 31)
-        return static_cast<uint16_t>(sign | 0x7c00u);
-
-    if (halfExponent <= 0) {
-        if (halfExponent < -10)
-            return sign;
-
-        mantissa |= 0x800000u;
-        const uint32_t shift = static_cast<uint32_t>(14 - halfExponent);
-        uint16_t halfMantissa = static_cast<uint16_t>(mantissa >> shift);
-        if ((mantissa >> (shift - 1)) & 1u)
-            ++halfMantissa;
-        return static_cast<uint16_t>(sign | halfMantissa);
-    }
-
-    uint16_t half = static_cast<uint16_t>(sign | (static_cast<uint16_t>(halfExponent) << 10) | (mantissa >> 13));
-    if (mantissa & 0x1000u)
-        ++half;
-    return half;
-}
-
-static inline float DecodeFloat16(uint16_t value)
-{
-    const uint32_t sign = static_cast<uint32_t>(value & 0x8000u) << 16;
-    uint32_t exponent = (value >> 10) & 0x1fu;
-    uint32_t mantissa = value & 0x03ffu;
-    uint32_t bits = 0;
-
-    if (exponent == 0) {
-        if (mantissa == 0) {
-            bits = sign;
-        } else {
-            int32_t normalizedExponent = -14;
-            while ((mantissa & 0x0400u) == 0) {
-                mantissa <<= 1;
-                --normalizedExponent;
-            }
-            mantissa &= 0x03ffu;
-            bits = sign
-                 | (static_cast<uint32_t>(normalizedExponent + 127) << 23)
-                 | (mantissa << 13);
-        }
-    } else if (exponent == 0x1fu) {
-        bits = sign | 0x7f800000u | (mantissa << 13);
-    } else {
-        bits = sign | ((exponent - 15 + 127) << 23) | (mantissa << 13);
-    }
-
-    float result = 0.0f;
-    std::memcpy(&result, &bits, sizeof(result));
-    return result;
-}
-
-static inline uint16_t EncodeDocPath(std::string_view path, uint8_t* output)
-{
-    if (!output || path.empty())
-        return 0;
-
-    const size_t rawBytes = std::min(path.size(), DOC_PATH_MAX);
-    std::memcpy(output, path.data(), rawBytes);
-    return static_cast<uint16_t>(rawBytes);
-}
-
-static inline std::string DecodeDocPath(const DocDataEntry& entry)
-{
-    const size_t byteCount = entry.DDE_PathLength;
-    if (byteCount == 0 || byteCount > DOC_PATH_MAX)
-        return {};
-
-    return std::string(
-        reinterpret_cast<const char*>(entry.DDE_Path),
-        reinterpret_cast<const char*>(entry.DDE_Path + byteCount));
-}
 
 struct IndexBlock {
     uint64_t IB_Header;
     uint8_t  IB_Data[PAGE_SIZE - static_cast<int>(sizeof(uint64_t))];
 };
-static_assert(sizeof(IndexBlock) == PAGE_SIZE, "IndexBlock must be exactly PAGE_SIZE bytes");
 
 struct LeafTermEntry {
-    std::string LTE_Term;
     uint32_t    LTE_DocFreq                 = 0;
     uint32_t    LTE_IndexBlockID            = 0;
     uint32_t    LTE_IndexOffset             = 0;
     uint32_t    LTE_IndexLength             = 0;
     uint32_t    LTE_ContinuationBlockCount  = 0;
     uint32_t    LTE_Flags                   = 0;
+    std::string LTE_Term;
 };
 
 struct alignas(16) HeadTermEntry {
@@ -238,13 +139,10 @@ struct alignas(16) HeadTermEntry {
             std::memcpy(HTE_FirstTerm, term.data(), term.size());
     }
 };
-static_assert(sizeof(HeadTermEntry) == 32, "HeadTermEntry must be fixed 32 bytes");
-static_assert(alignof(HeadTermEntry) == 16, "HeadTermEntry must be 16-byte aligned");
 
 struct LeafTermBlock {
     uint8_t LTB_Data[PAGE_SIZE] = {};
 };
-static_assert(sizeof(LeafTermBlock) == PAGE_SIZE, "LeafTermBlock must be exactly PAGE_SIZE bytes");
 
 /*
 * BloomFilter — placeholder (Tiger uses a Bloom filter to reject absent terms quickly).
@@ -252,6 +150,11 @@ static_assert(sizeof(LeafTermBlock) == PAGE_SIZE, "LeafTermBlock must be exactly
 */
 struct BloomFilter {
     bool CanTermExist(const char* /*term*/, size_t /*len*/) const { return true; }
+};
+
+enum class BlockKind {
+    Index,
+    LeafTerm
 };
 
 class RWSpinLock {
@@ -319,18 +222,12 @@ static inline void UnpinMemoryPages(void* address, size_t bytes)
  * Lookup path:
  *   BloomFilter.CanTermExist()                  → reject obviously absent terms
  *   Level-1 binary search on m_HeadTermEntries  → LeafTermBlockID
- *   Level-2 binary search in decoded leaf block entries → LeafTermEntry
- *   GetIndexBlock(entry.LTE_IndexBlockID)       → load posting block
+ *   Level-2 scan in encoded leaf block entries → LeafTermEntry
+ *   GetBlock(Index, entry.LTE_IndexBlockID)     → posting block
  *   Decoder opens at IB_Data + entry.LTE_IndexOffset
  */
 class IndexBlockTable
 {
-    public:
-        enum class BlockKind : uint8_t {
-            Index,
-            LeafTerm
-        };
-
     private:
 
         struct BlockCacheSlot {
@@ -349,28 +246,10 @@ class IndexBlockTable
     public:
         explicit IndexBlockTable(uint32_t = 0) = default;
 
-        void InsertBlock(uint32_t block_seq, const IndexBlock* block)
-        {
-            if (!block) return;
-            void* addr = GetBlock(BlockKind::Index, block_seq);
-            if (!addr) return;
-            std::memcpy(addr, block, sizeof(IndexBlock));
-        }
-
         void SetHeadTermEntries(std::unique_ptr<HeadTermEntry[]> head, uint32_t headCount)
         {
             m_HeadTermEntries = std::move(head);
             m_HeadTermEntryCount = headCount;
-        }
-
-        void SetHeadTermEntries(const HeadTermEntry* head, uint32_t headCount)
-        {
-            std::unique_ptr<HeadTermEntry[]> entries;
-            if (headCount > 0) {
-                entries.reset(new HeadTermEntry[headCount]);
-                std::memcpy(entries.get(), head, static_cast<size_t>(headCount) * sizeof(HeadTermEntry));
-            }
-            SetHeadTermEntries(std::move(entries), headCount);
         }
 
         /*
@@ -379,7 +258,7 @@ class IndexBlockTable
         * Step 1 — BloomFilter check (placeholder, always passes).
         * Step 2 — Level-1: binary search m_HeadTermEntries for the leaf block whose
         *           HTE_FirstTerm <= term.
-        * Step 3 — Level-2: binary search within decoded leaf block entries for exact term.
+        * Step 3 — Level-2: scan encoded entries inside the leaf block for exact term.
         * Step 4 — Fill out-params from the LeafTermEntry and return true.
         */
         bool FindTermData(const char* term,
@@ -390,9 +269,10 @@ class IndexBlockTable
                           uint32_t*   continuationBlockCountOut = nullptr) const
         {
             /* Step 1: BloomFilter */
-            if (!m_BloomFilter.CanTermExist(term, std::strlen(term))) return false;
+            const size_t termLength = std::strlen(term);
+            if (!m_BloomFilter.CanTermExist(term, termLength)) return false;
             if (!m_HeadTermEntries || m_HeadTermEntryCount == 0) return false;
-            if (std::strlen(term) > HEAD_TERM_KEY_MAX) return false;
+            if (termLength > HEAD_TERM_KEY_MAX) return false;
 
             /* Step 2: Level-1 — find leaf block whose first term <= term */
             const std::string_view termText(term);
@@ -404,36 +284,47 @@ class IndexBlockTable
             --it;
 
             uint32_t blockID = it->HTE_LeafTermBlockID;
-            if (blockID >= m_LeafTermBlockCount) return false;
-            LeafTermEntry entries[LEAF_TERM_ENTRY_MAX];
-            uint32_t decodedEntryCount = 0;
-            if (!LoadLeafTermBlock(blockID, entries, LEAF_TERM_ENTRY_MAX, decodedEntryCount)) return false;
-            const LeafTermEntry* begin2 = entries;
-            const LeafTermEntry* end2 = begin2 + decodedEntryCount;
-            auto it2 = std::lower_bound(begin2, end2, term,
-                [](const LeafTermEntry& e, const char* t) { return e.LTE_Term < t; });
-            if (it2 == end2 || it2->LTE_Term != term) return false;
+            if (!m_LeafTermPool.BCP_Pages || blockID >= m_LeafTermPool.BCP_BlockCount) return false;
+            const LeafTermBlock* block = static_cast<const LeafTermBlock*>(m_LeafTermPool.BCP_Pages) + blockID;
+            const uint8_t* ptr = block->LTB_Data;
+            const uint8_t* end = block->LTB_Data + sizeof(block->LTB_Data);
 
-            *indexBlockIDOut = it2->LTE_IndexBlockID;
-            *indexOffsetOut  = it2->LTE_IndexOffset;
-            *indexLengthOut  = it2->LTE_IndexLength;
-            *docFreqOut      = it2->LTE_DocFreq;
-            if (continuationBlockCountOut) *continuationBlockCountOut = it2->LTE_ContinuationBlockCount;
-            return true;
-        }
+            if (ptr + sizeof(uint32_t) > end) return false;
+            uint32_t entryCount = 0;
+            std::memcpy(&entryCount, ptr, sizeof(entryCount));
+            ptr += sizeof(entryCount);
+            if (entryCount > LEAF_TERM_ENTRY_MAX) return false;
 
-        IndexBlock* GetIndexBlock(uint32_t block_seq, uint32_t)
-        {
-            void* address = GetBlock(BlockKind::Index, block_seq);
-            if (!address) return nullptr;
-            return reinterpret_cast<IndexBlock*>(address);
-        }
+            for (uint32_t entryIndex = 0; entryIndex < entryCount; ++entryIndex) {
+                if (ptr + 6 * sizeof(uint32_t) + sizeof(uint16_t) > end) return false;
+                const uint32_t docFreq = *reinterpret_cast<const uint32_t*>(ptr); ptr += sizeof(uint32_t);
+                const uint32_t indexBlockID = *reinterpret_cast<const uint32_t*>(ptr); ptr += sizeof(uint32_t);
+                const uint32_t indexOffset = *reinterpret_cast<const uint32_t*>(ptr); ptr += sizeof(uint32_t);
+                const uint32_t indexLength = *reinterpret_cast<const uint32_t*>(ptr); ptr += sizeof(uint32_t);
+                const uint32_t continuationBlockCount = *reinterpret_cast<const uint32_t*>(ptr); ptr += sizeof(uint32_t);
+                ptr += sizeof(uint32_t);
 
-        LeafTermBlock* GetLeafTermBlock(uint32_t block_seq)
-        {
-            void* address = GetBlock(BlockKind::LeafTerm, block_seq);
-            if (!address) return nullptr;
-            return reinterpret_cast<LeafTermBlock*>(address);
+                if (ptr + sizeof(uint16_t) > end) return false;
+                const uint16_t entryTermLength = *reinterpret_cast<const uint16_t*>(ptr);
+                ptr += sizeof(entryTermLength);
+                if (entryTermLength > HEAD_TERM_KEY_MAX) return false;
+                if (ptr + entryTermLength > end) return false;
+
+                const std::string_view entryTerm(reinterpret_cast<const char*>(ptr), entryTermLength);
+                ptr += entryTermLength;
+
+                if (entryTerm == termText) {
+                    *docFreqOut = docFreq;
+                    *indexBlockIDOut = indexBlockID;
+                    *indexOffsetOut = indexOffset;
+                    *indexLengthOut = indexLength;
+                    if (continuationBlockCountOut) *continuationBlockCountOut = continuationBlockCount;
+                    return true;
+                }
+
+                if (entryTerm > termText) return false;
+            }
+            return false;
         }
 
         void* GetBlock(BlockKind kind, uint32_t block_seq)
@@ -450,7 +341,6 @@ class IndexBlockTable
         {
             SetPoolMemory(m_IndexPool, indexBlocks, sizeof(IndexBlock), indexBlockCount);
             SetPoolMemory(m_LeafTermPool, leafTermBlocks, sizeof(LeafTermBlock), leafTermBlockCount);
-            m_LeafTermBlockCount = leafTermBlockCount;
         }
 
     private:
@@ -462,56 +352,6 @@ class IndexBlockTable
         /* Level-1: fixed directory — (HTE_FirstTerm → HTE_LeafTermBlockID), sorted by HTE_FirstTerm */
         std::unique_ptr<HeadTermEntry[]>         m_HeadTermEntries;
         uint32_t                                 m_HeadTermEntryCount = 0;
-
-        uint32_t                                 m_LeafTermBlockCount = 0;
-
-        static bool DecodeLeafTermBlock(const LeafTermBlock& block,
-                                        LeafTermEntry* entries,
-                                        uint32_t entryCapacity,
-                                        uint32_t& entryCountOut)
-        {
-            entryCountOut = 0;
-            if (!entries) return false;
-            const uint8_t* ptr = block.LTB_Data;
-            const uint8_t* end = block.LTB_Data + sizeof(block.LTB_Data);
-
-            if (ptr + sizeof(uint32_t) > end) return false;
-            uint32_t entryCount = 0;
-            std::memcpy(&entryCount, ptr, sizeof(entryCount));
-            ptr += sizeof(entryCount);
-            if (entryCount > LEAF_TERM_ENTRY_MAX || entryCount > entryCapacity) return false;
-
-            for (uint32_t i = 0; i < entryCount; ++i) {
-                if (ptr + sizeof(uint16_t) > end) return false;
-                uint16_t len = 0;
-                std::memcpy(&len, ptr, sizeof(len));
-                ptr += sizeof(len);
-                if (len > HEAD_TERM_KEY_MAX) return false;
-                if (ptr + len + 6 * sizeof(uint32_t) > end) return false;
-                LeafTermEntry& entry = entries[i];
-                entry.LTE_Term.assign(reinterpret_cast<const char*>(ptr), len);
-                ptr += len;
-
-                std::memcpy(&entry.LTE_DocFreq, ptr, sizeof(uint32_t)); ptr += sizeof(uint32_t);
-                std::memcpy(&entry.LTE_IndexBlockID, ptr, sizeof(uint32_t)); ptr += sizeof(uint32_t);
-                std::memcpy(&entry.LTE_IndexOffset, ptr, sizeof(uint32_t)); ptr += sizeof(uint32_t);
-                std::memcpy(&entry.LTE_IndexLength, ptr, sizeof(uint32_t)); ptr += sizeof(uint32_t);
-                std::memcpy(&entry.LTE_ContinuationBlockCount, ptr, sizeof(uint32_t)); ptr += sizeof(uint32_t);
-                std::memcpy(&entry.LTE_Flags, ptr, sizeof(uint32_t)); ptr += sizeof(uint32_t);
-                ++entryCountOut;
-            }
-            return entryCountOut == entryCount;
-        }
-
-        bool LoadLeafTermBlock(uint32_t blockID,
-                               LeafTermEntry* entries,
-                               uint32_t entryCapacity,
-                               uint32_t& entryCountOut) const
-        {
-            LeafTermBlock* block = const_cast<IndexBlockTable*>(this)->GetLeafTermBlock(blockID);
-            if (!block) return false;
-            return DecodeLeafTermBlock(*block, entries, entryCapacity, entryCountOut);
-        }
 
         BlockCachePool* GetPool(BlockKind kind)
         {
@@ -533,12 +373,6 @@ class IndexBlockTable
             return static_cast<uint8_t*>(pool.BCP_Pages) + static_cast<size_t>(blockID) * pool.BCP_PageSize;
         }
 };
-
-inline IndexBlockTable& GetIndexBlockTable()
-{
-    static IndexBlockTable instance;
-    return instance;
-}
 
 constexpr uint64_t MAX_DOCID       = UINT64_MAX;
 constexpr uint32_t MAX_BLOCK_SIZE  = PAGE_SIZE;

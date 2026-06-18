@@ -20,28 +20,19 @@ void AdvancedIndexReader::Open(const char*      streamKey,
     m_BlockTable      = blockTable;
     m_Context         = context;
     m_DocFreq         = 0;
-    m_InitialBlockSeq = 0;
-    m_TotalContinuationBlocks = 0;
+    m_BlockSeqNumber  = 0;
     m_RemainingContinuationBlocks = 0;
 
-    uint32_t indexBlockID = 0, indexOffset = 0, indexLength = 0, freq = 0;
-    uint32_t continuationBlockCount = 0;
+    uint32_t indexOffset = 0, indexLength = 0;
 
     bool found = m_BlockTable->FindTermData(streamKey,
-                                            &indexBlockID, &indexOffset,
-                                            &indexLength,  &freq,
-                                            &continuationBlockCount);
+                                            &m_BlockSeqNumber, &indexOffset,
+                                            &indexLength,      &m_DocFreq,
+                                            &m_RemainingContinuationBlocks);
     if (found) {
-        /* Use doc_freq from LeafTermEntry — correct after Load(), unlike PostingStore */
-        m_DocFreq = freq;
-
-        IndexBlock* block = m_BlockTable->GetIndexBlock(indexBlockID, 1);
+        IndexBlock* block = reinterpret_cast<IndexBlock*>(
+            m_BlockTable->GetBlock(BlockKind::Index, m_BlockSeqNumber));
         assert(block);
-        m_BlockSeqNumber  = indexBlockID;
-        m_InitialBlockSeq = indexBlockID;
-        m_TotalContinuationBlocks = continuationBlockCount;
-        m_RemainingContinuationBlocks = continuationBlockCount;
-        m_IndexBlock      = std::shared_ptr<IndexBlock>(block, [](IndexBlock*){});
         m_Decoder.OpenRaw(block->IB_Data + indexOffset, indexLength);
     }
 
@@ -57,10 +48,10 @@ void AdvancedIndexReader::GoNext()
         m_Decoder.GoNext();
 
     while (m_Decoder.IsEnd() && HasMoreBlocks()) {
-        IndexBlock* next = m_BlockTable->GetIndexBlock(m_BlockSeqNumber + 1, 1);
+        IndexBlock* next = reinterpret_cast<IndexBlock*>(
+            m_BlockTable->GetBlock(BlockKind::Index, m_BlockSeqNumber + 1));
         assert(next);
         ++m_BlockSeqNumber;
-        m_IndexBlock = std::shared_ptr<IndexBlock>(next, [](IndexBlock*){});
         OpenContinuation(next);
         --m_RemainingContinuationBlocks;
         m_Decoder.GoNext();
@@ -73,10 +64,10 @@ void AdvancedIndexReader::GoUntil(uint64_t target, uint64_t /*limit*/)
         m_Decoder.GoUntil(target);
         if (!m_Decoder.IsEnd()) break;
         if (!HasMoreBlocks())   break;
-        IndexBlock* next = m_BlockTable->GetIndexBlock(m_BlockSeqNumber + 1, 1);
+        IndexBlock* next = reinterpret_cast<IndexBlock*>(
+            m_BlockTable->GetBlock(BlockKind::Index, m_BlockSeqNumber + 1));
         assert(next);
         ++m_BlockSeqNumber;
-        m_IndexBlock = std::shared_ptr<IndexBlock>(next, [](IndexBlock*){});
         OpenContinuation(next);
         --m_RemainingContinuationBlocks;
         m_Decoder.GoNext();
@@ -132,7 +123,6 @@ float AdvancedIndexReader::GetScore(const DocDataEntry* entry) {
     return idf * tfNorm;
 }
 void AdvancedIndexReader::Close() {
-    m_IndexBlock.reset();
     delete[] m_Word;
     m_Word = nullptr;
 }

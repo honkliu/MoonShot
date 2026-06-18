@@ -53,7 +53,7 @@ static uint64_t page_aligned_bytes(uint64_t bytes)
 
 static size_t leaf_entry_bytes(const LeafTermEntry& e)
 {
-    return 2u + e.LTE_Term.size() + 6u * sizeof(uint32_t);
+    return 6u * sizeof(uint32_t) + 2u + e.LTE_Term.size();
 }
 
 static bool read_vbc_pair_end(const uint8_t* data, size_t size, size_t& offset)
@@ -94,14 +94,14 @@ static void encode_leaf_block(const std::vector<LeafTermEntry>& entries, LeafTer
 
     write_u32(static_cast<uint32_t>(entries.size()));
     for (const auto& e : entries) {
-        write_u16(static_cast<uint16_t>(e.LTE_Term.size()));
-        std::memcpy(ptr, e.LTE_Term.data(), e.LTE_Term.size()); ptr += e.LTE_Term.size();
         write_u32(e.LTE_DocFreq);
         write_u32(e.LTE_IndexBlockID);
         write_u32(e.LTE_IndexOffset);
         write_u32(e.LTE_IndexLength);
         write_u32(e.LTE_ContinuationBlockCount);
         write_u32(e.LTE_Flags);
+        write_u16(static_cast<uint16_t>(e.LTE_Term.size()));
+        std::memcpy(ptr, e.LTE_Term.data(), e.LTE_Term.size()); ptr += e.LTE_Term.size();
     }
 }
 
@@ -171,13 +171,14 @@ static BuildBlocksResult build_blocks(const PostingStore& store)
         src       += data_here;
         remaining -= data_here;
 
-        flat.push_back({key,
+        flat.push_back({
             doc_freq,
             seq,
             static_cast<uint32_t>(data_offset),
             static_cast<uint32_t>(data_here),
             0u,
-            0u});
+            0u,
+            key});
 
         if (has_more) {
             flush(true);
@@ -271,11 +272,11 @@ bool IndexSerializer::Save(const PostingStore& store, const char* path)
         DocDataEntry entry{};
         entry.DDE_DocID     = id;
         entry.DDE_DocLength = ds.doc_len;
-        entry.DDE_StaticRankHalf = EncodeFloat16(ds.importance);
-        entry.DDE_QualityScoreHalf = EncodeFloat16(0.0f);
-        entry.DDE_FreshnessScoreHalf = EncodeFloat16(0.0f);
-        entry.DDE_ClickScoreHalf = EncodeFloat16(0.0f);
-        entry.DDE_EngagementScoreHalf = EncodeFloat16(0.0f);
+        entry.DDE_StaticRank = ds.importance;
+        entry.DDE_QualityScore = 0.0f;
+        entry.DDE_FreshnessScore = 0.0f;
+        entry.DDE_ClickScore = 0.0f;
+        entry.DDE_EngagementScore = 0.0f;
         // Doc vectors are stored in the in-memory vector index, not in DocStats.
         // DDE_VectorData is int8_t[512], quantized from float32.
         if (const auto* docVector = store.GetDocVector(id);
@@ -289,7 +290,9 @@ bool IndexSerializer::Save(const PostingStore& store, const char* path)
                 entry.DDE_VectorData[i] = static_cast<int8_t>(std::round(clipped));
             }
         }
-        entry.DDE_PathLength = EncodeDocPath(ds.path, entry.DDE_Path);
+        entry.DDE_PathLength = static_cast<uint16_t>(std::min(ds.path.size(), DOC_PATH_MAX));
+        if (entry.DDE_PathLength > 0)
+            std::memcpy(entry.DDE_Path, ds.path.data(), entry.DDE_PathLength);
         docdata[static_cast<size_t>(id)] = entry;
     }
 
@@ -404,7 +407,7 @@ bool IndexSerializer::Load(PostingStore&                           store,
             if (entry.DDE_DocID != row)
                 continue;
             store.AddDocTokens(entry.DDE_DocID, entry.DDE_DocLength);
-            store.SetDocImportance(entry.DDE_DocID, DecodeFloat16(entry.DDE_StaticRankHalf));
+            store.SetDocImportance(entry.DDE_DocID, entry.DDE_StaticRank);
             if (entry.DDE_VectorDim > 0 && entry.DDE_VectorDim <= DOC_VECTOR_STORAGE_MAX_DIM && entry.DDE_VectorFormat == 1) {
                 std::vector<float> vector(entry.DDE_VectorDim);
                 for (size_t i = 0; i < entry.DDE_VectorDim; ++i) {
@@ -413,8 +416,8 @@ bool IndexSerializer::Load(PostingStore&                           store,
                 }
                 store.SetDocVector(entry.DDE_DocID, std::move(vector));
             }
-            if (entry.DDE_PathLength > 0)
-                store.SetDocPath(entry.DDE_DocID, DecodeDocPath(entry));
+            if (entry.DDE_PathLength > 0 && entry.DDE_PathLength <= DOC_PATH_MAX)
+                store.SetDocPath(entry.DDE_DocID, std::string(reinterpret_cast<const char*>(entry.DDE_Path), entry.DDE_PathLength));
         }
     }
 

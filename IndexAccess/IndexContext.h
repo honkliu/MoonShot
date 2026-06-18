@@ -190,8 +190,13 @@ public:
         if (leafTermBlockCount > 0)
             std::memcpy(m_LeafTermBlocks, br.BBR_LeafTermBlocks.data(), static_cast<size_t>(leafTermBlockCount) * sizeof(LeafTermBlock));
 
+        std::unique_ptr<HeadTermEntry[]> headTermEntries;
+        if (headCount > 0) {
+            headTermEntries.reset(new HeadTermEntry[headCount]);
+            std::memcpy(headTermEntries.get(), br.BBR_HeadTermEntries.data(), static_cast<size_t>(headCount) * sizeof(HeadTermEntry));
+        }
         m_BlockTable.SetBlockMemory(m_IndexBlocks, m_LeafTermBlocks, indexBlockCount, leafTermBlockCount);
-        m_BlockTable.SetHeadTermEntries(br.BBR_HeadTermEntries.data(), headCount);
+        m_BlockTable.SetHeadTermEntries(std::move(headTermEntries), headCount);
 
         m_Built = true;
         m_LoadedFromDisk = false;
@@ -207,8 +212,6 @@ public:
             auto empty = make_shared<AdvancedIndexReader>();
             return empty;
         }
-
-        EnsureBuilt();
 
         if (evalTree->HasTextQuery() && evalTree->HasVectorQuery()) {
             std::vector<shared_ptr<IndexReader>> children;
@@ -239,7 +242,6 @@ public:
     /* Open a reader for one specific stream key (e.g. "raceA", "carT"). */
     shared_ptr<IndexReader> GetStreamReader(const char* streamKey)
     {
-        EnsureBuilt();
         auto reader = make_shared<AdvancedIndexReader>();
         reader->Open(streamKey, &m_BlockTable, this);
         return reader;
@@ -282,7 +284,6 @@ public:
         if (!path || !*path) return false;
         m_IndexPath = path;
 
-        EnsureBuilt();
         if (!IndexSerializer::Save(*m_Store, path)) return false;
 
         IndexFileHeader header{};
@@ -456,12 +457,6 @@ private:
     static constexpr uint32_t LEAF_TERM_BLOCK_CACHE_SLOT_COUNT =
         static_cast<uint32_t>(LEAF_TERM_CACHE_BYTES / sizeof(LeafTermBlock));
 
-    void EnsureBuilt()
-    {
-        if (!m_Built)
-            Build();
-    }
-
     void ClearDocDataOnly()
     {
         if (m_DocData)
@@ -518,7 +513,7 @@ private:
         for (const auto& [docId, stats] : m_Store->AllDocStats()) {
             auto* entry = reinterpret_cast<DocDataEntry*>(m_DocData + docId * DOC_REC_SIZE);
             entry->DDE_DocID = docId;
-            entry->DDE_StaticRankHalf = EncodeFloat16(stats.importance);
+            entry->DDE_StaticRank = stats.importance;
             entry->DDE_DocLength = stats.doc_len;
             if (const auto* vector = m_Store->GetDocVector(docId);
                 vector && !vector->empty() && vector->size() <= DOC_VECTOR_STORAGE_MAX_DIM) {
@@ -531,7 +526,9 @@ private:
                     entry->DDE_VectorData[i] = static_cast<int8_t>(std::round(clipped));
                 }
             }
-            entry->DDE_PathLength = EncodeDocPath(stats.path, entry->DDE_Path);
+            entry->DDE_PathLength = static_cast<uint16_t>(std::min(stats.path.size(), DOC_PATH_MAX));
+            if (entry->DDE_PathLength > 0)
+                std::memcpy(entry->DDE_Path, stats.path.data(), entry->DDE_PathLength);
             totalLen += stats.doc_len;
         }
 
@@ -556,7 +553,7 @@ private:
                 continue;
 
             m_Store->AddDocTokens(docId, entry->DDE_DocLength);
-            m_Store->SetDocImportance(docId, DecodeFloat16(entry->DDE_StaticRankHalf));
+            m_Store->SetDocImportance(docId, entry->DDE_StaticRank);
 
             if (entry->DDE_VectorDim > 0
                 && entry->DDE_VectorDim <= DOC_VECTOR_STORAGE_MAX_DIM
@@ -568,8 +565,8 @@ private:
                 m_Store->SetDocVector(docId, std::move(vector));
             }
 
-            if (entry->DDE_PathLength > 0)
-                m_Store->SetDocPath(docId, DecodeDocPath(*entry));
+            if (entry->DDE_PathLength > 0 && entry->DDE_PathLength <= DOC_PATH_MAX)
+                m_Store->SetDocPath(docId, std::string(reinterpret_cast<const char*>(entry->DDE_Path), entry->DDE_PathLength));
         }
     }
 

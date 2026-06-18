@@ -3,7 +3,6 @@
 
 #include <stdint.h>
 #include <cinttypes>
-#include <memory>
 #include <string>
 
 #include "BlockTable.h"
@@ -82,12 +81,9 @@ class AdvancedIndexReader : public IndexReader
         void Close() override;
 
     private:
-        std::shared_ptr<IndexBlock> m_IndexBlock;
         char*                       m_Word            = nullptr;
         uint32_t                    m_BlockSeqNumber  = 0;
-        uint32_t                    m_InitialBlockSeq = 0;   // first block of this term
         uint32_t                    m_DocFreq         = 0;
-        uint32_t                    m_TotalContinuationBlocks = 0;
         uint32_t                    m_RemainingContinuationBlocks = 0;
         IndexBlockTable*            m_BlockTable      = nullptr;
         const IndexContext*         m_Context         = nullptr;

@@ -142,7 +142,10 @@ static std::vector<IndexEntry> decode_IndexEntries(const uint8_t* data, size_t s
 
 static std::string doc_path(const DocDataEntry& entry)
 {
-    return DecodeDocPath(entry);
+    if (entry.DDE_PathLength == 0 || entry.DDE_PathLength > DOC_PATH_MAX)
+        return {};
+
+    return std::string(reinterpret_cast<const char*>(entry.DDE_Path), entry.DDE_PathLength);
 }
 
 static Index parse_index(const char* path)
@@ -350,7 +353,7 @@ static void emit(std::ostream& out, const Index& index, const char* path)
 
     out << "<div class='panel' id='docs'><table><tr><th>DocID</th><th>Importance</th><th>DocLen</th><th>Path</th></tr>";
     for (const auto& doc : index.docs) {
-        out << "<tr><td class='mono num'>" << doc.DDE_DocID << "</td><td class='num'>" << DecodeFloat16(doc.DDE_StaticRankHalf) << "</td><td class='num'>" << doc.DDE_DocLength << "</td><td class='path'>" << esc(doc_path(doc)) << "</td></tr>";
+        out << "<tr><td class='mono num'>" << doc.DDE_DocID << "</td><td class='num'>" << doc.DDE_StaticRank << "</td><td class='num'>" << doc.DDE_DocLength << "</td><td class='path'>" << esc(doc_path(doc)) << "</td></tr>";
     }
     out << "</table></div>";
 

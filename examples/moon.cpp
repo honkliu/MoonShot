@@ -631,7 +631,7 @@ static void SaveFromRuns(const std::string& idxPath,
     std::vector<DocDataEntry> docdata(docs.size());
     for (size_t i = 0; i < docs.size(); ++i) {
         docdata[i].DDE_DocID = docs[i].doc_id;
-        docdata[i].DDE_StaticRankHalf = EncodeFloat16(docs[i].importance);
+        docdata[i].DDE_StaticRank = docs[i].importance;
         docdata[i].DDE_DocLength = docs[i].doc_len;
         if (!docs[i].vector.empty() && docs[i].vector.size() <= DOC_VECTOR_STORAGE_MAX_DIM) {
             docdata[i].DDE_VectorDim = static_cast<uint16_t>(docs[i].vector.size());
@@ -643,7 +643,9 @@ static void SaveFromRuns(const std::string& idxPath,
                 docdata[i].DDE_VectorData[j] = static_cast<int8_t>(std::round(clipped));
             }
         }
-        docdata[i].DDE_PathLength = EncodeDocPath(docs[i].path, docdata[i].DDE_Path);
+        docdata[i].DDE_PathLength = static_cast<uint16_t>(std::min(docs[i].path.size(), DOC_PATH_MAX));
+        if (docdata[i].DDE_PathLength > 0)
+            std::memcpy(docdata[i].DDE_Path, docs[i].path.data(), docdata[i].DDE_PathLength);
     }
 
     uint64_t hdrSize = sizeof(IndexFileHeader);
