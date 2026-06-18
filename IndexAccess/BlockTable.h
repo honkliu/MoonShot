@@ -311,7 +311,7 @@ class IndexBlockTable
 
         void* GetBlock(BlockKind kind, uint32_t block_seq)
         {
-            BlockCachePool* pool = GetPool(kind);
+            BlockCachePool* pool = kind == BlockKind::Index ? &m_IndexPool : &m_LeafTermPool;
             if (!pool || block_seq >= pool->BCP_BlockCount) return nullptr;
             return SlotAddress(*pool, block_seq);
         }
@@ -334,11 +334,6 @@ class IndexBlockTable
         /* Level-1: fixed directory — (HTE_FirstTerm → HTE_LeafTermBlockID), sorted by HTE_FirstTerm */
         std::unique_ptr<HeadTermEntry[]>         m_HeadTermEntries;
         uint32_t                                 m_HeadTermEntryCount = 0;
-
-        BlockCachePool* GetPool(BlockKind kind)
-        {
-            return kind == BlockKind::Index ? &m_IndexPool : &m_LeafTermPool;
-        }
 
         static void SetPoolMemory(BlockCachePool& pool, void* pages, size_t pageSize, uint32_t blockCount)
         {
