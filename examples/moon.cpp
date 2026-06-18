@@ -564,9 +564,7 @@ static void SaveFromRuns(const std::string& idxPath,
     uint32_t seq = 0;
     uint64_t totalTerms = 0;
 
-    auto flushBlock = [&](bool hasMore) {
-        cur.IB_Header = seq;
-        if (hasMore) cur.IB_Header |= IB_HEADER_HAS_MORE;
+    auto flushBlock = [&]() {
         blocks.push_back(cur);
         ++seq; cur = {}; wptr = 0;
     };
@@ -593,14 +591,14 @@ static void SaveFromRuns(const std::string& idxPath,
 
         auto bytes = EncodePostings(compact);
         if (bytes.empty()) continue;
-        if (wptr >= DATA_CAP) flushBlock(false);
+        if (wptr >= DATA_CAP) flushBlock();
 
         uint32_t indexBlockID = seq;
         uint32_t indexOffset = static_cast<uint32_t>(wptr);
         size_t src = 0;
         size_t first = PostingPrefixBytes(bytes.data(), bytes.size(), DATA_CAP - wptr);
         if (first == 0) {
-            flushBlock(false);
+            flushBlock();
             first = PostingPrefixBytes(bytes.data(), bytes.size(), DATA_CAP);
             if (first == 0) continue;
         }
@@ -609,26 +607,39 @@ static void SaveFromRuns(const std::string& idxPath,
         uint32_t indexLength = static_cast<uint32_t>(first);
         uint32_t contCount = 0;
         if (src < bytes.size()) {
-            flushBlock(true);
+            flushBlock();
             while (src < bytes.size()) {
-                constexpr size_t CONT_HDR = 4;
+                constexpr size_t CONT_HDR = sizeof(IndexBlockContinuationHeader);
                 size_t take = PostingPrefixBytes(bytes.data() + src, bytes.size() - src, DATA_CAP - CONT_HDR);
                 if (take == 0) break;
                 bool more = take < bytes.size() - src;
-                uint16_t marker = BLOCK_CONTINUATION_MARKER;
-                uint16_t len = static_cast<uint16_t>(take);
-                std::memcpy(cur.IB_Data + wptr, &marker, 2); wptr += 2;
-                std::memcpy(cur.IB_Data + wptr, &len, 2); wptr += 2;
+                size_t contCursor = 0;
+                uint64_t contMaxDocId = 0;
+                while (contCursor < take) {
+                    contMaxDocId = 0;
+                    uint8_t shift = 0;
+                    while (true) {
+                        uint8_t byte = bytes[src + contCursor++];
+                        contMaxDocId |= static_cast<uint64_t>(byte & 0x7Fu) << shift;
+                        if ((byte & 0x80u) == 0) break;
+                        shift += 7;
+                    }
+                    while (bytes[src + contCursor++] & 0x80u) {}
+                }
+                auto* header = reinterpret_cast<IndexBlockContinuationHeader*>(cur.IB_Data + wptr);
+                header->IBCH_MaxDocID = contMaxDocId;
+                header->IBCH_DataLength = static_cast<uint32_t>(take);
+                wptr += sizeof(IndexBlockContinuationHeader);
                 std::memcpy(cur.IB_Data + wptr, bytes.data() + src, take); wptr += take;
                 src += take;
                 ++contCount;
-                if (more) flushBlock(true);
+                if (more) flushBlock();
             }
         }
         leafTermWriter.add(term, static_cast<uint32_t>(compact.size()), indexBlockID, indexOffset, indexLength, contCount, 0);
         ++totalTerms;
     }
-    if (wptr > 0) flushBlock(false);
+    if (wptr > 0) flushBlock();
 
     leafTermWriter.finish();
 

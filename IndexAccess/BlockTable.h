@@ -38,8 +38,6 @@ static constexpr size_t LEAF_TERM_DATA_OFFSET = LEAF_TERM_DIRECTORY_COUNT * size
 static constexpr uint8_t  INDEX_FILE_MAGIC[8] = {'M','O','O','N','S','H','O','T'};
 static constexpr uint32_t INDEX_FORMAT_VERSION = 12;
 
-static constexpr uint64_t IB_HEADER_HAS_MORE = (1ULL << 63);
-static constexpr uint16_t BLOCK_CONTINUATION_MARKER = 0xFFFFu;
 static constexpr uint64_t INDEX_BLOCK_CACHE_BYTES = 100ull * 1024ull * 1024ull;
 static constexpr uint64_t LEAF_TERM_CACHE_BYTES = 100ull * 1024ull * 1024ull;
 
@@ -100,9 +98,15 @@ struct DocDataEntry {
 };
 #pragma pack(pop)
 
-struct IndexBlock {
-    uint64_t IB_Header;
-    uint8_t  IB_Data[PAGE_SIZE - static_cast<int>(sizeof(uint64_t))];
+#pragma pack(push,1)
+struct IndexBlockContinuationHeader {
+    uint64_t IBCH_MaxDocID;
+    uint32_t IBCH_DataLength;
+};
+#pragma pack(pop)
+
+struct alignas(8) IndexBlock {
+    uint8_t IB_Data[PAGE_SIZE];
 };
 
 #pragma pack(push,1)

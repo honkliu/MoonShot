@@ -5,23 +5,11 @@
 #include <cstdint>
 #include <cstddef>
 
-// Forward declaration to avoid circular dependency
-struct IndexBlock;
-
 /*
 * VarByte decoder for posting lists.
 *
-* Two open modes:
-*
-*   Open(IndexBlock*)
-*       Block-based: reads from IndexBlock::IB_Data.
-*       End-of-data detected by a zero sentinel byte.
-*       Used by AdvancedIndexReader (disk + BlockTable path).
-*
-*   OpenRaw(data, len)
-*       Raw-bytes: reads from a tightly packed VarByte buffer of exact length.
-*       End-of-data detected by ptr >= end (no sentinel).
-*       Used by TermIndexReader (in-memory PostingStore path).
+* OpenRaw(data, len) reads from a tightly packed VarByte buffer of exact length.
+* End-of-data is detected by ptr >= end.
 *
 * IsEnd() semantics
 * -----------------
@@ -40,40 +28,22 @@ struct IndexBlock;
 class UnifiedDecoder {
 public:
     UnifiedDecoder()
-        : m_block(nullptr)
-        , m_current_ptr(nullptr)
+        : m_current_ptr(nullptr)
         , m_block_end(nullptr)
         , m_current_doc(0)
         , m_current_tf(0)
-        , m_raw_mode(false)
         , m_has_current(false)
     {}
-
-    /*
-    * Open on a 4KB IndexBlock.
-    */
-    void Open(IndexBlock* block)
-    {
-        m_block       = block;
-        m_current_doc = 0;
-        m_current_tf  = 0;
-        m_current_ptr = reinterpret_cast<const uint8_t*>(block->IB_Data);
-        m_block_end   = m_current_ptr + sizeof(block->IB_Data);
-        m_raw_mode    = false;
-        m_has_current = false;
-    }
 
     /*
     * Open on an arbitrary VarByte byte buffer of exact length.
     */
     void OpenRaw(const uint8_t* data, size_t len)
     {
-        m_block       = nullptr;
         m_current_doc = 0;
         m_current_tf  = 0;
         m_current_ptr = data;
         m_block_end   = data ? data + len : data;
-        m_raw_mode    = true;
         m_has_current = false;
     }
 
@@ -93,7 +63,7 @@ public:
     */
     void GoNext()
     {
-        if (!HasMoreBytes()) {
+        if (!m_current_ptr || m_current_ptr >= m_block_end) {
             m_has_current = false;
             return;
         }
@@ -101,10 +71,6 @@ public:
         uint64_t docID = 0;
         uint8_t  shift = 0;
         while (true) {
-            if (m_current_ptr >= m_block_end) {
-                m_has_current = false;
-                return;
-            }
             uint8_t byte = *m_current_ptr++;
             docID |= static_cast<uint64_t>(byte & 0x7F) << shift;
             if (!(byte & 0x80))
@@ -116,10 +82,6 @@ public:
         m_current_tf = 0;
         shift        = 0;
         while (true) {
-            if (m_current_ptr >= m_block_end) {
-                m_has_current = false;
-                return;
-            }
             uint8_t byte = *m_current_ptr++;
             m_current_tf |= static_cast<uint32_t>(byte & 0x7F) << shift;
             if (!(byte & 0x80))
@@ -142,7 +104,7 @@ public:
         * If not yet on any entry, advance once to read the first one,
         * then continue seeking.
         */
-        if (!m_has_current && HasMoreBytes()) {
+        if (!m_has_current && m_current_ptr && m_current_ptr < m_block_end) {
             GoNext();
             while (m_has_current && m_current_doc < target)
                 GoNext();
@@ -151,27 +113,13 @@ public:
 
     uint64_t GetDocumentID()    const { return m_current_doc; }
     uint32_t GetTermFrequency() const { return m_current_tf;  }
-    bool HasMore() const { return HasMoreBytes(); }
 
 private:
-    IndexBlock*    m_block;
     const uint8_t* m_current_ptr;
     const uint8_t* m_block_end;
     uint64_t       m_current_doc;
     uint32_t       m_current_tf;
-    bool           m_raw_mode;
     bool           m_has_current;
-
-    bool HasMoreBytes() const
-    {
-        if (!m_current_ptr || m_current_ptr >= m_block_end)
-            return false;
-
-        if (!m_raw_mode && *m_current_ptr == 0)
-            return false;
-
-        return true;
-    }
 };
 
 #endif

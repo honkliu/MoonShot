@@ -41,18 +41,15 @@ void AdvancedIndexReader::Open(const char*      streamKey,
 
 void AdvancedIndexReader::GoNext()
 {
-    if (!m_Decoder.IsEnd())
-        m_Decoder.GoNext();
+    m_Decoder.GoNext();
 
-    if (m_Decoder.IsEnd() && m_Decoder.HasMore())
-        m_Decoder.GoNext();
-
-    while (m_Decoder.IsEnd() && HasMoreBlocks()) {
+    while (m_Decoder.IsEnd() && m_RemainingContinuationBlocks > 0) {
         IndexBlock* next = reinterpret_cast<IndexBlock*>(
             m_BlockTable->GetBlock(BlockKind::Index, m_BlockSeqNumber + 1));
         assert(next);
         ++m_BlockSeqNumber;
-        OpenContinuation(next);
+        const auto* header = reinterpret_cast<const IndexBlockContinuationHeader*>(next->IB_Data);
+        m_Decoder.OpenRaw(next->IB_Data + sizeof(IndexBlockContinuationHeader), header->IBCH_DataLength);
         --m_RemainingContinuationBlocks;
         m_Decoder.GoNext();
     }
@@ -63,28 +60,19 @@ void AdvancedIndexReader::GoUntil(uint64_t target, uint64_t /*limit*/)
     while (true) {
         m_Decoder.GoUntil(target);
         if (!m_Decoder.IsEnd()) break;
-        if (!HasMoreBlocks())   break;
+        if (m_RemainingContinuationBlocks == 0) break;
         IndexBlock* next = reinterpret_cast<IndexBlock*>(
             m_BlockTable->GetBlock(BlockKind::Index, m_BlockSeqNumber + 1));
         assert(next);
+        const auto* header = reinterpret_cast<const IndexBlockContinuationHeader*>(next->IB_Data);
         ++m_BlockSeqNumber;
-        OpenContinuation(next);
         --m_RemainingContinuationBlocks;
+        if (target > header->IBCH_MaxDocID)
+            continue;
+        m_Decoder.OpenRaw(next->IB_Data + sizeof(IndexBlockContinuationHeader), header->IBCH_DataLength);
         m_Decoder.GoNext();
         if (m_Decoder.IsEnd()) break;
     }
-}
-
-void AdvancedIndexReader::OpenContinuation(IndexBlock* blk)
-{
-    /* New format: [CONT_MARKER:2][cont_len:2][VarByte:cont_len] */
-    const uint8_t* d = blk->IB_Data;
-    uint16_t marker = 0;
-    std::memcpy(&marker, d, 2);
-    assert(marker == BLOCK_CONTINUATION_MARKER);
-    uint16_t cont_len = 0;
-    std::memcpy(&cont_len, d + 2, 2);
-    m_Decoder.OpenRaw(d + 4, cont_len);
 }
 
 bool AdvancedIndexReader::IsEnd()          { return m_Decoder.IsEnd(); }

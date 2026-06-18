@@ -94,7 +94,6 @@ static size_t posting_prefix_bytes(const uint8_t* data, size_t size, size_t capa
 static BuildBlocksResult build_blocks(const PostingStore& store)
 {
     constexpr size_t   DATA_CAP = sizeof(IndexBlock::IB_Data);
-    constexpr uint16_t CONT     = BLOCK_CONTINUATION_MARKER;
 
     /* Sort terms alphabetically */
     std::vector<std::pair<const std::string*, const PostingList*>> terms;
@@ -162,9 +161,7 @@ static BuildBlocksResult build_blocks(const PostingStore& store)
         ++res.BBR_TotalTerms;
     };
 
-    auto flush = [&](bool has_more) {
-        cur.IB_Header = static_cast<uint64_t>(seq);
-        if (has_more) cur.IB_Header |= IB_HEADER_HAS_MORE;
+    auto flush = [&]() {
         res.BBR_IndexBlocks.push_back(cur);
         ++seq; cur = {}; wptr = 0;
     };
@@ -180,12 +177,12 @@ static BuildBlocksResult build_blocks(const PostingStore& store)
         const uint8_t* src       = bytes.data();
         size_t         remaining = bytes.size();
 
-        if (wptr >= DATA_CAP) flush(false);
+        if (wptr >= DATA_CAP) flush();
 
         size_t data_offset = wptr;
         size_t data_here   = posting_prefix_bytes(src, remaining, DATA_CAP - wptr);
         if (data_here == 0) {
-            flush(false);
+            flush();
             data_here = posting_prefix_bytes(src, remaining, DATA_CAP);
             if (data_here == 0) continue;
         }
@@ -199,25 +196,39 @@ static BuildBlocksResult build_blocks(const PostingStore& store)
         uint32_t continuationBlockCount = 0;
 
         if (has_more) {
-            flush(true);
+            flush();
 
             while (remaining > 0) {
-                constexpr size_t CONT_HDR = 4u;
+                constexpr size_t CONT_HDR = sizeof(IndexBlockContinuationHeader);
                 size_t cont_cap  = DATA_CAP - CONT_HDR;
                 size_t cont_here = posting_prefix_bytes(src, remaining, cont_cap);
                 if (cont_here == 0) break;
                 bool   more_cont = (cont_here < remaining);
+                size_t cont_cursor = 0;
+                uint64_t cont_max_docid = 0;
+                while (cont_cursor < cont_here) {
+                    cont_max_docid = 0;
+                    uint8_t shift = 0;
+                    while (true) {
+                        const uint8_t byte = src[cont_cursor++];
+                        cont_max_docid |= static_cast<uint64_t>(byte & 0x7Fu) << shift;
+                        if ((byte & 0x80u) == 0) break;
+                        shift += 7;
+                    }
+                    while (src[cont_cursor++] & 0x80u) {}
+                }
 
-                uint16_t cm = CONT, cl = static_cast<uint16_t>(cont_here);
-                std::memcpy(cur.IB_Data + wptr, &cm, 2); wptr += 2;
-                std::memcpy(cur.IB_Data + wptr, &cl, 2); wptr += 2;
+                auto* header = reinterpret_cast<IndexBlockContinuationHeader*>(cur.IB_Data + wptr);
+                header->IBCH_MaxDocID = cont_max_docid;
+                header->IBCH_DataLength = static_cast<uint32_t>(cont_here);
+                wptr += sizeof(IndexBlockContinuationHeader);
                 std::memcpy(cur.IB_Data + wptr, src, cont_here); wptr += cont_here;
                 src       += cont_here;
                 remaining -= cont_here;
 
                 ++continuationBlockCount;
 
-                if (more_cont) flush(true);
+                if (more_cont) flush();
             }
         }
 
@@ -230,7 +241,7 @@ static BuildBlocksResult build_blocks(const PostingStore& store)
                          0u);
     }
 
-    if (wptr > 0) flush(false);
+    if (wptr > 0) flush();
     flush_leaf_block();
 
     return res;

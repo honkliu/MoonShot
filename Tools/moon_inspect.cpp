@@ -258,15 +258,9 @@ static Index parse_index(const char* path)
 
         const uint8_t* block = data + block_offset;
         const uint8_t* ib_data = block + INDEX_BLOCK_DATA_OFFSET;
-        uint64_t ib_header = 0;
-        std::memcpy(&ib_header, block, 8);
 
         BlockView view;
         view.seq = static_cast<uint32_t>(seq);
-        view.has_more = (ib_header & IB_HEADER_HAS_MORE) != 0;
-        uint16_t marker = 0;
-        std::memcpy(&marker, ib_data, 2);
-        view.is_continuation = marker == BLOCK_CONTINUATION_MARKER;
 
         auto found = terms_by_block.find(view.seq);
         if (found != terms_by_block.end()) {

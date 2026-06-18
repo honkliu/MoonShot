@@ -88,11 +88,6 @@ class AdvancedIndexReader : public IndexReader
         IndexBlockTable*            m_BlockTable      = nullptr;
         const IndexContext*         m_Context         = nullptr;
         UnifiedDecoder              m_Decoder;
-
-        bool HasMoreBlocks() const { return m_RemainingContinuationBlocks > 0; }
-
-        /* Open decoder on a continuation block, reading cont_len from the block header. */
-        void OpenContinuation(IndexBlock* blk);
 };
 
 #endif
