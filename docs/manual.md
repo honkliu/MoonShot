@@ -239,8 +239,10 @@ It uses:
     section offsets, and fixed-region counts.
 - A fixed `HeadTermEntry` section: 32-byte entries, count stored in
     `IFH_HeadTermEntryCount`.
-- A fixed `LeafTermPage` section: 4096-byte pages, count stored in
-    `IFH_LeafTermPageCount`.
+    Each entry stores the full first stream key for its leaf block; stream keys
+        longer than 26 bytes are not written to the index.
+- A fixed `LeafTermBlock` section: 4096-byte blocks, count stored in
+    `IFH_LeafTermBlockCount`.
 - A DocData section: fixed 1024-byte `DocDataEntry` records.
 - An IndexBlock section: fixed 4096-byte posting blocks containing VBC-encoded
     absolute `(docID, tf)` pairs.
@@ -535,7 +537,8 @@ Offset    Section          Contents
 0         File Header      88 bytes — magic, version, num_docs,
                            num_terms, section offsets/counts
 N₁        HeadTermEntry    fixed 32-byte entries
-N₂        LeafTermPage     fixed 4096-byte pages
+                           full first stream key, max 26 bytes
+N₂        LeafTermBlock    fixed 4096-byte blocks
 N₃        DocData          fixed 1024-byte DocDataEntry records
 N₄        IndexBlock       fixed 4096-byte posting blocks
                                                      { docID:varint, tf:varint } × N

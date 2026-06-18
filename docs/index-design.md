@@ -167,52 +167,56 @@ The index is stored in a **single binary file** with five contiguous sections.
 
 ```
 ┌──────────────────────────────────┐  offset 0
-│  Section 0: File Header          │  fixed 4 KB
+│  Section 0: File Header          │  fixed 88 bytes
 ├──────────────────────────────────┤
-│  Section 1: DocData              │  N_docs × 64 bytes
+│  Section 1: HeadTermEntry        │  fixed 32-byte records
 ├──────────────────────────────────┤
-│  Section 2: TermDictionary       │  variable
+│  Section 2: LeafTermBlock        │  fixed 4 KB blocks
 ├──────────────────────────────────┤
-│  Section 3: Posting Blocks       │  variable (4 KB blocks)
+│  Section 3: DocData              │  fixed 1024-byte records
+├──────────────────────────────────┤
+│  Section 4: IndexBlock           │  fixed 4 KB posting blocks
 └──────────────────────────────────┘
 ```
 
-### 4.1 File Header (Section 0 — 4 KB)
+### 4.1 File Header (Section 0 — 88 bytes)
 
 ```
 Offset  Size  Field
 ──────  ────  ──────────────────────────────────
- 0       8    Magic number  (0x4D4F4F4E53484F54 = "MOONSHOT")
- 8       4    Version       (u32, currently 1)
-12       4    Flags         (reserved)
+ 0       8    Magic number  ("MOONSHOT")
+ 8       4    Version
+12       4    AvgDocLength
 16       8    NumDocuments
 24       8    NumTerms
-32       8    DocData_Offset        (byte offset of Section 1)
-40       8    TermDict_Offset       (byte offset of Section 2)
-48       8    PostingBlocks_Offset  (byte offset of Section 3)
-56       8    PostingBlocks_Size    (total bytes in Section 3)
-64      32    SHA-256 of Sections 1–3 (integrity check)
-96    3999    Reserved / zero-filled
+32       8    HeadTermEntryOffset
+40       8    HeadTermEntryCount
+48       8    LeafTermBlockOffset
+56       8    LeafTermBlockCount
+64       8    DocDataOffset
+72       8    IndexBlockOffset
+80       8    IndexBlockCount
 ```
 
-### 4.2 TermDictionary (Section 2)
+### 4.2 HeadTermEntry and LeafTermBlock
 
-A **sorted array of (term_key, block_id, intra_block_offset)** entries.
+The level-1 term directory is a sorted fixed array of 32-byte `HeadTermEntry`
+records.  Each record stores the full first stream key for one `LeafTermBlock`
+and that block's ID.  The maximum stream-key length in a head entry is 26 bytes;
+longer stream keys are not written to the index because lookup is a pure binary
+search over the sorted head array.
 
 ```
-Entry layout (variable):
-  u8   key_len
-  [u8; key_len]   term_key (e.g. "badB", "rustT")
-  u32  block_id          — which 4 KB block contains this posting list
-  u16  intra_block_off   — byte offset within that block
-  u32  posting_byte_len  — length of the encoded posting list
-  u32  doc_freq          — number of documents in this posting list
+HeadTermEntry:
+    u32  leaf_page_id
+    u16  first_key_len
+    char first_key[26]
 ```
 
-At startup, the entire TermDictionary is loaded into a `HashMap<String, DictEntry>`.
-Lookup is O(1) at query time.
+Each `LeafTermBlock` is a 4096-byte block containing sorted variable-length
+`LeafTermEntry` records for exact term lookup inside the selected block.
 
-### 4.3 Posting Blocks (Section 3)
+### 4.3 Posting Blocks (Section 4)
 
 Posting data is stored in **4 096-byte (4 KB) fixed-size blocks**.  4 KB
 matches the OS virtual-memory page size, so each disk read aligns perfectly
