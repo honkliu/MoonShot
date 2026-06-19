@@ -12,18 +12,6 @@
 #include <string>
 #include <string_view>
 #include <algorithm>
-#ifdef _WIN32
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <windows.h>
-#ifdef PAGE_SIZE
-#undef PAGE_SIZE
-#endif
-#else
-#include <sys/mman.h>
-#include <unistd.h>
-#endif
 #include "../Utils/FileAccess.h"
 #include "ElementFilter.h"
 
@@ -118,7 +106,7 @@ struct LeafTermEntry {
     uint32_t    LTE_ContinuationBlockCount  = 0;
     uint32_t    LTE_Flags                   = 0;
     uint8_t     LTE_TermLength              = 0;
-    char        LTE_Term[0];
+    char        LTE_Term[0]                 ='\0';
 };
 #pragma pack(pop)
 
@@ -181,36 +169,6 @@ class WriterSpinLock {
         RWSpinLock& m_lock;
 };
 
-static inline bool PinMemoryPages(void* address, size_t bytes)
-{
-    if (!address || bytes == 0) return false;
-#ifdef _WIN32
-    static std::atomic<size_t> requestedLockedBytes {0};
-    SIZE_T minWorkingSet = 0, maxWorkingSet = 0;
-    HANDLE process = GetCurrentProcess();
-    if (GetProcessWorkingSetSize(process, &minWorkingSet, &maxWorkingSet)) {
-        const size_t totalLockedBytes = requestedLockedBytes.fetch_add(bytes) + bytes;
-        const SIZE_T desiredMin = std::max<SIZE_T>(minWorkingSet, totalLockedBytes + (16ull * 1024ull * 1024ull));
-        const SIZE_T desiredMax = std::max<SIZE_T>(maxWorkingSet, desiredMin + (16ull * 1024ull * 1024ull));
-        if (minWorkingSet < desiredMin || maxWorkingSet < desiredMax)
-            SetProcessWorkingSetSize(process, desiredMin, desiredMax);
-    }
-    return VirtualLock(address, bytes) != 0;
-#else
-    return mlock(address, bytes) == 0;
-#endif
-}
-
-static inline void UnpinMemoryPages(void* address, size_t bytes)
-{
-    if (!address || bytes == 0) return;
-#ifdef _WIN32
-    VirtualUnlock(address, bytes);
-#else
-    munlock(address, bytes);
-#endif
-}
-
 /* ── IndexBlockTable ─────────────────────────────────────────────────────────
  * Posting block manager + two-level head/leaf term table.
  *
@@ -224,16 +182,20 @@ static inline void UnpinMemoryPages(void* address, size_t bytes)
 class IndexBlockTable
 {
     private:
-        struct BlockCachePool {
-            void*                             BCP_Pages = nullptr;
-            size_t                            BCP_PageSize = 0;
-            uint32_t                          BCP_TotalBlockCount = 0;
-            uint32_t                          BCP_LoadedBlockCount = 0;
-        };
-
         struct IndexSlotEntry {
             uint32_t BlockID = UINT32_MAX;
             uint32_t Ref = 0;
+        };
+
+        struct BlockCachePool {
+            void*                             BCP_Pages = nullptr;
+            uint64_t                          BCP_BaseOffset = 0;
+            uint32_t                          BCP_TotalBlockCount = 0;
+            uint32_t                          BCP_LoadedBlockCount = 0;
+            uint32_t                          BCP_EvictSlot = 0;
+            uint32_t*                         BCP_LogicTable = nullptr;
+            IndexSlotEntry*                   BCP_SlotTable = nullptr;
+            FileAccess*                       BCP_File = nullptr;
         };
 
     public:
@@ -241,9 +203,12 @@ class IndexBlockTable
 
         ~IndexBlockTable()
         {
-            delete[] m_IndexLogicTable;
-            delete[] m_IndexSlotTable;
-            delete m_IndexBlockFile;
+            delete[] m_IndexPool.BCP_LogicTable;
+            delete[] m_IndexPool.BCP_SlotTable;
+            delete m_IndexPool.BCP_File;
+            delete[] m_LeafTermPool.BCP_LogicTable;
+            delete[] m_LeafTermPool.BCP_SlotTable;
+            delete m_LeafTermPool.BCP_File;
         }
 
         void SetHeadTermEntries(std::unique_ptr<HeadTermEntry[]> head, uint32_t headCount)
@@ -266,7 +231,7 @@ class IndexBlockTable
                           uint32_t*   indexOffsetOut,
                           uint32_t*   indexLengthOut,
                           uint32_t*   docFreqOut,
-                          uint32_t*   continuationBlockCountOut = nullptr) const
+                          uint32_t*   continuationBlockCountOut = nullptr)
         {
             /* Step 1: BloomFilter */
             const size_t termLength = std::strlen(term);
@@ -284,8 +249,8 @@ class IndexBlockTable
             --it;
 
             uint32_t blockID = it->HTE_LeafTermBlockID;
-            if (!m_LeafTermPool.BCP_Pages || blockID >= m_LeafTermPool.BCP_LoadedBlockCount) return false;
-            const LeafTermBlock* block = static_cast<const LeafTermBlock*>(m_LeafTermPool.BCP_Pages) + blockID;
+            const LeafTermBlock* block = static_cast<const LeafTermBlock*>(GetBlock(BlockKind::LeafTerm, blockID));
+            if (!block) return false;
             const uint8_t* blockBase = reinterpret_cast<const uint8_t*>(block);
             const uint32_t entryCount = block->LTB_Directory[LEAF_TERM_DIRECTORY_COUNT - 1];
 
@@ -319,101 +284,97 @@ class IndexBlockTable
             BlockCachePool* pool = kind == BlockKind::Index ? &m_IndexPool : &m_LeafTermPool;
             if (slotOut) *slotOut = UINT32_MAX;
 
-            if (kind == BlockKind::Index && m_IndexLogicTable) {
+            if (pool->BCP_LogicTable) {
                 WriterSpinLock lock(m_IndexCacheLock);
-                if (block_seq >= m_IndexPool.BCP_TotalBlockCount) return nullptr;
+                if (block_seq >= pool->BCP_TotalBlockCount) return nullptr;
 
-                uint32_t slot = m_IndexLogicTable[block_seq];
-                if (slot != UINT32_MAX && slot < m_IndexPool.BCP_LoadedBlockCount) {
-                    ++m_IndexSlotTable[slot].Ref;
+                uint32_t slot = pool->BCP_LogicTable[block_seq];
+                if (slot != UINT32_MAX && slot < pool->BCP_LoadedBlockCount) {
+                    if (slotOut) ++pool->BCP_SlotTable[slot].Ref;
                     if (slotOut) *slotOut = slot;
                     return SlotAddress(*pool, slot);
                 }
 
-                if (!m_IndexBlockFile) return nullptr;
+                if (!pool->BCP_File) return nullptr;
 
                 uint32_t found = UINT32_MAX;
-                for (uint32_t scanned = 0; scanned < m_IndexPool.BCP_LoadedBlockCount; ++scanned) {
-                    uint32_t candidate = m_IndexEvictSlot++ % m_IndexPool.BCP_LoadedBlockCount;
-                    if (m_IndexSlotTable[candidate].Ref == 0) {
+                for (uint32_t scanned = 0; scanned < pool->BCP_LoadedBlockCount; ++scanned) {
+                    uint32_t candidate = pool->BCP_EvictSlot++ % pool->BCP_LoadedBlockCount;
+                    if (pool->BCP_SlotTable[candidate].Ref == 0) {
                         found = candidate;
                         break;
                     }
                 }
                 if (found == UINT32_MAX) return nullptr;
 
-                uint32_t oldBlock = m_IndexSlotTable[found].BlockID;
-                if (oldBlock != UINT32_MAX && oldBlock < m_IndexPool.BCP_TotalBlockCount && m_IndexLogicTable[oldBlock] == found)
-                    m_IndexLogicTable[oldBlock] = UINT32_MAX;
+                uint32_t oldBlock = pool->BCP_SlotTable[found].BlockID;
+                if (oldBlock != UINT32_MAX && oldBlock < pool->BCP_TotalBlockCount && pool->BCP_LogicTable[oldBlock] == found)
+                    pool->BCP_LogicTable[oldBlock] = UINT32_MAX;
 
                 void* address = SlotAddress(*pool, found);
                 if (!address) return nullptr;
 
-                m_IndexSlotTable[found].BlockID = block_seq;
-                m_IndexSlotTable[found].Ref = 1;
-                if (!m_IndexBlockFile->ReadBlock(block_seq, address, sizeof(IndexBlock), m_IndexBlockBaseOffset)) {
-                    m_IndexSlotTable[found].BlockID = UINT32_MAX;
-                    m_IndexSlotTable[found].Ref = 0;
+                pool->BCP_SlotTable[found].BlockID = block_seq;
+                pool->BCP_SlotTable[found].Ref = slotOut ? 1 : 0;
+                if (!pool->BCP_File->ReadBlock(block_seq, address, PAGE_SIZE, pool->BCP_BaseOffset)) {
+                    pool->BCP_SlotTable[found].BlockID = UINT32_MAX;
+                    pool->BCP_SlotTable[found].Ref = 0;
                     return nullptr;
                 }
 
-                m_IndexLogicTable[block_seq] = found;
+                pool->BCP_LogicTable[block_seq] = found;
                 if (slotOut) *slotOut = found;
                 return address;
             }
 
-            if (!pool || block_seq >= pool->BCP_LoadedBlockCount) return nullptr;
+            if (block_seq >= pool->BCP_TotalBlockCount) return nullptr;
             return SlotAddress(*pool, block_seq);
         }
 
         void ReleaseBlock(BlockKind kind, uint32_t slot)
         {
-            if (kind != BlockKind::Index || slot == UINT32_MAX || !m_IndexSlotTable) return;
+            BlockCachePool* pool = kind == BlockKind::Index ? &m_IndexPool : &m_LeafTermPool;
+            if (slot == UINT32_MAX || !pool->BCP_SlotTable) return;
             WriterSpinLock lock(m_IndexCacheLock);
-            if (slot >= m_IndexPool.BCP_LoadedBlockCount) return;
-            if (m_IndexSlotTable[slot].Ref > 0)
-                --m_IndexSlotTable[slot].Ref;
+            if (slot >= pool->BCP_LoadedBlockCount) return;
+            if (pool->BCP_SlotTable[slot].Ref > 0)
+                --pool->BCP_SlotTable[slot].Ref;
         }
 
         void SetBlockMemory(IndexBlock* indexBlocks,
                             LeafTermBlock* leafTermBlocks)
         {
             m_IndexPool.BCP_Pages = indexBlocks;
-            m_IndexPool.BCP_PageSize = sizeof(IndexBlock);
             m_LeafTermPool.BCP_Pages = leafTermBlocks;
-            m_LeafTermPool.BCP_PageSize = sizeof(LeafTermBlock);
         }
 
-        void Init(const char* path,
-                  uint64_t indexBlockBaseOffset,
-                  uint32_t indexBlockCount,
-                  uint32_t indexBlockLoadCount,
-                  uint64_t leafTermBlockBaseOffset,
-                  uint32_t leafTermBlockCount,
-                  uint32_t leafTermBlockLoadCount)
+        void Init(BlockKind kind,
+                  const char* path,
+                  uint64_t baseOffset,
+                  uint32_t blockCount,
+                  uint32_t loadedBlockCount)
         {
             WriterSpinLock lock(m_IndexCacheLock);
-            m_IndexBlockBaseOffset = indexBlockBaseOffset;
+            BlockCachePool* pool = kind == BlockKind::Index ? &m_IndexPool : &m_LeafTermPool;
+            pool->BCP_BaseOffset = baseOffset;
             if (path && *path) {
-                m_IndexBlockFile = new FileAccess(path);
-                m_IndexBlockFile->Init();
+                pool->BCP_File = new FileAccess(path);
+                pool->BCP_File->Init();
             }
-            m_IndexPool.BCP_TotalBlockCount = indexBlockCount;
-            m_IndexPool.BCP_LoadedBlockCount = indexBlockLoadCount;
-            m_LeafTermPool.BCP_TotalBlockCount = leafTermBlockCount;
-            m_LeafTermPool.BCP_LoadedBlockCount = leafTermBlockLoadCount;
-            m_IndexLogicTable = m_IndexPool.BCP_TotalBlockCount ? new uint32_t[m_IndexPool.BCP_TotalBlockCount] : nullptr;
-            m_IndexSlotTable = m_IndexPool.BCP_LoadedBlockCount ? new IndexSlotEntry[m_IndexPool.BCP_LoadedBlockCount] : nullptr;
+            pool->BCP_TotalBlockCount = blockCount;
+            pool->BCP_LoadedBlockCount = loadedBlockCount;
+            pool->BCP_LogicTable = pool->BCP_TotalBlockCount ? new uint32_t[pool->BCP_TotalBlockCount] : nullptr;
+            pool->BCP_SlotTable = pool->BCP_LoadedBlockCount ? new IndexSlotEntry[pool->BCP_LoadedBlockCount] : nullptr;
 
-            for (uint32_t i = 0; i < m_IndexPool.BCP_TotalBlockCount; ++i)
-                m_IndexLogicTable[i] = UINT32_MAX;
+            for (uint32_t i = 0; i < pool->BCP_TotalBlockCount; ++i)
+                pool->BCP_LogicTable[i] = UINT32_MAX;
 
-            uint32_t loaded = std::min(indexBlockLoadCount, indexBlockCount);
+            uint32_t loaded = std::min(loadedBlockCount, blockCount);
             for (uint32_t block = 0; block < loaded; ++block) {
-                m_IndexLogicTable[block] = block;
-                m_IndexSlotTable[block].BlockID = block;
+                pool->BCP_LogicTable[block] = block;
+                pool->BCP_SlotTable[block].BlockID = block;
             }
-            m_IndexEvictSlot = loaded;
+            pool->BCP_EvictSlot = loaded;
         }
 
     private:
@@ -421,11 +382,6 @@ class IndexBlockTable
         BlockCachePool                           m_IndexPool;
         BlockCachePool                           m_LeafTermPool;
         RWSpinLock                               m_IndexCacheLock;
-        FileAccess*                              m_IndexBlockFile = nullptr;
-        uint64_t                                 m_IndexBlockBaseOffset = 0;
-        uint32_t                                 m_IndexEvictSlot = 0;
-        uint32_t*                                m_IndexLogicTable = nullptr;
-        IndexSlotEntry*                          m_IndexSlotTable = nullptr;
         BloomFilter                              m_BloomFilter;
 
         /* Level-1: fixed directory — (HTE_FirstTerm → HTE_LeafTermBlockID), sorted by HTE_FirstTerm */
@@ -434,10 +390,10 @@ class IndexBlockTable
 
         static void* SlotAddress(BlockCachePool& pool, uint32_t blockID)
         {
-            if (!pool.BCP_Pages || pool.BCP_PageSize == 0 || blockID >= pool.BCP_LoadedBlockCount)
+            if (!pool.BCP_Pages || blockID >= pool.BCP_LoadedBlockCount)
                 return nullptr;
 
-            return static_cast<uint8_t*>(pool.BCP_Pages) + static_cast<size_t>(blockID) * pool.BCP_PageSize;
+            return static_cast<uint8_t*>(pool.BCP_Pages) + static_cast<size_t>(blockID) * PAGE_SIZE;
         }
 };
 

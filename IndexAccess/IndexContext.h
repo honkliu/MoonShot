@@ -85,7 +85,6 @@ public:
         if (m_LoadedFromDisk) {
             m_Store = make_shared<PostingStore>();
             ClearPinnedIndexData();
-            m_BlockTable.Init(nullptr, 0, 0, 0, 0, 0, 0);
             m_BlockTable.SetBlockMemory(nullptr, nullptr);
             m_Executor = IndexSearchExecutor(this);
             m_Built = false;
@@ -196,7 +195,8 @@ public:
             headTermEntries.reset(new HeadTermEntry[headCount]);
             std::memcpy(headTermEntries.get(), br.BBR_HeadTermEntries.data(), static_cast<size_t>(headCount) * sizeof(HeadTermEntry));
         }
-        m_BlockTable.Init(nullptr, 0, indexBlockCount, indexBlockCount, 0, leafTermBlockCount, leafTermBlockCount);
+        m_BlockTable.Init(BlockKind::Index, nullptr, 0, indexBlockCount, indexBlockCount);
+        m_BlockTable.Init(BlockKind::LeafTerm, nullptr, 0, leafTermBlockCount, leafTermBlockCount);
         m_BlockTable.SetBlockMemory(m_IndexBlocks, m_LeafTermBlocks);
         m_BlockTable.SetHeadTermEntries(std::move(headTermEntries), headCount);
 
@@ -393,8 +393,9 @@ public:
             return;
         }
 
-        m_BlockTable.Init(m_IndexPath.c_str(),
-                  m_IndexFileHeader.IFH_IndexBlockOffset, indexBlockCount, indexBlockLoadCount,
+        m_BlockTable.Init(BlockKind::Index, m_IndexPath.c_str(),
+                  m_IndexFileHeader.IFH_IndexBlockOffset, indexBlockCount, indexBlockLoadCount);
+        m_BlockTable.Init(BlockKind::LeafTerm, m_IndexPath.c_str(),
                   m_IndexFileHeader.IFH_LeafTermBlockOffset, leafTermBlockCount, leafTermBlockLoadCount);
         m_BlockTable.SetBlockMemory(m_IndexBlocks, m_LeafTermBlocks);
         m_BlockTable.SetHeadTermEntries(std::move(headTermEntries), static_cast<uint32_t>(m_IndexFileHeader.IFH_HeadTermEntryCount));
@@ -490,7 +491,6 @@ private:
     void ResetLoadedRuntimeState()
     {
         ClearPinnedIndexData();
-        m_BlockTable.Init(nullptr, 0, 0, 0, 0, 0, 0);
         m_BlockTable.SetBlockMemory(nullptr, nullptr);
         m_Executor = IndexSearchExecutor(this);
         m_Built = false;
