@@ -204,6 +204,8 @@ public:
     */
     shared_ptr<IndexReader> GetReader(EvalTree* evalTree)
     {
+        Build();
+
         if (!evalTree || evalTree->IsEmpty()) {
             auto empty = make_shared<AdvancedIndexReader>();
             return empty;
@@ -238,6 +240,8 @@ public:
     /* Open a reader for one specific stream key (e.g. "raceA", "carT"). */
     shared_ptr<IndexReader> GetStreamReader(const char* streamKey)
     {
+        Build();
+
         auto reader = make_shared<AdvancedIndexReader>();
         reader->Open(streamKey, &m_BlockTable, this);
         return reader;
@@ -355,9 +359,9 @@ public:
         const uint32_t indexBlockLoadCount = std::min(indexBlockCount, INDEX_BLOCK_CACHE_SLOT_COUNT);
         const uint32_t leafTermBlockLoadCount = std::min(leafTermBlockCount, LEAF_TERM_BLOCK_CACHE_SLOT_COUNT);
 
-        auto* indexBlocks = static_cast<uint8_t*>(PinnedMemAlloc(static_cast<uint64_t>(INDEX_BLOCK_CACHE_SLOT_COUNT) * sizeof(IndexBlock)));
-        auto* leafTermBlocks = static_cast<uint8_t*>(PinnedMemAlloc(static_cast<uint64_t>(LEAF_TERM_BLOCK_CACHE_SLOT_COUNT) * sizeof(LeafTermBlock)));
-        if (!indexBlocks || !leafTermBlocks) {
+        auto* indexBlocks = indexBlockLoadCount ? static_cast<uint8_t*>(PinnedMemAlloc(static_cast<uint64_t>(indexBlockLoadCount) * sizeof(IndexBlock))) : nullptr;
+        auto* leafTermBlocks = leafTermBlockLoadCount ? static_cast<uint8_t*>(PinnedMemAlloc(static_cast<uint64_t>(leafTermBlockLoadCount) * sizeof(LeafTermBlock))) : nullptr;
+        if ((indexBlockLoadCount && !indexBlocks) || (leafTermBlockLoadCount && !leafTermBlocks)) {
             std::cerr << "Failed to allocate pinned index/leaf runtime cache memory for: " << m_IndexPath << "\n";
             ResetLoadedRuntimeState();
             return;

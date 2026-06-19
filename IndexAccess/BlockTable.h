@@ -353,12 +353,48 @@ class IndexBlockTable
         void SetBlockMemory(uint8_t* indexBlocks,
                     uint8_t* leafTermBlocks)
         {
-            if (!indexBlocks)
+            if (m_IndexPool.BCP_Pages != indexBlocks) {
                 ExitBlockThread(m_IndexPool);
-            if (!leafTermBlocks)
+                if (m_IndexPool.BCP_Pages)
+                    PinnedMemFree(m_IndexPool.BCP_Pages);
+            }
+            if (m_LeafTermPool.BCP_Pages != leafTermBlocks) {
                 ExitBlockThread(m_LeafTermPool);
+                if (m_LeafTermPool.BCP_Pages)
+                    PinnedMemFree(m_LeafTermPool.BCP_Pages);
+            }
             m_IndexPool.BCP_Pages = indexBlocks;
             m_LeafTermPool.BCP_Pages = leafTermBlocks;
+            if (!m_IndexPool.BCP_Pages) {
+                if (m_IndexPool.BCP_LogicTable)
+                    PinnedMemFree(m_IndexPool.BCP_LogicTable);
+                if (m_IndexPool.BCP_SlotTable)
+                    PinnedMemFree(m_IndexPool.BCP_SlotTable);
+                delete m_IndexPool.BCP_File;
+                m_IndexPool.BCP_LogicTable = nullptr;
+                m_IndexPool.BCP_SlotTable = nullptr;
+                m_IndexPool.BCP_File = nullptr;
+                m_IndexPool.BCP_TotalBlockCount = 0;
+                m_IndexPool.BCP_SlotCount = 0;
+                m_IndexPool.BCP_EvictSlot = 0;
+                m_IndexPool.BCP_Requests.clear();
+                m_IndexPool.BCP_ExitThread = false;
+            }
+            if (!m_LeafTermPool.BCP_Pages) {
+                if (m_LeafTermPool.BCP_LogicTable)
+                    PinnedMemFree(m_LeafTermPool.BCP_LogicTable);
+                if (m_LeafTermPool.BCP_SlotTable)
+                    PinnedMemFree(m_LeafTermPool.BCP_SlotTable);
+                delete m_LeafTermPool.BCP_File;
+                m_LeafTermPool.BCP_LogicTable = nullptr;
+                m_LeafTermPool.BCP_SlotTable = nullptr;
+                m_LeafTermPool.BCP_File = nullptr;
+                m_LeafTermPool.BCP_TotalBlockCount = 0;
+                m_LeafTermPool.BCP_SlotCount = 0;
+                m_LeafTermPool.BCP_EvictSlot = 0;
+                m_LeafTermPool.BCP_Requests.clear();
+                m_LeafTermPool.BCP_ExitThread = false;
+            }
             if (m_IndexPool.BCP_Pages && m_IndexPool.BCP_SlotCount && !m_IndexPool.BCP_Thread.joinable()) {
                 m_IndexPool.BCP_ExitThread = false;
                 m_IndexPool.BCP_Thread = std::thread([this]() { BlockThreadMain(m_IndexPool); });
@@ -376,6 +412,26 @@ class IndexBlockTable
                   uint32_t slotCount)
         {
             BlockCachePool* pool = kind == BlockKind::Index ? &m_IndexPool : &m_LeafTermPool;
+            ExitBlockThread(*pool);
+            if (pool->BCP_Pages) {
+                PinnedMemFree(pool->BCP_Pages);
+                pool->BCP_Pages = nullptr;
+            }
+            if (pool->BCP_LogicTable) {
+                PinnedMemFree(pool->BCP_LogicTable);
+                pool->BCP_LogicTable = nullptr;
+            }
+            if (pool->BCP_SlotTable) {
+                PinnedMemFree(pool->BCP_SlotTable);
+                pool->BCP_SlotTable = nullptr;
+            }
+            delete pool->BCP_File;
+            pool->BCP_File = nullptr;
+            pool->BCP_TotalBlockCount = 0;
+            pool->BCP_SlotCount = 0;
+            pool->BCP_EvictSlot = 0;
+            pool->BCP_Requests.clear();
+            pool->BCP_ExitThread = false;
             pool->BCP_BaseOffset = baseOffset;
             if (path && *path) {
                 pool->BCP_File = new FileAccess(path);

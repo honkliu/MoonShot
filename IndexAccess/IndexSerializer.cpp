@@ -109,14 +109,14 @@ static BuildBlocksResult build_blocks(const PostingStore& store)
     uint32_t   seq   = 0;
 
     LeafTermBlock leafBlock{};
-    size_t leafWriteOffset = sizeof(uint32_t);
+    size_t leafWriteOffset = 0;
     uint32_t leafEntryCount = 0;
     char firstLeafTerm[HEAD_TERM_KEY_MAX] = {};
     uint16_t firstLeafTermLength = 0;
 
     auto flush_leaf_block = [&]() {
         if (leafEntryCount == 0) return;
-        std::memcpy(leafBlock.LTB_Data, &leafEntryCount, sizeof(leafEntryCount));
+        leafBlock.LTB_Directory[LEAF_TERM_DIRECTORY_COUNT - 1] = static_cast<uint16_t>(leafEntryCount);
         HeadTermEntry head{};
         head.HTE_LeafTermBlockID = static_cast<uint32_t>(res.BBR_LeafTermBlocks.size());
         head.HTE_FirstTermLength = firstLeafTermLength;
@@ -124,7 +124,7 @@ static BuildBlocksResult build_blocks(const PostingStore& store)
         res.BBR_HeadTermEntries.push_back(head);
         res.BBR_LeafTermBlocks.push_back(leafBlock);
         leafBlock = LeafTermBlock{};
-        leafWriteOffset = sizeof(uint32_t);
+        leafWriteOffset = 0;
         leafEntryCount = 0;
         firstLeafTermLength = 0;
         std::memset(firstLeafTerm, 0, sizeof(firstLeafTerm));
@@ -139,7 +139,9 @@ static BuildBlocksResult build_blocks(const PostingStore& store)
                                 uint32_t flags) {
         const uint8_t termLength = static_cast<uint8_t>(term.size());
         const size_t entryBytes = sizeof(LeafTermEntry) + termLength;
-        if (leafEntryCount > 0 && leafWriteOffset + entryBytes > PAGE_SIZE)
+        if (leafEntryCount > 0
+            && (leafEntryCount >= LEAF_TERM_DIRECTORY_COUNT - 1
+                || leafWriteOffset + entryBytes > sizeof(leafBlock.LTB_Data)))
             flush_leaf_block();
 
         if (leafEntryCount == 0) {
@@ -147,6 +149,7 @@ static BuildBlocksResult build_blocks(const PostingStore& store)
             std::memcpy(firstLeafTerm, term.data(), termLength);
         }
 
+        leafBlock.LTB_Directory[leafEntryCount] = static_cast<uint16_t>(LEAF_TERM_DATA_OFFSET + leafWriteOffset);
         LeafTermEntry* entry = reinterpret_cast<LeafTermEntry*>(leafBlock.LTB_Data + leafWriteOffset);
         entry->LTE_DocFreq = docFreq;
         entry->LTE_IndexBlockID = indexBlockID;
