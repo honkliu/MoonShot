@@ -164,31 +164,25 @@ public:
         const uint32_t indexBlockCount = static_cast<uint32_t>(n);
         const uint32_t leafTermBlockCount = static_cast<uint32_t>(br.BBR_LeafTermBlocks.size());
         const uint32_t headCount = static_cast<uint32_t>(br.BBR_HeadTermEntries.size());
+        auto* indexBlocks = static_cast<uint8_t*>(PinnedMemAlloc(static_cast<uint64_t>(indexBlockCount) * sizeof(IndexBlock)));
+        auto* leafTermBlocks = static_cast<uint8_t*>(PinnedMemAlloc(static_cast<uint64_t>(leafTermBlockCount) * sizeof(LeafTermBlock)));
 
-        if (indexBlockCount > 0) {
-            m_IndexBlocks = static_cast<IndexBlock*>(
-                PinnedMemAlloc(static_cast<uint64_t>(indexBlockCount) * sizeof(IndexBlock)));
-            if (!m_IndexBlocks) {
-                std::cerr << "Failed to allocate pinned index block memory\n";
-                ResetLoadedRuntimeState();
-                return;
-            }
+        if (indexBlockCount > 0 && !indexBlocks) {
+            std::cerr << "Failed to allocate pinned index block memory\n";
+            ResetLoadedRuntimeState();
+            return;
         }
 
-        if (leafTermBlockCount > 0) {
-            m_LeafTermBlocks = static_cast<LeafTermBlock*>(
-                PinnedMemAlloc(static_cast<uint64_t>(leafTermBlockCount) * sizeof(LeafTermBlock)));
-            if (!m_LeafTermBlocks) {
-                std::cerr << "Failed to allocate pinned leaf term block memory\n";
-                ResetLoadedRuntimeState();
-                return;
-            }
+        if (leafTermBlockCount > 0 && !leafTermBlocks) {
+            std::cerr << "Failed to allocate pinned leaf term block memory\n";
+            ResetLoadedRuntimeState();
+            return;
         }
 
         if (indexBlockCount > 0)
-            std::memcpy(m_IndexBlocks, br.BBR_IndexBlocks.data(), static_cast<size_t>(indexBlockCount) * sizeof(IndexBlock));
+            std::memcpy(indexBlocks, br.BBR_IndexBlocks.data(), static_cast<size_t>(indexBlockCount) * sizeof(IndexBlock));
         if (leafTermBlockCount > 0)
-            std::memcpy(m_LeafTermBlocks, br.BBR_LeafTermBlocks.data(), static_cast<size_t>(leafTermBlockCount) * sizeof(LeafTermBlock));
+            std::memcpy(leafTermBlocks, br.BBR_LeafTermBlocks.data(), static_cast<size_t>(leafTermBlockCount) * sizeof(LeafTermBlock));
 
         std::unique_ptr<HeadTermEntry[]> headTermEntries;
         if (headCount > 0) {
@@ -197,7 +191,7 @@ public:
         }
         m_BlockTable.Init(BlockKind::Index, nullptr, 0, indexBlockCount, indexBlockCount);
         m_BlockTable.Init(BlockKind::LeafTerm, nullptr, 0, leafTermBlockCount, leafTermBlockCount);
-        m_BlockTable.SetBlockMemory(m_IndexBlocks, m_LeafTermBlocks);
+        m_BlockTable.SetBlockMemory(indexBlocks, leafTermBlocks);
         m_BlockTable.SetHeadTermEntries(std::move(headTermEntries), headCount);
 
         m_Built = true;
@@ -361,11 +355,9 @@ public:
         const uint32_t indexBlockLoadCount = std::min(indexBlockCount, INDEX_BLOCK_CACHE_SLOT_COUNT);
         const uint32_t leafTermBlockLoadCount = std::min(leafTermBlockCount, LEAF_TERM_BLOCK_CACHE_SLOT_COUNT);
 
-        m_IndexBlocks = static_cast<IndexBlock*>(
-            PinnedMemAlloc(static_cast<uint64_t>(INDEX_BLOCK_CACHE_SLOT_COUNT) * sizeof(IndexBlock)));
-        m_LeafTermBlocks = static_cast<LeafTermBlock*>(
-            PinnedMemAlloc(static_cast<uint64_t>(LEAF_TERM_BLOCK_CACHE_SLOT_COUNT) * sizeof(LeafTermBlock)));
-        if (!m_IndexBlocks || !m_LeafTermBlocks) {
+        auto* indexBlocks = static_cast<uint8_t*>(PinnedMemAlloc(static_cast<uint64_t>(INDEX_BLOCK_CACHE_SLOT_COUNT) * sizeof(IndexBlock)));
+        auto* leafTermBlocks = static_cast<uint8_t*>(PinnedMemAlloc(static_cast<uint64_t>(LEAF_TERM_BLOCK_CACHE_SLOT_COUNT) * sizeof(LeafTermBlock)));
+        if (!indexBlocks || !leafTermBlocks) {
             std::cerr << "Failed to allocate pinned index/leaf runtime cache memory for: " << m_IndexPath << "\n";
             ResetLoadedRuntimeState();
             return;
@@ -375,7 +367,7 @@ public:
         if (indexBlockBytes > 0
             && (indexBlockBytes > static_cast<uint64_t>(std::numeric_limits<int>::max())
                 || !indexFile.SetPosition(m_IndexFileHeader.IFH_IndexBlockOffset)
-                || indexFile.GetData(m_IndexBlocks, static_cast<int>(indexBlockBytes)) != static_cast<int>(indexBlockBytes)))
+                || indexFile.GetData(indexBlocks, static_cast<int>(indexBlockBytes)) != static_cast<int>(indexBlockBytes)))
         {
             std::cerr << "Failed to read IndexBlocks for: " << m_IndexPath << "\n";
             ResetLoadedRuntimeState();
@@ -386,7 +378,7 @@ public:
         if (leafTermBlockBytes > 0
             && (leafTermBlockBytes > static_cast<uint64_t>(std::numeric_limits<int>::max())
                 || !indexFile.SetPosition(m_IndexFileHeader.IFH_LeafTermBlockOffset)
-                || indexFile.GetData(m_LeafTermBlocks, static_cast<int>(leafTermBlockBytes)) != static_cast<int>(leafTermBlockBytes)))
+                || indexFile.GetData(leafTermBlocks, static_cast<int>(leafTermBlockBytes)) != static_cast<int>(leafTermBlockBytes)))
         {
             std::cerr << "Failed to read LeafTermBlocks for: " << m_IndexPath << "\n";
             ResetLoadedRuntimeState();
@@ -397,7 +389,7 @@ public:
                   m_IndexFileHeader.IFH_IndexBlockOffset, indexBlockCount, indexBlockLoadCount);
         m_BlockTable.Init(BlockKind::LeafTerm, m_IndexPath.c_str(),
                   m_IndexFileHeader.IFH_LeafTermBlockOffset, leafTermBlockCount, leafTermBlockLoadCount);
-        m_BlockTable.SetBlockMemory(m_IndexBlocks, m_LeafTermBlocks);
+        m_BlockTable.SetBlockMemory(indexBlocks, leafTermBlocks);
         m_BlockTable.SetHeadTermEntries(std::move(headTermEntries), static_cast<uint32_t>(m_IndexFileHeader.IFH_HeadTermEntryCount));
 
         ClearDocDataOnly();
@@ -455,8 +447,6 @@ private:
     bool                         m_LoadedFromDisk;
     IndexFileHeader              m_IndexFileHeader{};
     uint8_t*                     m_DocData = nullptr;
-    IndexBlock*                  m_IndexBlocks = nullptr;
-    LeafTermBlock*               m_LeafTermBlocks = nullptr;
 
     static constexpr uint32_t INDEX_BLOCK_CACHE_SLOT_COUNT =
         static_cast<uint32_t>(INDEX_BLOCK_CACHE_BYTES / sizeof(IndexBlock));
@@ -479,13 +469,6 @@ private:
 
     void ClearBlockPageDataOnly()
     {
-        if (m_IndexBlocks)
-            PinnedMemFree(m_IndexBlocks);
-        m_IndexBlocks = nullptr;
-
-        if (m_LeafTermBlocks)
-            PinnedMemFree(m_LeafTermBlocks);
-        m_LeafTermBlocks = nullptr;
     }
 
     void ResetLoadedRuntimeState()
