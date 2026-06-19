@@ -12,6 +12,10 @@
 #include <string>
 #include <string_view>
 #include <algorithm>
+#include <condition_variable>
+#include <deque>
+#include <latch>
+#include <mutex>
 #include "../Utils/FileAccess.h"
 #include "ElementFilter.h"
 #include "MemOperation.h"
@@ -188,15 +192,33 @@ class IndexBlockTable
             uint32_t Ref = 0;
         };
 
+        enum class BlockRequestType {
+            Get,
+            Release
+        };
+
+        struct BlockRequest {
+            BlockRequestType Type = BlockRequestType::Get;
+            uint32_t BlockSeq = 0;
+            uint32_t Slot = UINT32_MAX;
+            void* Address = nullptr;
+            std::latch Completion{1};
+        };
+
         struct BlockCachePool {
             uint8_t*                          BCP_Pages = nullptr;
             uint64_t                          BCP_BaseOffset = 0;
             uint32_t                          BCP_TotalBlockCount = 0;
-            uint32_t                          BCP_LoadedBlockCount = 0;
+            uint32_t                          BCP_SlotCount = 0;
             uint32_t                          BCP_EvictSlot = 0;
             uint32_t*                         BCP_LogicTable = nullptr;
             IndexSlotEntry*                   BCP_SlotTable = nullptr;
             FileAccess*                       BCP_File = nullptr;
+            std::thread                       BCP_Thread;
+            std::mutex                        BCP_RequestMutex;
+            std::condition_variable           BCP_RequestCv;
+            std::deque<BlockRequest*>         BCP_Requests;
+            bool                              BCP_ExitThread = false;
         };
 
     public:
@@ -204,15 +226,21 @@ class IndexBlockTable
 
         ~IndexBlockTable()
         {
+            ExitBlockThread(m_IndexPool);
+            ExitBlockThread(m_LeafTermPool);
             if (m_IndexPool.BCP_Pages)
                 PinnedMemFree(m_IndexPool.BCP_Pages);
-            delete[] m_IndexPool.BCP_LogicTable;
-            delete[] m_IndexPool.BCP_SlotTable;
+            if (m_IndexPool.BCP_LogicTable)
+                PinnedMemFree(m_IndexPool.BCP_LogicTable);
+            if (m_IndexPool.BCP_SlotTable)
+                PinnedMemFree(m_IndexPool.BCP_SlotTable);
             delete m_IndexPool.BCP_File;
             if (m_LeafTermPool.BCP_Pages)
                 PinnedMemFree(m_LeafTermPool.BCP_Pages);
-            delete[] m_LeafTermPool.BCP_LogicTable;
-            delete[] m_LeafTermPool.BCP_SlotTable;
+            if (m_LeafTermPool.BCP_LogicTable)
+                PinnedMemFree(m_LeafTermPool.BCP_LogicTable);
+            if (m_LeafTermPool.BCP_SlotTable)
+                PinnedMemFree(m_LeafTermPool.BCP_SlotTable);
             delete m_LeafTermPool.BCP_File;
         }
 
@@ -294,74 +322,59 @@ class IndexBlockTable
 
         void* GetBlock(BlockKind kind, uint32_t block_seq, uint32_t* slotOut)
         {
-            BlockCachePool* pool = kind == BlockKind::Index ? &m_IndexPool : &m_LeafTermPool;
-            *slotOut = UINT32_MAX;
-
-            WriterSpinLock lock(m_IndexCacheLock);
-            
-            uint32_t slot = pool->BCP_LogicTable[block_seq];
-            if (slot != UINT32_MAX) {
-                ++pool->BCP_SlotTable[slot].Ref;
-                *slotOut = slot;
-                return pool->BCP_Pages + static_cast<size_t>(slot) * PAGE_SIZE;
+            BlockRequest request;
+            request.Type = BlockRequestType::Get;
+            request.BlockSeq = block_seq;
+            BlockCachePool& pool = kind == BlockKind::Index ? m_IndexPool : m_LeafTermPool;
+            {
+                std::lock_guard<std::mutex> lock(pool.BCP_RequestMutex);
+                pool.BCP_Requests.push_back(&request);
             }
-
-            uint32_t found = UINT32_MAX;
-            for (uint32_t scanned = 0; scanned < pool->BCP_LoadedBlockCount; ++scanned) {
-                uint32_t candidate = pool->BCP_EvictSlot++ % pool->BCP_LoadedBlockCount;
-                if (pool->BCP_SlotTable[candidate].Ref == 0) {
-                    found = candidate;
-                    break;
-                }
-            }
-            if (found == UINT32_MAX) return nullptr;
-
-            uint32_t oldBlock = pool->BCP_SlotTable[found].BlockID;
-            if (oldBlock != UINT32_MAX && oldBlock < pool->BCP_TotalBlockCount && pool->BCP_LogicTable[oldBlock] == found)
-                pool->BCP_LogicTable[oldBlock] = UINT32_MAX;
-
-            void* address = pool->BCP_Pages + static_cast<size_t>(found) * PAGE_SIZE;
-
-
-            if (!pool->BCP_File->ReadBlock(block_seq, address, PAGE_SIZE, pool->BCP_BaseOffset)) {
-                pool->BCP_SlotTable[found].BlockID = UINT32_MAX;
-                pool->BCP_SlotTable[found].Ref = 0;
-                return nullptr;
-            }
-
-            pool->BCP_SlotTable[found].BlockID = block_seq;
-            pool->BCP_SlotTable[found].Ref = 1;
-
-            pool->BCP_LogicTable[block_seq] = found;
-            
-            *slotOut = found;
-            return address;
+            pool.BCP_RequestCv.notify_one();
+            request.Completion.wait();
+            *slotOut = request.Slot;
+            return request.Address;
         }
 
         void ReleaseBlock(BlockKind kind, uint32_t slot)
         {
-            BlockCachePool* pool = kind == BlockKind::Index ? &m_IndexPool : &m_LeafTermPool;
-            if (slot == UINT32_MAX || !pool->BCP_SlotTable) return;
-            WriterSpinLock lock(m_IndexCacheLock);
-            if (slot >= pool->BCP_LoadedBlockCount) return;
-            if (pool->BCP_SlotTable[slot].Ref > 0)
-                --pool->BCP_SlotTable[slot].Ref;
+            BlockRequest request;
+            request.Type = BlockRequestType::Release;
+            request.Slot = slot;
+            BlockCachePool& pool = kind == BlockKind::Index ? m_IndexPool : m_LeafTermPool;
+            {
+                std::lock_guard<std::mutex> lock(pool.BCP_RequestMutex);
+                pool.BCP_Requests.push_back(&request);
+            }
+            pool.BCP_RequestCv.notify_one();
+            request.Completion.wait();
         }
 
         void SetBlockMemory(uint8_t* indexBlocks,
                     uint8_t* leafTermBlocks)
         {
+            if (!indexBlocks)
+                ExitBlockThread(m_IndexPool);
+            if (!leafTermBlocks)
+                ExitBlockThread(m_LeafTermPool);
             m_IndexPool.BCP_Pages = indexBlocks;
             m_LeafTermPool.BCP_Pages = leafTermBlocks;
+            if (m_IndexPool.BCP_Pages && m_IndexPool.BCP_SlotCount && !m_IndexPool.BCP_Thread.joinable()) {
+                m_IndexPool.BCP_ExitThread = false;
+                m_IndexPool.BCP_Thread = std::thread([this]() { BlockThreadMain(m_IndexPool); });
+            }
+            if (m_LeafTermPool.BCP_Pages && m_LeafTermPool.BCP_SlotCount && !m_LeafTermPool.BCP_Thread.joinable()) {
+                m_LeafTermPool.BCP_ExitThread = false;
+                m_LeafTermPool.BCP_Thread = std::thread([this]() { BlockThreadMain(m_LeafTermPool); });
+            }
         }
 
         void Init(BlockKind kind,
                   const char* path,
                   uint64_t baseOffset,
                   uint32_t blockCount,
-                  uint32_t loadedBlockCount)
+                  uint32_t slotCount)
         {
-            WriterSpinLock lock(m_IndexCacheLock);
             BlockCachePool* pool = kind == BlockKind::Index ? &m_IndexPool : &m_LeafTermPool;
             pool->BCP_BaseOffset = baseOffset;
             if (path && *path) {
@@ -369,31 +382,114 @@ class IndexBlockTable
                 pool->BCP_File->Init();
             }
             pool->BCP_TotalBlockCount = blockCount;
-            pool->BCP_LoadedBlockCount = loadedBlockCount;
-            pool->BCP_LogicTable = pool->BCP_TotalBlockCount ? new uint32_t[pool->BCP_TotalBlockCount] : nullptr;
-            pool->BCP_SlotTable = pool->BCP_LoadedBlockCount ? new IndexSlotEntry[pool->BCP_LoadedBlockCount] : nullptr;
+            pool->BCP_SlotCount = std::min(slotCount, blockCount);
+            pool->BCP_LogicTable = pool->BCP_TotalBlockCount ? static_cast<uint32_t*>(PinnedMemAlloc(static_cast<uint64_t>(pool->BCP_TotalBlockCount) * sizeof(uint32_t))) : nullptr;
+            pool->BCP_SlotTable = pool->BCP_SlotCount ? static_cast<IndexSlotEntry*>(PinnedMemAlloc(static_cast<uint64_t>(pool->BCP_SlotCount) * sizeof(IndexSlotEntry))) : nullptr;
 
             for (uint32_t i = 0; i < pool->BCP_TotalBlockCount; ++i)
                 pool->BCP_LogicTable[i] = UINT32_MAX;
 
-            uint32_t loaded = std::min(loadedBlockCount, blockCount);
-            for (uint32_t block = 0; block < loaded; ++block) {
+            for (uint32_t slot = 0; slot < pool->BCP_SlotCount; ++slot) {
+                pool->BCP_SlotTable[slot].BlockID = UINT32_MAX;
+                pool->BCP_SlotTable[slot].Ref = 0;
+            }
+
+            for (uint32_t block = 0; block < pool->BCP_SlotCount; ++block) {
                 pool->BCP_LogicTable[block] = block;
                 pool->BCP_SlotTable[block].BlockID = block;
             }
-            pool->BCP_EvictSlot = loaded;
+            pool->BCP_EvictSlot = pool->BCP_SlotCount;
         }
 
     private:
         std::shared_ptr<ElementFilter>           m_ElementFilter;
         BlockCachePool                           m_IndexPool;
         BlockCachePool                           m_LeafTermPool;
-        RWSpinLock                               m_IndexCacheLock;
         BloomFilter                              m_BloomFilter;
 
         /* Level-1: fixed directory — (HTE_FirstTerm → HTE_LeafTermBlockID), sorted by HTE_FirstTerm */
         std::unique_ptr<HeadTermEntry[]>         m_HeadTermEntries;
         uint32_t                                 m_HeadTermEntryCount = 0;
+
+        void ExitBlockThread(BlockCachePool& pool)
+        {
+            if (!pool.BCP_Thread.joinable()) return;
+            {
+                std::lock_guard<std::mutex> lock(pool.BCP_RequestMutex);
+                pool.BCP_ExitThread = true;
+            }
+            pool.BCP_RequestCv.notify_one();
+            pool.BCP_Thread.join();
+        }
+
+        void BlockThreadMain(BlockCachePool& pool)
+        {
+            while (true) {
+                BlockRequest* request = nullptr;
+                {
+                    std::unique_lock<std::mutex> lock(pool.BCP_RequestMutex);
+                    while (!pool.BCP_ExitThread && pool.BCP_Requests.empty())
+                        pool.BCP_RequestCv.wait(lock);
+                    if (pool.BCP_ExitThread && pool.BCP_Requests.empty())
+                        break;
+                    request = pool.BCP_Requests.front();
+                    pool.BCP_Requests.pop_front();
+                }
+
+                if (request->Type == BlockRequestType::Get)
+                    ProcessGetBlock(pool, *request);
+                else if (request->Type == BlockRequestType::Release)
+                    ProcessReleaseBlock(pool, *request);
+
+                request->Completion.count_down();
+            }
+        }
+
+        void ProcessGetBlock(BlockCachePool& pool, BlockRequest& request)
+        {
+            uint32_t block_seq = request.BlockSeq;
+            uint32_t slot = pool.BCP_LogicTable[block_seq];
+            if (slot != UINT32_MAX) {
+                ++pool.BCP_SlotTable[slot].Ref;
+                request.Slot = slot;
+                request.Address = pool.BCP_Pages + static_cast<size_t>(slot) * PAGE_SIZE;
+                return;
+            }
+
+            uint32_t found = UINT32_MAX;
+            for (uint32_t scanned = 0; scanned < pool.BCP_SlotCount; ++scanned) {
+                uint32_t candidate = pool.BCP_EvictSlot++ % pool.BCP_SlotCount;
+                if (pool.BCP_SlotTable[candidate].Ref == 0) {
+                    found = candidate;
+                    break;
+                }
+            }
+            if (found == UINT32_MAX) return;
+
+            uint32_t oldBlock = pool.BCP_SlotTable[found].BlockID;
+            if (oldBlock != UINT32_MAX)
+                pool.BCP_LogicTable[oldBlock] = UINT32_MAX;
+
+            void* address = pool.BCP_Pages + static_cast<size_t>(found) * PAGE_SIZE;
+            if (!pool.BCP_File->ReadBlock(block_seq, address, PAGE_SIZE, pool.BCP_BaseOffset)) {
+                pool.BCP_SlotTable[found].BlockID = UINT32_MAX;
+                pool.BCP_SlotTable[found].Ref = 0;
+                return;
+            }
+
+            pool.BCP_SlotTable[found].BlockID = block_seq;
+            pool.BCP_SlotTable[found].Ref = 1;
+            pool.BCP_LogicTable[block_seq] = found;
+            request.Slot = found;
+            request.Address = address;
+        }
+
+        void ProcessReleaseBlock(BlockCachePool& pool, BlockRequest& request)
+        {
+            uint32_t slot = request.Slot;
+            if (slot != UINT32_MAX && pool.BCP_SlotTable[slot].Ref > 0)
+                --pool.BCP_SlotTable[slot].Ref;
+        }
 
 };
 
