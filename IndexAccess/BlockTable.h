@@ -106,7 +106,7 @@ struct LeafTermEntry {
     uint32_t    LTE_ContinuationBlockCount  = 0;
     uint32_t    LTE_Flags                   = 0;
     uint8_t     LTE_TermLength              = 0;
-    char        LTE_Term[0]                 ='\0';
+    char        LTE_Term[0];
 };
 #pragma pack(pop)
 
