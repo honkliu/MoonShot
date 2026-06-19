@@ -85,7 +85,8 @@ public:
         if (m_LoadedFromDisk) {
             m_Store = make_shared<PostingStore>();
             ClearPinnedIndexData();
-            m_BlockTable.SetBlockMemory(nullptr, nullptr, 0, 0);
+            m_BlockTable.Init(nullptr, 0, 0, 0, 0, 0, 0);
+            m_BlockTable.SetBlockMemory(nullptr, nullptr);
             m_Executor = IndexSearchExecutor(this);
             m_Built = false;
             m_LoadedFromDisk = false;
@@ -195,7 +196,8 @@ public:
             headTermEntries.reset(new HeadTermEntry[headCount]);
             std::memcpy(headTermEntries.get(), br.BBR_HeadTermEntries.data(), static_cast<size_t>(headCount) * sizeof(HeadTermEntry));
         }
-        m_BlockTable.SetBlockMemory(m_IndexBlocks, m_LeafTermBlocks, indexBlockCount, leafTermBlockCount);
+        m_BlockTable.Init(nullptr, 0, indexBlockCount, indexBlockCount, 0, leafTermBlockCount, leafTermBlockCount);
+        m_BlockTable.SetBlockMemory(m_IndexBlocks, m_LeafTermBlocks);
         m_BlockTable.SetHeadTermEntries(std::move(headTermEntries), headCount);
 
         m_Built = true;
@@ -391,7 +393,10 @@ public:
             return;
         }
 
-        m_BlockTable.SetBlockMemory(m_IndexBlocks, m_LeafTermBlocks, indexBlockLoadCount, leafTermBlockLoadCount);
+        m_BlockTable.Init(m_IndexPath.c_str(),
+                  m_IndexFileHeader.IFH_IndexBlockOffset, indexBlockCount, indexBlockLoadCount,
+                  m_IndexFileHeader.IFH_LeafTermBlockOffset, leafTermBlockCount, leafTermBlockLoadCount);
+        m_BlockTable.SetBlockMemory(m_IndexBlocks, m_LeafTermBlocks);
         m_BlockTable.SetHeadTermEntries(std::move(headTermEntries), static_cast<uint32_t>(m_IndexFileHeader.IFH_HeadTermEntryCount));
 
         ClearDocDataOnly();
@@ -485,7 +490,8 @@ private:
     void ResetLoadedRuntimeState()
     {
         ClearPinnedIndexData();
-        m_BlockTable.SetBlockMemory(nullptr, nullptr, 0, 0);
+        m_BlockTable.Init(nullptr, 0, 0, 0, 0, 0, 0);
+        m_BlockTable.SetBlockMemory(nullptr, nullptr);
         m_Executor = IndexSearchExecutor(this);
         m_Built = false;
         m_LoadedFromDisk = false;

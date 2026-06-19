@@ -13,6 +13,9 @@ void AdvancedIndexReader::Open(const char*      streamKey,
     assert(blockTable);
     assert(context);
 
+    if (m_BlockTable && m_BlockSlotNumber != UINT32_MAX)
+        m_BlockTable->ReleaseBlock(BlockKind::Index, m_BlockSlotNumber);
+
     delete[] m_Word;
     m_Word = new char[std::strlen(streamKey) + 1];
     std::strcpy(m_Word, streamKey);
@@ -21,6 +24,7 @@ void AdvancedIndexReader::Open(const char*      streamKey,
     m_Context         = context;
     m_DocFreq         = 0;
     m_BlockSeqNumber  = 0;
+    m_BlockSlotNumber = UINT32_MAX;
     m_RemainingContinuationBlocks = 0;
 
     uint32_t indexOffset = 0, indexLength = 0;
@@ -31,7 +35,7 @@ void AdvancedIndexReader::Open(const char*      streamKey,
                                             &m_RemainingContinuationBlocks);
     if (found) {
         IndexBlock* block = reinterpret_cast<IndexBlock*>(
-            m_BlockTable->GetBlock(BlockKind::Index, m_BlockSeqNumber));
+            m_BlockTable->GetBlock(BlockKind::Index, m_BlockSeqNumber, &m_BlockSlotNumber));
         assert(block);
         m_Decoder.OpenRaw(block->IB_Data + indexOffset, indexLength);
     }
@@ -44,14 +48,20 @@ void AdvancedIndexReader::GoNext()
     m_Decoder.GoNext();
 
     while (m_Decoder.IsEnd() && m_RemainingContinuationBlocks > 0) {
+        m_BlockTable->ReleaseBlock(BlockKind::Index, m_BlockSlotNumber);
         IndexBlock* next = reinterpret_cast<IndexBlock*>(
-            m_BlockTable->GetBlock(BlockKind::Index, m_BlockSeqNumber + 1));
+            m_BlockTable->GetBlock(BlockKind::Index, m_BlockSeqNumber + 1, &m_BlockSlotNumber));
         assert(next);
         ++m_BlockSeqNumber;
         const auto* header = reinterpret_cast<const IndexBlockContinuationHeader*>(next->IB_Data);
         m_Decoder.OpenRaw(next->IB_Data + sizeof(IndexBlockContinuationHeader), header->IBCH_DataLength);
         --m_RemainingContinuationBlocks;
         m_Decoder.GoNext();
+    }
+
+    if (m_Decoder.IsEnd() && m_RemainingContinuationBlocks == 0) {
+        m_BlockTable->ReleaseBlock(BlockKind::Index, m_BlockSlotNumber);
+        m_BlockSlotNumber = UINT32_MAX;
     }
 }
 
@@ -60,18 +70,30 @@ void AdvancedIndexReader::GoUntil(uint64_t target, uint64_t /*limit*/)
     while (true) {
         m_Decoder.GoUntil(target);
         if (!m_Decoder.IsEnd()) break;
-        if (m_RemainingContinuationBlocks == 0) break;
+        if (m_RemainingContinuationBlocks == 0) {
+            m_BlockTable->ReleaseBlock(BlockKind::Index, m_BlockSlotNumber);
+            m_BlockSlotNumber = UINT32_MAX;
+            break;
+        }
+        m_BlockTable->ReleaseBlock(BlockKind::Index, m_BlockSlotNumber);
         IndexBlock* next = reinterpret_cast<IndexBlock*>(
-            m_BlockTable->GetBlock(BlockKind::Index, m_BlockSeqNumber + 1));
+            m_BlockTable->GetBlock(BlockKind::Index, m_BlockSeqNumber + 1, &m_BlockSlotNumber));
         assert(next);
         const auto* header = reinterpret_cast<const IndexBlockContinuationHeader*>(next->IB_Data);
         ++m_BlockSeqNumber;
         --m_RemainingContinuationBlocks;
-        if (target > header->IBCH_MaxDocID)
+        if (target > header->IBCH_MaxDocID) {
+            m_BlockTable->ReleaseBlock(BlockKind::Index, m_BlockSlotNumber);
+            m_BlockSlotNumber = UINT32_MAX;
             continue;
+        }
         m_Decoder.OpenRaw(next->IB_Data + sizeof(IndexBlockContinuationHeader), header->IBCH_DataLength);
         m_Decoder.GoNext();
-        if (m_Decoder.IsEnd()) break;
+        if (m_Decoder.IsEnd()) {
+            m_BlockTable->ReleaseBlock(BlockKind::Index, m_BlockSlotNumber);
+            m_BlockSlotNumber = UINT32_MAX;
+            break;
+        }
     }
 }
 
@@ -111,6 +133,9 @@ float AdvancedIndexReader::GetScore(const DocDataEntry* entry) {
     return idf * tfNorm;
 }
 void AdvancedIndexReader::Close() {
+    if (m_BlockTable && m_BlockSlotNumber != UINT32_MAX)
+        m_BlockTable->ReleaseBlock(BlockKind::Index, m_BlockSlotNumber);
+    m_BlockSlotNumber = UINT32_MAX;
     delete[] m_Word;
     m_Word = nullptr;
 }

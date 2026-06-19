@@ -38,7 +38,7 @@ class AdvancedIndexReader : public IndexReader
 
         ~AdvancedIndexReader()
         {
-            delete[] m_Word;
+            Close();
         }
 
         /*
@@ -83,6 +83,7 @@ class AdvancedIndexReader : public IndexReader
     private:
         char*                       m_Word            = nullptr;
         uint32_t                    m_BlockSeqNumber  = 0;
+        uint32_t                    m_BlockSlotNumber = UINT32_MAX;
         uint32_t                    m_DocFreq         = 0;
         uint32_t                    m_RemainingContinuationBlocks = 0;
         IndexBlockTable*            m_BlockTable      = nullptr;
