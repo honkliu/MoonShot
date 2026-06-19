@@ -14,13 +14,14 @@
  *   [Header 88B]       magic, version, fixed section offsets and counts
  *   [HeadTermEntry]    fixed 32B records, count = IFH_HeadTermEntryCount
  *   [LeafTermBlock]    fixed 4096B blocks, count = IFH_LeafTermBlockCount
- *                          each block: [entry_count:4] then per entry:
- *                          [LeafTermEntry header][LTE_Term bytes]
+ *                          LTB_Directory[0..94]: LeafTermEntry offsets from block base
+ *                          LTB_Directory[95]: entry count
+ *                          LTB_Data: packed LeafTermEntry records + LTE_Term bytes
  *   [DocData]          N x 1024B records
  *   [Padding]          to PAGE_SIZE
  *   [Blocks]           raw IndexBlock structs
- *                        IB_Data = packed varbyte pairs:
- *                        docID, tf, docID, tf, ...
+ *                        first block: packed varbyte docID/tf pairs
+ *                        continuation block: 12B IndexBlockContinuationHeader + pairs
  */
 
 struct BuildBlocksResult {

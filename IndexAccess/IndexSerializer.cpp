@@ -1,11 +1,13 @@
 /*
- * IndexSerializer — v8 paged Head/Leaf term table format.
+ * IndexSerializer — v12 paged Head/Leaf term table format.
  *
  * Block IB_Data: raw posting bytes only (no key/doc_freq/data_len headers).
  * Head/Leaf term table: two-level term metadata structure.
  *   Level-1 head table: fixed sorted HeadTermEntry array.
- *   Level-2 leaf blocks: 4096-byte pages, sorted by term and loaded on demand.
- * Continuation tails can be reused for new term starts; readers use continuation counts.
+ *   Level-2 leaf blocks: 4096-byte pages with directory offsets and packed entries.
+ * A term's continuation segment starts at byte 0 of the next block and carries
+ * IndexBlockContinuationHeader; the final continuation block can reuse its tail
+ * for later term starts.
  */
 
 #include "IndexSerializer.h"
@@ -83,9 +85,10 @@ static size_t posting_prefix_bytes(const uint8_t* data, size_t size, size_t capa
 /* ─────────────────────────────────────────────────────────────────────────
  * build_blocks
  *
- * 1. Pack posting bytes into IndexBlocks (no key/freq/len headers).
- *    Continuation blocks carry [marker,len,bytes] at the current offset; the
- *    final continuation block can also host subsequent term starts.
+ * 1. Pack posting bytes into IndexBlocks.
+ *    First block: raw posting bytes at LTE_IndexOffset/LTE_IndexLength.
+ *    Continuation segment: [IndexBlockContinuationHeader][posting bytes] at page start;
+ *    the last continuation block may reuse remaining bytes for following terms.
  * 2. Build a flat sorted LeafTermEntry list (one LeafTermEntry per term).
  * 3. Organize into two-level Head/Leaf term table:
  *    HeadTermEntry: one entry per 4096-byte LeafTermBlock -> first term in block.
@@ -186,6 +189,7 @@ static BuildBlocksResult build_blocks(const PostingStore& store)
         size_t data_here   = posting_prefix_bytes(src, remaining, DATA_CAP - wptr);
         if (data_here == 0) {
             flush();
+            data_offset = wptr;
             data_here = posting_prefix_bytes(src, remaining, DATA_CAP);
             if (data_here == 0) continue;
         }
