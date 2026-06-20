@@ -34,7 +34,7 @@ cmake --build build --target shennong --config Debug
 Windows debug binary:
 
 ```powershell
-.\build\Service\Debug\shennong.exe --port 9000 --index "$env:USERPROFILE\moon.idx"
+.\build\x64\Debug\shennong.exe --port 9000 --index "$env:USERPROFILE\moon.idx"
 ```
 
 Startup should fail fast if:

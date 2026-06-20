@@ -1,3 +1,4 @@
 [build]
-# Route all Rust build artifacts to build/rust/ — mirrors cmake -B build for C++.
-target-dir = "build/rust"
+# Direct cargo commands default to the Debug layout.
+# CMake/MSBuild pass a config-specific target-dir: build/x64/<Config>/rust.
+target-dir = "build/x64/Debug/rust"

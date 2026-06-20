@@ -9,6 +9,17 @@ project(MoonShot VERSION 0.1.0)
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+set(MOONSHOT_OUTPUT_ROOT "${CMAKE_BINARY_DIR}/x64")
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${MOONSHOT_OUTPUT_ROOT}")
+set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${MOONSHOT_OUTPUT_ROOT}")
+set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY "${MOONSHOT_OUTPUT_ROOT}")
+foreach(config Debug Release RelWithDebInfo MinSizeRel)
+    string(TOUPPER "${config}" config_upper)
+    set(CMAKE_RUNTIME_OUTPUT_DIRECTORY_${config_upper} "${MOONSHOT_OUTPUT_ROOT}/${config}")
+    set(CMAKE_LIBRARY_OUTPUT_DIRECTORY_${config_upper} "${MOONSHOT_OUTPUT_ROOT}/${config}")
+    set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY_${config_upper} "${MOONSHOT_OUTPUT_ROOT}/${config}")
+endforeach()
+
 # Default install prefix to <build>/sdk so that
 # "cmake --install build" works without --prefix.
 # An explicit --prefix on the command line overrides this.

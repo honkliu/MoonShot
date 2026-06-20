@@ -1,5 +1,45 @@
 # MoonShot
 
+## Build
+
+Keep all generated files under `build/`. Do not build from source folders.
+
+Windows:
+
+```powershell
+cd Q:\gitroot\MoonShot
+cmake -S . -B build
+cmake --build build --config Debug -- /m
+cmake --build build --config Release -- /m
+```
+
+Linux/macOS:
+
+```bash
+cd ~/gitroot/MoonShot
+cmake -S . -B build
+cmake --build build
+```
+
+Output layout:
+
+```text
+build/x64/Debug/      C++ executables/libs, Rust binaries, moon_wasm viewer
+build/x64/Release/    C++ executables/libs, Rust binaries, moon_wasm viewer
+```
+
+Examples:
+
+```powershell
+.\build\x64\Debug\moon.exe -i
+.\build\x64\Debug\shennong.exe --port 9000 --index "$env:USERPROFILE\moon.idx"
+.\build\x64\Debug\moon_rs.exe -i
+.\build\x64\Debug\shennong_rs.exe --port 9000 --index "$env:USERPROFILE\moon.idx"
+cd .\build\x64\Debug\moon_wasm; python3 serve.py
+```
+
+Rust cargo invoked directly from the repo root defaults to `build/x64/Debug/rust` via `.cargo/config.toml`. CMake/MSBuild passes the config-specific Rust target directory automatically.
+
 C:\gitroot\MoonShot\ThirdParty>git submodule add https://github.com/microsoft/mimalloc.git
 
 

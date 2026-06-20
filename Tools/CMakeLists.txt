@@ -33,28 +33,28 @@ else()
 
     add_custom_target(moon_wasm ALL
         COMMAND ${CMAKE_COMMAND} -E make_directory
-                "${CMAKE_BINARY_DIR}/Tools/$<CONFIG>/moon_wasm/pkg"
+            "${MOONSHOT_OUTPUT_ROOT}/$<CONFIG>/moon_wasm/pkg"
         COMMAND ${WASM_PACK_COMMAND}
                 build
                 --target web
                 --release
-                --out-dir "${CMAKE_BINARY_DIR}/Tools/$<CONFIG>/moon_wasm/pkg"
+            --out-dir "${MOONSHOT_OUTPUT_ROOT}/$<CONFIG>/moon_wasm/pkg"
                 .
                 --
-                --target-dir "${CMAKE_BINARY_DIR}/rust"
+            --target-dir "${MOONSHOT_OUTPUT_ROOT}/$<CONFIG>/rust"
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
                 "${CMAKE_CURRENT_SOURCE_DIR}/moon_wasm/index.html"
-                "${CMAKE_BINARY_DIR}/Tools/$<CONFIG>/moon_wasm/index.html"
+            "${MOONSHOT_OUTPUT_ROOT}/$<CONFIG>/moon_wasm/index.html"
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
                 "${CMAKE_CURRENT_SOURCE_DIR}/moon_wasm/serve.py"
-                "${CMAKE_BINARY_DIR}/Tools/$<CONFIG>/moon_wasm/serve.py"
+            "${MOONSHOT_OUTPUT_ROOT}/$<CONFIG>/moon_wasm/serve.py"
         WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/moon_wasm"
         COMMENT "Building moon_wasm (Rust → WASM viewer)"
         VERBATIM
     )
 
     # RustBlade must build first so proc-macro host binaries are cached
-    # in build/rust before wasm-pack tries to compile them.
+    # in the config-specific Rust target dir before wasm-pack compiles.
     if(TARGET rustblade)
         add_dependencies(moon_wasm rustblade)
     endif()
