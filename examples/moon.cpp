@@ -706,6 +706,11 @@ static void SaveFromRuns(const std::string& idxPath,
 
 static void Search(IndexContext& ctx, const std::string& query)
 {
+    if (ctx.GetStore()->TotalDocs() == 0) {
+        std::cout << "(no results)\n";
+        return;
+    }
+
     IndexSearchCompiler compiler;
     auto* tree = compiler.Compile(query.c_str(), "AUTB");
 
