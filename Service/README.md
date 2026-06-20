@@ -137,7 +137,7 @@ Response:
 ```json
 {
   "query": "usage",
-  "vector_dim": 128,
+  "vector_dim": 512,
   "vector_count": 19347,
   "total": 19347,
   "offset": 0,

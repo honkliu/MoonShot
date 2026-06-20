@@ -7,25 +7,25 @@
 int main() {
     // Test 1: Create embedding model
     std::cout << "Test 1: Create TFIDFSemanticEmbedding model...";
-    auto model = std::make_shared<TFIDFSemanticEmbedding>(128);
+    auto model = std::make_shared<TFIDFSemanticEmbedding>(DOC_VECTOR_DIM);
     std::cout << " OK\n";
 
     // Test 2: Check dimension
-    std::cout << "Test 2: Check dimension (expected 128)... " << model->GetDimension();
-    assert(model->GetDimension() == 128);
+    std::cout << "Test 2: Check dimension (expected 512)... " << model->GetDimension();
+    assert(model->GetDimension() == DOC_VECTOR_DIM);
     std::cout << " OK\n";
 
     // Test 3: Embed empty tokens
     std::cout << "Test 3: Embed empty tokens...";
     auto empty_vec = model->Embed(std::vector<std::string>{});
-    assert(empty_vec.size() == 128);
+    assert(empty_vec.size() == DOC_VECTOR_DIM);
     std::cout << " OK\n";
 
     // Test 4: Embed some tokens
     std::cout << "Test 4: Embed real tokens with TF-IDF semantics...";
     std::vector<std::string> tokens = {"search", "engine", "rocks"};
     auto vec = model->Embed(tokens);
-    assert(vec.size() == 128);
+    assert(vec.size() == DOC_VECTOR_DIM);
     std::cout << " OK\n";
 
     // Test 5: Verify normalization (L2 norm ≈ 1.0)

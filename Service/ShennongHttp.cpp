@@ -272,7 +272,7 @@ public:
     explicit SearchService(std::string index_path)
         : m_IndexPath(std::move(index_path)), m_Context("", m_IndexPath.c_str())
     {
-        if (m_Context.GetStore()->TotalDocs() == 0) {
+        if (m_Context.DocumentCount() == 0) {
             throw std::runtime_error("index loaded with zero docs or failed to load: " + m_IndexPath);
         }
     }
@@ -284,8 +284,8 @@ public:
         out << "{\"status\":\"ok\",\"index\":\"" << json_escape(m_IndexPath) << "\""
             << ",\"documents\":" << header.IFH_NumDocuments
             << ",\"avg_doc_len\":" << header.IFH_AvgDocLength
-            << ",\"vector_count\":" << m_Context.GetStore()->VectorCount()
-            << ",\"vector_dim\":" << m_Context.GetStore()->VectorDimension()
+            << ",\"vector_count\":" << m_Context.VectorCount()
+            << ",\"vector_dim\":" << m_Context.VectorDimension()
             << "}";
         return out.str();
     }
@@ -311,7 +311,7 @@ public:
         std::vector<SearchResult> results;
         {
             std::lock_guard<std::mutex> lock(m_QueryMutex);
-            auto tree = std::unique_ptr<EvalTree>(m_Context.GetCompiler()->Compile(query.c_str(), streams.c_str()));
+            auto tree = std::unique_ptr<EvalTree>(m_Context.Compile(query.c_str(), streams.c_str()));
             if (tree && !tree->IsEmpty()) {
                 auto reader = m_Context.GetReader(tree.get());
                 auto executor = std::unique_ptr<IndexSearchExecutor>(m_Context.GetExecutor());
@@ -337,7 +337,7 @@ public:
         for (int i = begin; i < end; ++i) {
             if (i > begin) out << ',';
             const auto& result = results[static_cast<size_t>(i)];
-            const std::string& path = m_Context.GetStore()->GetDocPath(result.doc_id);
+            const std::string path = m_Context.GetDocPath(result.doc_id);
             out << "{\"rank\":" << (i + 1)
                 << ",\"doc_id\":" << result.doc_id
                 << ",\"score\":" << result.score
@@ -364,7 +364,7 @@ public:
             auto qit = params.find("q");
             queryText = qit == params.end() ? "" : qit->second;
             if (queryText.empty()) return "{\"error\":\"missing q or vector parameter\"}";
-            tree.reset(m_Context.GetCompiler()->Compile(queryText.c_str(), "V"));
+            tree.reset(m_Context.Compile(queryText.c_str(), "V"));
         }
 
         if (!tree || !tree->HasVectorQuery()) return "{\"error\":\"empty query vector\"}";
@@ -387,7 +387,7 @@ public:
         std::ostringstream out;
         out << "{\"query\":\"" << json_escape(queryText) << "\""
             << ",\"vector_dim\":" << tree->vector_query.size()
-            << ",\"vector_count\":" << m_Context.GetStore()->VectorCount()
+            << ",\"vector_count\":" << m_Context.VectorCount()
             << ",\"efSearch\":" << efSearch
             << ",\"total\":" << total
             << ",\"offset\":" << begin
@@ -397,7 +397,7 @@ public:
         for (int i = begin; i < end; ++i) {
             if (i > begin) out << ',';
             const auto& result = results[static_cast<size_t>(i)];
-            const std::string& path = m_Context.GetStore()->GetDocPath(result.doc_id);
+            const std::string path = m_Context.GetDocPath(result.doc_id);
             out << "{\"rank\":" << (i + 1)
                 << ",\"doc_id\":" << result.doc_id
                 << ",\"score\":" << result.score

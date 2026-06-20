@@ -433,12 +433,11 @@ void TestEndToEnd()
     }
 
     {
-        IndexSearchCompiler compiler;
-        std::unique_ptr<EvalTree> tree(compiler.Compile("fox lazy", "AUTBV"));
+        std::unique_ptr<EvalTree> tree(index_context->Compile("fox lazy", "AUTBV"));
         assert(tree != nullptr);
         assert(tree->HasTextQuery());
         assert(tree->HasVectorQuery());
-        assert(tree->vector_query.size() == 128);
+        assert(tree->vector_query.size() == DOC_VECTOR_DIM);
         auto reader = index_context->GetReader(tree.get());
         auto executor = index_context->GetExecutor();
         auto results = executor->Execute(reader, 10);
@@ -502,15 +501,18 @@ void TestDiskPersistence()
     {
         IndexContext engine2("", INDEX_FILE);  // auto-loads on construction
 
-        std::cout << "  Loaded " << engine2.GetStore()->TotalDocs()
-                  << " docs from disk\n";
+        std::cout << "  Loaded " << engine2.DocumentCount()
+              << " docs from disk\n";
 
-        assert(engine2.GetStore()->TotalDocs() == 3 &&
+        assert(engine2.DocumentCount() == 3 &&
                "Loaded doc count must match written doc count");
-         assert(engine2.GetStore()->VectorCount() == 3 &&
+         assert(engine2.VectorCount() == 3 &&
              "Loaded vector count must come from DocDataEntry vectors");
-         assert(engine2.GetStore()->GetDocVector(0) != nullptr &&
-             "DocDataEntry must preserve doc 0 embedding");
+         auto vectorResults = engine2.VectorSearch(BuildHashedEmbedding(g_tokenizer.Tokenize("rust systems programming")), 3);
+         bool foundVectorDoc0 = false;
+         for (const auto& result : vectorResults)
+             if (result.doc_id == 0) foundVectorDoc0 = true;
+         assert(foundVectorDoc0 && "DocDataEntry vectors must rebuild IndexContext vector index");
 
         /*
         * Run the same queries as the other tests to confirm results match.
@@ -560,10 +562,11 @@ void TestDiskPersistence()
         IndexContext engine3("", INDEX_FILE);
         auto writer = engine3.GetWriter();
         writer->Write(g_tokenizer.Tokenize("New document after overwrite"), 0, "Body");
+        writer->SetDocVector(0, BuildHashedEmbedding(g_tokenizer.Tokenize("new document overwrite")));
         engine3.SaveIndex();
 
         IndexContext engine4("", INDEX_FILE);
-        assert(engine4.GetStore()->TotalDocs() == 1 &&
+        assert(engine4.DocumentCount() == 1 &&
                "After overwrite, only new doc should be present");
         std::cout << "  Overwrite test passed: 1 doc loaded\n";
     }

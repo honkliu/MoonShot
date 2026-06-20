@@ -8,7 +8,8 @@ use crate::pinned_memory::PinnedMemory;
 
 pub const PAGE_SIZE: usize = 4096;
 pub const DOC_REC_SIZE: usize = 1024;
-pub const DOC_VECTOR_STORAGE_MAX_DIM: usize = 512;
+pub const DOC_VECTOR_DIM: usize = 512;
+pub const DOC_VECTOR_STORAGE_MAX_DIM: usize = DOC_VECTOR_DIM;
 pub const DOC_PATH_MAX: usize = 256;
 pub const HEAD_TERM_KEY_MAX: usize = 26;
 pub const LEAF_TERM_DIRECTORY_COUNT: usize = 96;

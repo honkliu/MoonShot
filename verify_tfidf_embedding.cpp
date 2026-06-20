@@ -11,12 +11,12 @@ class IEmbeddingModel {
 public:
     virtual ~IEmbeddingModel() = default;
     virtual std::vector<float> Embed(const std::vector<std::string>& tokens) const = 0;
-    virtual size_t GetDimension() const { return 128; }
+    virtual size_t GetDimension() const { return 512; }
 };
 
 class TFIDFSemanticEmbedding : public IEmbeddingModel {
 public:
-    explicit TFIDFSemanticEmbedding(size_t dim = 128) : m_Dim(dim) {}
+    explicit TFIDFSemanticEmbedding(size_t dim = 512) : m_Dim(dim) {}
 
     std::vector<float> Embed(const std::vector<std::string>& tokens) const override
     {
@@ -65,7 +65,7 @@ private:
 };
 
 int main() {
-    auto model = std::make_shared<TFIDFSemanticEmbedding>(128);
+    auto model = std::make_shared<TFIDFSemanticEmbedding>(512);
     
     std::vector<std::string> tokens = {"search", "engine", "production", "semantic"};
     auto vec = model->Embed(tokens);

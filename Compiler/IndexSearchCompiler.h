@@ -10,7 +10,6 @@
 #include <vector>
 #include <algorithm>
 #include <cctype>
-#include <cassert>
 
 /*
 * Compiles a query string into an EvalTree.
@@ -45,9 +44,8 @@ public:
         auto tree  = new EvalTree();
         tree->root = root;
         if (HasVectorStream(streamSet)) {
-            static TFIDFSemanticEmbedding defaultEmbeddingModel(128);
-            IEmbeddingModel* model = embeddingModel ? embeddingModel : &defaultEmbeddingModel;
-            tree->vector_query = CompileToVector(queryString, model);
+            if (embeddingModel)
+                tree->vector_query = CompileToVector(queryString, embeddingModel);
         }
         return tree;
     }
@@ -55,7 +53,6 @@ public:
     std::vector<float> CompileToVector(const char* queryString,
                                        IEmbeddingModel* model)
     {
-        assert(model && "Embedding model is required!");
         if (!queryString || !*queryString)
             return std::vector<float>(model->GetDimension(), 0.0f);
         return model->Embed(m_Tokenizer->Tokenize(queryString));

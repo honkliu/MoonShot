@@ -288,18 +288,10 @@ bool IndexSerializer::Save(const PostingStore& store, const char* path)
         entry.DDE_FreshnessScore = 0.0f;
         entry.DDE_ClickScore = 0.0f;
         entry.DDE_EngagementScore = 0.0f;
-        // Doc vectors are stored in the in-memory vector index, not in DocStats.
-        // DDE_VectorData is int8_t[512], quantized from float32.
-        if (const auto* docVector = store.GetDocVector(id);
-            docVector && !docVector->empty() && docVector->size() <= DOC_VECTOR_STORAGE_MAX_DIM) {
-            entry.DDE_VectorDim = static_cast<uint16_t>(docVector->size());
+        if (const auto* docVector = store.GetDocVector(id)) {
+            entry.DDE_VectorDim = static_cast<uint16_t>(DOC_VECTOR_DIM);
             entry.DDE_VectorFormat = 1;  // int8 quantized
-            for (size_t i = 0; i < docVector->size(); ++i) {
-                // Quantize float32 to int8: clamp to [-128, 127]
-                const float val = (*docVector)[i];
-                const float clipped = std::max(-128.0f, std::min(127.0f, val * 128.0f));
-                entry.DDE_VectorData[i] = static_cast<int8_t>(std::round(clipped));
-            }
+            std::memcpy(entry.DDE_VectorData, docVector, DOC_VECTOR_DIM);
         }
         entry.DDE_PathLength = static_cast<uint16_t>(std::min(ds.path.size(), DOC_PATH_MAX));
         if (entry.DDE_PathLength > 0)
@@ -419,14 +411,7 @@ bool IndexSerializer::Load(PostingStore&                           store,
                 continue;
             store.AddDocTokens(entry.DDE_DocID, entry.DDE_DocLength);
             store.SetDocImportance(entry.DDE_DocID, entry.DDE_StaticRank);
-            if (entry.DDE_VectorDim > 0 && entry.DDE_VectorDim <= DOC_VECTOR_STORAGE_MAX_DIM && entry.DDE_VectorFormat == 1) {
-                std::vector<float> vector(entry.DDE_VectorDim);
-                for (size_t i = 0; i < entry.DDE_VectorDim; ++i) {
-                    // Dequantize int8 back to float32
-                    vector[i] = static_cast<float>(entry.DDE_VectorData[i]) / 128.0f;
-                }
-                store.SetDocVector(entry.DDE_DocID, std::move(vector));
-            }
+            store.SetDocVector(entry.DDE_DocID, entry.DDE_VectorData);
             if (entry.DDE_PathLength > 0 && entry.DDE_PathLength <= DOC_PATH_MAX)
                 store.SetDocPath(entry.DDE_DocID, std::string(reinterpret_cast<const char*>(entry.DDE_Path), entry.DDE_PathLength));
         }

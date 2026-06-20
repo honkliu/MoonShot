@@ -648,10 +648,10 @@ static void SaveFromRuns(const std::string& idxPath,
         docdata[i].DDE_DocID = docs[i].doc_id;
         docdata[i].DDE_StaticRank = docs[i].importance;
         docdata[i].DDE_DocLength = docs[i].doc_len;
-        if (!docs[i].vector.empty() && docs[i].vector.size() <= DOC_VECTOR_STORAGE_MAX_DIM) {
-            docdata[i].DDE_VectorDim = static_cast<uint16_t>(docs[i].vector.size());
+        if (docs[i].vector.size() == DOC_VECTOR_DIM) {
+            docdata[i].DDE_VectorDim = static_cast<uint16_t>(DOC_VECTOR_DIM);
             docdata[i].DDE_VectorFormat = 1;
-            for (size_t j = 0; j < docs[i].vector.size(); ++j) {
+            for (size_t j = 0; j < DOC_VECTOR_DIM; ++j) {
                 // Quantize float32 to int8: clamp to [-128, 127]
                 const float val = docs[i].vector[j];
                 const float clipped = std::max(-128.0f, std::min(127.0f, val * 128.0f));
@@ -740,7 +740,7 @@ static void Search(IndexContext& ctx, const std::string& query)
 
         for (size_t i = offset; i < end; ++i) {
             const auto& r = results[i];
-            const std::string& path = ctx.GetStore()->GetDocPath(r.doc_id);
+            const std::string path = ctx.GetDocPath(r.doc_id);
             std::cout << (path.empty() ? "[unknown]" : path) << "\n";
         }
 

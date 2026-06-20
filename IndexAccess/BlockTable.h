@@ -22,8 +22,8 @@
 
 static constexpr int PAGE_SIZE  = 4096;
 static constexpr size_t DOC_REC_SIZE = 1024;
-static constexpr size_t DOC_VECTOR_DIM = 128;
-static constexpr size_t DOC_VECTOR_STORAGE_MAX_DIM = 512;  // int8[512]
+static constexpr size_t DOC_VECTOR_DIM = 512;
+static constexpr size_t DOC_VECTOR_STORAGE_MAX_DIM = DOC_VECTOR_DIM;  // fixed int8[512]
 static constexpr size_t DOC_PATH_MAX = 256;
 static constexpr size_t HEAD_TERM_KEY_MAX = 26;
 static constexpr size_t LEAF_TERM_DIRECTORY_COUNT = 96;

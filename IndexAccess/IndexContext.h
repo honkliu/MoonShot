@@ -66,7 +66,6 @@ public:
         , m_BlockTable(512)
         , m_Compiler(&m_Tokenizer)
         , m_Executor(this)
-        , m_EmbeddingModel(make_shared<TFIDFSemanticEmbedding>(128))
         , m_IndexPath(indexFile ? indexFile : "")
         , m_Built(false)
         , m_LoadedFromDisk(false)
@@ -131,7 +130,7 @@ public:
         writer->Write(metaTokens, docId, "Meta");
         writer->SetDocImportance(docId, doc.importance);
         if (!embeddingTokens.empty())
-            writer->SetDocVector(docId, m_EmbeddingModel->Embed(embeddingTokens));
+            writer->SetDocVector(docId, m_VectorIndex.GetModel()->Embed(embeddingTokens));
         if (!doc.path.empty())
             m_Store->SetDocPath(docId, doc.path);
 
@@ -193,6 +192,7 @@ public:
         m_BlockTable.Init(BlockKind::LeafTerm, nullptr, 0, leafTermBlockCount, leafTermBlockCount);
         m_BlockTable.SetBlockMemory(indexBlocks, leafTermBlocks);
         m_BlockTable.SetHeadTermEntries(std::move(headTermEntries), headCount);
+        RefreshVectorIndexFromDocData();
 
         m_Built = true;
         m_LoadedFromDisk = false;
@@ -228,12 +228,17 @@ public:
     IndexSearchCompiler* GetCompiler()  { return &m_Compiler; }
     IndexSearchExecutor* GetExecutor()  { return new IndexSearchExecutor(this); }
 
+    EvalTree* Compile(const char* queryString,
+                      const char* streamSet = "AUT")
+    {
+        return m_Compiler.Compile(queryString, streamSet, m_VectorIndex.GetModel());
+    }
+
     /* Compile query string and return an ISR tree ready for traversal. */
     shared_ptr<IndexReader> GetReader(const char* queryString,
                                       const char* streamSet = "AUT")
     {
-        auto tree = std::unique_ptr<EvalTree>(
-                        m_Compiler.Compile(queryString, streamSet, m_EmbeddingModel.get()));
+        auto tree = std::unique_ptr<EvalTree>(Compile(queryString, streamSet));
         return GetReader(tree.get());
     }
 
@@ -249,6 +254,14 @@ public:
 
     PostingStore* GetStore() { return m_Store.get(); }
 
+    std::string GetDocPath(uint64_t docId) const
+    {
+        const auto* entry = GetDocDataEntry(docId);
+        if (!entry || entry->DDE_PathLength == 0 || entry->DDE_PathLength > DOC_PATH_MAX)
+            return {};
+        return std::string(reinterpret_cast<const char*>(entry->DDE_Path), entry->DDE_PathLength);
+    }
+
     const DocDataEntry* GetDocDataEntry(uint64_t docId) const
     {
         if (!m_DocData || docId >= m_IndexFileHeader.IFH_NumDocuments)
@@ -259,10 +272,11 @@ public:
     }
 
     const IndexFileHeader& GetIndexFileHeader() const { return m_IndexFileHeader; }
+    uint64_t DocumentCount() const { return m_IndexFileHeader.IFH_NumDocuments; }
 
     std::vector<float> CompileToVector(const char* queryString)
     {
-        return m_Compiler.CompileToVector(queryString, m_EmbeddingModel.get());
+        return m_Compiler.CompileToVector(queryString, m_VectorIndex.GetModel());
     }
 
     std::vector<VectorSearchResult> VectorSearch(const std::vector<float>& query,
@@ -270,8 +284,11 @@ public:
                                                  VectorMetric metric = VectorMetric::Cosine,
                                                  size_t efSearch = 200)
     {
-        return m_Store->VectorSearch(query, topK, metric, efSearch);
+        return m_VectorIndex.Search(query, topK, metric, efSearch);
     }
+
+    size_t VectorCount() const { return m_VectorIndex.Size(); }
+    size_t VectorDimension() const { return m_VectorIndex.Dimension(); }
 
     bool SaveIndex()
     {
@@ -424,7 +441,7 @@ public:
             }
         }
 
-        RefreshStoreFromLoadedDocData();
+        RefreshVectorIndexFromDocData();
 
         m_Executor = IndexSearchExecutor(this);
         m_Built    = true;
@@ -442,10 +459,10 @@ private:
     shared_ptr<PostingStore>     m_Store;
     shared_ptr<ConfigParameters> m_Params;
     IndexBlockTable              m_BlockTable;
+    FreshDiskAnnVectorIndex      m_VectorIndex;
     SmartTokenizer               m_Tokenizer;
     IndexSearchCompiler          m_Compiler;
     IndexSearchExecutor          m_Executor;
-    shared_ptr<IEmbeddingModel>  m_EmbeddingModel;
     std::string                  m_IndexPath;
     bool                         m_Built;
     bool                         m_LoadedFromDisk;
@@ -462,6 +479,7 @@ private:
         if (m_DocData)
             PinnedMemFree(m_DocData);
         m_DocData = nullptr;
+        m_VectorIndex.Clear();
     }
 
     void ClearPinnedIndexData()
@@ -508,16 +526,10 @@ private:
             entry->DDE_DocID = docId;
             entry->DDE_StaticRank = stats.importance;
             entry->DDE_DocLength = stats.doc_len;
-            if (const auto* vector = m_Store->GetDocVector(docId);
-                vector && !vector->empty() && vector->size() <= DOC_VECTOR_STORAGE_MAX_DIM) {
-                entry->DDE_VectorDim = static_cast<uint16_t>(vector->size());
+            if (const auto* vector = m_Store->GetDocVector(docId)) {
+                entry->DDE_VectorDim = static_cast<uint16_t>(DOC_VECTOR_DIM);
                 entry->DDE_VectorFormat = 1;
-                for (size_t i = 0; i < vector->size(); ++i) {
-                    // Quantize float32 to int8: clamp to [-128, 127]
-                    const float val = (*vector)[i];
-                    const float clipped = std::max(-128.0f, std::min(127.0f, val * 128.0f));
-                    entry->DDE_VectorData[i] = static_cast<int8_t>(std::round(clipped));
-                }
+                std::memcpy(entry->DDE_VectorData, vector, DOC_VECTOR_DIM);
             }
             entry->DDE_PathLength = static_cast<uint16_t>(std::min(stats.path.size(), DOC_PATH_MAX));
             if (entry->DDE_PathLength > 0)
@@ -534,32 +546,12 @@ private:
         return true;
     }
 
-    void RefreshStoreFromLoadedDocData()
+    void RefreshVectorIndexFromDocData()
     {
-        m_Store = make_shared<PostingStore>();
-        if (!m_DocData || m_IndexFileHeader.IFH_NumDocuments == 0)
-            return;
+        m_VectorIndex.SetDocData(m_DocData);
 
         for (uint64_t docId = 0; docId < m_IndexFileHeader.IFH_NumDocuments; ++docId) {
-            const auto* entry = reinterpret_cast<const DocDataEntry*>(m_DocData + docId * DOC_REC_SIZE);
-            if (entry->DDE_DocID != docId)
-                continue;
-
-            m_Store->AddDocTokens(docId, entry->DDE_DocLength);
-            m_Store->SetDocImportance(docId, entry->DDE_StaticRank);
-
-            if (entry->DDE_VectorDim > 0
-                && entry->DDE_VectorDim <= DOC_VECTOR_STORAGE_MAX_DIM
-                && entry->DDE_VectorFormat == 1)
-            {
-                std::vector<float> vector(entry->DDE_VectorDim);
-                for (size_t i = 0; i < entry->DDE_VectorDim; ++i)
-                    vector[i] = static_cast<float>(entry->DDE_VectorData[i]) / 128.0f;
-                m_Store->SetDocVector(docId, std::move(vector));
-            }
-
-            if (entry->DDE_PathLength > 0 && entry->DDE_PathLength <= DOC_PATH_MAX)
-                m_Store->SetDocPath(docId, std::string(reinterpret_cast<const char*>(entry->DDE_Path), entry->DDE_PathLength));
+            m_VectorIndex.Add(docId);
         }
     }
 
@@ -648,13 +640,13 @@ private:
     shared_ptr<IndexReader> BuildVectorIndexReader(const std::vector<float>& queryVector,
                                                    size_t efSearch = 200)
     {
-        if (queryVector.empty() || m_Store->VectorCount() == 0) {
+        if (queryVector.empty() || m_VectorIndex.Empty()) {
             auto empty = make_shared<AdvancedIndexReader>();
             return empty;
         }
 
         return make_shared<VectorIndexReader>(
-            m_Store->VectorSearch(queryVector, 0, VectorMetric::Cosine, efSearch));
+            m_VectorIndex.Search(queryVector, 0, VectorMetric::Cosine, efSearch));
     }
 };
 

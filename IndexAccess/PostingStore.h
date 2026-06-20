@@ -3,7 +3,10 @@
 
 #include "Embeddings.h"
 
+#include <array>
+#include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <string>
 #include <vector>
 #include <unordered_map>
@@ -182,34 +185,25 @@ public:
 
     bool SetDocVector(uint64_t doc_id, std::vector<float> vector)
     {
+        if (vector.size() != DOC_VECTOR_DIM) return false;
         if (!HasDoc(doc_id))
             m_DocStats[doc_id];
-        return m_VectorIndex.Add(doc_id, std::move(vector));
+        m_DocVectors[doc_id] = QuantizeVector(vector);
+        return true;
     }
 
-    const std::vector<float>* GetDocVector(uint64_t doc_id) const
+    bool SetDocVector(uint64_t doc_id, const int8_t* vector)
     {
-        return m_VectorIndex.Get(doc_id);
+        if (!vector) return false;
+        if (!HasDoc(doc_id))
+            m_DocStats[doc_id];
+        DocVectorBytes payload{};
+        std::memcpy(payload.data(), vector, DOC_VECTOR_DIM);
+        m_DocVectors[doc_id] = std::move(payload);
+        return true;
     }
 
-    std::vector<VectorSearchResult> VectorSearch(const std::vector<float>& query,
-                                                 size_t topK = 20,
-                                                 VectorMetric metric = VectorMetric::Cosine,
-                                                 size_t efSearch = 200) const
-    {
-        return m_VectorIndex.Search(query, topK, metric, efSearch);
-    }
-
-    const std::unordered_map<uint64_t, std::vector<float>>& AllDocVectors() const
-    {
-        return m_VectorIndex.AllVectors();
-    }
-
-    FreshDiskAnnVectorIndex& MutableVectorIndex() { return m_VectorIndex; }
-    const FreshDiskAnnVectorIndex& GetVectorIndex() const { return m_VectorIndex; }
-
-    size_t VectorDimension() const { return m_VectorIndex.Dimension(); }
-    size_t VectorCount() const { return m_VectorIndex.Size(); }
+    const int8_t* GetDocVector(uint64_t doc_id) const { return m_DocVectors.at(doc_id).data(); }
 
     uint64_t TotalTerms() const { return m_TotalTerms; }
 
@@ -218,9 +212,21 @@ public:
     size_t UniqueTermCount() const { return m_Postings.size(); }
 
 private:
+    using DocVectorBytes = std::array<int8_t, DOC_VECTOR_DIM>;
+
+    static DocVectorBytes QuantizeVector(const std::vector<float>& vector)
+    {
+        DocVectorBytes out{};
+        for (size_t i = 0; i < DOC_VECTOR_DIM; ++i) {
+            const float clipped = std::max(-128.0f, std::min(127.0f, vector[i] * 128.0f));
+            out[i] = static_cast<int8_t>(std::round(clipped));
+        }
+        return out;
+    }
+
     std::unordered_map<std::string, PostingList> m_Postings;
     std::unordered_map<uint64_t, DocStats>       m_DocStats;
-    FreshDiskAnnVectorIndex                      m_VectorIndex;
+    std::unordered_map<uint64_t, DocVectorBytes> m_DocVectors;
     uint64_t m_TotalTerms = 0;
     uint64_t m_PostingEntries = 0;
 };
