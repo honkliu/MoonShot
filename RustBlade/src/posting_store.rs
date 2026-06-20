@@ -37,11 +37,9 @@ impl PostingList {
 
     fn encode(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(self.entries.len() * 3);
-        let mut prev = 0u64;
         for e in &self.entries {
-            vb_write(e.ie_doc_id - prev, &mut out);
+            vb_write(e.ie_doc_id, &mut out);
             vb_write(e.ie_term_frequency as u64, &mut out);
-            prev = e.ie_doc_id;
         }
         out
     }

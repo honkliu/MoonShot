@@ -61,15 +61,12 @@ impl IndexContext {
         let table = Arc::get_mut(&mut self.block_table)
             .expect("BlockTable must have no other refs during build");
 
-        let (blocks, head_term_entries, leaf_term_blocks, pageskip) = IndexSerializer::build_blocks_pub(&store);
+        let (blocks, head_term_entries, leaf_term_blocks) = IndexSerializer::build_blocks_pub(&store);
         let n = blocks.len();
         *table = IndexBlockTable::new(n.max(512) + 64);
 
-        for (seq, blk) in blocks.into_iter().enumerate() {
-            table.insert_block(seq as u32, blk);
-        }
+        table.set_index_blocks(blocks);
         table.set_head_leaf_term_table(head_term_entries, leaf_term_blocks);
-        table.set_page_skip_data(pageskip);
 
         self.built = true;
     }
@@ -118,13 +115,10 @@ impl IndexContext {
     pub fn load_index(&mut self, path: &str) -> Result<()> {
         self.index_path = Some(path.to_string());
         let mut store = PostingStore::new();
-        let (head_term_entries, leaf_term_blocks, blocks, pageskip) = IndexSerializer::load(&mut store, path)?;
+        let (head_term_entries, leaf_term_blocks, blocks) = IndexSerializer::load(&mut store, path)?;
         let mut table = IndexBlockTable::new(blocks.len().max(512) + 64);
-        for (seq, blk) in blocks.into_iter().enumerate() {
-            table.insert_block(seq as u32, blk);
-        }
+        table.set_index_blocks(blocks);
         table.set_head_leaf_term_table(head_term_entries, leaf_term_blocks);
-        table.set_page_skip_data(pageskip);
 
         self.store       = Arc::new(Mutex::new(store));
         self.block_table = Arc::new(table);
@@ -135,13 +129,10 @@ impl IndexContext {
     /// Load from raw bytes (WASM path — no file system access needed).
     pub fn load_from_bytes(&mut self, data: &[u8]) -> Result<()> {
         let mut store = PostingStore::new();
-        let (head_term_entries, leaf_term_blocks, blocks, pageskip) = IndexSerializer::decode(&mut store, data)?;
+        let (head_term_entries, leaf_term_blocks, blocks) = IndexSerializer::decode(&mut store, data)?;
         let mut table = IndexBlockTable::new(blocks.len().max(512) + 64);
-        for (seq, blk) in blocks.into_iter().enumerate() {
-            table.insert_block(seq as u32, blk);
-        }
+        table.set_index_blocks(blocks);
         table.set_head_leaf_term_table(head_term_entries, leaf_term_blocks);
-        table.set_page_skip_data(pageskip);
 
         self.store       = Arc::new(Mutex::new(store));
         self.block_table = Arc::new(table);

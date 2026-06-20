@@ -1,7 +1,8 @@
 use std::sync::Arc;
 use crate::block_table::IndexBlock;
 
-/// Stateful VarByte-delta decoder.  Two modes:
+/// Stateful VarByte decoder.  Posting bytes store absolute (docID, tf) pairs.
+/// Two modes:
 ///   open_raw — reads from an explicit byte slice (offset + len within a block).
 ///   open_cont — reads continuation bytes from the start of a continuation block.
 pub struct VarByteDecoder {
@@ -38,19 +39,6 @@ impl VarByteDecoder {
         self.has_current = false;
     }
 
-    /// Open on a continuation block (skip 2-byte CONT_MARKER, read remainder).
-    pub fn open_continuation(&mut self, block: Arc<IndexBlock>, last_doc: u64) {
-        let data = if block.ib_data.len() > 2 { &block.ib_data[2..] } else { &[] };
-        self.raw_data    = data.to_vec();
-        self.block       = Some(block);
-        self.raw_mode    = true;
-        self.pos         = 0;
-        self.end         = self.raw_data.len();
-        self.current_doc = last_doc;
-        self.current_tf  = 0;
-        self.has_current = false;
-    }
-
     fn has_more_bytes(&self) -> bool {
         self.pos < self.end
     }
@@ -60,7 +48,7 @@ impl VarByteDecoder {
             self.has_current = false;
             return;
         }
-        let (delta, n) = vb_read(&self.raw_data, self.pos);
+        let (doc_id, n) = vb_read(&self.raw_data, self.pos);
         self.pos += n;
         if self.pos >= self.end && n == 0 {
             self.has_current = false;
@@ -69,7 +57,7 @@ impl VarByteDecoder {
         let (tf, m) = vb_read(&self.raw_data, self.pos);
         self.pos += m;
 
-        self.current_doc += delta;
+        self.current_doc  = doc_id;
         self.current_tf   = tf as u32;
         self.has_current  = true;
     }

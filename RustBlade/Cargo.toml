@@ -32,6 +32,3 @@ tempfile = "3"
 name = "demo"
 path = "examples/demo.rs"
 
-[[example]]
-name = "morning_vietnam"
-path = "examples/morning_vietnam.rs"
