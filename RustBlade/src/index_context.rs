@@ -115,10 +115,18 @@ impl IndexContext {
     pub fn load_index(&mut self, path: &str) -> Result<()> {
         self.index_path = Some(path.to_string());
         let mut store = PostingStore::new();
-        let (head_term_entries, leaf_term_blocks, blocks) = IndexSerializer::load(&mut store, path)?;
-        let mut table = IndexBlockTable::new(blocks.len().max(512) + 64);
-        table.set_index_blocks(blocks);
-        table.set_head_leaf_term_table(head_term_entries, leaf_term_blocks);
+        let (header, head_term_entries) = IndexSerializer::load_file_tables(&mut store, path)?;
+        let mut table = IndexBlockTable::new(header.ifh_index_block_count as usize);
+        table.init_file_backed(
+            path,
+            header.ifh_index_block_offset,
+            header.ifh_index_block_count as u32,
+            header.ifh_index_block_count.min(25_600) as u32,
+            header.ifh_leaf_term_block_offset,
+            header.ifh_leaf_term_block_count as u32,
+            header.ifh_leaf_term_block_count.min(25_600) as u32,
+        )?;
+        table.set_head_entries(head_term_entries);
 
         self.store       = Arc::new(Mutex::new(store));
         self.block_table = Arc::new(table);

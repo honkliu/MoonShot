@@ -34,6 +34,9 @@ endif()
 # -------------------------------------------------------------------------
 find_package(mimalloc REQUIRED)
 message(STATUS "mimalloc ${mimalloc_VERSION} found")
+if(NOT TARGET mimalloc-static)
+    message(FATAL_ERROR "MoonShot requires the mimalloc-static target; install mimalloc with static target support")
+endif()
 
 find_package(Threads REQUIRED)
 
@@ -63,11 +66,7 @@ target_link_libraries(MoonShot INTERFACE
     Utils
 )
 
-if(TARGET mimalloc-static)
-    target_link_libraries(MoonShot INTERFACE mimalloc-static)
-else()
-    target_link_libraries(MoonShot INTERFACE mimalloc)
-endif()
+target_link_libraries(MoonShot INTERFACE mimalloc-static)
 
 target_link_libraries(MoonShot INTERFACE Threads::Threads)
 

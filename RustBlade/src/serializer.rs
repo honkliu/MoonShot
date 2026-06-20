@@ -1,5 +1,5 @@
 use std::fs::File;
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::io::{BufReader, BufWriter, Read, Seek, Write};
 
 use crate::block_table::{
     HeadTermEntry,
@@ -21,6 +21,40 @@ use crate::error::{Result, RustBladeError};
 use crate::posting_store::PostingStore;
 
 const MAGIC: &[u8; 8] = b"MOONSHOT";
+
+#[derive(Debug, Clone, Copy)]
+pub struct IndexFileHeader {
+    pub ifh_avg_doc_length: f32,
+    pub ifh_num_documents: u64,
+    pub ifh_num_terms: u64,
+    pub ifh_head_term_entry_offset: u64,
+    pub ifh_head_term_entry_count: u64,
+    pub ifh_leaf_term_block_offset: u64,
+    pub ifh_leaf_term_block_count: u64,
+    pub ifh_doc_data_offset: u64,
+    pub ifh_index_block_offset: u64,
+    pub ifh_index_block_count: u64,
+}
+
+impl IndexFileHeader {
+    pub fn parse(data: &[u8]) -> Result<Self> {
+        if data.len() < INDEX_FILE_HEADER_SIZE { return Err(RustBladeError::InvalidFormat); }
+        if &data[0..8] != MAGIC { return Err(RustBladeError::InvalidFormat); }
+        if u32_at(data, 8) != INDEX_FORMAT_VERSION { return Err(RustBladeError::InvalidFormat); }
+        Ok(Self {
+            ifh_avg_doc_length: f32_at(data, 12),
+            ifh_num_documents: u64_at(data, 16),
+            ifh_num_terms: u64_at(data, 24),
+            ifh_head_term_entry_offset: u64_at(data, 32),
+            ifh_head_term_entry_count: u64_at(data, 40),
+            ifh_leaf_term_block_offset: u64_at(data, 48),
+            ifh_leaf_term_block_count: u64_at(data, 56),
+            ifh_doc_data_offset: u64_at(data, 64),
+            ifh_index_block_offset: u64_at(data, 72),
+            ifh_index_block_count: u64_at(data, 80),
+        })
+    }
+}
 
 pub struct BlocksResult {
     pub bbr_index_blocks: Vec<IndexBlock>,
@@ -99,21 +133,40 @@ impl IndexSerializer {
         Self::decode(store, &bytes)
     }
 
+    pub fn load_file_tables(store: &mut PostingStore, path: &str)
+        -> Result<(IndexFileHeader, Vec<HeadTermEntry>)>
+    {
+        let file = File::open(path)?;
+        let mut reader = BufReader::new(file);
+        let mut header_bytes = [0u8; INDEX_FILE_HEADER_SIZE];
+        reader.read_exact(&mut header_bytes)?;
+        let header = IndexFileHeader::parse(&header_bytes)?;
+
+        let mut head = Vec::with_capacity(header.ifh_head_term_entry_count as usize);
+        reader.seek(std::io::SeekFrom::Start(header.ifh_head_term_entry_offset))?;
+        for _ in 0..header.ifh_head_term_entry_count {
+            let mut bytes = [0u8; 32];
+            reader.read_exact(&mut bytes)?;
+            head.push(HeadTermEntry::from_bytes(&bytes).ok_or(RustBladeError::InvalidFormat)?);
+        }
+
+        Self::load_docdata(store, &mut reader, &header)?;
+        Ok((header, head))
+    }
+
     pub fn decode(store: &mut PostingStore, data: &[u8])
         -> Result<(Vec<HeadTermEntry>, Vec<LeafTermBlock>, Vec<IndexBlock>)>
     {
-        if data.len() < INDEX_FILE_HEADER_SIZE { return Err(RustBladeError::InvalidFormat); }
-        if &data[0..8] != MAGIC { return Err(RustBladeError::InvalidFormat); }
-        if u32_at(data, 8) != INDEX_FORMAT_VERSION { return Err(RustBladeError::InvalidFormat); }
+        let header = IndexFileHeader::parse(data)?;
 
-        let head_offset = u64_at(data, 32) as usize;
-        let head_count = u64_at(data, 40) as usize;
-        let leaf_offset = u64_at(data, 48) as usize;
-        let leaf_count = u64_at(data, 56) as usize;
-        let docdata_offset = u64_at(data, 64) as usize;
-        let index_offset = u64_at(data, 72) as usize;
-        let index_count = u64_at(data, 80) as usize;
-        let num_docs = u64_at(data, 16) as usize;
+        let head_offset = header.ifh_head_term_entry_offset as usize;
+        let head_count = header.ifh_head_term_entry_count as usize;
+        let leaf_offset = header.ifh_leaf_term_block_offset as usize;
+        let leaf_count = header.ifh_leaf_term_block_count as usize;
+        let docdata_offset = header.ifh_doc_data_offset as usize;
+        let index_offset = header.ifh_index_block_offset as usize;
+        let index_count = header.ifh_index_block_count as usize;
+        let num_docs = header.ifh_num_documents as usize;
 
         let mut head = Vec::with_capacity(head_count);
         for index in 0..head_count {
@@ -132,19 +185,7 @@ impl IndexSerializer {
         for index in 0..num_docs {
             let offset = docdata_offset + index * DOC_REC_SIZE;
             if offset + DOC_REC_SIZE > data.len() { return Err(RustBladeError::InvalidFormat); }
-            let doc_id = u64_at(data, offset);
-            if doc_id != index as u64 { continue; }
-            let doc_len = u32_at(data, offset + 32);
-            let importance = f32_at(data, offset + 44);
-            let path_len = u16_at(data, offset + 72) as usize;
-            store.add_doc_tokens(doc_id, doc_len);
-            store.set_doc_importance(doc_id, importance);
-            if path_len > 0 && path_len <= DOC_PATH_MAX {
-                let path_offset = offset + 768;
-                if let Ok(path) = std::str::from_utf8(&data[path_offset..path_offset + path_len]) {
-                    store.set_doc_path(doc_id, path.to_string());
-                }
-            }
+            Self::decode_docdata_record(store, index as u64, &data[offset..offset + DOC_REC_SIZE])?;
         }
 
         let mut index_blocks = Vec::with_capacity(index_count);
@@ -157,6 +198,32 @@ impl IndexSerializer {
         }
 
         Ok((head, leaf_blocks, index_blocks))
+    }
+
+    fn load_docdata<R: Read + std::io::Seek>(store: &mut PostingStore, reader: &mut R, header: &IndexFileHeader) -> Result<()> {
+        reader.seek(std::io::SeekFrom::Start(header.ifh_doc_data_offset))?;
+        let mut record = [0u8; DOC_REC_SIZE];
+        for index in 0..header.ifh_num_documents {
+            reader.read_exact(&mut record)?;
+            Self::decode_docdata_record(store, index, &record)?;
+        }
+        Ok(())
+    }
+
+    fn decode_docdata_record(store: &mut PostingStore, index: u64, record: &[u8]) -> Result<()> {
+        let doc_id = u64_at(record, 0);
+        if doc_id != index { return Ok(()); }
+        let doc_len = u32_at(record, 32);
+        let importance = f32_at(record, 44);
+        let path_len = u16_at(record, 72) as usize;
+        store.add_doc_tokens(doc_id, doc_len);
+        store.set_doc_importance(doc_id, importance);
+        if path_len > 0 && path_len <= DOC_PATH_MAX {
+            if let Ok(path) = std::str::from_utf8(&record[768..768 + path_len]) {
+                store.set_doc_path(doc_id, path.to_string());
+            }
+        }
+        Ok(())
     }
 
     pub fn is_valid_index(path: &str) -> bool {

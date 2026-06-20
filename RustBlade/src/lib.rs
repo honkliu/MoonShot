@@ -1,12 +1,13 @@
-#[cfg(feature = "native-alloc")]
+#[cfg(not(target_arch = "wasm32"))]
 use mimalloc::MiMalloc;
 
-#[cfg(feature = "native-alloc")]
+#[cfg(not(target_arch = "wasm32"))]
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
 pub mod error;
 pub mod tokenizer;
+pub mod pinned_memory;
 pub mod posting_store;
 pub mod block_table;
 pub mod varbyte_decoder;

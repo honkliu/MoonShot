@@ -5,6 +5,7 @@ use crate::block_table::{
     IndexBlockContinuationHeader,
     IndexBlockTable,
     INDEX_BLOCK_CONTINUATION_HEADER_SIZE,
+    PinnedBlock,
 };
 use crate::bm25::Bm25Scorer;
 use crate::index_reader::{IndexReader, NO_MORE_DOCS};
@@ -51,7 +52,7 @@ impl AdvancedIndexReader {
         true
     }
 
-    fn open_continuation(&mut self, block: Arc<IndexBlock>) {
+    fn open_continuation(&mut self, block: PinnedBlock<IndexBlock>) {
         if let Some(header) = IndexBlockContinuationHeader::from_bytes(&block.ib_data) {
             let len = header.ibch_data_length as usize;
             self.decoder.open_raw(
@@ -79,7 +80,14 @@ impl IndexReader for AdvancedIndexReader {
             self.decoder.go_until(target);
             if !self.decoder.is_end() { break; }
             if self.remaining_continuation_blocks == 0 { break; }
-            if !self.load_continuation() { break; }
+            let Some(block) = self.block_table.get_block_by_seq(self.block_seq + 1) else { break; };
+            let Some(header) = IndexBlockContinuationHeader::from_bytes(&block.ib_data) else { break; };
+            self.block_seq += 1;
+            self.remaining_continuation_blocks = self.remaining_continuation_blocks.saturating_sub(1);
+            if target > header.ibch_max_doc_id {
+                continue;
+            }
+            self.open_continuation(block);
         }
     }
 

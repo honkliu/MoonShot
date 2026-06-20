@@ -6,6 +6,7 @@ use crate::eval_tree::BIGRAM_SEP;
 pub trait IndexWriter {
     fn write(&mut self, tokens: Vec<String>, doc_id: u64, stream: &str);
     fn set_doc_importance(&mut self, doc_id: u64, score: f32);
+    fn set_doc_path(&mut self, doc_id: u64, path: String);
 }
 
 /*
@@ -80,5 +81,9 @@ impl IndexWriter for AdvancedIndexWriter {
 
     fn set_doc_importance(&mut self, doc_id: u64, score: f32) {
         self.store.lock().unwrap().set_doc_importance(doc_id, score);
+    }
+
+    fn set_doc_path(&mut self, doc_id: u64, path: String) {
+        self.store.lock().unwrap().set_doc_path(doc_id, path);
     }
 }

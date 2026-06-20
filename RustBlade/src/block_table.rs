@@ -1,5 +1,10 @@
 use std::cell::RefCell;
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
+use std::ops::Deref;
 use std::sync::Arc;
+
+use crate::pinned_memory::PinnedMemory;
 
 pub const PAGE_SIZE: usize = 4096;
 pub const DOC_REC_SIZE: usize = 1024;
@@ -12,7 +17,7 @@ pub const INDEX_FILE_HEADER_SIZE: usize = 88;
 pub const INDEX_FORMAT_VERSION: u32 = 12;
 pub const INDEX_BLOCK_CONTINUATION_HEADER_SIZE: usize = 12;
 
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 pub struct IndexBlock {
     pub ib_data: [u8; PAGE_SIZE],
 }
@@ -21,7 +26,7 @@ impl Default for IndexBlock {
     fn default() -> Self { Self { ib_data: [0; PAGE_SIZE] } }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 pub struct LeafTermBlock {
     pub ltb_directory: [u16; LEAF_TERM_DIRECTORY_COUNT],
     pub ltb_data: [u8; PAGE_SIZE - LEAF_TERM_DATA_OFFSET],
@@ -175,7 +180,7 @@ impl BloomFilter {
     pub fn can_term_exist(&self, _term: &str) -> bool { true }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 struct IndexSlotEntry {
     block_id: u32,
     ref_count: u32,
@@ -185,49 +190,137 @@ impl Default for IndexSlotEntry {
     fn default() -> Self { Self { block_id: u32::MAX, ref_count: 0 } }
 }
 
-struct BlockCachePool<T: Default + Clone> {
-    pages: Vec<Arc<T>>,
+#[derive(Clone)]
+pub struct PinnedBlock<T: Copy> {
+    pages: Arc<PinnedMemory<T>>,
+    slot: usize,
+}
+
+impl<T: Copy> Deref for PinnedBlock<T> {
+    type Target = T;
+    fn deref(&self) -> &Self::Target { &self.pages[self.slot] }
+}
+
+struct BlockCachePool<T: Default + Copy> {
+    pages: Option<Arc<PinnedMemory<T>>>,
+    path: Option<String>,
+    base_offset: u64,
     total_block_count: u32,
     slot_count: u32,
     evict_slot: u32,
-    logic_table: Vec<u32>,
-    slot_table: Vec<IndexSlotEntry>,
+    logic_table: Option<PinnedMemory<u32>>,
+    slot_table: Option<PinnedMemory<IndexSlotEntry>>,
 }
 
-impl<T: Default + Clone> BlockCachePool<T> {
+impl<T: Default + Copy> BlockCachePool<T> {
     fn new() -> Self {
         Self {
-            pages: Vec::new(),
+            pages: None,
+            path: None,
+            base_offset: 0,
             total_block_count: 0,
             slot_count: 0,
             evict_slot: 0,
-            logic_table: Vec::new(),
-            slot_table: Vec::new(),
+            logic_table: None,
+            slot_table: None,
         }
+    }
+
+    fn reset_tables(&mut self, total_block_count: u32, slot_count: u32) {
+        self.total_block_count = total_block_count;
+        self.slot_count = slot_count.min(total_block_count);
+        self.evict_slot = self.slot_count;
+        self.logic_table = Some(PinnedMemory::from_slice(&vec![u32::MAX; self.total_block_count as usize]));
+        self.slot_table = Some(PinnedMemory::from_slice(&vec![IndexSlotEntry::default(); self.slot_count as usize]));
     }
 
     fn set_pages(&mut self, pages: Vec<T>) {
-        self.total_block_count = pages.len() as u32;
-        self.slot_count = self.total_block_count;
-        self.evict_slot = self.slot_count;
-        self.logic_table = vec![u32::MAX; self.total_block_count as usize];
-        self.slot_table = vec![IndexSlotEntry::default(); self.slot_count as usize];
-        self.pages = pages.into_iter().map(Arc::new).collect();
+        self.path = None;
+        self.base_offset = 0;
+        self.reset_tables(pages.len() as u32, pages.len() as u32);
+        self.pages = Some(Arc::new(PinnedMemory::from_slice(&pages)));
 
         for block in 0..self.slot_count {
-            self.logic_table[block as usize] = block;
-            self.slot_table[block as usize].block_id = block;
+            self.logic_table.as_mut().unwrap()[block as usize] = block;
+            self.slot_table.as_mut().unwrap()[block as usize].block_id = block;
         }
     }
 
-    fn get(&mut self, block_seq: u32) -> Option<(u32, Arc<T>)> {
-        let slot = *self.logic_table.get(block_seq as usize)?;
-        if slot == u32::MAX { return None; }
-        let entry = self.slot_table.get_mut(slot as usize)?;
-        entry.ref_count += 1;
-        Some((slot, Arc::clone(self.pages.get(slot as usize)?)))
+    fn init_file_backed(&mut self,
+                        path: String,
+                        base_offset: u64,
+                        total_block_count: u32,
+                        slot_count: u32) -> std::io::Result<()>
+    {
+        self.path = Some(path.clone());
+        self.base_offset = base_offset;
+        self.reset_tables(total_block_count, slot_count);
+        let mut pages = PinnedMemory::<T>::new_zeroed(self.slot_count as usize);
+
+        let mut file = File::open(path)?;
+        for block in 0..self.slot_count {
+            file.seek(SeekFrom::Start(self.base_offset + block as u64 * PAGE_SIZE as u64))?;
+            let page = &mut pages.as_mut_slice()[block as usize];
+            let bytes = unsafe {
+                std::slice::from_raw_parts_mut(page as *mut T as *mut u8, PAGE_SIZE)
+            };
+            file.read_exact(bytes)?;
+            self.logic_table.as_mut().unwrap()[block as usize] = block;
+            self.slot_table.as_mut().unwrap()[block as usize].block_id = block;
+        }
+
+        self.pages = Some(Arc::new(pages));
+        Ok(())
     }
 
+    fn get(&mut self, block_seq: u32) -> Option<(u32, PinnedBlock<T>)> {
+        let logic_table = self.logic_table.as_ref()?;
+        let slot = *logic_table.as_slice().get(block_seq as usize)?;
+        if slot == u32::MAX { return None; }
+        let entry = self.slot_table.as_mut()?.as_mut_slice().get_mut(slot as usize)?;
+        entry.ref_count += 1;
+        let pages = Arc::clone(self.pages.as_ref()?);
+        Some((slot, PinnedBlock { pages, slot: slot as usize }))
+    }
+
+    fn read_miss(&mut self, block_seq: u32) -> Option<(u32, PinnedBlock<T>)> {
+        let path = self.path.as_ref()?.clone();
+        let mut found = u32::MAX;
+        for _ in 0..self.slot_count {
+            let candidate = self.evict_slot % self.slot_count;
+            self.evict_slot = self.evict_slot.wrapping_add(1);
+            if self.slot_table.as_ref()?.as_slice()[candidate as usize].ref_count == 0 {
+                found = candidate;
+                break;
+            }
+        }
+        if found == u32::MAX { return None; }
+
+        let old_block = self.slot_table.as_ref()?.as_slice()[found as usize].block_id;
+        if old_block != u32::MAX {
+            self.logic_table.as_mut()?.as_mut_slice()[old_block as usize] = u32::MAX;
+        }
+
+        let mut file = File::open(path).ok()?;
+        file.seek(SeekFrom::Start(self.base_offset + block_seq as u64 * PAGE_SIZE as u64)).ok()?;
+        let pages = Arc::get_mut(self.pages.as_mut()?)?;
+        let page = &mut pages.as_mut_slice()[found as usize];
+        let bytes = unsafe {
+            std::slice::from_raw_parts_mut(page as *mut T as *mut u8, PAGE_SIZE)
+        };
+        file.read_exact(bytes).ok()?;
+
+        self.slot_table.as_mut()?.as_mut_slice()[found as usize].block_id = block_seq;
+        self.slot_table.as_mut()?.as_mut_slice()[found as usize].ref_count = 1;
+        self.logic_table.as_mut()?.as_mut_slice()[block_seq as usize] = found;
+        let pages = Arc::clone(self.pages.as_ref()?);
+        Some((found, PinnedBlock { pages, slot: found as usize }))
+    }
+
+    fn get_or_read(&mut self, block_seq: u32) -> Option<(u32, PinnedBlock<T>)> {
+        if let Some(hit) = self.get(block_seq) { return Some(hit); }
+        self.read_miss(block_seq)
+    }
 }
 
 pub struct IndexLocation {
@@ -263,8 +356,28 @@ impl IndexBlockTable {
         self.leaf_term_pool.borrow_mut().set_pages(blocks);
     }
 
+    pub fn init_file_backed(&mut self,
+                            path: &str,
+                            index_base_offset: u64,
+                            index_block_count: u32,
+                            index_slot_count: u32,
+                            leaf_base_offset: u64,
+                            leaf_block_count: u32,
+                            leaf_slot_count: u32) -> std::io::Result<()> {
+        self.index_pool.borrow_mut().init_file_backed(
+            path.to_string(), index_base_offset, index_block_count, index_slot_count)?;
+        self.leaf_term_pool.borrow_mut().init_file_backed(
+            path.to_string(), leaf_base_offset, leaf_block_count, leaf_slot_count)?;
+        Ok(())
+    }
+
     pub fn insert_block(&mut self, seq: u32, block: IndexBlock) {
-        let mut pages: Vec<IndexBlock> = self.index_pool.borrow().pages.iter().map(|page| (**page).clone()).collect();
+        let mut pages: Vec<IndexBlock> = self.index_pool
+            .borrow()
+            .pages
+            .as_ref()
+            .map(|pages| pages.as_slice().to_vec())
+            .unwrap_or_default();
         if pages.len() <= seq as usize { pages.resize_with(seq as usize + 1, IndexBlock::default); }
         pages[seq as usize] = block;
         self.set_index_blocks(pages);
@@ -275,14 +388,18 @@ impl IndexBlockTable {
         self.set_leaf_term_blocks(blocks);
     }
 
-    pub fn find_term_data(&self, term: &str) -> Option<(IndexLocation, Arc<IndexBlock>)> {
+    pub fn set_head_entries(&mut self, head: Vec<HeadTermEntry>) {
+        self.head_term_entries = head;
+    }
+
+    pub fn find_term_data(&self, term: &str) -> Option<(IndexLocation, PinnedBlock<IndexBlock>)> {
         if !self.bloom.can_term_exist(term) { return None; }
         if self.head_term_entries.is_empty() { return None; }
 
         let pos = self.head_term_entries.partition_point(|entry| entry.first_term() <= term);
         if pos == 0 { return None; }
         let leaf_block_id = self.head_term_entries[pos - 1].hte_leaf_term_block_id;
-        let (_leaf_slot, leaf_block) = self.leaf_term_pool.borrow_mut().get(leaf_block_id)?;
+        let (_leaf_slot, leaf_block) = self.leaf_term_pool.borrow_mut().get_or_read(leaf_block_id)?;
 
         let entry_count = leaf_block.entry_count();
         let mut left = 0usize;
@@ -298,7 +415,7 @@ impl IndexBlockTable {
         let entry = leaf_block.entry(left)?;
         if entry.lte_term != term { return None; }
 
-        let (_index_slot, index_block) = self.index_pool.borrow_mut().get(entry.lte_index_block_id)?;
+        let (_index_slot, index_block) = self.index_pool.borrow_mut().get_or_read(entry.lte_index_block_id)?;
         Some((IndexLocation {
             index_block_id: entry.lte_index_block_id,
             index_offset: entry.lte_index_offset as usize,
@@ -308,22 +425,22 @@ impl IndexBlockTable {
         }, index_block))
     }
 
-    pub fn get_block_by_seq(&self, seq: u32) -> Option<Arc<IndexBlock>> {
-        self.index_pool.borrow_mut().get(seq).map(|(_, block)| block)
+    pub fn get_block_by_seq(&self, seq: u32) -> Option<PinnedBlock<IndexBlock>> {
+        self.index_pool.borrow_mut().get_or_read(seq).map(|(_, block)| block)
     }
 
     pub fn head_term_entries(&self) -> &[HeadTermEntry] { &self.head_term_entries }
 
     pub fn leaf_term_blocks(&self) -> Vec<LeafTermBlock> {
-        self.leaf_term_pool.borrow().pages.iter().map(|page| (**page).clone()).collect()
-    }
-
-    pub fn all_leaf_term_entries(&self) -> Vec<LeafTermEntry> {
         self.leaf_term_pool
             .borrow()
             .pages
-            .iter()
-            .flat_map(|block| block.entries())
-            .collect()
+            .as_ref()
+            .map(|pages| pages.as_slice().to_vec())
+            .unwrap_or_default()
+    }
+
+    pub fn all_leaf_term_entries(&self) -> Vec<LeafTermEntry> {
+        self.leaf_term_blocks().iter().flat_map(|block| block.entries()).collect()
     }
 }
