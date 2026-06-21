@@ -12,6 +12,7 @@
 #include <string>
 #include <string_view>
 #include <algorithm>
+#include <utility>
 #include <condition_variable>
 #include <deque>
 #include <latch>
@@ -251,6 +252,28 @@ class IndexBlockTable
             m_HeadTermEntryCount = headCount;
         }
 
+        void HandOverBlockTable(IndexBlockTable& source)
+        {
+            if (this == &source) return;
+
+            SetBlockMemory(nullptr, nullptr);
+            m_HeadTermEntries.reset();
+            m_HeadTermEntryCount = 0;
+
+            source.ExitBlockThread(source.m_IndexPool);
+            source.ExitBlockThread(source.m_LeafTermPool);
+
+            HandOverPool(m_IndexPool, source.m_IndexPool);
+            HandOverPool(m_LeafTermPool, source.m_LeafTermPool);
+            m_ElementFilter = std::move(source.m_ElementFilter);
+            m_HeadTermEntries = std::move(source.m_HeadTermEntries);
+            m_HeadTermEntryCount = source.m_HeadTermEntryCount;
+            source.m_HeadTermEntryCount = 0;
+
+            StartBlockThread(m_IndexPool);
+            StartBlockThread(m_LeafTermPool);
+        }
+
         /*
         * FindTermData — two-level lookup through HeadTermEntry + leaf term block.
         *
@@ -396,14 +419,8 @@ class IndexBlockTable
                 m_LeafTermPool.BCP_Requests.clear();
                 m_LeafTermPool.BCP_ExitThread = false;
             }
-            if (m_IndexPool.BCP_Pages && m_IndexPool.BCP_SlotCount && !m_IndexPool.BCP_Thread.joinable()) {
-                m_IndexPool.BCP_ExitThread = false;
-                m_IndexPool.BCP_Thread = std::thread([this]() { BlockThreadMain(m_IndexPool); });
-            }
-            if (m_LeafTermPool.BCP_Pages && m_LeafTermPool.BCP_SlotCount && !m_LeafTermPool.BCP_Thread.joinable()) {
-                m_LeafTermPool.BCP_ExitThread = false;
-                m_LeafTermPool.BCP_Thread = std::thread([this]() { BlockThreadMain(m_LeafTermPool); });
-            }
+            StartBlockThread(m_IndexPool);
+            StartBlockThread(m_LeafTermPool);
         }
 
         void Init(BlockKind kind,
@@ -468,6 +485,40 @@ class IndexBlockTable
         uint32_t                                 m_HeadTermEntryCount = 0;
 
     private:
+        void HandOverPool(BlockCachePool& dest, BlockCachePool& source)
+        {
+            dest.BCP_Pages = source.BCP_Pages;
+            dest.BCP_BaseOffset = source.BCP_BaseOffset;
+            dest.BCP_TotalBlockCount = source.BCP_TotalBlockCount;
+            dest.BCP_SlotCount = source.BCP_SlotCount;
+            dest.BCP_EvictSlot = source.BCP_EvictSlot;
+            dest.BCP_LogicTable = source.BCP_LogicTable;
+            dest.BCP_SlotTable = source.BCP_SlotTable;
+            dest.BCP_File = source.BCP_File;
+            dest.BCP_Requests.clear();
+            dest.BCP_ExitThread = false;
+
+            source.BCP_Pages = nullptr;
+            source.BCP_BaseOffset = 0;
+            source.BCP_TotalBlockCount = 0;
+            source.BCP_SlotCount = 0;
+            source.BCP_EvictSlot = 0;
+            source.BCP_LogicTable = nullptr;
+            source.BCP_SlotTable = nullptr;
+            source.BCP_File = nullptr;
+            source.BCP_Requests.clear();
+            source.BCP_ExitThread = false;
+        }
+
+        void StartBlockThread(BlockCachePool& pool)
+        {
+            if (pool.BCP_Pages && pool.BCP_SlotCount && !pool.BCP_Thread.joinable()) {
+                pool.BCP_ExitThread = false;
+                BlockCachePool* target = &pool;
+                pool.BCP_Thread = std::thread([this, target]() { BlockThreadMain(*target); });
+            }
+        }
+
         void ExitBlockThread(BlockCachePool& pool)
         {
             if (!pool.BCP_Thread.joinable()) return;

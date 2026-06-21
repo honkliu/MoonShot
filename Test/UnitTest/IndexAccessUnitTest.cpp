@@ -86,6 +86,7 @@ static void BuildSharedIndex()
         writer->Write(g_tokenizer.Tokenize(d.title), d.id, "Title");
         writer->Write(g_tokenizer.Tokenize(d.body),  d.id, "Body");
         writer->SetDocImportance(d.id, d.importance);
+        writer->SetDocVector(d.id, BuildHashedEmbedding(g_tokenizer.Tokenize((std::string(d.title) + " " + d.body).c_str())));
     }
 
     std::cout << "Index built: "
@@ -362,6 +363,8 @@ void TestDocImportance()
     writer->Write(g_tokenizer.Tokenize(same_text), 1, "Body");
     writer->SetDocImportance(0, 2.0f);
     writer->SetDocImportance(1, 0.1f);
+    writer->SetDocVector(0, BuildHashedEmbedding(g_tokenizer.Tokenize(same_text)));
+    writer->SetDocVector(1, BuildHashedEmbedding(g_tokenizer.Tokenize(same_text)));
 
     auto compiler = new IndexSearchCompiler();
     auto tree     = compiler->Compile("fox", "B");
@@ -579,7 +582,59 @@ void TestDiskPersistence()
 } // namespace IndexAccessTests
 
 // ============================================================
-// Test 12: bigram indexing and query
+// Test 12: save delta and read it without reloading from disk
+// ============================================================
+namespace IndexAccessTests {
+
+void TestDeltaRuntimeHandoff()
+{
+    const char* INDEX_FILE = "test_moonshot_delta_base.bin";
+    const char* DELTA_FILE = "test_moonshot_delta_base.delta.bin";
+    std::remove(INDEX_FILE);
+    std::remove(DELTA_FILE);
+
+    {
+        IndexContext base;
+        Document doc;
+        doc.doc_id = 0;
+        doc.path = "base.txt";
+        doc.title = "base apple";
+        doc.body = "base document only";
+        base.AddDocument(doc);
+        assert(base.SaveIndex(INDEX_FILE));
+    }
+
+    {
+        IndexContext engine("", INDEX_FILE);
+        Document doc;
+        doc.doc_id = 0;
+        doc.path = "delta.txt";
+        doc.title = "delta banana";
+        doc.body = "delta runtime document";
+        engine.AddDocument(doc);
+
+        assert(engine.SaveIndex(DELTA_FILE));
+        assert(engine.HasDelta());
+
+        auto* delta = engine.GetDeltaContext();
+        assert(delta != nullptr);
+        assert(delta->DocumentCount() == 1);
+        assert(delta->GetDocPath(0) == "delta.txt");
+
+        std::unique_ptr<EvalTree> tree(delta->Compile("banana", "AUTB"));
+        std::unique_ptr<IndexSearchExecutor> exec(delta->GetExecutor());
+        auto results = exec->Execute(delta->GetReader(tree.get()), 5);
+        AssertContains(results, 0, "delta runtime handoff");
+    }
+
+    std::remove(INDEX_FILE);
+    std::remove(DELTA_FILE);
+}
+
+} // namespace IndexAccessTests
+
+// ============================================================
+// Test 13: bigram indexing and query
 // ============================================================
 namespace IndexAccessTests {
 
@@ -596,12 +651,15 @@ void TestBigram()
     */
     writer->Write(tok.Tokenize("good morning vietnam"), 0, "Title");
     writer->SetDocImportance(0, 0.9f);
+    writer->SetDocVector(0, BuildHashedEmbedding(tok.Tokenize("good morning vietnam")));
 
     writer->Write(tok.Tokenize("bad morning london"),   1, "Title");
     writer->SetDocImportance(1, 0.7f);
+    writer->SetDocVector(1, BuildHashedEmbedding(tok.Tokenize("bad morning london")));
 
     writer->Write(tok.Tokenize("good night vietnam"),   2, "Title");
     writer->SetDocImportance(2, 0.6f);
+    writer->SetDocVector(2, BuildHashedEmbedding(tok.Tokenize("good night vietnam")));
 
     auto* store = engine.GetStore();
 
@@ -697,9 +755,11 @@ void TestContinuationPostings()
     auto writer = engine.GetWriter();
 
     constexpr uint32_t DOC_COUNT = 5000;
+    const auto vector = BuildHashedEmbedding(g_tokenizer.Tokenize("continuationterm"));
     for (uint32_t docId = 0; docId < DOC_COUNT; ++docId) {
         writer->Write(g_tokenizer.Tokenize("continuationterm"), docId, "Title");
         writer->SetDocImportance(docId, 0.1f);
+        writer->SetDocVector(docId, vector);
     }
 
     auto reader = engine.GetStreamReader("continuationtermT");
@@ -725,8 +785,10 @@ void TestHeadTermMaxKeyBoundary()
 
     writer->Write({maxToken}, 0, "Title");
     writer->SetDocImportance(0, 0.1f);
+    writer->SetDocVector(0, BuildHashedEmbedding(std::vector<std::string>{maxToken}));
     writer->Write({tooLongToken}, 1, "Title");
     writer->SetDocImportance(1, 0.1f);
+    writer->SetDocVector(1, BuildHashedEmbedding(std::vector<std::string>{tooLongToken}));
 
     auto reader = engine.GetStreamReader((maxToken + "T").c_str());
     assert(!reader->IsEnd());
@@ -753,6 +815,7 @@ std::map<std::string, std::function<void()>> testRegistry = {
     {"TestDocImportance",    IndexAccessTests::TestDocImportance},
     {"TestEndToEnd",         IndexAccessTests::TestEndToEnd},
     {"TestDiskPersistence",  IndexAccessTests::TestDiskPersistence},
+    {"TestDeltaRuntimeHandoff", IndexAccessTests::TestDeltaRuntimeHandoff},
     {"TestBigram",           IndexAccessTests::TestBigram},
     {"TestContinuationPostings", IndexAccessTests::TestContinuationPostings},
     {"TestHeadTermMaxKeyBoundary", IndexAccessTests::TestHeadTermMaxKeyBoundary},

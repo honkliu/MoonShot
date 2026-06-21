@@ -22,6 +22,7 @@
 #include <cstring>
 #include <iostream>
 #include <limits>
+#include <utility>
 #include <vector>
 
 using std::shared_ptr;
@@ -259,8 +260,11 @@ public:
     bool SaveIndex(const char* path)
     {
         if (!path || !*path) return false;
-        const bool overwritingLoadedIndex = m_LoadedFromDisk && m_IndexPath == path;
-        m_IndexPath = path;
+        const std::string savePath(path);
+        const bool savingDeltaIndex = !m_IndexPath.empty() && savePath == DeltaIndexPath(m_IndexPath);
+        const bool overwritingLoadedIndex = !savingDeltaIndex && m_LoadedFromDisk && m_IndexPath == savePath;
+        if (!savingDeltaIndex)
+            m_IndexPath = savePath;
 
         if (!BuildRuntime(m_WriteBlockTable, m_WriteVectorIndex, m_WriteIndexFileHeader, m_WriteDocData, m_WriteBuilt))
             return false;
@@ -275,16 +279,26 @@ public:
 
         if (!IndexSerializer::Save(m_WriteIndexFileHeader, m_WriteBlockTable, m_WriteDocData, path)) return false;
 
-        IndexFileHeader header{};
-        FileAccess indexFile(path);
-        if (!indexFile.Init()
-            || indexFile.GetData(&header, static_cast<int>(sizeof(header))) != static_cast<int>(sizeof(header))
-            || std::memcmp(header.IFH_Magic, INDEX_FILE_MAGIC, sizeof(INDEX_FILE_MAGIC)) != 0
-            || header.IFH_Version != INDEX_FORMAT_VERSION)
-        {
-            return true;  // save succeeded; FileBlockManager wiring is best-effort
-        }
+        if (!savingDeltaIndex)
+            return true;
 
+        auto delta = std::make_unique<IndexContext>("", "", false);
+        delta->m_IndexPath = savePath;
+        delta->m_BlockTable.HandOverBlockTable(m_WriteBlockTable);
+        delta->m_VectorIndex = std::move(m_WriteVectorIndex);
+        delta->m_IndexFileHeader = m_WriteIndexFileHeader;
+        delta->m_DocData = m_WriteDocData;
+        delta->m_Built = true;
+        delta->m_LoadedFromDisk = true;
+        delta->m_Executor = IndexSearchExecutor(delta.get());
+
+        m_WriteDocData = nullptr;
+        m_WriteIndexFileHeader = {};
+        m_WriteBuilt = false;
+        m_WriteVectorIndex.Clear();
+
+        m_DeltaContext.reset();
+        m_DeltaContext = std::move(delta);
         return true;
     }
 
