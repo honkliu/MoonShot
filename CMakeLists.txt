@@ -45,9 +45,16 @@ endif()
 # -------------------------------------------------------------------------
 find_package(mimalloc REQUIRED)
 message(STATUS "mimalloc ${mimalloc_VERSION} found")
-if(NOT TARGET mimalloc-static)
-    message(FATAL_ERROR "MoonShot requires the mimalloc-static target; install mimalloc with static target support")
+if(TARGET mimalloc-static)
+    set(MOONSHOT_MIMALLOC_TARGET mimalloc-static)
+elseif(TARGET mimalloc)
+    set(MOONSHOT_MIMALLOC_TARGET mimalloc)
+elseif(TARGET mimalloc::mimalloc)
+    set(MOONSHOT_MIMALLOC_TARGET mimalloc::mimalloc)
+else()
+    message(FATAL_ERROR "MoonShot found mimalloc, but no supported CMake target was exported")
 endif()
+message(STATUS "MoonShot using ${MOONSHOT_MIMALLOC_TARGET}")
 
 find_package(Threads REQUIRED)
 
@@ -77,7 +84,7 @@ target_link_libraries(MoonShot INTERFACE
     Utils
 )
 
-target_link_libraries(MoonShot INTERFACE mimalloc-static)
+target_link_libraries(MoonShot INTERFACE ${MOONSHOT_MIMALLOC_TARGET})
 
 target_link_libraries(MoonShot INTERFACE Threads::Threads)
 
