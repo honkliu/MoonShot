@@ -176,7 +176,7 @@ static BuildBlocksResult build_blocks(const PostingStore& store)
         const std::string& key   = *key_ptr;
         if (key.size() > HEAD_TERM_KEY_MAX)
             continue;
-        const auto&        bytes = pl->GetBytes();
+        const auto         bytes = pl->GetBytes();
         if (bytes.empty()) continue;
 
         uint32_t       doc_freq  = pl->doc_freq();
@@ -288,11 +288,9 @@ bool IndexSerializer::Save(const PostingStore& store, const char* path)
         entry.DDE_FreshnessScore = 0.0f;
         entry.DDE_ClickScore = 0.0f;
         entry.DDE_EngagementScore = 0.0f;
-        if (const auto* docVector = store.GetDocVector(id)) {
-            entry.DDE_VectorDim = static_cast<uint16_t>(DOC_VECTOR_DIM);
-            entry.DDE_VectorFormat = 1;  // int8 quantized
-            std::memcpy(entry.DDE_VectorData, docVector, DOC_VECTOR_DIM);
-        }
+        entry.DDE_VectorDim = static_cast<uint16_t>(DOC_VECTOR_DIM);
+        entry.DDE_VectorFormat = 1;  // int8 quantized
+        std::memcpy(entry.DDE_VectorData, store.GetDocVector(id), DOC_VECTOR_DIM);
         entry.DDE_PathLength = static_cast<uint16_t>(std::min(ds.path.size(), DOC_PATH_MAX));
         if (entry.DDE_PathLength > 0)
             std::memcpy(entry.DDE_Path, ds.path.data(), entry.DDE_PathLength);

@@ -1,11 +1,12 @@
-use std::collections::{BinaryHeap, HashSet};
 use std::cmp::{Ordering, Reverse};
-use rand::Rng;
+use std::collections::{BinaryHeap, HashMap, HashSet};
+
 use serde::{Deserialize, Serialize};
 
-// ---------------------------------------------------------------------------
-// Distance metrics
-// ---------------------------------------------------------------------------
+use crate::block_table::{DOC_REC_SIZE, DOC_VECTOR_DIM};
+
+const DOC_VECTOR_OFFSET: usize = 256;
+
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum Metric {
     L2,
@@ -13,33 +14,13 @@ pub enum Metric {
     DotProduct,
 }
 
-pub fn l2_sq(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b).map(|(x, y)| (x - y).powi(2)).sum()
-}
-
-pub fn dot(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b).map(|(x, y)| x * y).sum()
-}
-
-pub fn cosine(a: &[f32], b: &[f32]) -> f32 {
-    let d = dot(a, b);
-    let na = a.iter().map(|x| x.powi(2)).sum::<f32>().sqrt();
-    let nb = b.iter().map(|x| x.powi(2)).sum::<f32>().sqrt();
-    if na == 0.0 || nb == 0.0 { 0.0 } else { d / (na * nb) }
-}
-
-// ---------------------------------------------------------------------------
-// Ordered f32 wrapper for BinaryHeap (f32 is not Ord).
-// ---------------------------------------------------------------------------
 #[derive(Clone, Copy, PartialEq)]
 struct F32(f32);
 
 impl Eq for F32 {}
 
 impl PartialOrd for F32 {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> { Some(self.cmp(other)) }
 }
 
 impl Ord for F32 {
@@ -48,345 +29,314 @@ impl Ord for F32 {
     }
 }
 
-// ---------------------------------------------------------------------------
-// FlatVectorIndex — exact brute-force O(N·d) search.
-// Good up to ~10k vectors; guaranteed correct.
-// ---------------------------------------------------------------------------
-#[derive(Serialize, Deserialize)]
-pub struct FlatVectorIndex {
-    entries: Vec<(u64, Vec<f32>)>,
-    pub dim:    usize,
-    metric:  Metric,
-}
-
-impl FlatVectorIndex {
-    pub fn new(dim: usize, metric: Metric) -> Self {
-        Self { entries: Vec::new(), dim, metric }
-    }
-
-    pub fn add(&mut self, doc_id: u64, vector: Vec<f32>) {
-        self.entries.push((doc_id, vector));
-    }
-
-    pub fn len(&self) -> usize { self.entries.len() }
-    pub fn is_empty(&self) -> bool { self.entries.is_empty() }
-
-    /// Return up to `k` (doc_id, score) pairs ranked highest first.
-    pub fn search(&self, query: &[f32], k: usize) -> Vec<(u64, f32)> {
-        let mut heap: BinaryHeap<Reverse<(F32, u64)>> = BinaryHeap::new();
-        for (id, v) in &self.entries {
-            let score = self.score(query, v);
-            heap.push(Reverse((F32(score), *id)));
-            if heap.len() > k {
-                heap.pop();
-            }
-        }
-        let mut out: Vec<(u64, f32)> = heap.into_sorted_vec()
-            .into_iter()
-            .map(|Reverse((F32(s), id))| (id, s))
-            .collect();
-        out.reverse(); // sorted_vec is ascending; we want descending
-        out
-    }
-
-    fn score(&self, a: &[f32], b: &[f32]) -> f32 {
-        match self.metric {
-            Metric::L2          => 1.0 / (1.0 + l2_sq(a, b)),
-            Metric::Cosine      => cosine(a, b),
-            Metric::DotProduct  => dot(a, b),
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// HnswIndex — Hierarchical Navigable Small World graph.
-//
-// Implements the algorithm from Malkov & Yashunin (2020).
-// Default M=16, ef_construction=200 match production settings in InfinityDB.
-// ---------------------------------------------------------------------------
-#[derive(Clone, Serialize, Deserialize)]
 struct HnswNode {
-    doc_id:    u64,
-    vector:    Vec<f32>,
-    /// neighbors[layer] = list of node indices in self.nodes
     neighbors: Vec<Vec<usize>>,
 }
 
-#[derive(Serialize, Deserialize)]
 pub struct HnswIndex {
-    nodes:          Vec<HnswNode>,
-    entry_point:    Option<usize>,
-    max_layer:      usize,
-    m:              usize,   // max neighbours per layer (except layer 0)
-    m0:             usize,   // max neighbours at layer 0  (= 2*m)
+    nodes: Vec<HnswNode>,
+    entry_point: Option<usize>,
+    max_layer: usize,
+    max_neighbors: usize,
     ef_construction: usize,
-    ml:             f64,     // 1 / ln(m) — level generation multiplier
-    pub dim:        usize,
-    metric:         Metric,
+    pub dim: usize,
+    metric: Metric,
+    docdata: Vec<u8>,
 }
 
 impl HnswIndex {
-    pub fn new(dim: usize, m: usize, ef_construction: usize, metric: Metric) -> Self {
-        let m = m.max(2);
+    pub fn new(dim: usize, max_neighbors: usize, ef_construction: usize, metric: Metric) -> Self {
         Self {
             nodes: Vec::new(),
             entry_point: None,
             max_layer: 0,
-            m,
-            m0: m * 2,
-            ef_construction,
-            ml: 1.0 / (m as f64).ln(),
+            max_neighbors: max_neighbors.max(2),
+            ef_construction: ef_construction.max(max_neighbors.max(2)),
             dim,
             metric,
+            docdata: Vec::new(),
         }
+    }
+
+    pub fn set_docdata(&mut self, docdata: Vec<u8>) {
+        self.docdata = docdata;
+    }
+
+    pub fn add(&mut self, doc_id: u64) -> bool {
+        self.add_node(doc_id)
+    }
+
+    pub fn search(&self, query: &[f32], k: usize, ef: usize) -> Vec<(u64, f32)> {
+        if query.len() != DOC_VECTOR_DIM || self.nodes.is_empty() { return Vec::new(); }
+
+        let mut entry = self.entry_point.unwrap();
+        for level in (1..=self.max_layer).rev() {
+            entry = self.greedy_search_layer_query(query, entry, level);
+        }
+
+        let wanted = if k == 0 { self.nodes.len() } else { k };
+        let mut candidates = self.search_layer_query(query, entry, ef.max(wanted), 0);
+
+        if k == 0 && candidates.len() < self.nodes.len() {
+            let mut seen = HashSet::new();
+            for &(_, node_id) in &candidates { seen.insert(node_id); }
+            for node_id in 0..self.nodes.len() {
+                if !seen.contains(&node_id) {
+                    candidates.push((self.score_query_to_node(query, node_id), node_id));
+                }
+            }
+            candidates.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(Ordering::Equal).then(a.1.cmp(&b.1)));
+        }
+
+        let mut out: Vec<(u64, f32)> = candidates
+            .into_iter()
+            .map(|(_, node_id)| (node_id as u64, self.score_query_to_node(query, node_id)))
+            .collect();
+        out.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal).then(a.0.cmp(&b.0)));
+        if k > 0 && out.len() > k { out.truncate(k); }
+        out
     }
 
     pub fn len(&self) -> usize { self.nodes.len() }
     pub fn is_empty(&self) -> bool { self.nodes.is_empty() }
 
-    // -- insertion ----------------------------------------------------------
+    fn add_node(&mut self, doc_id: u64) -> bool {
+        if doc_id < self.nodes.len() as u64 { return true; }
+        if doc_id != self.nodes.len() as u64 { return false; }
 
-    pub fn add(&mut self, doc_id: u64, vector: Vec<f32>) {
-        let new_idx  = self.nodes.len();
-        let level    = self.random_level();
-
-        // Initialise node with empty neighbour lists up to `level`.
+        let level = self.random_level(doc_id);
+        let new_node_id = doc_id as usize;
         self.nodes.push(HnswNode {
-            doc_id,
-            vector,
             neighbors: (0..=level).map(|_| Vec::new()).collect(),
         });
 
-        let Some(ep) = self.entry_point else {
-            self.entry_point = Some(new_idx);
-            self.max_layer   = level;
-            return;
+        let Some(mut entry) = self.entry_point else {
+            self.entry_point = Some(new_node_id);
+            self.max_layer = level;
+            return true;
         };
 
-        let mut ep_idx = ep;
-        let top        = self.max_layer;
+        for layer in (level + 1..=self.max_layer).rev() {
+            entry = self.greedy_search_layer_doc(new_node_id, entry, layer);
+        }
 
-        // Phase 1: greedy descent from top_layer down to level+1 (ef=1).
-        for lc in (level + 1..=top).rev() {
-            let cands = self.search_layer_(&self.nodes[new_idx].vector, ep_idx, 1, lc);
-            if let Some(&(_, nearest)) = cands.first() {
-                ep_idx = nearest;
+        for layer in (0..=level.min(self.max_layer)).rev() {
+            let candidates = self.search_layer_doc(new_node_id, entry, self.ef_construction, layer);
+            let selected: Vec<usize> = candidates.iter().take(self.max_neighbors).map(|&(_, id)| id).collect();
+
+            self.nodes[new_node_id].neighbors[layer] = selected.clone();
+            for neighbor in selected {
+                self.link_back(neighbor, new_node_id, layer);
+            }
+
+            if let Some(&(_, nearest)) = candidates.first() {
+                entry = nearest;
             }
         }
 
-        // Phase 2: build connections at each layer from min(level,top) to 0.
-        for lc in (0..=level.min(top)).rev() {
-            let m_max = if lc == 0 { self.m0 } else { self.m };
-            let query: Vec<f32> = self.nodes[new_idx].vector.clone();
-            let cands = self.search_layer_(&query, ep_idx, self.ef_construction, lc);
-
-            let selected: Vec<usize> = cands.iter().take(m_max).map(|&(_, i)| i).collect();
-
-            // Store this node's neighbours.
-            if lc < self.nodes[new_idx].neighbors.len() {
-                self.nodes[new_idx].neighbors[lc] = selected.clone();
-            }
-
-            // Back-links: add new_idx to each selected neighbour's list and prune.
-            let mut back_updates: Vec<(usize, Vec<usize>)> = Vec::new();
-            for &nb in &selected {
-                let mut conns = if lc < self.nodes[nb].neighbors.len() {
-                    self.nodes[nb].neighbors[lc].clone()
-                } else {
-                    Vec::new()
-                };
-                conns.push(new_idx);
-
-                if conns.len() > m_max {
-                    // Prune: keep the m_max closest to `nb`.
-                    let nb_vec: Vec<f32> = self.nodes[nb].vector.clone();
-                    conns.sort_by(|&a, &b| {
-                        let da = self.dist(&self.nodes[a].vector, &nb_vec);
-                        let db = self.dist(&self.nodes[b].vector, &nb_vec);
-                        da.partial_cmp(&db).unwrap_or(Ordering::Equal)
-                    });
-                    conns.truncate(m_max);
-                }
-                back_updates.push((nb, conns));
-            }
-
-            for (nb, conns) in back_updates {
-                while self.nodes[nb].neighbors.len() <= lc {
-                    self.nodes[nb].neighbors.push(Vec::new());
-                }
-                self.nodes[nb].neighbors[lc] = conns;
-            }
-
-            // Carry the best candidate as entry point for the next layer.
-            if let Some(&(_, nearest)) = cands.first() {
-                ep_idx = nearest;
-            }
-        }
-
-        // Update global entry point if the new node has a higher level.
         if level > self.max_layer {
-            self.max_layer   = level;
-            self.entry_point = Some(new_idx);
+            self.entry_point = Some(new_node_id);
+            self.max_layer = level;
+        }
+        true
+    }
+
+    fn get_doc_vector(&self, doc_id: usize) -> &[u8] {
+        let offset = doc_id * DOC_REC_SIZE + DOC_VECTOR_OFFSET;
+        &self.docdata[offset..offset + DOC_VECTOR_DIM]
+    }
+
+    fn score_query_to_node(&self, query: &[f32], node_id: usize) -> f32 {
+        let doc = self.get_doc_vector(node_id);
+        let mut dot = 0.0f32;
+        let mut nq = 0.0f32;
+        let mut nd = 0.0f32;
+        let mut l2 = 0.0f32;
+        for i in 0..DOC_VECTOR_DIM {
+            let q = query[i];
+            let d = (doc[i] as i8) as f32 / 128.0;
+            dot += q * d;
+            nq += q * q;
+            nd += d * d;
+            let delta = q - d;
+            l2 += delta * delta;
+        }
+        match self.metric {
+            Metric::DotProduct => dot,
+            Metric::L2 => 1.0 / (1.0 + l2),
+            Metric::Cosine => dot / (nq.sqrt() * nd.sqrt()),
         }
     }
 
-    // -- search -------------------------------------------------------------
+    fn score_doc_to_node(&self, query_doc_id: usize, node_id: usize) -> f32 {
+        let left = self.get_doc_vector(query_doc_id);
+        let right = self.get_doc_vector(node_id);
+        let mut dot = 0i32;
+        let mut nl = 0i32;
+        let mut nr = 0i32;
+        let mut l2 = 0i32;
+        for i in 0..DOC_VECTOR_DIM {
+            let l = left[i] as i8 as i32;
+            let r = right[i] as i8 as i32;
+            dot += l * r;
+            nl += l * l;
+            nr += r * r;
+            let delta = l - r;
+            l2 += delta * delta;
+        }
+        match self.metric {
+            Metric::DotProduct => dot as f32 / (128.0 * 128.0),
+            Metric::L2 => 1.0 / (1.0 + l2 as f32 / (128.0 * 128.0)),
+            Metric::Cosine => dot as f32 / ((nl as f32).sqrt() * (nr as f32).sqrt()),
+        }
+    }
 
-    /// Approximate nearest-neighbour search.
-    /// `ef` controls recall vs speed (try 50–200).
-    pub fn search(&self, query: &[f32], k: usize, ef: usize) -> Vec<(u64, f32)> {
-        let Some(ep) = self.entry_point else { return vec![]; };
+    fn greedy_search_layer_query(&self, query: &[f32], entry: usize, layer: usize) -> usize {
+        let mut best = entry;
+        let mut best_score = self.score_query_to_node(query, best);
+        loop {
+            let mut changed = false;
+            if layer >= self.nodes[best].neighbors.len() { break; }
+            for &neighbor in &self.nodes[best].neighbors[layer] {
+                let score = self.score_query_to_node(query, neighbor);
+                if score > best_score {
+                    best = neighbor;
+                    best_score = score;
+                    changed = true;
+                }
+            }
+            if !changed { break; }
+        }
+        best
+    }
 
-        let mut ep_idx = ep;
+    fn greedy_search_layer_doc(&self, query_doc_id: usize, entry: usize, layer: usize) -> usize {
+        let mut best = entry;
+        let mut best_score = self.score_doc_to_node(query_doc_id, best);
+        loop {
+            let mut changed = false;
+            if layer >= self.nodes[best].neighbors.len() { break; }
+            for &neighbor in &self.nodes[best].neighbors[layer] {
+                let score = self.score_doc_to_node(query_doc_id, neighbor);
+                if score > best_score {
+                    best = neighbor;
+                    best_score = score;
+                    changed = true;
+                }
+            }
+            if !changed { break; }
+        }
+        best
+    }
 
-        // Greedy descent from max_layer down to layer 1 (ef=1).
-        for lc in (1..=self.max_layer).rev() {
-            let cands = self.search_layer_(query, ep_idx, 1, lc);
-            if let Some(&(_, nearest)) = cands.first() {
-                ep_idx = nearest;
+    fn search_layer_query(&self, query: &[f32], entry: usize, ef: usize, layer: usize) -> Vec<(f32, usize)> {
+        self.search_layer(entry, ef, layer, |node| self.score_query_to_node(query, node))
+    }
+
+    fn search_layer_doc(&self, query_doc_id: usize, entry: usize, ef: usize, layer: usize) -> Vec<(f32, usize)> {
+        self.search_layer(entry, ef, layer, |node| self.score_doc_to_node(query_doc_id, node))
+    }
+
+    fn search_layer<F>(&self, entry: usize, ef: usize, layer: usize, score: F) -> Vec<(f32, usize)>
+    where
+        F: Fn(usize) -> f32,
+    {
+        let mut visited = HashSet::<usize>::new();
+        let mut candidates: BinaryHeap<(F32, usize)> = BinaryHeap::new();
+        let mut results: BinaryHeap<Reverse<(F32, usize)>> = BinaryHeap::new();
+
+        let entry_score = score(entry);
+        candidates.push((F32(entry_score), entry));
+        results.push(Reverse((F32(entry_score), entry)));
+        visited.insert(entry);
+
+        while let Some((F32(current_score), current)) = candidates.pop() {
+            if let Some(Reverse((F32(worst), _))) = results.peek() {
+                if current_score < *worst { break; }
+            }
+            if layer >= self.nodes[current].neighbors.len() { continue; }
+            for &neighbor in &self.nodes[current].neighbors[layer] {
+                if !visited.insert(neighbor) { continue; }
+                let neighbor_score = score(neighbor);
+                if results.len() < ef || results.peek().map(|Reverse((F32(worst), _))| neighbor_score > *worst).unwrap_or(true) {
+                    candidates.push((F32(neighbor_score), neighbor));
+                    results.push(Reverse((F32(neighbor_score), neighbor)));
+                    if results.len() > ef { results.pop(); }
+                }
             }
         }
 
-        // Full beam search at layer 0.
-        let ef_search = ef.max(k);
-        let cands = self.search_layer_(query, ep_idx, ef_search, 0);
-
-        cands.into_iter().take(k).map(|(dist, idx)| {
-            let score = self.dist_to_score(dist);
-            (self.nodes[idx].doc_id, score)
-        }).collect()
+        let mut out: Vec<(f32, usize)> = results.into_iter().map(|Reverse((F32(score), id))| (score, id)).collect();
+        out.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(Ordering::Equal).then(a.1.cmp(&b.1)));
+        out
     }
 
-    // -- private helpers ----------------------------------------------------
-
-    fn dist(&self, a: &[f32], b: &[f32]) -> f32 {
-        match self.metric {
-            Metric::L2         => l2_sq(a, b),
-            Metric::Cosine     => 1.0 - cosine(a, b),  // distance = 1 − similarity
-            Metric::DotProduct => -dot(a, b),
+    fn link_back(&mut self, node: usize, neighbor: usize, layer: usize) {
+        while self.nodes[node].neighbors.len() <= layer {
+            self.nodes[node].neighbors.push(Vec::new());
+        }
+        if !self.nodes[node].neighbors[layer].contains(&neighbor) {
+            self.nodes[node].neighbors[layer].push(neighbor);
+        }
+        if self.nodes[node].neighbors[layer].len() > self.max_neighbors {
+            let mut links = std::mem::take(&mut self.nodes[node].neighbors[layer]);
+            links.sort_by(|&a, &b| {
+                self.score_doc_to_node(node, b)
+                    .partial_cmp(&self.score_doc_to_node(node, a))
+                    .unwrap_or(Ordering::Equal)
+                    .then(a.cmp(&b))
+            });
+            links.truncate(self.max_neighbors);
+            self.nodes[node].neighbors[layer] = links;
         }
     }
 
-    fn dist_to_score(&self, dist: f32) -> f32 {
-        match self.metric {
-            Metric::L2         => 1.0 / (1.0 + dist),
-            Metric::Cosine     => 1.0 - dist,
-            Metric::DotProduct => -dist,
-        }
-    }
-
-    fn random_level(&self) -> usize {
-        let mut rng = rand::thread_rng();
+    fn random_level(&self, doc_id: u64) -> usize {
+        let mut hash = doc_id.wrapping_mul(11400714819323198485u64).wrapping_add(0x9e3779b97f4a7c15);
         let mut level = 0usize;
-        while rng.gen::<f64>() < self.ml && level < 16 {
+        while (hash & 0x3) == 0 && level < 16 {
             level += 1;
+            hash >>= 2;
         }
         level
     }
-
-    /// Beam search within one layer; returns (distance, node_idx) sorted
-    /// ascending by distance (closest first).
-    fn search_layer_(&self, query: &[f32], entry: usize, ef: usize, layer: usize) -> Vec<(f32, usize)> {
-        let mut visited  = HashSet::<usize>::new();
-        visited.insert(entry);
-
-        let entry_dist = self.dist(query, &self.nodes[entry].vector);
-
-        // candidates: min-heap (Reverse wrapper).
-        let mut candidates: BinaryHeap<Reverse<(F32, usize)>> = BinaryHeap::new();
-        // results: max-heap — evict the worst (farthest) when over capacity.
-        let mut results: BinaryHeap<(F32, usize)> = BinaryHeap::new();
-
-        candidates.push(Reverse((F32(entry_dist), entry)));
-        results.push((F32(entry_dist), entry));
-
-        while let Some(Reverse((F32(c_dist), c_idx))) = candidates.pop() {
-            // Pruning: the candidate is farther than the worst in results.
-            if results.len() >= ef {
-                if let Some(&(F32(worst), _)) = results.peek() {
-                    if c_dist > worst {
-                        break;
-                    }
-                }
-            }
-
-            let layer_ok = layer < self.nodes[c_idx].neighbors.len();
-            if !layer_ok { continue; }
-
-            for &nb in &self.nodes[c_idx].neighbors[layer] {
-                if visited.contains(&nb) { continue; }
-                visited.insert(nb);
-
-                let nb_dist = self.dist(query, &self.nodes[nb].vector);
-
-                let should_add = results.len() < ef || {
-                    results.peek().map(|&(F32(w), _)| nb_dist < w).unwrap_or(true)
-                };
-
-                if should_add {
-                    candidates.push(Reverse((F32(nb_dist), nb)));
-                    results.push((F32(nb_dist), nb));
-                    if results.len() > ef {
-                        results.pop();
-                    }
-                }
-            }
-        }
-
-        let mut out: Vec<(f32, usize)> = results.into_iter().map(|(F32(d), i)| (d, i)).collect();
-        out.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(Ordering::Equal));
-        out
-    }
 }
 
-// ---------------------------------------------------------------------------
-// VectorIndex — public enum unifying Flat and HNSW.
-// ---------------------------------------------------------------------------
-#[derive(Serialize, Deserialize)]
 pub enum VectorIndex {
-    Flat(FlatVectorIndex),
     Hnsw(HnswIndex),
 }
 
 impl VectorIndex {
-    pub fn flat(dim: usize, metric: Metric) -> Self {
-        VectorIndex::Flat(FlatVectorIndex::new(dim, metric))
+    pub fn hnsw(_dim: usize, metric: Metric) -> Self {
+        VectorIndex::Hnsw(HnswIndex::new(DOC_VECTOR_DIM, 32, 200, metric))
     }
 
-    pub fn hnsw(dim: usize, metric: Metric) -> Self {
-        VectorIndex::Hnsw(HnswIndex::new(dim, 16, 200, metric))
+    pub fn hnsw_custom(_dim: usize, max_neighbors: usize, ef_construction: usize, metric: Metric) -> Self {
+        VectorIndex::Hnsw(HnswIndex::new(DOC_VECTOR_DIM, max_neighbors, ef_construction, metric))
     }
 
-    pub fn hnsw_custom(dim: usize, m: usize, ef_construction: usize, metric: Metric) -> Self {
-        VectorIndex::Hnsw(HnswIndex::new(dim, m, ef_construction, metric))
-    }
-
-    pub fn add(&mut self, doc_id: u64, vector: Vec<f32>) {
+    pub fn set_docdata(&mut self, docdata: Vec<u8>) {
         match self {
-            VectorIndex::Flat(f) => f.add(doc_id, vector),
-            VectorIndex::Hnsw(h) => h.add(doc_id, vector),
+            VectorIndex::Hnsw(h) => h.set_docdata(docdata),
         }
     }
 
-    /// Search for the `k` approximate nearest neighbours.
-    /// `ef` is the beam width for HNSW (ignored for Flat).
+    pub fn add(&mut self, doc_id: u64) -> bool {
+        match self {
+            VectorIndex::Hnsw(h) => h.add(doc_id),
+        }
+    }
+
     pub fn search(&self, query: &[f32], k: usize, ef: usize) -> Vec<(u64, f32)> {
         match self {
-            VectorIndex::Flat(f) => f.search(query, k),
             VectorIndex::Hnsw(h) => h.search(query, k, ef),
         }
     }
 
-    pub fn dim(&self) -> usize {
-        match self {
-            VectorIndex::Flat(f) => f.dim,
-            VectorIndex::Hnsw(h) => h.dim,
-        }
-    }
+    pub fn dim(&self) -> usize { DOC_VECTOR_DIM }
 
     pub fn len(&self) -> usize {
         match self {
-            VectorIndex::Flat(f) => f.len(),
             VectorIndex::Hnsw(h) => h.len(),
         }
     }
@@ -394,27 +344,75 @@ impl VectorIndex {
     pub fn is_empty(&self) -> bool { self.len() == 0 }
 }
 
+pub fn build_hashed_embedding(tokens: &[String]) -> Vec<f32> {
+    let mut result = vec![0.0f32; DOC_VECTOR_DIM];
+    if tokens.is_empty() { return result; }
+
+    let mut freq: HashMap<&str, usize> = HashMap::new();
+    for token in tokens {
+        if !token.is_empty() { *freq.entry(token.as_str()).or_insert(0) += 1; }
+    }
+
+    for (token, count) in freq {
+        let slot = fnv_slot(token);
+        let tf = 1.0 + (1.0 + count as f32).ln();
+        let idf = 1.0 + (1.0 + 3.0 / token.len().max(1) as f32).ln();
+        result[slot] += tf * idf;
+    }
+
+    let norm = result.iter().map(|v| v * v).sum::<f32>().sqrt();
+    if norm > 0.0 {
+        for value in &mut result { *value /= norm; }
+    }
+    result
+}
+
+fn fnv_slot(token: &str) -> usize {
+    let mut hash = 14695981039346656037u64;
+    for byte in token.bytes() {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(1099511628211);
+    }
+    hash as usize % DOC_VECTOR_DIM
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::block_table::{DOC_REC_SIZE, DOC_VECTOR_DIM};
 
-    #[test]
-    fn flat_search_returns_correct_nearest() {
-        let mut idx = FlatVectorIndex::new(2, Metric::L2);
-        idx.add(1, vec![0.0, 0.0]);
-        idx.add(2, vec![1.0, 0.0]);
-        idx.add(3, vec![0.0, 1.0]);
-        let results = idx.search(&[0.1, 0.1], 1);
-        assert_eq!(results[0].0, 1); // nearest to origin
+    fn docdata(vectors: &[[i8; DOC_VECTOR_DIM]]) -> Vec<u8> {
+        let mut bytes = vec![0u8; vectors.len() * DOC_REC_SIZE];
+        for (doc_id, vector) in vectors.iter().enumerate() {
+            let offset = doc_id * DOC_REC_SIZE;
+            bytes[offset..offset + 8].copy_from_slice(&(doc_id as u64).to_le_bytes());
+            bytes[offset + 144..offset + 146].copy_from_slice(&(DOC_VECTOR_DIM as u16).to_le_bytes());
+            bytes[offset + 146..offset + 148].copy_from_slice(&1u16.to_le_bytes());
+            for i in 0..DOC_VECTOR_DIM {
+                bytes[offset + DOC_VECTOR_OFFSET + i] = vector[i] as u8;
+            }
+        }
+        bytes
     }
 
     #[test]
-    fn hnsw_search_finds_nearest() {
-        let mut idx = HnswIndex::new(2, 4, 10, Metric::L2);
-        for i in 0u64..50 {
-            idx.add(i, vec![i as f32, 0.0]);
+    fn hnsw_search_finds_nearest_from_docdata_bytes() {
+        let mut vectors = Vec::new();
+        for doc_id in 0..50 {
+            let mut vector = [0i8; DOC_VECTOR_DIM];
+            vector[0] = doc_id as i8;
+            vectors.push(vector);
         }
-        let results = idx.search(&[25.1, 0.0], 1, 20);
+
+        let mut idx = HnswIndex::new(DOC_VECTOR_DIM, 4, 10, Metric::L2);
+        idx.set_docdata(docdata(&vectors));
+        for doc_id in 0u64..50 {
+            assert!(idx.add(doc_id));
+        }
+
+        let mut query = vec![0.0f32; DOC_VECTOR_DIM];
+        query[0] = 25.0 / 128.0;
+        let results = idx.search(&query, 1, 20);
         assert!(!results.is_empty());
         assert_eq!(results[0].0, 25);
     }

@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 use rustblade::index_writer::IndexWriter;
 use rustblade::tokenizer::Tokenizer;
+use rustblade::vector_index::build_hashed_embedding;
 use rustblade::{IndexContext, SmartTokenizer};
 
 fn home_dir() -> PathBuf {
@@ -48,9 +49,14 @@ fn index_path(path: &Path) -> io::Result<()> {
     for (doc_id, file) in files.iter().enumerate() {
         let Ok(body) = fs::read_to_string(file) else { continue; };
         let title = file.file_stem().and_then(|stem| stem.to_str()).unwrap_or("");
-        writer.write(tokenizer.tokenize(title), doc_id as u64, "Title");
-        writer.write(tokenizer.tokenize(&body), doc_id as u64, "Body");
+        let title_tokens = tokenizer.tokenize(title);
+        let body_tokens = tokenizer.tokenize(&body);
+        let mut embedding_tokens = title_tokens.clone();
+        embedding_tokens.extend(body_tokens.iter().cloned());
+        writer.write(title_tokens, doc_id as u64, "Title");
+        writer.write(body_tokens, doc_id as u64, "Body");
         writer.set_doc_importance(doc_id as u64, 0.1);
+        writer.set_doc_vector(doc_id as u64, build_hashed_embedding(&embedding_tokens));
         let abs = file.canonicalize().unwrap_or_else(|_| file.clone());
         writer.set_doc_path(doc_id as u64, abs.to_string_lossy().to_string());
     }

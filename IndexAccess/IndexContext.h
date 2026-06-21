@@ -77,18 +77,11 @@ public:
     ~IndexContext()
     {
         ClearPinnedIndexData();
+        ClearWritePinnedIndexData();
     }
 
     shared_ptr<IndexWriter> GetWriter()
     {
-        if (m_LoadedFromDisk) {
-            m_Store = make_shared<PostingStore>();
-            ClearPinnedIndexData();
-            m_BlockTable.SetBlockMemory(nullptr, nullptr);
-            m_Executor = IndexSearchExecutor(this);
-            m_Built = false;
-            m_LoadedFromDisk = false;
-        }
         return make_shared<AdvancedIndexWriter>(m_Store);
     }
 
@@ -134,8 +127,7 @@ public:
         if (!doc.path.empty())
             m_Store->SetDocPath(docId, doc.path);
 
-        if (!RefreshDocDataFromBuildState())
-            return UINT64_MAX;
+        m_WriteBuilt = false;
 
         return docId;
     }
@@ -148,54 +140,8 @@ public:
     {
         if (m_Built) return;
 
-        if (!RefreshDocDataFromBuildState())
-            return;
-        auto br = IndexSerializer::BuildBlocksForContext(*m_Store);
-
-        size_t n = br.BBR_IndexBlocks.size();
-        if (n > UINT32_MAX || br.BBR_LeafTermBlocks.size() > UINT32_MAX || br.BBR_HeadTermEntries.size() > UINT32_MAX) {
-            std::cerr << "Built index section count exceeds runtime limit\n";
-            ResetLoadedRuntimeState();
-            return;
-        }
-        ClearBlockPageDataOnly();
-
-        const uint32_t indexBlockCount = static_cast<uint32_t>(n);
-        const uint32_t leafTermBlockCount = static_cast<uint32_t>(br.BBR_LeafTermBlocks.size());
-        const uint32_t headCount = static_cast<uint32_t>(br.BBR_HeadTermEntries.size());
-        auto* indexBlocks = static_cast<uint8_t*>(PinnedMemAlloc(static_cast<uint64_t>(indexBlockCount) * sizeof(IndexBlock)));
-        auto* leafTermBlocks = static_cast<uint8_t*>(PinnedMemAlloc(static_cast<uint64_t>(leafTermBlockCount) * sizeof(LeafTermBlock)));
-
-        if (indexBlockCount > 0 && !indexBlocks) {
-            std::cerr << "Failed to allocate pinned index block memory\n";
-            ResetLoadedRuntimeState();
-            return;
-        }
-
-        if (leafTermBlockCount > 0 && !leafTermBlocks) {
-            std::cerr << "Failed to allocate pinned leaf term block memory\n";
-            ResetLoadedRuntimeState();
-            return;
-        }
-
-        if (indexBlockCount > 0)
-            std::memcpy(indexBlocks, br.BBR_IndexBlocks.data(), static_cast<size_t>(indexBlockCount) * sizeof(IndexBlock));
-        if (leafTermBlockCount > 0)
-            std::memcpy(leafTermBlocks, br.BBR_LeafTermBlocks.data(), static_cast<size_t>(leafTermBlockCount) * sizeof(LeafTermBlock));
-
-        std::unique_ptr<HeadTermEntry[]> headTermEntries;
-        if (headCount > 0) {
-            headTermEntries.reset(new HeadTermEntry[headCount]);
-            std::memcpy(headTermEntries.get(), br.BBR_HeadTermEntries.data(), static_cast<size_t>(headCount) * sizeof(HeadTermEntry));
-        }
-        m_BlockTable.Init(BlockKind::Index, nullptr, 0, indexBlockCount, indexBlockCount);
-        m_BlockTable.Init(BlockKind::LeafTerm, nullptr, 0, leafTermBlockCount, leafTermBlockCount);
-        m_BlockTable.SetBlockMemory(indexBlocks, leafTermBlocks);
-        m_BlockTable.SetHeadTermEntries(std::move(headTermEntries), headCount);
-        RefreshVectorIndexFromDocData();
-
-        m_Built = true;
-        m_LoadedFromDisk = false;
+        if (BuildRuntime(m_BlockTable, m_VectorIndex, m_IndexFileHeader, m_DocData, m_Built))
+            m_LoadedFromDisk = false;
     }
 
     /*
@@ -299,7 +245,19 @@ public:
     bool SaveIndex(const char* path)
     {
         if (!path || !*path) return false;
+        const bool overwritingLoadedIndex = m_LoadedFromDisk && m_IndexPath == path;
         m_IndexPath = path;
+
+        if (!BuildRuntime(m_WriteBlockTable, m_WriteVectorIndex, m_WriteIndexFileHeader, m_WriteDocData, m_WriteBuilt))
+            return false;
+
+        if (overwritingLoadedIndex) {
+            ClearPinnedIndexData();
+            m_BlockTable.SetBlockMemory(nullptr, nullptr);
+            m_Executor = IndexSearchExecutor(this);
+            m_Built = false;
+            m_LoadedFromDisk = false;
+        }
 
         if (!IndexSerializer::Save(*m_Store, path)) return false;
 
@@ -469,17 +427,28 @@ private:
     IndexFileHeader              m_IndexFileHeader{};
     uint8_t*                     m_DocData = nullptr;
 
+    IndexBlockTable              m_WriteBlockTable;
+    FreshDiskAnnVectorIndex      m_WriteVectorIndex;
+    IndexFileHeader              m_WriteIndexFileHeader{};
+    uint8_t*                     m_WriteDocData = nullptr;
+    bool                         m_WriteBuilt = false;
+
     static constexpr uint32_t INDEX_BLOCK_CACHE_SLOT_COUNT =
         static_cast<uint32_t>(INDEX_BLOCK_CACHE_BYTES / sizeof(IndexBlock));
     static constexpr uint32_t LEAF_TERM_BLOCK_CACHE_SLOT_COUNT =
         static_cast<uint32_t>(LEAF_TERM_CACHE_BYTES / sizeof(LeafTermBlock));
 
+    void ClearDocDataOnly(uint8_t*& docData, FreshDiskAnnVectorIndex& vectorIndex)
+    {
+        if (docData)
+            PinnedMemFree(docData);
+        docData = nullptr;
+        vectorIndex.Clear();
+    }
+
     void ClearDocDataOnly()
     {
-        if (m_DocData)
-            PinnedMemFree(m_DocData);
-        m_DocData = nullptr;
-        m_VectorIndex.Clear();
+        ClearDocDataOnly(m_DocData, m_VectorIndex);
     }
 
     void ClearPinnedIndexData()
@@ -487,6 +456,14 @@ private:
         ClearDocDataOnly();
         ClearBlockPageDataOnly();
         m_IndexFileHeader = {};
+    }
+
+    void ClearWritePinnedIndexData()
+    {
+        ClearDocDataOnly(m_WriteDocData, m_WriteVectorIndex);
+        m_WriteBlockTable.SetBlockMemory(nullptr, nullptr);
+        m_WriteIndexFileHeader = {};
+        m_WriteBuilt = false;
     }
 
     void ClearBlockPageDataOnly()
@@ -502,7 +479,21 @@ private:
         m_LoadedFromDisk = false;
     }
 
-    bool RefreshDocDataFromBuildState()
+    void ResetRuntimeState(IndexBlockTable& blockTable,
+                           FreshDiskAnnVectorIndex& vectorIndex,
+                           IndexFileHeader& header,
+                           uint8_t*& docData,
+                           bool& built)
+    {
+        ClearDocDataOnly(docData, vectorIndex);
+        blockTable.SetBlockMemory(nullptr, nullptr);
+        header = {};
+        built = false;
+    }
+
+    bool RefreshDocDataFromBuildState(IndexFileHeader& header,
+                                      uint8_t*& docData,
+                                      FreshDiskAnnVectorIndex& vectorIndex)
     {
         if (!m_Store || m_Store->AllDocStats().empty())
             return true;
@@ -511,26 +502,24 @@ private:
         for (const auto& [docId, _] : m_Store->AllDocStats())
             maxDocId = std::max(maxDocId, docId);
 
-        ClearDocDataOnly();
+        ClearDocDataOnly(docData, vectorIndex);
         const uint64_t bytes = (maxDocId + 1) * DOC_REC_SIZE;
-        m_DocData = static_cast<uint8_t*>(PinnedMemAlloc(bytes));
-        if (!m_DocData) {
+        docData = static_cast<uint8_t*>(PinnedMemAlloc(bytes));
+        if (!docData) {
             std::cerr << "Failed to allocate pinned DocData memory\n";
-            ClearDocDataOnly();
+            ClearDocDataOnly(docData, vectorIndex);
             return false;
         }
 
         uint64_t totalLen = 0;
         for (const auto& [docId, stats] : m_Store->AllDocStats()) {
-            auto* entry = reinterpret_cast<DocDataEntry*>(m_DocData + docId * DOC_REC_SIZE);
+            auto* entry = reinterpret_cast<DocDataEntry*>(docData + docId * DOC_REC_SIZE);
             entry->DDE_DocID = docId;
             entry->DDE_StaticRank = stats.importance;
             entry->DDE_DocLength = stats.doc_len;
-            if (const auto* vector = m_Store->GetDocVector(docId)) {
-                entry->DDE_VectorDim = static_cast<uint16_t>(DOC_VECTOR_DIM);
-                entry->DDE_VectorFormat = 1;
-                std::memcpy(entry->DDE_VectorData, vector, DOC_VECTOR_DIM);
-            }
+            entry->DDE_VectorDim = static_cast<uint16_t>(DOC_VECTOR_DIM);
+            entry->DDE_VectorFormat = 1;
+            std::memcpy(entry->DDE_VectorData, m_Store->GetDocVector(docId), DOC_VECTOR_DIM);
             entry->DDE_PathLength = static_cast<uint16_t>(std::min(stats.path.size(), DOC_PATH_MAX));
             if (entry->DDE_PathLength > 0)
                 std::memcpy(entry->DDE_Path, stats.path.data(), entry->DDE_PathLength);
@@ -539,20 +528,90 @@ private:
 
         const uint64_t totalDocs = maxDocId + 1;
         const float avgDocLen = totalDocs ? static_cast<float>(totalLen) / static_cast<float>(totalDocs) : 1.0f;
-        std::memcpy(m_IndexFileHeader.IFH_Magic, INDEX_FILE_MAGIC, sizeof(INDEX_FILE_MAGIC));
-        m_IndexFileHeader.IFH_Version = INDEX_FORMAT_VERSION;
-        m_IndexFileHeader.IFH_NumDocuments = totalDocs;
-        m_IndexFileHeader.IFH_AvgDocLength = avgDocLen;
+        std::memcpy(header.IFH_Magic, INDEX_FILE_MAGIC, sizeof(INDEX_FILE_MAGIC));
+        header.IFH_Version = INDEX_FORMAT_VERSION;
+        header.IFH_NumDocuments = totalDocs;
+        header.IFH_AvgDocLength = avgDocLen;
         return true;
+    }
+
+    void RefreshDocDataFromBuildState()
+    {
+        RefreshDocDataFromBuildState(m_IndexFileHeader, m_DocData, m_VectorIndex);
+    }
+
+    void RefreshVectorIndexFromDocData(const IndexFileHeader& header,
+                                       uint8_t* docData,
+                                       FreshDiskAnnVectorIndex& vectorIndex)
+    {
+        vectorIndex.SetDocData(docData);
+
+        for (uint64_t docId = 0; docId < header.IFH_NumDocuments; ++docId) {
+            vectorIndex.Add(docId);
+        }
     }
 
     void RefreshVectorIndexFromDocData()
     {
-        m_VectorIndex.SetDocData(m_DocData);
+        RefreshVectorIndexFromDocData(m_IndexFileHeader, m_DocData, m_VectorIndex);
+    }
 
-        for (uint64_t docId = 0; docId < m_IndexFileHeader.IFH_NumDocuments; ++docId) {
-            m_VectorIndex.Add(docId);
+    bool BuildRuntime(IndexBlockTable& blockTable,
+                      FreshDiskAnnVectorIndex& vectorIndex,
+                      IndexFileHeader& header,
+                      uint8_t*& docData,
+                      bool& built)
+    {
+        if (built) return true;
+
+        if (!RefreshDocDataFromBuildState(header, docData, vectorIndex))
+            return false;
+        auto br = IndexSerializer::BuildBlocksForContext(*m_Store);
+
+        size_t n = br.BBR_IndexBlocks.size();
+        if (n > UINT32_MAX || br.BBR_LeafTermBlocks.size() > UINT32_MAX || br.BBR_HeadTermEntries.size() > UINT32_MAX) {
+            std::cerr << "Built index section count exceeds runtime limit\n";
+            ResetRuntimeState(blockTable, vectorIndex, header, docData, built);
+            return false;
         }
+
+        const uint32_t indexBlockCount = static_cast<uint32_t>(n);
+        const uint32_t leafTermBlockCount = static_cast<uint32_t>(br.BBR_LeafTermBlocks.size());
+        const uint32_t headCount = static_cast<uint32_t>(br.BBR_HeadTermEntries.size());
+        auto* indexBlocks = static_cast<uint8_t*>(PinnedMemAlloc(static_cast<uint64_t>(indexBlockCount) * sizeof(IndexBlock)));
+        auto* leafTermBlocks = static_cast<uint8_t*>(PinnedMemAlloc(static_cast<uint64_t>(leafTermBlockCount) * sizeof(LeafTermBlock)));
+
+        if (indexBlockCount > 0 && !indexBlocks) {
+            std::cerr << "Failed to allocate pinned index block memory\n";
+            ResetRuntimeState(blockTable, vectorIndex, header, docData, built);
+            return false;
+        }
+
+        if (leafTermBlockCount > 0 && !leafTermBlocks) {
+            std::cerr << "Failed to allocate pinned leaf term block memory\n";
+            if (indexBlocks) PinnedMemFree(indexBlocks);
+            ResetRuntimeState(blockTable, vectorIndex, header, docData, built);
+            return false;
+        }
+
+        if (indexBlockCount > 0)
+            std::memcpy(indexBlocks, br.BBR_IndexBlocks.data(), static_cast<size_t>(indexBlockCount) * sizeof(IndexBlock));
+        if (leafTermBlockCount > 0)
+            std::memcpy(leafTermBlocks, br.BBR_LeafTermBlocks.data(), static_cast<size_t>(leafTermBlockCount) * sizeof(LeafTermBlock));
+
+        std::unique_ptr<HeadTermEntry[]> headTermEntries;
+        if (headCount > 0) {
+            headTermEntries.reset(new HeadTermEntry[headCount]);
+            std::memcpy(headTermEntries.get(), br.BBR_HeadTermEntries.data(), static_cast<size_t>(headCount) * sizeof(HeadTermEntry));
+        }
+        blockTable.Init(BlockKind::Index, nullptr, 0, indexBlockCount, indexBlockCount);
+        blockTable.Init(BlockKind::LeafTerm, nullptr, 0, leafTermBlockCount, leafTermBlockCount);
+        blockTable.SetBlockMemory(indexBlocks, leafTermBlocks);
+        blockTable.SetHeadTermEntries(std::move(headTermEntries), headCount);
+        RefreshVectorIndexFromDocData(header, docData, vectorIndex);
+
+        built = true;
+        return true;
     }
 
     /*

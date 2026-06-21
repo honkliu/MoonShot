@@ -33,17 +33,11 @@ public:
 
         const std::string abbrev = StreamAbbrev(postingType);
 
-        /*
-        * Index unigrams: count TF per distinct term.
-        */
-        std::unordered_map<std::string, uint32_t> unigramTf;
+        std::unordered_map<std::string, uint32_t> termTf;
         for (auto& word : words) {
             if (!word.empty())
-                ++unigramTf[word];
+                ++termTf[word];
         }
-
-        for (auto& [term, tf] : unigramTf)
-            m_Store->AddPosting(term + abbrev, documentId, tf);
 
         /*
         * Index bigrams: adjacent pairs joined by BIGRAM_SEP (\x1F).
@@ -52,16 +46,15 @@ public:
         * ICU's word breaker, so "morning\x1FcallT" (bigram) is unambiguous
         * from "morning_callT" (unigram token containing an underscore).
         */
-        std::unordered_map<std::string, uint32_t> bigramTf;
         for (size_t i = 0; i + 1 < words.size(); ++i) {
             if (!words[i].empty() && !words[i + 1].empty()) {
                 std::string bigram = words[i] + BIGRAM_SEP + words[i + 1];
-                ++bigramTf[bigram];
+                ++termTf[bigram];
             }
         }
 
-        for (auto& [bigram, tf] : bigramTf)
-            m_Store->AddPosting(bigram + abbrev, documentId, tf);
+        for (auto& [term, tf] : termTf)
+            m_Store->AddPosting(term + abbrev, documentId, tf);
 
         m_Store->AddDocTokens(documentId,
                              static_cast<uint32_t>(words.size()));

@@ -11,6 +11,8 @@ use crate::executor::{IndexSearchExecutor, SearchResult};
 use crate::tokenizer::SmartTokenizer;
 use crate::serializer::IndexSerializer;
 use crate::error::Result;
+use crate::block_table::DOC_VECTOR_DIM;
+use crate::vector_index::{HnswIndex, Metric as VectorMetric};
 
 /// Central factory — owns PostingStore, BlockTable and all search components.
 /// Mirrors MoonShot's IndexContext.h.
@@ -19,6 +21,7 @@ pub struct IndexContext {
     block_table: Arc<IndexBlockTable>,
     tokenizer:   SmartTokenizer,
     compiler:    IndexSearchCompiler,
+    vector_index: HnswIndex,
     index_path:  Option<String>,
     built:       bool,
 }
@@ -33,6 +36,7 @@ impl IndexContext {
             block_table: Arc::new(IndexBlockTable::new(512)),
             tokenizer:   SmartTokenizer::new(),
             compiler:    IndexSearchCompiler::new(SmartTokenizer::new()),
+            vector_index: HnswIndex::new(DOC_VECTOR_DIM, 32, 200, VectorMetric::Cosine),
             index_path:  index_path.clone(),
             built:       false,
         };
@@ -104,6 +108,10 @@ impl IndexContext {
         executor.execute(reader.as_mut(), top_k)
     }
 
+    pub fn vector_search(&self, query: &[f32], top_k: usize, ef_search: usize) -> Vec<(u64, f32)> {
+        self.vector_index.search(query, top_k, ef_search)
+    }
+
     // ── Persistence ─────────────────────────────────────────────────────────
 
     pub fn save_index(&mut self, path: &str) -> Result<()> {
@@ -115,7 +123,7 @@ impl IndexContext {
     pub fn load_index(&mut self, path: &str) -> Result<()> {
         self.index_path = Some(path.to_string());
         let mut store = PostingStore::new();
-        let (header, head_term_entries) = IndexSerializer::load_file_tables(&mut store, path)?;
+        let (header, head_term_entries, docdata) = IndexSerializer::load_file_tables(&mut store, path)?;
         let mut table = IndexBlockTable::new(header.ifh_index_block_count as usize);
         table.init_file_backed(
             path,
@@ -128,8 +136,13 @@ impl IndexContext {
         )?;
         table.set_head_entries(head_term_entries);
 
+        let mut vector_index = HnswIndex::new(DOC_VECTOR_DIM, 32, 200, VectorMetric::Cosine);
+        vector_index.set_docdata(docdata);
+        for doc_id in 0..header.ifh_num_documents { vector_index.add(doc_id); }
+
         self.store       = Arc::new(Mutex::new(store));
         self.block_table = Arc::new(table);
+        self.vector_index = vector_index;
         self.built       = true;
         Ok(())
     }
@@ -137,13 +150,19 @@ impl IndexContext {
     /// Load from raw bytes (WASM path — no file system access needed).
     pub fn load_from_bytes(&mut self, data: &[u8]) -> Result<()> {
         let mut store = PostingStore::new();
-        let (head_term_entries, leaf_term_blocks, blocks) = IndexSerializer::decode(&mut store, data)?;
+        let (head_term_entries, leaf_term_blocks, blocks, docdata) = IndexSerializer::decode(&mut store, data)?;
         let mut table = IndexBlockTable::new(blocks.len().max(512) + 64);
         table.set_index_blocks(blocks);
         table.set_head_leaf_term_table(head_term_entries, leaf_term_blocks);
 
+        let doc_count = store.total_docs();
+        let mut vector_index = HnswIndex::new(DOC_VECTOR_DIM, 32, 200, VectorMetric::Cosine);
+        vector_index.set_docdata(docdata);
+        for doc_id in 0..doc_count { vector_index.add(doc_id); }
+
         self.store       = Arc::new(Mutex::new(store));
         self.block_table = Arc::new(table);
+        self.vector_index = vector_index;
         self.built       = true;
         Ok(())
     }

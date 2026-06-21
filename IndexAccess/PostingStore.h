@@ -24,32 +24,16 @@ struct IndexEntry {
 * Sorted array of entries for one (term+stream) key, e.g. "foxT".
 *
 * entries  — decoded form; used by the writer to accumulate postings.
-* bytes    — VarByte-encoded absolute (docID, termFrequency) pairs; used by TermIndexReader via
-*             UnifiedDecoder::OpenRaw().  Computed lazily on first call to
-*             GetBytes() so encoding only runs once per posting list.
+* GetBytes() returns VarByte-encoded absolute (docID, termFrequency) pairs.
 */
 struct PostingList {
-    std::vector<IndexEntry>      entries;
-    mutable std::vector<uint8_t> bytes;
+    std::vector<IndexEntry> entries;
 
     uint32_t doc_freq() const { return static_cast<uint32_t>(entries.size()); }
 
-    /*
-    * Return the VarByte-encoded representation, encoding lazily on first call.
-    */
-    const std::vector<uint8_t>& GetBytes() const
+    std::vector<uint8_t> GetBytes() const
     {
-        if (bytes.empty() && !entries.empty())
-            Encode();
-        return bytes;
-    }
-
-    /*
-    * Invalidate the byte cache when entries are modified.
-    */
-    void InvalidateBytes()
-    {
-        bytes.clear();
+        return Encode();
     }
 
 private:
@@ -62,15 +46,16 @@ private:
         out.push_back(static_cast<uint8_t>(v));
     }
 
-    void Encode() const
+    std::vector<uint8_t> Encode() const
     {
-        bytes.clear();
+        std::vector<uint8_t> bytes;
         bytes.reserve(entries.size() * 3);
 
         for (const auto& e : entries) {
             vb_write(e.IE_DocID, bytes);
             vb_write(e.IE_TermFrequency, bytes);
         }
+        return bytes;
     }
 };
 
@@ -97,17 +82,11 @@ public:
             [](const IndexEntry& e, uint64_t d) { return e.IE_DocID < d; });
 
         if (it != pl.entries.end() && it->IE_DocID == doc_id) {
-            it->IE_TermFrequency += tf;
+            it->IE_TermFrequency = tf;
         } else {
             pl.entries.insert(it, IndexEntry{doc_id, tf});
             ++m_PostingEntries;
         }
-
-        /*
-        * Byte cache is now stale — clear it so the next GetBytes() call
-        * re-encodes the updated entries list.
-        */
-        pl.InvalidateBytes();
     }
 
     void AddDocTokens(uint64_t doc_id, uint32_t count)

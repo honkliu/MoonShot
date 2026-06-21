@@ -9,6 +9,7 @@ use crate::block_table::{
     LeafTermEntry,
     DOC_PATH_MAX,
     DOC_REC_SIZE,
+    DOC_VECTOR_DIM,
     HEAD_TERM_KEY_MAX,
     INDEX_BLOCK_CONTINUATION_HEADER_SIZE,
     INDEX_FILE_HEADER_SIZE,
@@ -124,7 +125,7 @@ impl IndexSerializer {
     }
 
     pub fn load(store: &mut PostingStore, path: &str)
-        -> Result<(Vec<HeadTermEntry>, Vec<LeafTermBlock>, Vec<IndexBlock>)>
+        -> Result<(Vec<HeadTermEntry>, Vec<LeafTermBlock>, Vec<IndexBlock>, Vec<u8>)>
     {
         let file = File::open(path)?;
         let mut reader = BufReader::new(file);
@@ -134,7 +135,7 @@ impl IndexSerializer {
     }
 
     pub fn load_file_tables(store: &mut PostingStore, path: &str)
-        -> Result<(IndexFileHeader, Vec<HeadTermEntry>)>
+        -> Result<(IndexFileHeader, Vec<HeadTermEntry>, Vec<u8>)>
     {
         let file = File::open(path)?;
         let mut reader = BufReader::new(file);
@@ -150,12 +151,12 @@ impl IndexSerializer {
             head.push(HeadTermEntry::from_bytes(&bytes).ok_or(RustBladeError::InvalidFormat)?);
         }
 
-        Self::load_docdata(store, &mut reader, &header)?;
-        Ok((header, head))
+        let docdata = Self::load_docdata(store, &mut reader, &header)?;
+        Ok((header, head, docdata))
     }
 
     pub fn decode(store: &mut PostingStore, data: &[u8])
-        -> Result<(Vec<HeadTermEntry>, Vec<LeafTermBlock>, Vec<IndexBlock>)>
+        -> Result<(Vec<HeadTermEntry>, Vec<LeafTermBlock>, Vec<IndexBlock>, Vec<u8>)>
     {
         let header = IndexFileHeader::parse(data)?;
 
@@ -182,9 +183,12 @@ impl IndexSerializer {
             leaf_blocks.push(LeafTermBlock::from_bytes(&data[offset..offset + PAGE_SIZE]).ok_or(RustBladeError::InvalidFormat)?);
         }
 
+        let docdata_size = num_docs * DOC_REC_SIZE;
+        if docdata_offset + docdata_size > data.len() { return Err(RustBladeError::InvalidFormat); }
+        let docdata = data[docdata_offset..docdata_offset + docdata_size].to_vec();
+
         for index in 0..num_docs {
             let offset = docdata_offset + index * DOC_REC_SIZE;
-            if offset + DOC_REC_SIZE > data.len() { return Err(RustBladeError::InvalidFormat); }
             Self::decode_docdata_record(store, index as u64, &data[offset..offset + DOC_REC_SIZE])?;
         }
 
@@ -197,17 +201,18 @@ impl IndexSerializer {
             index_blocks.push(block);
         }
 
-        Ok((head, leaf_blocks, index_blocks))
+        Ok((head, leaf_blocks, index_blocks, docdata))
     }
 
-    fn load_docdata<R: Read + std::io::Seek>(store: &mut PostingStore, reader: &mut R, header: &IndexFileHeader) -> Result<()> {
+    fn load_docdata<R: Read + std::io::Seek>(store: &mut PostingStore, reader: &mut R, header: &IndexFileHeader) -> Result<Vec<u8>> {
         reader.seek(std::io::SeekFrom::Start(header.ifh_doc_data_offset))?;
-        let mut record = [0u8; DOC_REC_SIZE];
-        for index in 0..header.ifh_num_documents {
-            reader.read_exact(&mut record)?;
-            Self::decode_docdata_record(store, index, &record)?;
+        let mut docdata = vec![0u8; header.ifh_num_documents as usize * DOC_REC_SIZE];
+        reader.read_exact(&mut docdata)?;
+        for index in 0..header.ifh_num_documents as usize {
+            let offset = index * DOC_REC_SIZE;
+            Self::decode_docdata_record(store, index as u64, &docdata[offset..offset + DOC_REC_SIZE])?;
         }
-        Ok(())
+        Ok(docdata)
     }
 
     fn decode_docdata_record(store: &mut PostingStore, index: u64, record: &[u8]) -> Result<()> {
@@ -218,6 +223,7 @@ impl IndexSerializer {
         let path_len = u16_at(record, 72) as usize;
         store.add_doc_tokens(doc_id, doc_len);
         store.set_doc_importance(doc_id, importance);
+        store.set_doc_vector_bytes(doc_id, &record[256..256 + DOC_VECTOR_DIM]);
         if path_len > 0 && path_len <= DOC_PATH_MAX {
             if let Ok(path) = std::str::from_utf8(&record[768..768 + path_len]) {
                 store.set_doc_path(doc_id, path.to_string());
@@ -288,7 +294,7 @@ impl IndexSerializer {
 
         for (term, posting_list) in terms {
             if term.len() > HEAD_TERM_KEY_MAX { continue; }
-            let bytes = posting_list.get_bytes_ref();
+            let bytes = posting_list.get_bytes();
             if bytes.is_empty() { continue; }
 
             if wptr >= PAGE_SIZE {
@@ -380,6 +386,12 @@ impl IndexSerializer {
             out[offset..offset + 8].copy_from_slice(&doc_id.to_le_bytes());
             out[offset + 32..offset + 36].copy_from_slice(&stats.doc_len.to_le_bytes());
             out[offset + 44..offset + 48].copy_from_slice(&stats.importance.to_le_bytes());
+            out[offset + 144..offset + 146].copy_from_slice(&(DOC_VECTOR_DIM as u16).to_le_bytes());
+            out[offset + 146..offset + 148].copy_from_slice(&1u16.to_le_bytes());
+            let vector = store.get_doc_vector(*doc_id);
+            for i in 0..DOC_VECTOR_DIM {
+                out[offset + 256 + i] = vector[i] as u8;
+            }
             let path_len = stats.path.len().min(DOC_PATH_MAX);
             out[offset + 72..offset + 74].copy_from_slice(&(path_len as u16).to_le_bytes());
             out[offset + 768..offset + 768 + path_len].copy_from_slice(&stats.path.as_bytes()[..path_len]);
