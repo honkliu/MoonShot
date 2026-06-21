@@ -26,8 +26,9 @@ class FileAccess {
 		FileAccess(const char * fileName);
 		~FileAccess();
 		bool Init();
-		bool InitWrite();
+		bool InitWrite(bool truncate = true);
 		int GetData(void * buffer, int numBytes);
+		bool PutData(const void * buffer, uint64_t numBytes);
 
 		bool ReadBlock(uint32_t block_seq, void* buffer, size_t block_size,
 		               uint64_t base_byte_offset = 0);

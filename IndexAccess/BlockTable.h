@@ -186,12 +186,13 @@ class WriterSpinLock {
  */
 class IndexBlockTable
 {
-    private:
+    public:
         struct IndexSlotEntry {
             uint32_t BlockID = UINT32_MAX;
             uint32_t Ref = 0;
         };
 
+    private:
         enum class BlockRequestType {
             Get,
             Release
@@ -205,6 +206,7 @@ class IndexBlockTable
             std::latch Completion{1};
         };
 
+    public:
         struct BlockCachePool {
             uint8_t*                          BCP_Pages = nullptr;
             uint64_t                          BCP_BaseOffset = 0;
@@ -221,7 +223,6 @@ class IndexBlockTable
             bool                              BCP_ExitThread = false;
         };
 
-    public:
         explicit IndexBlockTable(uint32_t = 0) {}
 
         ~IndexBlockTable()
@@ -457,7 +458,6 @@ class IndexBlockTable
             pool->BCP_EvictSlot = pool->BCP_SlotCount;
         }
 
-    private:
         std::shared_ptr<ElementFilter>           m_ElementFilter;
         BlockCachePool                           m_IndexPool;
         BlockCachePool                           m_LeafTermPool;
@@ -467,6 +467,7 @@ class IndexBlockTable
         std::unique_ptr<HeadTermEntry[]>         m_HeadTermEntries;
         uint32_t                                 m_HeadTermEntryCount = 0;
 
+    private:
         void ExitBlockThread(BlockCachePool& pool)
         {
             if (!pool.BCP_Thread.joinable()) return;

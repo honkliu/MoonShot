@@ -12,46 +12,15 @@
 
 #include "IndexSerializer.h"
 #include "BlockTable.h"
+#include "FileAccess.h"
 
-#include <cstdio>
 #include <cstring>
 #include <vector>
 #include <string>
 #include <algorithm>
 #include <cassert>
-#include <memory>
 
 /* ── helpers ─────────────────────────────────────────────────────────────── */
-
-using FilePtr = std::unique_ptr<FILE, decltype(&std::fclose)>;
-
-static FilePtr open_file(const char* path, const char* mode)
-{
-    return FilePtr(std::fopen(path, mode), &std::fclose);
-}
-
-static bool seek_file(FILE* file, uint64_t offset)
-{
-#if defined(_WIN32)
-    return _fseeki64(file, static_cast<__int64>(offset), SEEK_SET) == 0;
-#else
-    return std::fseek(file, static_cast<long>(offset), SEEK_SET) == 0;
-#endif
-}
-
-static uint64_t file_pos(FILE* file)
-{
-#if defined(_WIN32)
-    return static_cast<uint64_t>(_ftelli64(file));
-#else
-    return static_cast<uint64_t>(std::ftell(file));
-#endif
-}
-
-static uint64_t page_aligned_bytes(uint64_t bytes)
-{
-    return ((bytes + PAGE_SIZE - 1) / PAGE_SIZE) * PAGE_SIZE;
-}
 
 static bool read_vbc_pair_end(const uint8_t* data, size_t size, size_t& offset)
 {
@@ -94,7 +63,7 @@ static size_t posting_prefix_bytes(const uint8_t* data, size_t size, size_t capa
  *    HeadTermEntry: one entry per 4096-byte LeafTermBlock -> first term in block.
  *    LeafTermBlocks: variable entry count, never crossing 4096-byte block boundary.
  * ─────────────────────────────────────────────────────────────────────────*/
-static BuildBlocksResult build_blocks(const PostingStore& store)
+BuildBlocksResult IndexSerializer::BuildBlocks(const PostingStore& store)
 {
     constexpr size_t   DATA_CAP = sizeof(IndexBlock::IB_Data);
 
@@ -256,163 +225,36 @@ static BuildBlocksResult build_blocks(const PostingStore& store)
 
 /* ── Save ─────────────────────────────────────────────────────────────────*/
 
-bool IndexSerializer::Save(const PostingStore& store, const char* path)
+bool IndexSerializer::Save(const IndexFileHeader& header,
+                           const IndexBlockTable& blockTable,
+                           const uint8_t* docData,
+                           const char* path)
 {
     if (!path || !*path) return false;
 
-    BuildBlocksResult br = build_blocks(store);
+    FileAccess file(path);
+    if (!file.InitWrite()) return false;
 
-    /* ── Encode Head/Leaf term table (paged two-level) ────────────────────
-     *
-     * Format:
-    *   [HeadTermEntry x IFH_HeadTermEntryCount]  // fixed 32B
-    *   [LeafTermBlock x IFH_LeafTermBlockCount]  // fixed 4096B
-     */
-    const uint64_t headTermEntryCount = br.BBR_HeadTermEntries.size();
-    const uint64_t leafTermBlockCount = br.BBR_LeafTermBlocks.size();
+    if (!file.PutData(&header, sizeof(header))) return false;
 
-    /* ── Encode DocData ───────────────────────────────────────────────────*/
-    std::vector<DocDataEntry> docdata;
-    uint64_t maxDocID = 0;
-    for (const auto& [id, _] : store.AllDocStats())
-        maxDocID = std::max(maxDocID, id);
-    if (!store.AllDocStats().empty())
-        docdata.resize(static_cast<size_t>(maxDocID + 1));
-
-    for (const auto& [id, ds] : store.AllDocStats()) {
-        DocDataEntry entry{};
-        entry.DDE_DocID     = id;
-        entry.DDE_DocLength = ds.doc_len;
-        entry.DDE_StaticRank = ds.importance;
-        entry.DDE_QualityScore = 0.0f;
-        entry.DDE_FreshnessScore = 0.0f;
-        entry.DDE_ClickScore = 0.0f;
-        entry.DDE_EngagementScore = 0.0f;
-        entry.DDE_VectorDim = static_cast<uint16_t>(DOC_VECTOR_DIM);
-        entry.DDE_VectorFormat = 1;  // int8 quantized
-        std::memcpy(entry.DDE_VectorData, store.GetDocVector(id), DOC_VECTOR_DIM);
-        entry.DDE_PathLength = static_cast<uint16_t>(std::min(ds.path.size(), DOC_PATH_MAX));
-        if (entry.DDE_PathLength > 0)
-            std::memcpy(entry.DDE_Path, ds.path.data(), entry.DDE_PathLength);
-        docdata[static_cast<size_t>(id)] = entry;
+    if (header.IFH_HeadTermEntryCount > 0) {
+        const uint64_t bytes = sizeof(HeadTermEntry) * header.IFH_HeadTermEntryCount;
+        if (!file.PutData(blockTable.m_HeadTermEntries.get(), bytes)) return false;
     }
 
-    /* ── Compute file offsets ─────────────────────────────────────────────*/
-    const uint64_t HDR_SIZE  = sizeof(IndexFileHeader);
-    uint64_t head_off        = HDR_SIZE;
-    uint64_t leaf_off        = head_off + headTermEntryCount * sizeof(HeadTermEntry);
-    uint64_t dd_off          = leaf_off + leafTermBlockCount * sizeof(LeafTermBlock);
-    uint64_t dd_size         = docdata.size() * DOC_REC_SIZE;
-    uint64_t raw_blk_off     = dd_off + dd_size;
-    uint64_t blk_off         = page_aligned_bytes(raw_blk_off);
-
-    FilePtr file = open_file(path, "wb");
-    FILE* f = file.get();
-    if (!f) return false;
-
-    IndexFileHeader hdr{};
-    std::memcpy(hdr.IFH_Magic, INDEX_FILE_MAGIC, 8);
-    hdr.IFH_Version       = INDEX_FORMAT_VERSION;
-    hdr.IFH_AvgDocLength  = store.AvgDocLen();
-    hdr.IFH_NumDocuments = static_cast<uint64_t>(docdata.size());
-    hdr.IFH_NumTerms     = br.BBR_TotalTerms;
-    hdr.IFH_HeadTermEntryOffset = head_off; hdr.IFH_HeadTermEntryCount = headTermEntryCount;
-    hdr.IFH_LeafTermBlockOffset = leaf_off; hdr.IFH_LeafTermBlockCount = leafTermBlockCount;
-    hdr.IFH_DocDataOffset = dd_off;
-    hdr.IFH_IndexBlockOffset = blk_off; hdr.IFH_IndexBlockCount = br.BBR_IndexBlocks.size();
-    fwrite(&hdr, sizeof(hdr), 1, f);
-
-    if (!br.BBR_HeadTermEntries.empty())
-        fwrite(br.BBR_HeadTermEntries.data(), sizeof(HeadTermEntry), br.BBR_HeadTermEntries.size(), f);
-    if (!br.BBR_LeafTermBlocks.empty())
-        fwrite(br.BBR_LeafTermBlocks.data(), sizeof(LeafTermBlock), br.BBR_LeafTermBlocks.size(), f);
-    if (!docdata.empty())
-        fwrite(docdata.data(), DOC_REC_SIZE, docdata.size(), f);
-
-    uint64_t cur_pos = file_pos(f);
-    if (cur_pos < blk_off) {
-        std::vector<uint8_t> pad(static_cast<size_t>(blk_off - cur_pos), 0);
-        fwrite(pad.data(), 1, pad.size(), f);
-    }
-    for (const auto& b : br.BBR_IndexBlocks)
-        fwrite(&b, sizeof(IndexBlock), 1, f);
-
-    return true;
-}
-
-/* ── Load ─────────────────────────────────────────────────────────────────*/
-
-bool IndexSerializer::Load(PostingStore&                           store,
-                           const char*                            path,
-                           std::vector<HeadTermEntry>*             headTermEntriesOut,
-                           std::vector<LeafTermBlock>*             leafTermBlocksOut,
-                           uint64_t*                              blocks_offset_out,
-                           uint64_t*                              num_blocks_out,
-                           uint64_t*                              leaf_blocks_offset_out,
-                           uint64_t*                              num_leaf_blocks_out,
-                           uint64_t*                              docdata_offset_out,
-                           uint64_t*                              docdata_size_out,
-                           uint64_t*                              num_documents_out,
-                           IndexFileHeader*                       header_out)
-{
-    if (!path || !*path) return false;
-    FilePtr file = open_file(path, "rb");
-    FILE* f = file.get();
-    if (!f) return false;
-
-    IndexFileHeader local_header{};
-    IndexFileHeader* hdr = header_out ? header_out : &local_header;
-    if (fread(hdr, sizeof(*hdr), 1, f) != 1
-        || std::memcmp(hdr->IFH_Magic, INDEX_FILE_MAGIC, 8) != 0
-        || hdr->IFH_Version != INDEX_FORMAT_VERSION)
-    {
-        return false;
+    if (header.IFH_LeafTermBlockCount > 0) {
+        const uint64_t bytes = sizeof(LeafTermBlock) * header.IFH_LeafTermBlockCount;
+        if (!file.PutData(blockTable.m_LeafTermPool.BCP_Pages, bytes)) return false;
     }
 
-    /* ── Head/Leaf term table ─────────────────────────────────────────────*/
-    if (headTermEntriesOut && hdr->IFH_HeadTermEntryCount > 0) {
-        const size_t count = static_cast<size_t>(hdr->IFH_HeadTermEntryCount);
-        headTermEntriesOut->resize(count);
-        if (!seek_file(f, hdr->IFH_HeadTermEntryOffset))
-            return false;
-        if (fread(headTermEntriesOut->data(), sizeof(HeadTermEntry), count, f) != count)
-            return false;
+    if (header.IFH_NumDocuments > 0) {
+        const uint64_t bytes = DOC_REC_SIZE * header.IFH_NumDocuments;
+        if (!file.PutData(docData, bytes)) return false;
     }
 
-    if (leaf_blocks_offset_out) *leaf_blocks_offset_out = hdr->IFH_LeafTermBlockOffset;
-    if (num_leaf_blocks_out) *num_leaf_blocks_out = hdr->IFH_LeafTermBlockCount;
-    if (leafTermBlocksOut && hdr->IFH_LeafTermBlockCount > 0) {
-        const size_t count = static_cast<size_t>(hdr->IFH_LeafTermBlockCount);
-        leafTermBlocksOut->resize(count);
-        if (!seek_file(f, hdr->IFH_LeafTermBlockOffset))
-            return false;
-        if (fread(leafTermBlocksOut->data(), sizeof(LeafTermBlock), count, f) != count)
-            return false;
-    }
-
-    if (blocks_offset_out) *blocks_offset_out = hdr->IFH_IndexBlockOffset;
-    if (num_blocks_out)    *num_blocks_out    = hdr->IFH_IndexBlockCount;
-    if (docdata_offset_out) *docdata_offset_out = hdr->IFH_DocDataOffset;
-    if (docdata_size_out)   *docdata_size_out   = hdr->IFH_NumDocuments * DOC_REC_SIZE;
-    if (num_documents_out)  *num_documents_out  = hdr->IFH_NumDocuments;
-
-    /* ── DocData ──────────────────────────────────────────────────────────*/
-    {
-        size_t n = static_cast<size_t>(hdr->IFH_NumDocuments);
-        if (!seek_file(f, hdr->IFH_DocDataOffset))
-            return false;
-        std::vector<DocDataEntry> entries(n);
-        if (n > 0) fread(entries.data(), DOC_REC_SIZE, n, f);
-        for (size_t row = 0; row < entries.size(); ++row) {
-            const auto& entry = entries[row];
-            if (entry.DDE_DocID != row)
-                continue;
-            store.AddDocTokens(entry.DDE_DocID, entry.DDE_DocLength);
-            store.SetDocImportance(entry.DDE_DocID, entry.DDE_StaticRank);
-            store.SetDocVector(entry.DDE_DocID, entry.DDE_VectorData);
-            if (entry.DDE_PathLength > 0 && entry.DDE_PathLength <= DOC_PATH_MAX)
-                store.SetDocPath(entry.DDE_DocID, std::string(reinterpret_cast<const char*>(entry.DDE_Path), entry.DDE_PathLength));
-        }
+    if (header.IFH_IndexBlockCount > 0) {
+        const uint64_t bytes = sizeof(IndexBlock) * header.IFH_IndexBlockCount;
+        if (!file.PutData(blockTable.m_IndexPool.BCP_Pages, bytes)) return false;
     }
 
     return true;
@@ -421,16 +263,11 @@ bool IndexSerializer::Load(PostingStore&                           store,
 bool IndexSerializer::IsValidIndex(const char* path)
 {
     if (!path || !*path) return false;
-    FilePtr file = open_file(path, "rb");
-    FILE* f = file.get();
-    if (!f) return false;
+    FileAccess file(path);
+    if (!file.Init()) return false;
     uint8_t magic[8] = {};
-    fread(magic, 1, 8, f);
+    if (file.GetData(magic, sizeof(magic)) != sizeof(magic)) return false;
     return std::memcmp(magic, INDEX_FILE_MAGIC, 8) == 0;
 }
 
-BuildBlocksResult IndexSerializer::BuildBlocksForContext(const PostingStore& store)
-{
-    return build_blocks(store);
-}
 

@@ -256,7 +256,7 @@ pub fn search_index(data: &[u8], query: &str, streams: &str) -> String {
     let mut out = String::from("[");
     for (index, result) in results.iter().enumerate() {
         if index > 0 { out.push(','); }
-        let path = context.with_store(|store| store.get_doc_path(result.doc_id).to_string());
+        let path = context.doc_path(result.doc_id);
         out.push_str(&format!(
             r#"{{"doc_id":"{}","score":{:.4},"path":{}}}"#,
             result.doc_id,

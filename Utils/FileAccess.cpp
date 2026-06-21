@@ -6,6 +6,9 @@
 
 #include "FileAccess.h"
 
+#include <algorithm>
+#include <limits>
+
 FileAccess::FileAccess(const char * fileName)
 : m_FileName(const_cast<char*>(fileName))
 {
@@ -33,19 +36,19 @@ bool FileAccess::Init()
 #endif
 }
 
-bool FileAccess::InitWrite()
+bool FileAccess::InitWrite(bool truncate)
 {
 #ifdef _WIN32
     m_FileHandle = CreateFileA(m_FileName,
                             GENERIC_READ | GENERIC_WRITE,
                             0,
                             NULL,
-                            OPEN_ALWAYS,
+                            truncate ? CREATE_ALWAYS : OPEN_ALWAYS,
                             FILE_ATTRIBUTE_NORMAL,
                             NULL);
     return m_FileHandle != INVALID_HANDLE_VALUE;
 #else
-    m_FileHandle = open(m_FileName, O_RDWR | O_CREAT, 0644);
+    m_FileHandle = open(m_FileName, O_RDWR | O_CREAT | (truncate ? O_TRUNC : 0), 0644);
     return m_FileHandle != -1;
 #endif
 }
@@ -70,6 +73,37 @@ int FileAccess::GetData(void * buffer, int numBytes)
     ssize_t bytesRead = read(m_FileHandle, buffer, numBytes);
     return static_cast<int>(bytesRead);
 #endif
+}
+
+bool FileAccess::PutData(const void * buffer, uint64_t numBytes)
+{
+    const auto* cursor = static_cast<const uint8_t*>(buffer);
+    while (numBytes > 0) {
+        const int chunk = static_cast<int>(std::min<uint64_t>(numBytes, static_cast<uint64_t>(std::numeric_limits<int>::max())));
+#ifdef _WIN32
+        if (m_FileHandle == INVALID_HANDLE_VALUE) {
+            return false;
+        }
+
+        DWORD bytesWritten = 0;
+        if (!WriteFile(m_FileHandle, cursor, static_cast<DWORD>(chunk), &bytesWritten, NULL)
+            || bytesWritten != static_cast<DWORD>(chunk)) {
+            return false;
+        }
+#else
+        if (m_FileHandle == -1) {
+            return false;
+        }
+
+        ssize_t bytesWritten = write(m_FileHandle, cursor, chunk);
+        if (bytesWritten != static_cast<ssize_t>(chunk)) {
+            return false;
+        }
+#endif
+        cursor += chunk;
+        numBytes -= static_cast<uint64_t>(chunk);
+    }
+    return true;
 }
 
 bool FileAccess::ReadBlock(uint32_t block_seq, void* buffer, size_t block_size,

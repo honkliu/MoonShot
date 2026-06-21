@@ -52,6 +52,9 @@ impl IndexContext {
 
     pub fn get_tokenizer(&self) -> &SmartTokenizer { &self.tokenizer }
     pub fn get_compiler(&self)  -> &IndexSearchCompiler { &self.compiler }
+    pub fn document_count(&self) -> u64 { self.store.lock().unwrap().total_docs() }
+    pub fn avg_doc_len(&self) -> f32 { self.store.lock().unwrap().avg_doc_len() }
+    pub fn doc_path(&self, doc_id: u64) -> String { self.store.lock().unwrap().get_doc_path(doc_id).to_string() }
 
     // ── Build (in-memory) ────────────────────────────────────────────────────
 

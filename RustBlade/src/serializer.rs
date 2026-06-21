@@ -83,8 +83,7 @@ impl IndexSerializer {
         let head_offset = INDEX_FILE_HEADER_SIZE;
         let leaf_offset = head_offset + blocks.bbr_head_term_entries.len() * 32;
         let docdata_offset = leaf_offset + blocks.bbr_leaf_term_blocks.len() * PAGE_SIZE;
-        let raw_index_offset = docdata_offset + docdata.len();
-        let index_offset = page_aligned_bytes(raw_index_offset);
+        let index_offset = docdata_offset + docdata.len();
         let total = index_offset + blocks.bbr_index_blocks.len() * PAGE_SIZE;
 
         let mut out = vec![0u8; total];
@@ -452,9 +451,6 @@ fn max_doc_id_in_pairs(data: &[u8]) -> u64 {
     max_doc_id
 }
 
-fn page_aligned_bytes(bytes: usize) -> usize {
-    ((bytes + PAGE_SIZE - 1) / PAGE_SIZE) * PAGE_SIZE
-}
 
 fn vb_read(data: &[u8], start: usize) -> (u64, usize) {
     let mut value = 0u64;

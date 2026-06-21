@@ -73,7 +73,7 @@ fn interactive() -> io::Result<()> {
     let idx = default_idx_path();
     let mut context = IndexContext::new();
     let loaded = context.load_index(idx.to_string_lossy().as_ref()).is_ok();
-    let docs = context.with_store(|store| store.total_docs());
+    let docs = context.document_count();
     if !loaded {
         eprintln!("Failed to load index: {}", idx.display());
     }
@@ -100,7 +100,7 @@ fn interactive() -> io::Result<()> {
         }
         println!("{} result(s)", results.len());
         for result in results.iter().take(20) {
-            let path = context.with_store(|store| store.get_doc_path(result.doc_id).to_string());
+            let path = context.doc_path(result.doc_id);
             println!("{}", if path.is_empty() { "[unknown]".to_string() } else { path });
         }
     }

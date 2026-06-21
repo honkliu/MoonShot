@@ -123,14 +123,15 @@ impl SearchService {
     fn new(index_path: String) -> Result<Self, String> {
         let mut context = IndexContext::new();
         context.load_index(&index_path).map_err(|error| format!("{error:?}"))?;
-        let docs = context.with_store(|store| store.total_docs());
+        let docs = context.document_count();
         if docs == 0 { return Err(format!("index loaded with zero docs or failed to load: {index_path}")); }
         Ok(Self { index_path, context: Mutex::new(context) })
     }
 
     fn health_json(&self) -> String {
         let context = self.context.lock().unwrap();
-        let (documents, avg_doc_len) = context.with_store(|store| (store.total_docs(), store.avg_doc_len()));
+        let documents = context.document_count();
+        let avg_doc_len = context.avg_doc_len();
         format!(
             "{{\"status\":\"ok\",\"index\":\"{}\",\"documents\":{},\"avg_doc_len\":{}}}",
             json_escape(&self.index_path), documents, avg_doc_len)
@@ -156,7 +157,7 @@ impl SearchService {
             json_escape(&query), json_escape(&streams), total, begin, limit, elapsed_ms);
         for (rank, result) in results[begin..end].iter().enumerate() {
             if rank > 0 { body.push(','); }
-            let path = context.with_store(|store| store.get_doc_path(result.doc_id).to_string());
+            let path = context.doc_path(result.doc_id);
             body.push_str(&format!(
                 "{{\"rank\":{},\"doc_id\":{},\"score\":{},\"path\":\"{}\"}}",
                 begin + rank + 1, result.doc_id, result.score, json_escape(&path)));

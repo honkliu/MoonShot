@@ -18,7 +18,6 @@
  *                          LTB_Directory[95]: entry count
  *                          LTB_Data: packed LeafTermEntry records + LTE_Term bytes
  *   [DocData]          N x 1024B records
- *   [Padding]          to PAGE_SIZE
  *   [Blocks]           raw IndexBlock structs
  *                        first block: packed varbyte docID/tf pairs
  *                        continuation block: 12B IndexBlockContinuationHeader + pairs
@@ -35,22 +34,12 @@ class IndexSerializer {
 public:
     using BlockResult = BuildBlocksResult;
 
-    static bool Save(const PostingStore& store, const char* path);
+    static bool Save(const IndexFileHeader& header,
+                     const IndexBlockTable& blockTable,
+                     const uint8_t* docData,
+                     const char* path);
     static bool IsValidIndex(const char* path);
-    static BuildBlocksResult BuildBlocksForContext(const PostingStore& store);
-
-    static bool Load(PostingStore&                           store,
-                     const char*                            path,
-                     std::vector<HeadTermEntry>*             headTermEntriesOut,
-                     std::vector<LeafTermBlock>*             leafTermBlocksOut,
-                     uint64_t*                              blocks_offset_out,
-                     uint64_t*                              num_blocks_out = nullptr,
-                     uint64_t*                              leaf_blocks_offset_out = nullptr,
-                     uint64_t*                              num_leaf_blocks_out = nullptr,
-                     uint64_t*                              docdata_offset_out = nullptr,
-                     uint64_t*                              docdata_size_out = nullptr,
-                     uint64_t*                              num_documents_out = nullptr,
-                     IndexFileHeader*                       header_out = nullptr);
+    static BuildBlocksResult BuildBlocks(const PostingStore& store);
 
 };
 

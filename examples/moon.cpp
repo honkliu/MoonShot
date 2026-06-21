@@ -98,11 +98,6 @@ static uint64_t FileOffset(FILE* file)
 #endif
 }
 
-static uint64_t PageAlignedBytes(uint64_t bytes)
-{
-    return ((bytes + PAGE_SIZE - 1) / PAGE_SIZE) * PAGE_SIZE;
-}
-
 static char ReadSingleKey()
 {
 #ifdef _WIN32
@@ -170,13 +165,11 @@ static PathMap LoadPathMap(const std::string& idxPath, uint64_t& max_id)
 {
     PathMap m;
     max_id = 0;
-    if (!IndexSerializer::IsValidIndex(idxPath.c_str())) return m;
-
-    PostingStore tmp;
-    IndexSerializer::Load(tmp, idxPath.c_str(), nullptr, nullptr, nullptr);
-    for (const auto& [id, ds] : tmp.AllDocStats()) {
-        if (!ds.path.empty()) {
-            m[ds.path] = id;
+    IndexContext ctx("", idxPath.c_str());
+    for (uint64_t id = 0; id < ctx.DocumentCount(); ++id) {
+        const std::string path = ctx.GetDocPath(id);
+        if (!path.empty()) {
+            m[path] = id;
             max_id = std::max(max_id, id + 1);
         }
     }
@@ -333,9 +326,7 @@ static std::string Stem(const std::string& path)
 
 static void Rebuild(const std::string& idxPath, const PathMap& pathMap)
 {
-    SmartTokenizer tok;
     IndexContext   ctx;
-    auto           writer = ctx.GetWriter();
     uint64_t       kept = 0;
     uint64_t       skipped = 0;
 
@@ -346,21 +337,12 @@ static void Rebuild(const std::string& idxPath, const PathMap& pathMap)
             ++skipped;
             continue;
         }
-        auto titleTokens = tok.Tokenize(Stem(fp).c_str());
-        auto urlTokens = tok.Tokenize(fp.c_str());
-        auto bodyTokens = tok.Tokenize(content.c_str());
-        std::vector<std::string> embeddingTokens;
-        embeddingTokens.reserve(titleTokens.size() + urlTokens.size() + bodyTokens.size());
-        embeddingTokens.insert(embeddingTokens.end(), titleTokens.begin(), titleTokens.end());
-        embeddingTokens.insert(embeddingTokens.end(), urlTokens.begin(), urlTokens.end());
-        embeddingTokens.insert(embeddingTokens.end(), bodyTokens.begin(), bodyTokens.end());
-
-        writer->Write(titleTokens, id, "Title");
-        writer->Write(urlTokens,   id, "URL");
-        writer->Write(bodyTokens,  id, "Body");
-        writer->SetDocVector(id, BuildHashedEmbedding(embeddingTokens));
-        // Path stored in DocData — no separate .meta file needed
-        ctx.GetStore()->SetDocPath(id, fp);
+        Document doc;
+        doc.doc_id = id;
+        doc.path = fp;
+        doc.title = Stem(fp);
+        doc.body = std::move(content);
+        ctx.AddDocument(doc);
         ++kept;
     }
 
@@ -670,8 +652,7 @@ static void SaveFromRuns(const std::string& idxPath,
     uint64_t leafCount = leafTermWriter.leafTermBlocks().size();
     uint64_t ddOff = leafOff + leafCount * sizeof(LeafTermBlock);
     uint64_t ddSize = docdata.size() * sizeof(DocDataEntry);
-    uint64_t rawBlocks = ddOff + ddSize;
-    uint64_t blkOff = PageAlignedBytes(rawBlocks);
+    uint64_t blkOff = ddOff + ddSize;
 
     FilePtr file = OpenFile(idxPath, "wb");
     FILE* f = file.get();
@@ -693,11 +674,6 @@ static void SaveFromRuns(const std::string& idxPath,
     if (!leafTermWriter.headEntries().empty()) fwrite(leafTermWriter.headEntries().data(), sizeof(HeadTermEntry), leafTermWriter.headEntries().size(), f);
     if (!leafTermWriter.leafTermBlocks().empty()) fwrite(leafTermWriter.leafTermBlocks().data(), sizeof(LeafTermBlock), leafTermWriter.leafTermBlocks().size(), f);
     if (!docdata.empty()) fwrite(docdata.data(), sizeof(DocDataEntry), docdata.size(), f);
-    uint64_t pos = FileOffset(f);
-    if (pos < blkOff) {
-        std::vector<uint8_t> pad(static_cast<size_t>(blkOff - pos), 0);
-        fwrite(pad.data(), 1, pad.size(), f);
-    }
     if (!blocks.empty()) fwrite(blocks.data(), sizeof(IndexBlock), blocks.size(), f);
 
 }
@@ -706,13 +682,12 @@ static void SaveFromRuns(const std::string& idxPath,
 
 static void Search(IndexContext& ctx, const std::string& query)
 {
-    if (ctx.GetStore()->TotalDocs() == 0) {
+    if (ctx.DocumentCount() == 0) {
         std::cout << "(no results)\n";
         return;
     }
 
-    IndexSearchCompiler compiler;
-    auto* tree = compiler.Compile(query.c_str(), "AUTB");
+    auto* tree = ctx.Compile(query.c_str(), "AUTB");
 
     if (!tree || tree->IsEmpty()) {
         delete tree;
@@ -941,7 +916,7 @@ int main(int argc, char* argv[])
             std::chrono::steady_clock::now() - loadStart).count();
 
         std::cout << "moon search — "
-                  << ctx.GetStore()->AllDocStats().size()
+                  << ctx.DocumentCount()
                   << " document(s)"
                   << " (loaded in " << loadMs << " ms)\n"
                   << "Type a query, or 'quit' to exit.\n";
