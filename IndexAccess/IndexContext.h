@@ -60,7 +60,8 @@ class IndexContext
 {
 public:
     explicit IndexContext(const char* configFile = "",
-                         const char* indexFile   = "")
+                         const char* indexFile   = "",
+                         bool        loadDelta   = true)
         : m_Store(make_shared<PostingStore>())
         , m_Params(make_shared<ConfigParameters>())
         , m_BlockTable(512)
@@ -69,6 +70,7 @@ public:
         , m_IndexPath(indexFile ? indexFile : "")
         , m_Built(false)
         , m_LoadedFromDisk(false)
+        , m_LoadDelta(loadDelta)
     {
         if (!m_IndexPath.empty())
             LoadIndex();
@@ -237,6 +239,16 @@ public:
 
     size_t VectorCount() const { return m_VectorIndex.Size(); }
     size_t VectorDimension() const { return m_VectorIndex.Dimension(); }
+
+    bool HasDelta() const
+    {
+        return m_DeltaContext && m_DeltaContext->DocumentCount() > 0;
+    }
+
+    IndexContext* GetDeltaContext()
+    {
+        return HasDelta() ? m_DeltaContext.get() : nullptr;
+    }
 
     bool SaveIndex()
     {
@@ -408,6 +420,7 @@ public:
         m_Executor = IndexSearchExecutor(this);
         m_Built    = true;
         m_LoadedFromDisk = true;
+        LoadDeltaIndex();
     }
 
     void LoadIndex(const char* path)
@@ -428,8 +441,10 @@ private:
     std::string                  m_IndexPath;
     bool                         m_Built;
     bool                         m_LoadedFromDisk;
+    bool                         m_LoadDelta;
     IndexFileHeader              m_IndexFileHeader{};
     uint8_t*                     m_DocData = nullptr;
+    std::unique_ptr<IndexContext> m_DeltaContext;
 
     IndexBlockTable              m_WriteBlockTable;
     FreshDiskAnnVectorIndex      m_WriteVectorIndex;
@@ -476,11 +491,36 @@ private:
 
     void ResetLoadedRuntimeState()
     {
+        m_DeltaContext.reset();
         ClearPinnedIndexData();
         m_BlockTable.SetBlockMemory(nullptr, nullptr);
         m_Executor = IndexSearchExecutor(this);
         m_Built = false;
         m_LoadedFromDisk = false;
+    }
+
+    static std::string DeltaIndexPath(const std::string& path)
+    {
+        const size_t slash = path.find_last_of("/\\");
+        const size_t dot = path.find_last_of('.');
+        if (dot != std::string::npos && (slash == std::string::npos || dot > slash))
+            return path.substr(0, dot) + ".delta" + path.substr(dot);
+        return path + ".delta.idx";
+    }
+
+    void LoadDeltaIndex()
+    {
+        m_DeltaContext.reset();
+
+        if (!m_LoadDelta || m_IndexPath.empty()) return;
+
+        const std::string deltaPath = DeltaIndexPath(m_IndexPath);
+        if (deltaPath == m_IndexPath) return;
+        if (!IndexSerializer::IsValidIndex(deltaPath.c_str())) return;
+
+        auto delta = std::make_unique<IndexContext>("", deltaPath.c_str(), false);
+        if (delta->m_LoadedFromDisk && delta->DocumentCount() > 0)
+            m_DeltaContext = std::move(delta);
     }
 
     void ResetRuntimeState(IndexBlockTable& blockTable,

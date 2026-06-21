@@ -125,6 +125,10 @@ static PathMap LoadPathMap(const std::string& idxPath, uint64_t& max_id)
 {
     PathMap m;
     max_id = 0;
+    std::error_code ec;
+    if (!std::filesystem::exists(FsPathFromUtf8(idxPath), ec))
+        return m;
+
     IndexContext ctx("", idxPath.c_str());
     for (uint64_t id = 0; id < ctx.DocumentCount(); ++id) {
         const std::string path = ctx.GetDocPath(id);
@@ -314,24 +318,43 @@ static void Rebuild(const std::string& idxPath, const PathMap& pathMap)
 
 // ─── search ──────────────────────────────────────────────────────────────────
 
+struct SearchHit {
+    const IndexContext* context = nullptr;
+    SearchResult result;
+};
+
+static void CollectSearchResults(IndexContext& ctx,
+                                 const std::string& query,
+                                 std::vector<SearchHit>& hits)
+{
+    if (ctx.DocumentCount() == 0)
+        return;
+
+    std::unique_ptr<EvalTree> tree(ctx.Compile(query.c_str(), "AUTB"));
+
+    if (!tree || tree->IsEmpty())
+        return;
+
+    auto reader = ctx.GetReader(tree.get());
+    std::unique_ptr<IndexSearchExecutor> executor(ctx.GetExecutor());
+    auto results = executor->Execute(reader, 0);
+
+    for (const auto& result : results)
+        hits.push_back({&ctx, result});
+}
+
 static void Search(IndexContext& ctx, const std::string& query)
 {
-    if (ctx.DocumentCount() == 0) {
-        std::cout << "(no results)\n";
-        return;
-    }
+    std::vector<SearchHit> results;
+    CollectSearchResults(ctx, query, results);
+    if (auto* delta = ctx.GetDeltaContext())
+        CollectSearchResults(*delta, query, results);
 
-    auto* tree = ctx.Compile(query.c_str(), "AUTB");
-
-    if (!tree || tree->IsEmpty()) {
-        delete tree;
-        std::cout << "(no results)\n";
-        return;
-    }
-
-    auto reader  = ctx.GetReader(tree);
-    auto results = ctx.GetExecutor()->Execute(reader, 0);
-    delete tree;
+    std::sort(results.begin(), results.end(), [](const SearchHit& left, const SearchHit& right) {
+        if (left.result.score != right.result.score)
+            return left.result.score > right.result.score;
+        return left.result.doc_id < right.result.doc_id;
+    });
 
     if (results.empty()) {
         std::cout << "(no results)\n";
@@ -348,8 +371,8 @@ static void Search(IndexContext& ctx, const std::string& query)
         }
 
         for (size_t i = offset; i < end; ++i) {
-            const auto& r = results[i];
-            const std::string path = ctx.GetDocPath(r.doc_id);
+            const auto& hit = results[i];
+            const std::string path = hit.context->GetDocPath(hit.result.doc_id);
             std::cout << (path.empty() ? "[unknown]" : path) << "\n";
         }
 
@@ -445,9 +468,12 @@ int main(int argc, char* argv[])
         IndexContext ctx("", idxPath.c_str());
         auto loadMs = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - loadStart).count();
+        uint64_t totalDocuments = ctx.DocumentCount();
+        if (auto* delta = ctx.GetDeltaContext())
+            totalDocuments += delta->DocumentCount();
 
         std::cout << "moon search — "
-                  << ctx.DocumentCount()
+                  << totalDocuments
                   << " document(s)"
                   << " (loaded in " << loadMs << " ms)\n"
                   << "Type a query, or 'quit' to exit.\n";
