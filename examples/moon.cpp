@@ -11,7 +11,6 @@
  */
 
 #include "moonshot.h"
-#include "IndexSerializer.h"
 
 #include <cstdint>
 #include <algorithm>
@@ -20,15 +19,11 @@
 #include <fstream>
 #include <iostream>
 #include <map>
-#include <memory>
 #include <sstream>
 #include <string>
-#include <unordered_map>
 #include <vector>
 #include <filesystem>
 #include <chrono>
-#include <queue>
-#include <cstdio>
 
 #ifdef _WIN32
 #  include <windows.h>
@@ -82,22 +77,6 @@ static char PathSep()
 #endif
 }
 
-using FilePtr = std::unique_ptr<FILE, decltype(&std::fclose)>;
-
-static FilePtr OpenFile(const std::string& path, const char* mode)
-{
-    return FilePtr(std::fopen(path.c_str(), mode), &std::fclose);
-}
-
-static uint64_t FileOffset(FILE* file)
-{
-#if defined(_WIN32)
-    return static_cast<uint64_t>(_ftelli64(file));
-#else
-    return static_cast<uint64_t>(std::ftell(file));
-#endif
-}
-
 static char ReadSingleKey()
 {
 #ifdef _WIN32
@@ -129,11 +108,6 @@ static std::string DefaultIdxPath()
 
 using PathMap = std::map<std::string, uint64_t>;  // filepath → sequential id
 static constexpr uintmax_t MAX_INDEX_FILE_BYTES = 8ull * 1024ull * 1024ull;
-static constexpr size_t DEFAULT_BATCH_SIZE = 1000;
-static constexpr uintmax_t DEFAULT_BATCH_BYTES = 128ull * 1024ull * 1024ull;
-static constexpr uint64_t DEFAULT_BATCH_TOKENS = 1000000ull;
-static constexpr uint64_t DEFAULT_BATCH_POSTINGS = 750000ull;
-static constexpr size_t DEFAULT_BATCH_UNIQUE_TERMS = 250000;
 
 struct FileItem {
     std::string path;
@@ -145,20 +119,6 @@ static std::filesystem::path FsPathFromUtf8(const std::string& path);
 static std::string ManifestPath(const std::string& idxPath)
 {
     return idxPath + ".manifest";
-}
-
-static std::filesystem::path ShardDir(const std::string& idxPath)
-{
-    return FsPathFromUtf8(idxPath + ".shards");
-}
-
-static std::string ToUtf8Path(const std::filesystem::path& path)
-{
-#ifdef _WIN32
-    return WideToUtf8(path.wstring().c_str());
-#else
-    return path.string();
-#endif
 }
 
 static PathMap LoadPathMap(const std::string& idxPath, uint64_t& max_id)
@@ -352,332 +312,6 @@ static void Rebuild(const std::string& idxPath, const PathMap& pathMap)
     std::cout << "\n";
 }
 
-struct DocMeta {
-    uint64_t    doc_id = 0;
-    uint32_t    doc_len = 0;
-    float       importance = 0.0f;
-    std::string path;
-    std::vector<float> vector;
-};
-
-static void write_u16(std::vector<uint8_t>& out, uint16_t v) { auto* p = reinterpret_cast<uint8_t*>(&v); out.insert(out.end(), p, p + 2); }
-static void write_u32(std::vector<uint8_t>& out, uint32_t v) { auto* p = reinterpret_cast<uint8_t*>(&v); out.insert(out.end(), p, p + 4); }
-
-static void vb_write(uint64_t v, std::vector<uint8_t>& out)
-{
-    while (v >= 0x80u) {
-        out.push_back(static_cast<uint8_t>((v & 0x7fu) | 0x80u));
-        v >>= 7;
-    }
-    out.push_back(static_cast<uint8_t>(v));
-}
-
-static std::vector<uint8_t> EncodePostings(const std::vector<IndexEntry>& entries)
-{
-    std::vector<uint8_t> bytes;
-    bytes.reserve(entries.size() * 3);
-    for (const auto& e : entries) {
-        vb_write(e.IE_DocID, bytes);
-        vb_write(e.IE_TermFrequency, bytes);
-    }
-    return bytes;
-}
-
-static bool ReadVbcPairEnd(const uint8_t* data, size_t size, size_t& offset)
-{
-    auto readOne = [&]() -> bool {
-        while (offset < size) {
-            uint8_t byte = data[offset++];
-            if ((byte & 0x80u) == 0) return true;
-        }
-        return false;
-    };
-    return readOne() && readOne();
-}
-
-static size_t PostingPrefixBytes(const uint8_t* data, size_t size, size_t capacity)
-{
-    size_t cursor = 0;
-    size_t lastPairEnd = 0;
-    size_t limit = std::min(size, capacity);
-    while (cursor < limit) {
-        size_t before = cursor;
-        if (!ReadVbcPairEnd(data, size, cursor) || cursor > limit) {
-            cursor = before;
-            break;
-        }
-        lastPairEnd = cursor;
-    }
-    return lastPairEnd;
-}
-
-static void DumpRun(const PostingStore& store, const std::string& runPath)
-{
-    FilePtr file = OpenFile(runPath, "wb");
-    FILE* f = file.get();
-    if (!f) throw std::runtime_error("Cannot write run: " + runPath);
-
-    std::vector<std::pair<const std::string*, const PostingList*>> terms;
-    terms.reserve(store.AllPostings().size());
-    for (const auto& [term, posting] : store.AllPostings()) terms.push_back({&term, &posting});
-    std::sort(terms.begin(), terms.end(), [](auto& a, auto& b){ return *a.first < *b.first; });
-    for (const auto& [term, posting] : terms) {
-        uint32_t len = static_cast<uint32_t>(term->size());
-        uint32_t count = static_cast<uint32_t>(posting->entries.size());
-        fwrite(&len, 4, 1, f);
-        fwrite(term->data(), 1, term->size(), f);
-        fwrite(&count, 4, 1, f);
-        if (count) fwrite(posting->entries.data(), sizeof(IndexEntry), count, f);
-    }
-    uint32_t zero = 0;
-    fwrite(&zero, 4, 1, f);
-}
-
-class RunReader {
-public:
-    explicit RunReader(const std::string& path) : m_File(path, std::ios::binary) { readNext(); }
-    bool valid() const { return m_Valid; }
-    const std::string& term() const { return m_Term; }
-    const std::vector<IndexEntry>& entries() const { return m_Entries; }
-    void next() { readNext(); }
-private:
-    std::ifstream m_File;
-    bool m_Valid = false;
-    std::string m_Term;
-    std::vector<IndexEntry> m_Entries;
-    void readNext() {
-        uint32_t len = 0;
-        if (!m_File.read(reinterpret_cast<char*>(&len), 4) || len == 0) {
-            m_Valid = false;
-            return;
-        }
-
-        m_Term.assign(len, '\0');
-        m_File.read(m_Term.data(), len);
-        uint32_t count = 0;
-        m_File.read(reinterpret_cast<char*>(&count), 4);
-        m_Entries.resize(count);
-        if (count) m_File.read(reinterpret_cast<char*>(m_Entries.data()), sizeof(IndexEntry) * count);
-        m_Valid = true;
-    }
-};
-
-class HeadLeafTermTableWriter {
-public:
-    void add(const std::string& term,
-             uint32_t docFreq,
-             uint32_t indexBlockID,
-             uint32_t indexOffset,
-             uint32_t indexLength,
-             uint32_t continuationBlockCount,
-             uint32_t flags)
-    {
-        size_t entryBytes = sizeof(LeafTermEntry) + term.size();
-        if (m_Count > 0 && m_Group.size() + entryBytes > PAGE_SIZE) flush();
-
-        if (m_Count == 0) {
-            m_FirstTerm = term;
-            m_Group.clear();
-            write_u32(m_Group, 0); // entry_count placeholder
-        }
-        LeafTermEntry header{};
-        header.LTE_DocFreq = docFreq;
-        header.LTE_IndexBlockID = indexBlockID;
-        header.LTE_IndexOffset = indexOffset;
-        header.LTE_IndexLength = indexLength;
-        header.LTE_ContinuationBlockCount = continuationBlockCount;
-        header.LTE_Flags = flags;
-        header.LTE_TermLength = static_cast<uint8_t>(term.size());
-        const uint8_t* headerBytes = reinterpret_cast<const uint8_t*>(&header);
-        m_Group.insert(m_Group.end(), headerBytes, headerBytes + sizeof(LeafTermEntry));
-        m_Group.insert(m_Group.end(), term.begin(), term.end());
-        ++m_Count;
-    }
-
-    void finish()
-    {
-        flush();
-    }
-
-    const std::vector<HeadTermEntry>& headEntries() const { return m_HeadTermEntries; }
-    const std::vector<LeafTermBlock>& leafTermBlocks() const { return m_LeafTermBlocks; }
-private:
-    std::vector<HeadTermEntry> m_HeadTermEntries;
-    std::vector<LeafTermBlock> m_LeafTermBlocks;
-    std::vector<uint8_t> m_Group;
-    std::string m_FirstTerm;
-    uint32_t m_Count = 0;
-    uint32_t m_LeafTermBlockCount = 0;
-    void flush() {
-        if (m_Count == 0) return;
-        std::memcpy(m_Group.data(), &m_Count, 4);
-        if (m_Group.size() < PAGE_SIZE) m_Group.resize(PAGE_SIZE, 0);
-        HeadTermEntry head{};
-        head.HTE_LeafTermBlockID = m_LeafTermBlockCount++;
-        head.HTE_FirstTermLength = static_cast<uint16_t>(m_FirstTerm.size());
-        std::memcpy(head.HTE_FirstTerm, m_FirstTerm.data(), head.HTE_FirstTermLength);
-        m_HeadTermEntries.push_back(head);
-        LeafTermBlock block{};
-        std::memcpy(block.LTB_Data, m_Group.data(), sizeof(block.LTB_Data));
-        m_LeafTermBlocks.push_back(block);
-        m_Group.clear();
-        m_FirstTerm.clear();
-        m_Count = 0;
-    }
-};
-
-static void SaveFromRuns(const std::string& idxPath,
-                         const std::vector<std::string>& runPaths,
-                         const std::vector<DocMeta>& docs)
-{
-    std::vector<std::unique_ptr<RunReader>> readers;
-    for (const auto& run : runPaths) readers.push_back(std::make_unique<RunReader>(run));
-    struct Item { std::string term; size_t reader = 0; };
-    struct Greater { bool operator()(const Item& a, const Item& b) const { return a.term > b.term; } };
-    std::priority_queue<Item, std::vector<Item>, Greater> pq;
-    for (size_t i = 0; i < readers.size(); ++i)
-        if (readers[i]->valid()) pq.push({readers[i]->term(), i});
-
-    constexpr size_t DATA_CAP = sizeof(IndexBlock::IB_Data);
-    std::vector<IndexBlock> blocks;
-    HeadLeafTermTableWriter leafTermWriter;
-    IndexBlock cur{};
-    size_t wptr = 0;
-    uint32_t seq = 0;
-    uint64_t totalTerms = 0;
-
-    auto flushBlock = [&]() {
-        blocks.push_back(cur);
-        ++seq; cur = {}; wptr = 0;
-    };
-
-    while (!pq.empty()) {
-        std::string term = pq.top().term;
-        std::vector<IndexEntry> merged;
-        while (!pq.empty() && pq.top().term == term) {
-            size_t idx = pq.top().reader;
-            pq.pop();
-            const auto& entries = readers[idx]->entries();
-            merged.insert(merged.end(), entries.begin(), entries.end());
-            readers[idx]->next();
-            if (readers[idx]->valid()) pq.push({readers[idx]->term(), idx});
-        }
-        std::sort(merged.begin(), merged.end(), [](const auto& a, const auto& b){ return a.IE_DocID < b.IE_DocID; });
-        std::vector<IndexEntry> compact;
-        for (const auto& e : merged) {
-            if (!compact.empty() && compact.back().IE_DocID == e.IE_DocID) compact.back().IE_TermFrequency += e.IE_TermFrequency;
-            else compact.push_back(e);
-        }
-        if (compact.empty()) continue;
-        if (term.size() > HEAD_TERM_KEY_MAX) continue;
-
-        auto bytes = EncodePostings(compact);
-        if (bytes.empty()) continue;
-        if (wptr >= DATA_CAP) flushBlock();
-
-        uint32_t indexBlockID = seq;
-        uint32_t indexOffset = static_cast<uint32_t>(wptr);
-        size_t src = 0;
-        size_t first = PostingPrefixBytes(bytes.data(), bytes.size(), DATA_CAP - wptr);
-        if (first == 0) {
-            flushBlock();
-            first = PostingPrefixBytes(bytes.data(), bytes.size(), DATA_CAP);
-            if (first == 0) continue;
-        }
-        std::memcpy(cur.IB_Data + wptr, bytes.data(), first);
-        wptr += first; src += first;
-        uint32_t indexLength = static_cast<uint32_t>(first);
-        uint32_t contCount = 0;
-        if (src < bytes.size()) {
-            flushBlock();
-            while (src < bytes.size()) {
-                constexpr size_t CONT_HDR = sizeof(IndexBlockContinuationHeader);
-                size_t take = PostingPrefixBytes(bytes.data() + src, bytes.size() - src, DATA_CAP - CONT_HDR);
-                if (take == 0) break;
-                bool more = take < bytes.size() - src;
-                size_t contCursor = 0;
-                uint64_t contMaxDocId = 0;
-                while (contCursor < take) {
-                    contMaxDocId = 0;
-                    uint8_t shift = 0;
-                    while (true) {
-                        uint8_t byte = bytes[src + contCursor++];
-                        contMaxDocId |= static_cast<uint64_t>(byte & 0x7Fu) << shift;
-                        if ((byte & 0x80u) == 0) break;
-                        shift += 7;
-                    }
-                    while (bytes[src + contCursor++] & 0x80u) {}
-                }
-                auto* header = reinterpret_cast<IndexBlockContinuationHeader*>(cur.IB_Data + wptr);
-                header->IBCH_MaxDocID = contMaxDocId;
-                header->IBCH_DataLength = static_cast<uint32_t>(take);
-                wptr += sizeof(IndexBlockContinuationHeader);
-                std::memcpy(cur.IB_Data + wptr, bytes.data() + src, take); wptr += take;
-                src += take;
-                ++contCount;
-                if (more) flushBlock();
-            }
-        }
-        leafTermWriter.add(term, static_cast<uint32_t>(compact.size()), indexBlockID, indexOffset, indexLength, contCount, 0);
-        ++totalTerms;
-    }
-    if (wptr > 0) flushBlock();
-
-    leafTermWriter.finish();
-
-    std::vector<DocDataEntry> docdata(docs.size());
-    for (size_t i = 0; i < docs.size(); ++i) {
-        docdata[i].DDE_DocID = docs[i].doc_id;
-        docdata[i].DDE_StaticRank = docs[i].importance;
-        docdata[i].DDE_DocLength = docs[i].doc_len;
-        if (docs[i].vector.size() == DOC_VECTOR_DIM) {
-            docdata[i].DDE_VectorDim = static_cast<uint16_t>(DOC_VECTOR_DIM);
-            docdata[i].DDE_VectorFormat = 1;
-            for (size_t j = 0; j < DOC_VECTOR_DIM; ++j) {
-                // Quantize float32 to int8: clamp to [-128, 127]
-                const float val = docs[i].vector[j];
-                const float clipped = std::max(-128.0f, std::min(127.0f, val * 128.0f));
-                docdata[i].DDE_VectorData[j] = static_cast<int8_t>(std::round(clipped));
-            }
-        }
-        docdata[i].DDE_PathLength = static_cast<uint16_t>(std::min(docs[i].path.size(), DOC_PATH_MAX));
-        if (docdata[i].DDE_PathLength > 0)
-            std::memcpy(docdata[i].DDE_Path, docs[i].path.data(), docdata[i].DDE_PathLength);
-    }
-
-    uint64_t hdrSize = sizeof(IndexFileHeader);
-    uint64_t headOff = hdrSize;
-    uint64_t headCount = leafTermWriter.headEntries().size();
-    uint64_t leafOff = headOff + headCount * sizeof(HeadTermEntry);
-    uint64_t leafCount = leafTermWriter.leafTermBlocks().size();
-    uint64_t ddOff = leafOff + leafCount * sizeof(LeafTermBlock);
-    uint64_t ddSize = docdata.size() * sizeof(DocDataEntry);
-    uint64_t blkOff = ddOff + ddSize;
-
-    FilePtr file = OpenFile(idxPath, "wb");
-    FILE* f = file.get();
-    if (!f) throw std::runtime_error("Cannot write index: " + idxPath);
-
-    IndexFileHeader hdr{};
-    std::memcpy(hdr.IFH_Magic, INDEX_FILE_MAGIC, 8);
-    hdr.IFH_Version = INDEX_FORMAT_VERSION;
-    uint64_t totalDocLen = 0;
-    for (const auto& doc : docs) totalDocLen += doc.doc_len;
-    hdr.IFH_AvgDocLength = docs.empty() ? 1.0f : static_cast<float>(totalDocLen) / static_cast<float>(docs.size());
-    hdr.IFH_NumDocuments = docs.size();
-    hdr.IFH_NumTerms = totalTerms;
-    hdr.IFH_HeadTermEntryOffset = headOff; hdr.IFH_HeadTermEntryCount = headCount;
-    hdr.IFH_LeafTermBlockOffset = leafOff; hdr.IFH_LeafTermBlockCount = leafCount;
-    hdr.IFH_DocDataOffset = ddOff;
-    hdr.IFH_IndexBlockOffset = blkOff; hdr.IFH_IndexBlockCount = blocks.size();
-    fwrite(&hdr, sizeof(hdr), 1, f);
-    if (!leafTermWriter.headEntries().empty()) fwrite(leafTermWriter.headEntries().data(), sizeof(HeadTermEntry), leafTermWriter.headEntries().size(), f);
-    if (!leafTermWriter.leafTermBlocks().empty()) fwrite(leafTermWriter.leafTermBlocks().data(), sizeof(LeafTermBlock), leafTermWriter.leafTermBlocks().size(), f);
-    if (!docdata.empty()) fwrite(docdata.data(), sizeof(DocDataEntry), docdata.size(), f);
-    if (!blocks.empty()) fwrite(blocks.data(), sizeof(IndexBlock), blocks.size(), f);
-
-}
-
 // ─── search ──────────────────────────────────────────────────────────────────
 
 static void Search(IndexContext& ctx, const std::string& query)
@@ -746,7 +380,6 @@ int main(int argc, char* argv[])
     // On Windows, argv uses the ANSI codepage and drops non-ASCII characters.
     // Use CommandLineToArgvW to get the real Unicode arguments instead.
     std::string cmd, filePath;
-    size_t batchSize = DEFAULT_BATCH_SIZE;
 #ifdef _WIN32
     SetConsoleOutputCP(CP_UTF8);
     SetConsoleCP(CP_UTF8);
@@ -755,19 +388,11 @@ int main(int argc, char* argv[])
     if (wargv) {
         if (wargc >= 2) cmd      = WideToUtf8(wargv[1]);
         if (wargc >= 3) filePath = WideToUtf8(wargv[2]);
-        for (int i = 3; i + 1 < wargc; ++i) {
-            std::string arg = WideToUtf8(wargv[i]);
-            if (arg == "-batch") batchSize = std::stoull(WideToUtf8(wargv[++i]));
-        }
         LocalFree(wargv);
     }
 #else
     if (argc >= 2) cmd      = argv[1];
     if (argc >= 3) filePath = argv[2];
-    for (int i = 3; i + 1 < argc; ++i) {
-        std::string arg = argv[i];
-        if (arg == "-batch") batchSize = std::stoull(argv[++i]);
-    }
 #endif
 
     if (cmd.empty()) {
@@ -791,122 +416,28 @@ int main(int argc, char* argv[])
                   << (MAX_INDEX_FILE_BYTES / (1024 * 1024)) << "MB under "
                   << filePath << "\n";
 
-        if (files.size() > batchSize) {
-            std::error_code ec;
-            std::filesystem::remove(FsPathFromUtf8(ManifestPath(idxPath)), ec);
-            std::filesystem::remove_all(ShardDir(idxPath), ec);
+        std::error_code ec;
+        std::filesystem::remove(FsPathFromUtf8(ManifestPath(idxPath)), ec);
+        uint64_t max_id = 0;
+        PathMap  pathMap = LoadPathMap(idxPath, max_id);
 
-            std::filesystem::path runDir = FsPathFromUtf8(idxPath + ".runs");
-            std::filesystem::remove_all(runDir, ec);
-            std::filesystem::create_directories(runDir, ec);
-
-            std::vector<std::string> runs;
-            std::vector<DocMeta> docs;
-            uint64_t nextDocId = 0;
-            size_t batch = 0;
-            std::vector<FileItem> pending;
-            uintmax_t pendingBytes = 0;
-
-            auto flushPending = [&]() {
-                if (pending.empty()) return;
-                SmartTokenizer tok;
-                PostingStore store;
-                uint64_t readable = 0;
-                uint64_t runFiles = 0;
-                uintmax_t runBytes = 0;
-                auto dumpCurrentRun = [&]() {
-                    if (readable == 0) return;
-                    std::filesystem::path runPath = runDir / ("run_" + std::to_string(batch) + ".bin");
-                    std::string run = ToUtf8Path(runPath);
-                    DumpRun(store, run);
-                    runs.push_back(run);
-                    std::cout << "Wrote run " << batch << " with " << readable << " doc(s) from "
-                              << runFiles << " file(s), " << (runBytes / (1024 * 1024)) << "MB input, "
-                              << store.TotalTerms() << " tokens, "
-                              << store.TotalPostingEntries() << " postings, "
-                              << store.UniqueTermCount() << " terms\n";
-                    ++batch;
-                    store = PostingStore{};
-                    readable = 0;
-                    runFiles = 0;
-                    runBytes = 0;
-                };
-                for (const auto& item : pending) {
-                    std::string content = ReadFile(item.path);
-                    if (content.empty()) continue;
-                    uint64_t docId = nextDocId++;
-                    auto title = tok.Tokenize(Stem(item.path).c_str());
-                    auto url = tok.Tokenize(item.path.c_str());
-                    auto body = tok.Tokenize(content.c_str());
-                    std::vector<std::string> embeddingTokens;
-                    embeddingTokens.reserve(title.size() + url.size() + body.size());
-                    embeddingTokens.insert(embeddingTokens.end(), title.begin(), title.end());
-                    embeddingTokens.insert(embeddingTokens.end(), url.begin(), url.end());
-                    embeddingTokens.insert(embeddingTokens.end(), body.begin(), body.end());
-                    auto vector = BuildHashedEmbedding(embeddingTokens);
-                    AdvancedIndexWriter writer(std::shared_ptr<PostingStore>(&store, [](PostingStore*){}));
-                    writer.Write(title, docId, "Title");
-                    writer.Write(url, docId, "URL");
-                    writer.Write(body, docId, "Body");
-                    writer.SetDocVector(docId, vector);
-                    store.SetDocPath(docId, item.path);
-                    docs.push_back({docId, store.GetDocLen(docId), 0.0f, item.path, std::move(vector)});
-                    ++readable;
-                    ++runFiles;
-                    runBytes += item.size;
-                    if (store.TotalTerms() >= DEFAULT_BATCH_TOKENS ||
-                        store.TotalPostingEntries() >= DEFAULT_BATCH_POSTINGS ||
-                        store.UniqueTermCount() >= DEFAULT_BATCH_UNIQUE_TERMS) {
-                        dumpCurrentRun();
-                    }
-                }
-                dumpCurrentRun();
-                pending.clear();
-                pendingBytes = 0;
-            };
-
-            for (const auto& file : files) {
-                pending.push_back(file);
-                pendingBytes += file.size;
-                if (pending.size() >= batchSize || pendingBytes >= DEFAULT_BATCH_BYTES) {
-                    flushPending();
-                }
+        uint64_t added = 0, existing = 0;
+        for (const auto& file : files) {
+            if (pathMap.count(file.path)) {
+                ++existing;
+            } else {
+                pathMap[file.path] = max_id++;
+                ++added;
             }
-            flushPending();
-            SaveFromRuns(idxPath, runs, docs);
-            std::filesystem::remove_all(runDir, ec);
-            std::cout << "Indexed input: " << filePath << "\n"
-                      << "Files:   " << files.size() << "\n"
-                      << "Batch:   " << batchSize << "\n"
-                      << "BatchBytes: " << (DEFAULT_BATCH_BYTES / (1024 * 1024)) << "MB\n"
-                      << "BatchTokens: " << DEFAULT_BATCH_TOKENS << "\n"
-                      << "BatchPostings: " << DEFAULT_BATCH_POSTINGS << "\n"
-                      << "BatchUniqueTerms: " << DEFAULT_BATCH_UNIQUE_TERMS << "\n"
-                      << "Index:   " << idxPath << "\n";
-        } else {
-            std::error_code ec;
-            std::filesystem::remove(FsPathFromUtf8(ManifestPath(idxPath)), ec);
-            uint64_t max_id = 0;
-            PathMap  pathMap = LoadPathMap(idxPath, max_id);
-
-            uint64_t added = 0, existing = 0;
-            for (const auto& file : files) {
-                if (pathMap.count(file.path)) {
-                    ++existing;
-                } else {
-                    pathMap[file.path] = max_id++;
-                    ++added;
-                }
-            }
-
-            Rebuild(idxPath, pathMap);
-
-            std::cout << "Indexed input: " << filePath << "\n"
-                      << "Files:   " << files.size()
-                      << " (new " << added << ", existing " << existing << ")\n"
-                      << "Total:   " << pathMap.size()
-                      << " document(s) in " << idxPath << "\n";
         }
+
+        Rebuild(idxPath, pathMap);
+
+        std::cout << "Indexed input: " << filePath << "\n"
+                  << "Files:   " << files.size()
+                  << " (new " << added << ", existing " << existing << ")\n"
+                  << "Total:   " << pathMap.size()
+                  << " document(s) in " << idxPath << "\n";
 
     // ── interactive search ────────────────────────────────────────────────────
     } else if (cmd == "-i") {

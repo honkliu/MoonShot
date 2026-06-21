@@ -2,8 +2,7 @@ use crate::block_table::{IndexBlock, PinnedBlock};
 
 /// Stateful VarByte decoder.  Posting bytes store absolute (docID, tf) pairs.
 /// Two modes:
-///   open_raw — reads from an explicit byte slice (offset + len within a block).
-///   open_cont — reads continuation bytes from the start of a continuation block.
+///   OpenRaw — reads from an explicit byte slice (offset + len within a block).
 pub struct VarByteDecoder {
     block:       Option<PinnedBlock<IndexBlock>>,
     raw_data:    Vec<u8>,
@@ -26,7 +25,8 @@ impl VarByteDecoder {
 
     /// Open on the term's posting bytes within a block's ib_data.
     /// `offset` and `len` are the byte range returned by IndexBlockTable::find_term_data.
-    pub fn open_raw(&mut self, block: PinnedBlock<IndexBlock>, offset: usize, len: usize, last_doc: u64) {
+    #[allow(non_snake_case)]
+    pub fn OpenRaw(&mut self, block: PinnedBlock<IndexBlock>, offset: usize, len: usize, last_doc: u64) {
         let end = (offset + len).min(block.ib_data.len());
         self.raw_data    = block.ib_data[offset..end].to_vec();
         self.block       = Some(block);
@@ -42,7 +42,8 @@ impl VarByteDecoder {
         self.pos < self.end
     }
 
-    pub fn go_next(&mut self) {
+    #[allow(non_snake_case)]
+    pub fn GoNext(&mut self) {
         if !self.has_more_bytes() {
             self.has_current = false;
             return;
@@ -61,15 +62,20 @@ impl VarByteDecoder {
         self.has_current  = true;
     }
 
-    pub fn go_until(&mut self, target: u64) {
-        if !self.has_current && self.has_more_bytes() { self.go_next(); }
-        while self.has_current && self.current_doc < target { self.go_next(); }
+    #[allow(non_snake_case)]
+    pub fn GoUntil(&mut self, target: u64) {
+        if !self.has_current && self.has_more_bytes() { self.GoNext(); }
+        while self.has_current && self.current_doc < target { self.GoNext(); }
     }
 
-    pub fn is_end(&self)             -> bool  { !self.has_current }
-    pub fn get_document_id(&self)    -> u64   { self.current_doc }
-    pub fn get_term_frequency(&self) -> u32   { self.current_tf }
-    pub fn get_current_block(&self)  -> Option<&PinnedBlock<IndexBlock>> { self.block.as_ref() }
+    #[allow(non_snake_case)]
+    pub fn IsEnd(&self)             -> bool  { !self.has_current }
+    #[allow(non_snake_case)]
+    pub fn GetDocumentID(&self)    -> u64   { self.current_doc }
+    #[allow(non_snake_case)]
+    pub fn GetTermFrequency(&self) -> u32   { self.current_tf }
+    #[allow(non_snake_case)]
+    pub fn GetCurrentBlock(&self)  -> Option<&PinnedBlock<IndexBlock>> { self.block.as_ref() }
 }
 
 impl Default for VarByteDecoder {

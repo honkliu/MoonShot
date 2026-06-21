@@ -6,6 +6,7 @@ use std::sync::Mutex;
 use std::time::Instant;
 
 use rustblade::IndexContext;
+use rustblade::executor::IndexSearchExecutor;
 
 struct Options {
     port: u16,
@@ -122,16 +123,16 @@ struct SearchService {
 impl SearchService {
     fn new(index_path: String) -> Result<Self, String> {
         let mut context = IndexContext::new();
-        context.load_index(&index_path).map_err(|error| format!("{error:?}"))?;
-        let docs = context.document_count();
+        context.LoadIndex(&index_path).map_err(|error| format!("{error:?}"))?;
+        let docs = context.DocumentCount();
         if docs == 0 { return Err(format!("index loaded with zero docs or failed to load: {index_path}")); }
         Ok(Self { index_path, context: Mutex::new(context) })
     }
 
     fn health_json(&self) -> String {
         let context = self.context.lock().unwrap();
-        let documents = context.document_count();
-        let avg_doc_len = context.avg_doc_len();
+        let documents = context.DocumentCount();
+        let avg_doc_len = context.AvgDocLen();
         format!(
             "{{\"status\":\"ok\",\"index\":\"{}\",\"documents\":{},\"avg_doc_len\":{}}}",
             json_escape(&self.index_path), documents, avg_doc_len)
@@ -146,7 +147,12 @@ impl SearchService {
         let started = Instant::now();
 
         let mut context = self.context.lock().unwrap();
-        let results = context.search(&query, 0, &streams);
+        let tree = context.Compile(&query, &streams);
+        let mut reader = context.GetReader(tree);
+        let store = context.GetStore();
+        let store = store.lock().unwrap();
+        let executor = IndexSearchExecutor::new(&store);
+        let results = executor.Execute(reader.as_mut(), 0);
         let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
         let total = results.len();
         let begin = offset.min(total);
@@ -157,7 +163,7 @@ impl SearchService {
             json_escape(&query), json_escape(&streams), total, begin, limit, elapsed_ms);
         for (rank, result) in results[begin..end].iter().enumerate() {
             if rank > 0 { body.push(','); }
-            let path = context.doc_path(result.doc_id);
+            let path = context.GetDocPath(result.doc_id);
             body.push_str(&format!(
                 "{{\"rank\":{},\"doc_id\":{},\"score\":{},\"path\":\"{}\"}}",
                 begin + rank + 1, result.doc_id, result.score, json_escape(&path)));
@@ -169,7 +175,7 @@ impl SearchService {
 
 fn http_response(status: u16, status_text: &str, body: &str) -> String {
     format!(
-        "HTTP/1.1 {} {}\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, OPTIONS\r\nConnection: close\r\n\r\n{}",
+        "HTTP/1.1 {} {}\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, OPTIONS\r\nConnection: Close\r\n\r\n{}",
         status, status_text, body.as_bytes().len(), body)
 }
 

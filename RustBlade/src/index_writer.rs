@@ -4,10 +4,14 @@ use crate::posting_store::PostingStore;
 use crate::eval_tree::BIGRAM_SEP;
 
 pub trait IndexWriter {
-    fn write(&mut self, tokens: Vec<String>, doc_id: u64, stream: &str);
-    fn set_doc_importance(&mut self, doc_id: u64, score: f32);
-    fn set_doc_path(&mut self, doc_id: u64, path: String);
-    fn set_doc_vector(&mut self, doc_id: u64, vector: Vec<f32>);
+    #[allow(non_snake_case)]
+    fn Write(&mut self, tokens: Vec<String>, doc_id: u64, stream: &str);
+    #[allow(non_snake_case)]
+    fn SetDocImportance(&mut self, doc_id: u64, score: f32);
+    #[allow(non_snake_case)]
+    fn SetDocPath(&mut self, doc_id: u64, path: String);
+    #[allow(non_snake_case)]
+    fn SetDocVector(&mut self, doc_id: u64, vector: Vec<f32>);
 }
 
 /*
@@ -49,7 +53,7 @@ impl AdvancedIndexWriter {
 }
 
 impl IndexWriter for AdvancedIndexWriter {
-    fn write(&mut self, tokens: Vec<String>, doc_id: u64, stream: &str) {
+    fn Write(&mut self, tokens: Vec<String>, doc_id: u64, stream: &str) {
         if tokens.is_empty() { return; }
         let abbrev = Self::stream_abbrev(stream);
         let mut store = self.store.lock().unwrap();
@@ -70,21 +74,21 @@ impl IndexWriter for AdvancedIndexWriter {
         }
 
         for (term, tf) in &term_tf {
-            store.add_posting(&format!("{}{}", term, abbrev), doc_id, *tf);
+            store.AddPosting(&format!("{}{}", term, abbrev), doc_id, *tf);
         }
 
-        store.add_doc_tokens(doc_id, tokens.len() as u32);
+        store.AddDocTokens(doc_id, tokens.len() as u32);
     }
 
-    fn set_doc_importance(&mut self, doc_id: u64, score: f32) {
-        self.store.lock().unwrap().set_doc_importance(doc_id, score);
+    fn SetDocImportance(&mut self, doc_id: u64, score: f32) {
+        self.store.lock().unwrap().SetDocImportance(doc_id, score);
     }
 
-    fn set_doc_path(&mut self, doc_id: u64, path: String) {
-        self.store.lock().unwrap().set_doc_path(doc_id, path);
+    fn SetDocPath(&mut self, doc_id: u64, path: String) {
+        self.store.lock().unwrap().SetDocPath(doc_id, path);
     }
 
-    fn set_doc_vector(&mut self, doc_id: u64, vector: Vec<f32>) {
-        self.store.lock().unwrap().set_doc_vector(doc_id, vector);
+    fn SetDocVector(&mut self, doc_id: u64, vector: Vec<f32>) {
+        self.store.lock().unwrap().SetDocVector(doc_id, vector);
     }
 }

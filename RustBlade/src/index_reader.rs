@@ -10,17 +10,18 @@ pub const NO_MORE_DOCS: u64 = u64::MAX;
 * Composite: AndIndexReader / OrIndexReader / NotIndexReader — combine leaves.
 *
 * TF and BM25 score live ONLY on leaf readers.
-* Composites aggregate from leaves via get_bm25_score / get_term_freq.
+* Composites aggregate from leaves via GetScore / GetTermFreq.
 *
 * Mirrors MoonShot's IndexReader.h and REF's ISR hierarchy.
 */
+#[allow(non_snake_case)]
 pub trait IndexReader {
-    fn go_next(&mut self);
-    fn go_until(&mut self, target: u64);
-    fn is_end(&self)            -> bool;
-    fn get_document_id(&self)   -> u64;
-    fn get_term_freq(&self)     -> u32   { 1 }
-    fn get_bm25_score(&self, _scorer: &Bm25Scorer, _doc_len: u32) -> f32 { 0.0 }
-    fn set_debug(&mut self, _label: &str, _depth: usize) {}
-    fn close(&mut self) {}
+    fn GoNext(&mut self);
+    fn GoUntil(&mut self, target: u64);
+    fn IsEnd(&self)            -> bool;
+    fn GetDocumentID(&self)   -> u64;
+    fn GetTermFreq(&self)     -> u32   { 1 }
+    fn GetScore(&self, _scorer: &Bm25Scorer, _doc_len: u32) -> f32 { 0.0 }
+    fn SetDebug(&mut self, _label: &str, _depth: usize) {}
+    fn Close(&mut self) {}
 }

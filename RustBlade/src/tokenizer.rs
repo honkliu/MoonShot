@@ -1,7 +1,8 @@
 use icu_segmenter::{options::WordBreakInvariantOptions, WordSegmenter};
 
 pub trait Tokenizer: Send + Sync {
-    fn tokenize(&self, text: &str) -> Vec<String>;
+    #[allow(non_snake_case)]
+    fn Tokenize(&self, text: &str) -> Vec<String>;
 }
 
 /*
@@ -35,7 +36,7 @@ impl Default for SmartTokenizer {
 }
 
 impl Tokenizer for SmartTokenizer {
-    fn tokenize(&self, text: &str) -> Vec<String> {
+    fn Tokenize(&self, text: &str) -> Vec<String> {
         if text.is_empty() { return Vec::new(); }
 
         let segmenter = WordSegmenter::new_auto(WordBreakInvariantOptions::default());
@@ -68,6 +69,6 @@ mod tests {
     #[test]
     fn keeps_cjk_word_segments() {
         let tokenizer = SmartTokenizer::new();
-        assert_eq!(tokenizer.tokenize("学习"), vec!["学习"]);
+        assert_eq!(tokenizer.Tokenize("学习"), vec!["学习"]);
     }
 }

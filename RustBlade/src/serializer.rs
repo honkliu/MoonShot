@@ -1,9 +1,10 @@
 use std::fs::File;
-use std::io::{BufReader, BufWriter, Read, Seek, Write};
+use std::io::{BufReader, Read, Seek, Write};
 
 use crate::block_table::{
     HeadTermEntry,
     IndexBlock,
+    IndexBlockTable,
     IndexBlockContinuationHeader,
     LeafTermBlock,
     LeafTermEntry,
@@ -23,7 +24,7 @@ use crate::posting_store::PostingStore;
 
 const MAGIC: &[u8; 8] = b"MOONSHOT";
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct IndexFileHeader {
     pub ifh_avg_doc_length: f32,
     pub ifh_num_documents: u64,
@@ -55,82 +56,73 @@ impl IndexFileHeader {
             ifh_index_block_count: u64_at(data, 80),
         })
     }
+
+    pub fn to_bytes(&self) -> [u8; INDEX_FILE_HEADER_SIZE] {
+        let mut out = [0u8; INDEX_FILE_HEADER_SIZE];
+        out[0..8].copy_from_slice(MAGIC);
+        write_u32(&mut out, 8, INDEX_FORMAT_VERSION);
+        write_f32(&mut out, 12, self.ifh_avg_doc_length);
+        write_u64(&mut out, 16, self.ifh_num_documents);
+        write_u64(&mut out, 24, self.ifh_num_terms);
+        write_u64(&mut out, 32, self.ifh_head_term_entry_offset);
+        write_u64(&mut out, 40, self.ifh_head_term_entry_count);
+        write_u64(&mut out, 48, self.ifh_leaf_term_block_offset);
+        write_u64(&mut out, 56, self.ifh_leaf_term_block_count);
+        write_u64(&mut out, 64, self.ifh_doc_data_offset);
+        write_u64(&mut out, 72, self.ifh_index_block_offset);
+        write_u64(&mut out, 80, self.ifh_index_block_count);
+        out
+    }
 }
 
-pub struct BlocksResult {
-    pub bbr_index_blocks: Vec<IndexBlock>,
-    pub bbr_head_term_entries: Vec<HeadTermEntry>,
-    pub bbr_leaf_term_blocks: Vec<LeafTermBlock>,
-    pub bbr_total_terms: u64,
+#[allow(non_snake_case)]
+pub struct BuildBlocksResult {
+    pub BBR_IndexBlocks: Vec<IndexBlock>,
+    pub BBR_HeadTermEntries: Vec<HeadTermEntry>,
+    pub BBR_LeafTermBlocks: Vec<LeafTermBlock>,
+    pub BBR_TotalTerms: u64,
 }
 
 pub struct IndexSerializer;
 
 impl IndexSerializer {
-    pub fn save(store: &mut PostingStore, path: &str) -> Result<()> {
-        let bytes = Self::encode(store)?;
-        let file = File::create(path)?;
-        let mut writer = BufWriter::new(file);
-        writer.write_all(&bytes)?;
-        writer.flush()?;
+    #[allow(non_snake_case)]
+    pub fn Save(header: &IndexFileHeader, blockTable: &IndexBlockTable, docData: &[u8], path: &str) -> Result<()> {
+        let mut file = File::create(path)?;
+        file.write_all(&header.to_bytes())?;
+
+        if header.ifh_head_term_entry_count > 0 {
+            let mut bytes = Vec::with_capacity(header.ifh_head_term_entry_count as usize * 32);
+            for entry in blockTable.HeadTermEntries() {
+                bytes.extend_from_slice(&entry.to_bytes());
+            }
+            file.write_all(&bytes)?;
+        }
+
+        if header.ifh_leaf_term_block_count > 0 {
+            let blocks = blockTable.LeafTermBlocks();
+            let mut bytes = Vec::with_capacity(blocks.len() * PAGE_SIZE);
+            for block in &blocks {
+                bytes.extend_from_slice(&block.to_bytes());
+            }
+            file.write_all(&bytes)?;
+        }
+
+        if header.ifh_num_documents > 0 {
+            file.write_all(docData)?;
+        }
+
+        if header.ifh_index_block_count > 0 {
+            let blocks = blockTable.IndexBlocks();
+            let mut bytes = Vec::with_capacity(blocks.len() * PAGE_SIZE);
+            for block in &blocks {
+                bytes.extend_from_slice(&block.ib_data);
+            }
+            file.write_all(&bytes)?;
+        }
+
+        file.flush()?;
         Ok(())
-    }
-
-    pub fn encode(store: &mut PostingStore) -> Result<Vec<u8>> {
-        let blocks = Self::build_blocks(store);
-        let (docdata, document_count) = Self::encode_docdata(store);
-
-        let head_offset = INDEX_FILE_HEADER_SIZE;
-        let leaf_offset = head_offset + blocks.bbr_head_term_entries.len() * 32;
-        let docdata_offset = leaf_offset + blocks.bbr_leaf_term_blocks.len() * PAGE_SIZE;
-        let index_offset = docdata_offset + docdata.len();
-        let total = index_offset + blocks.bbr_index_blocks.len() * PAGE_SIZE;
-
-        let mut out = vec![0u8; total];
-        out[0..8].copy_from_slice(MAGIC);
-        write_u32(&mut out, 8, INDEX_FORMAT_VERSION);
-        write_f32(&mut out, 12, store.avg_doc_len());
-        write_u64(&mut out, 16, document_count);
-        write_u64(&mut out, 24, blocks.bbr_total_terms);
-        write_u64(&mut out, 32, head_offset as u64);
-        write_u64(&mut out, 40, blocks.bbr_head_term_entries.len() as u64);
-        write_u64(&mut out, 48, leaf_offset as u64);
-        write_u64(&mut out, 56, blocks.bbr_leaf_term_blocks.len() as u64);
-        write_u64(&mut out, 64, docdata_offset as u64);
-        write_u64(&mut out, 72, index_offset as u64);
-        write_u64(&mut out, 80, blocks.bbr_index_blocks.len() as u64);
-
-        let mut cursor = head_offset;
-        for entry in &blocks.bbr_head_term_entries {
-            out[cursor..cursor + 32].copy_from_slice(&entry.to_bytes());
-            cursor += 32;
-        }
-
-        cursor = leaf_offset;
-        for block in &blocks.bbr_leaf_term_blocks {
-            out[cursor..cursor + PAGE_SIZE].copy_from_slice(&block.to_bytes());
-            cursor += PAGE_SIZE;
-        }
-
-        out[docdata_offset..docdata_offset + docdata.len()].copy_from_slice(&docdata);
-
-        cursor = index_offset;
-        for block in &blocks.bbr_index_blocks {
-            out[cursor..cursor + PAGE_SIZE].copy_from_slice(&block.ib_data);
-            cursor += PAGE_SIZE;
-        }
-
-        Ok(out)
-    }
-
-    pub fn load(store: &mut PostingStore, path: &str)
-        -> Result<(Vec<HeadTermEntry>, Vec<LeafTermBlock>, Vec<IndexBlock>, Vec<u8>)>
-    {
-        let file = File::open(path)?;
-        let mut reader = BufReader::new(file);
-        let mut bytes = Vec::new();
-        reader.read_to_end(&mut bytes)?;
-        Self::decode(store, &bytes)
     }
 
     pub fn load_file_tables(store: &mut PostingStore, path: &str)
@@ -220,12 +212,12 @@ impl IndexSerializer {
         let doc_len = u32_at(record, 32);
         let importance = f32_at(record, 44);
         let path_len = u16_at(record, 72) as usize;
-        store.add_doc_tokens(doc_id, doc_len);
-        store.set_doc_importance(doc_id, importance);
-        store.set_doc_vector_bytes(doc_id, &record[256..256 + DOC_VECTOR_DIM]);
+        store.AddDocTokens(doc_id, doc_len);
+        store.SetDocImportance(doc_id, importance);
+        store.SetDocVectorBytes(doc_id, &record[256..256 + DOC_VECTOR_DIM]);
         if path_len > 0 && path_len <= DOC_PATH_MAX {
             if let Ok(path) = std::str::from_utf8(&record[768..768 + path_len]) {
-                store.set_doc_path(doc_id, path.to_string());
+                store.SetDocPath(doc_id, path.to_string());
             }
         }
         Ok(())
@@ -239,22 +231,12 @@ impl IndexSerializer {
             && u32::from_le_bytes(header[8..12].try_into().unwrap()) == INDEX_FORMAT_VERSION
     }
 
-    pub fn is_valid_bytes(data: &[u8]) -> bool {
-        data.len() >= 12 && &data[0..8] == MAGIC && u32_at(data, 8) == INDEX_FORMAT_VERSION
-    }
-
-    pub fn build_blocks_pub(store: &PostingStore)
-        -> (Vec<IndexBlock>, Vec<HeadTermEntry>, Vec<LeafTermBlock>)
-    {
-        let blocks = Self::build_blocks(store);
-        (blocks.bbr_index_blocks, blocks.bbr_head_term_entries, blocks.bbr_leaf_term_blocks)
-    }
-
-    fn build_blocks(store: &PostingStore) -> BlocksResult {
-        let mut terms: Vec<(&String, &crate::posting_store::PostingList)> = store.all_postings().iter().collect();
+    #[allow(non_snake_case)]
+    pub fn BuildBlocks(store: &PostingStore) -> BuildBlocksResult {
+        let mut terms: Vec<(&String, &crate::posting_store::PostingList)> = store.AllPostings().iter().collect();
         terms.sort_by_key(|(term, _)| term.as_str());
 
-        let mut index_blocks = Vec::new();
+        let mut IndexBlocks = Vec::new();
         let mut cur = IndexBlock::default();
         let mut wptr = 0usize;
         let mut seq = 0u32;
@@ -265,8 +247,8 @@ impl IndexSerializer {
         let mut leaf_entry_count = 0usize;
         let mut first_leaf_term = String::new();
 
-        let flush_index_block = |index_blocks: &mut Vec<IndexBlock>, cur: &mut IndexBlock, wptr: &mut usize, seq: &mut u32| {
-            index_blocks.push(cur.clone());
+        let flush_index_block = |IndexBlocks: &mut Vec<IndexBlock>, cur: &mut IndexBlock, wptr: &mut usize, seq: &mut u32| {
+            IndexBlocks.push(cur.clone());
             *seq += 1;
             *cur = IndexBlock::default();
             *wptr = 0;
@@ -297,7 +279,7 @@ impl IndexSerializer {
             if bytes.is_empty() { continue; }
 
             if wptr >= PAGE_SIZE {
-                flush_index_block(&mut index_blocks, &mut cur, &mut wptr, &mut seq);
+                flush_index_block(&mut IndexBlocks, &mut cur, &mut wptr, &mut seq);
             }
 
             let mut src = 0usize;
@@ -305,7 +287,7 @@ impl IndexSerializer {
             let mut data_offset = wptr;
             let mut data_here = posting_prefix_bytes(&bytes[src..], PAGE_SIZE - wptr);
             if data_here == 0 {
-                flush_index_block(&mut index_blocks, &mut cur, &mut wptr, &mut seq);
+                flush_index_block(&mut IndexBlocks, &mut cur, &mut wptr, &mut seq);
                 data_offset = wptr;
                 data_here = posting_prefix_bytes(&bytes[src..], PAGE_SIZE);
                 if data_here == 0 { continue; }
@@ -319,7 +301,7 @@ impl IndexSerializer {
             let mut continuation_block_count = 0u32;
 
             if remaining > 0 {
-                flush_index_block(&mut index_blocks, &mut cur, &mut wptr, &mut seq);
+                flush_index_block(&mut IndexBlocks, &mut cur, &mut wptr, &mut seq);
 
                 while remaining > 0 {
                     let cont_cap = PAGE_SIZE - INDEX_BLOCK_CONTINUATION_HEADER_SIZE;
@@ -338,7 +320,7 @@ impl IndexSerializer {
                     remaining -= cont_here;
                     continuation_block_count += 1;
                     if more_cont {
-                        flush_index_block(&mut index_blocks, &mut cur, &mut wptr, &mut seq);
+                        flush_index_block(&mut IndexBlocks, &mut cur, &mut wptr, &mut seq);
                     }
                 }
             }
@@ -366,37 +348,17 @@ impl IndexSerializer {
             total_terms += 1;
         }
 
-        if wptr > 0 { flush_index_block(&mut index_blocks, &mut cur, &mut wptr, &mut seq); }
+        if wptr > 0 { flush_index_block(&mut IndexBlocks, &mut cur, &mut wptr, &mut seq); }
         flush_leaf_block(&mut leaf_blocks, &mut head_entries, &mut leaf_block, &mut leaf_write_offset, &mut leaf_entry_count, &mut first_leaf_term);
 
-        BlocksResult {
-            bbr_index_blocks: index_blocks,
-            bbr_head_term_entries: head_entries,
-            bbr_leaf_term_blocks: leaf_blocks,
-            bbr_total_terms: total_terms,
+        BuildBlocksResult {
+            BBR_IndexBlocks: IndexBlocks,
+            BBR_HeadTermEntries: head_entries,
+            BBR_LeafTermBlocks: leaf_blocks,
+            BBR_TotalTerms: total_terms,
         }
     }
 
-    fn encode_docdata(store: &PostingStore) -> (Vec<u8>, u64) {
-        let document_count = store.all_doc_stats().keys().copied().max().map(|id| id + 1).unwrap_or(0);
-        let mut out = vec![0u8; document_count as usize * DOC_REC_SIZE];
-        for (doc_id, stats) in store.all_doc_stats() {
-            let offset = *doc_id as usize * DOC_REC_SIZE;
-            out[offset..offset + 8].copy_from_slice(&doc_id.to_le_bytes());
-            out[offset + 32..offset + 36].copy_from_slice(&stats.doc_len.to_le_bytes());
-            out[offset + 44..offset + 48].copy_from_slice(&stats.importance.to_le_bytes());
-            out[offset + 144..offset + 146].copy_from_slice(&(DOC_VECTOR_DIM as u16).to_le_bytes());
-            out[offset + 146..offset + 148].copy_from_slice(&1u16.to_le_bytes());
-            let vector = store.get_doc_vector(*doc_id);
-            for i in 0..DOC_VECTOR_DIM {
-                out[offset + 256 + i] = vector[i] as u8;
-            }
-            let path_len = stats.path.len().min(DOC_PATH_MAX);
-            out[offset + 72..offset + 74].copy_from_slice(&(path_len as u16).to_le_bytes());
-            out[offset + 768..offset + 768 + path_len].copy_from_slice(&stats.path.as_bytes()[..path_len]);
-        }
-        (out, document_count)
-    }
 }
 
 fn write_leaf_entry(block: &mut LeafTermBlock, entry_index: usize, offset: usize, entry: &LeafTermEntry) {

@@ -70,18 +70,18 @@ fn build_index() {
 
     let mut ctx    = IndexContext::new();
     let tok        = SmartTokenizer::new();
-    let mut writer = ctx.get_writer();
+    let mut writer = ctx.GetWriter();
 
     for doc in DOCS {
-        writer.write(tok.tokenize(doc.anchor), doc.id, "Anchor");
-        writer.write(tok.tokenize(doc.url),    doc.id, "URL");
-        writer.write(tok.tokenize(doc.title),  doc.id, "Title");
-        writer.write(tok.tokenize(doc.body),   doc.id, "Body");
-        writer.set_doc_importance(doc.id, doc.importance);
+        writer.Write(tok.Tokenize(doc.anchor), doc.id, "Anchor");
+        writer.Write(tok.Tokenize(doc.url),    doc.id, "URL");
+        writer.Write(tok.Tokenize(doc.title),  doc.id, "Title");
+        writer.Write(tok.Tokenize(doc.body),   doc.id, "Body");
+        writer.SetDocImportance(doc.id, doc.importance);
         println!("  indexed doc {}: {}", doc.id, doc.title);
     }
 
-    ctx.save_index(INDEX_FILE).expect("save failed");
+    ctx.SaveIndex(INDEX_FILE).expect("save failed");
     println!("  saved → {}", INDEX_FILE);
 }
 
@@ -96,12 +96,12 @@ fn search_index() {
     let compiler     = IndexSearchCompiler::new(SmartTokenizer::new());
 
     let run = |ctx: &mut IndexContext, q: &str| {
-        let tree    = compiler.compile(q, "AUTB");
-        let mut reader = ctx.get_reader(tree);
-        let hits    = ctx.with_store(|store| {
-            let exec = IndexSearchExecutor::new(store);
-            exec.execute(reader.as_mut(), 10)
-        });
+        let tree    = compiler.Compile(q, "AUTB");
+        let mut reader = ctx.GetReader(tree);
+        let store = ctx.GetStore();
+        let store = store.lock().unwrap();
+        let exec = IndexSearchExecutor::new(&store);
+        let hits = exec.Execute(reader.as_mut(), 10);
         println!("\n[{}]", q);
         for h in &hits {
             println!("  doc {:<3}  score={:.3}  {}", h.doc_id, h.score, doc_title(h.doc_id));
@@ -117,14 +117,14 @@ fn search_index() {
     /* debug trace */
     println!("\n--- trace: race car toy ---");
     {
-        let tree        = compiler.compile("race car toy", "AUTB");
-        let mut reader  = ctx.get_reader(tree);
-        reader.set_debug("race car toy", 0);
+        let tree        = compiler.Compile("race car toy", "AUTB");
+        let mut reader  = ctx.GetReader(tree);
+        reader.SetDebug("race car toy", 0);
 
-        let hits = ctx.with_store(|store| {
-            let exec = IndexSearchExecutor::new(store);
-            exec.execute(reader.as_mut(), 10)
-        });
+        let store = ctx.GetStore();
+        let store = store.lock().unwrap();
+        let exec = IndexSearchExecutor::new(&store);
+        let hits = exec.Execute(reader.as_mut(), 10);
 
         println!("\n  results:");
         for h in &hits {

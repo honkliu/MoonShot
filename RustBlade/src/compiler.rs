@@ -23,7 +23,8 @@ impl IndexSearchCompiler {
         Self { tokenizer: Box::new(tokenizer) }
     }
 
-    pub fn compile(&self, query: &str, stream_set: &str) -> EvalTree {
+    #[allow(non_snake_case)]
+    pub fn Compile(&self, query: &str, stream_set: &str) -> EvalTree {
         let streams = parse_stream_set(stream_set);
         let root = if streams.is_empty() { None } else { parse_expression(query, &streams, self.tokenizer.as_ref()) };
         EvalTree::new(root)
@@ -121,7 +122,7 @@ fn add_raw_item(raw: &str,
     }
 
     let target = if exclude { negative } else { positive };
-    for token in tokenizer.tokenize(&item) {
+    for token in tokenizer.Tokenize(&item) {
         target.push(QueryTerm { term: token, streams: streams.clone() });
     }
 }

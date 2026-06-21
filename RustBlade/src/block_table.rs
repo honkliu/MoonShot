@@ -213,6 +213,7 @@ struct BlockCachePool<T: Default + Copy> {
     slot_table: Option<PinnedMemory<IndexSlotEntry>>,
 }
 
+#[allow(non_snake_case)]
 impl<T: Default + Copy> BlockCachePool<T> {
     fn new() -> Self {
         Self {
@@ -247,7 +248,7 @@ impl<T: Default + Copy> BlockCachePool<T> {
         }
     }
 
-    fn init_file_backed(&mut self,
+    fn InitFileBacked(&mut self,
                         path: String,
                         base_offset: u64,
                         total_block_count: u32,
@@ -339,6 +340,7 @@ pub struct IndexBlockTable {
     bloom: BloomFilter,
 }
 
+#[allow(non_snake_case)]
 impl IndexBlockTable {
     pub fn new(_capacity: usize) -> Self {
         Self {
@@ -349,15 +351,15 @@ impl IndexBlockTable {
         }
     }
 
-    pub fn set_index_blocks(&mut self, blocks: Vec<IndexBlock>) {
+    pub fn SetIndexBlocks(&mut self, blocks: Vec<IndexBlock>) {
         self.index_pool.borrow_mut().set_pages(blocks);
     }
 
-    pub fn set_leaf_term_blocks(&mut self, blocks: Vec<LeafTermBlock>) {
+    pub fn SetLeafTermBlocks(&mut self, blocks: Vec<LeafTermBlock>) {
         self.leaf_term_pool.borrow_mut().set_pages(blocks);
     }
 
-    pub fn init_file_backed(&mut self,
+    pub fn InitFileBacked(&mut self,
                             path: &str,
                             index_base_offset: u64,
                             index_block_count: u32,
@@ -365,14 +367,14 @@ impl IndexBlockTable {
                             leaf_base_offset: u64,
                             leaf_block_count: u32,
                             leaf_slot_count: u32) -> std::io::Result<()> {
-        self.index_pool.borrow_mut().init_file_backed(
+        self.index_pool.borrow_mut().InitFileBacked(
             path.to_string(), index_base_offset, index_block_count, index_slot_count)?;
-        self.leaf_term_pool.borrow_mut().init_file_backed(
+        self.leaf_term_pool.borrow_mut().InitFileBacked(
             path.to_string(), leaf_base_offset, leaf_block_count, leaf_slot_count)?;
         Ok(())
     }
 
-    pub fn insert_block(&mut self, seq: u32, block: IndexBlock) {
+    pub fn InsertBlock(&mut self, seq: u32, block: IndexBlock) {
         let mut pages: Vec<IndexBlock> = self.index_pool
             .borrow()
             .pages
@@ -381,19 +383,41 @@ impl IndexBlockTable {
             .unwrap_or_default();
         if pages.len() <= seq as usize { pages.resize_with(seq as usize + 1, IndexBlock::default); }
         pages[seq as usize] = block;
-        self.set_index_blocks(pages);
+        self.SetIndexBlocks(pages);
     }
 
-    pub fn set_head_leaf_term_table(&mut self, head: Vec<HeadTermEntry>, blocks: Vec<LeafTermBlock>) {
+    pub fn SetHeadLeafTermTable(&mut self, head: Vec<HeadTermEntry>, blocks: Vec<LeafTermBlock>) {
         self.head_term_entries = head;
-        self.set_leaf_term_blocks(blocks);
+        self.SetLeafTermBlocks(blocks);
     }
 
-    pub fn set_head_entries(&mut self, head: Vec<HeadTermEntry>) {
+    pub fn SetHeadEntries(&mut self, head: Vec<HeadTermEntry>) {
         self.head_term_entries = head;
     }
 
-    pub fn find_term_data(&self, term: &str) -> Option<(IndexLocation, PinnedBlock<IndexBlock>)> {
+    pub fn HeadTermEntries(&self) -> &[HeadTermEntry] {
+        &self.head_term_entries
+    }
+
+    pub fn IndexBlocks(&self) -> Vec<IndexBlock> {
+        self.index_pool
+            .borrow()
+            .pages
+            .as_ref()
+            .map(|pages| pages.as_slice().to_vec())
+            .unwrap_or_default()
+    }
+
+    pub fn LeafTermBlocks(&self) -> Vec<LeafTermBlock> {
+        self.leaf_term_pool
+            .borrow()
+            .pages
+            .as_ref()
+            .map(|pages| pages.as_slice().to_vec())
+            .unwrap_or_default()
+    }
+
+    pub fn FindTermData(&self, term: &str) -> Option<(IndexLocation, PinnedBlock<IndexBlock>)> {
         if !self.bloom.can_term_exist(term) { return None; }
         if self.head_term_entries.is_empty() { return None; }
 
@@ -426,22 +450,11 @@ impl IndexBlockTable {
         }, index_block))
     }
 
-    pub fn get_block_by_seq(&self, seq: u32) -> Option<PinnedBlock<IndexBlock>> {
+    pub fn GetBlockBySeq(&self, seq: u32) -> Option<PinnedBlock<IndexBlock>> {
         self.index_pool.borrow_mut().get_or_read(seq).map(|(_, block)| block)
     }
 
-    pub fn head_term_entries(&self) -> &[HeadTermEntry] { &self.head_term_entries }
-
-    pub fn leaf_term_blocks(&self) -> Vec<LeafTermBlock> {
-        self.leaf_term_pool
-            .borrow()
-            .pages
-            .as_ref()
-            .map(|pages| pages.as_slice().to_vec())
-            .unwrap_or_default()
-    }
-
-    pub fn all_leaf_term_entries(&self) -> Vec<LeafTermEntry> {
-        self.leaf_term_blocks().iter().flat_map(|block| block.entries()).collect()
+    pub fn AllLeafTermEntries(&self) -> Vec<LeafTermEntry> {
+        self.LeafTermBlocks().iter().flat_map(|block| block.entries()).collect()
     }
 }

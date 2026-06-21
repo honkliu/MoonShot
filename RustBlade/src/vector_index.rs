@@ -58,15 +58,18 @@ impl HnswIndex {
         }
     }
 
-    pub fn set_docdata(&mut self, docdata: Vec<u8>) {
+    #[allow(non_snake_case)]
+    pub fn SetDocData(&mut self, docdata: Vec<u8>) {
         self.docdata = docdata;
     }
 
-    pub fn add(&mut self, doc_id: u64) -> bool {
+    #[allow(non_snake_case)]
+    pub fn Add(&mut self, doc_id: u64) -> bool {
         self.add_node(doc_id)
     }
 
-    pub fn search(&self, query: &[f32], k: usize, ef: usize) -> Vec<(u64, f32)> {
+    #[allow(non_snake_case)]
+    pub fn Search(&self, query: &[f32], k: usize, ef: usize) -> Vec<(u64, f32)> {
         if query.len() != DOC_VECTOR_DIM || self.nodes.is_empty() { return Vec::new(); }
 
         let mut entry = self.entry_point.unwrap();
@@ -97,8 +100,10 @@ impl HnswIndex {
         out
     }
 
-    pub fn len(&self) -> usize { self.nodes.len() }
-    pub fn is_empty(&self) -> bool { self.nodes.is_empty() }
+    #[allow(non_snake_case)]
+    pub fn Size(&self) -> usize { self.nodes.len() }
+    #[allow(non_snake_case)]
+    pub fn Empty(&self) -> bool { self.nodes.is_empty() }
 
     fn add_node(&mut self, doc_id: u64) -> bool {
         if doc_id < self.nodes.len() as u64 { return true; }
@@ -315,33 +320,39 @@ impl VectorIndex {
         VectorIndex::Hnsw(HnswIndex::new(DOC_VECTOR_DIM, max_neighbors, ef_construction, metric))
     }
 
-    pub fn set_docdata(&mut self, docdata: Vec<u8>) {
+    #[allow(non_snake_case)]
+    pub fn SetDocData(&mut self, docdata: Vec<u8>) {
         match self {
-            VectorIndex::Hnsw(h) => h.set_docdata(docdata),
+            VectorIndex::Hnsw(h) => h.SetDocData(docdata),
         }
     }
 
-    pub fn add(&mut self, doc_id: u64) -> bool {
+    #[allow(non_snake_case)]
+    pub fn Add(&mut self, doc_id: u64) -> bool {
         match self {
-            VectorIndex::Hnsw(h) => h.add(doc_id),
+            VectorIndex::Hnsw(h) => h.Add(doc_id),
         }
     }
 
-    pub fn search(&self, query: &[f32], k: usize, ef: usize) -> Vec<(u64, f32)> {
+    #[allow(non_snake_case)]
+    pub fn Search(&self, query: &[f32], k: usize, ef: usize) -> Vec<(u64, f32)> {
         match self {
-            VectorIndex::Hnsw(h) => h.search(query, k, ef),
+            VectorIndex::Hnsw(h) => h.Search(query, k, ef),
         }
     }
 
-    pub fn dim(&self) -> usize { DOC_VECTOR_DIM }
+    #[allow(non_snake_case)]
+    pub fn Dimension(&self) -> usize { DOC_VECTOR_DIM }
 
-    pub fn len(&self) -> usize {
+    #[allow(non_snake_case)]
+    pub fn Size(&self) -> usize {
         match self {
-            VectorIndex::Hnsw(h) => h.len(),
+            VectorIndex::Hnsw(h) => h.Size(),
         }
     }
 
-    pub fn is_empty(&self) -> bool { self.len() == 0 }
+    #[allow(non_snake_case)]
+    pub fn Empty(&self) -> bool { self.Size() == 0 }
 }
 
 pub fn build_hashed_embedding(tokens: &[String]) -> Vec<f32> {
@@ -405,14 +416,14 @@ mod tests {
         }
 
         let mut idx = HnswIndex::new(DOC_VECTOR_DIM, 4, 10, Metric::L2);
-        idx.set_docdata(docdata(&vectors));
+        idx.SetDocData(docdata(&vectors));
         for doc_id in 0u64..50 {
-            assert!(idx.add(doc_id));
+            assert!(idx.Add(doc_id));
         }
 
         let mut query = vec![0.0f32; DOC_VECTOR_DIM];
         query[0] = 25.0 / 128.0;
-        let results = idx.search(&query, 1, 20);
+        let results = idx.Search(&query, 1, 20);
         assert!(!results.is_empty());
         assert_eq!(results[0].0, 25);
     }

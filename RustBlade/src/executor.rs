@@ -12,35 +12,36 @@ pub struct IndexSearchExecutor<'a> {
     store: &'a PostingStore,
 }
 
+#[allow(non_snake_case)]
 impl<'a> IndexSearchExecutor<'a> {
     pub fn new(store: &'a PostingStore) -> Self { Self { store } }
 
-    pub fn execute(&self, reader: &mut dyn IndexReader, top_k: usize) -> Vec<SearchResult> {
-        if reader.is_end() { return vec![]; }
-        let scorer  = Bm25Scorer::new(self.store.total_docs(), self.store.avg_doc_len());
+    pub fn Execute(&self, reader: &mut dyn IndexReader, top_k: usize) -> Vec<SearchResult> {
+        if reader.IsEnd() { return vec![]; }
+        let scorer  = Bm25Scorer::new(self.store.TotalDocs(), self.store.AvgDocLen());
         let mut results = Vec::new();
 
-        while !reader.is_end() {
-            let doc_id  = reader.get_document_id();
-            let doc_len = self.store.get_doc_len(doc_id);
-            let score   = reader.get_bm25_score(&scorer, doc_len)
-                        + self.store.get_doc_importance(doc_id);
+        while !reader.IsEnd() {
+            let doc_id  = reader.GetDocumentID();
+            let doc_len = self.store.GetDocLen(doc_id);
+            let score   = reader.GetScore(&scorer, doc_len)
+                        + self.store.GetDocImportance(doc_id);
             results.push(SearchResult { doc_id, score });
-            reader.go_next();
+            reader.GoNext();
         }
 
         sort_and_truncate(&mut results, top_k);
         results
     }
 
-    pub fn execute_phased(
+    pub fn ExecutePhased(
         &self,
         phase1:     &mut dyn IndexReader,
         phase2:     &mut dyn IndexReader,
         top_k:      usize,
         min_phase1: usize,
     ) -> Vec<SearchResult> {
-        let scorer   = Bm25Scorer::new(self.store.total_docs(), self.store.avg_doc_len());
+        let scorer   = Bm25Scorer::new(self.store.TotalDocs(), self.store.AvgDocLen());
         let mut results = collect_results(phase1, &scorer, self.store);
 
         if results.len() < min_phase1 {
@@ -55,12 +56,12 @@ impl<'a> IndexSearchExecutor<'a> {
 
 fn collect_results(r: &mut dyn IndexReader, s: &Bm25Scorer, store: &PostingStore) -> Vec<SearchResult> {
     let mut out = Vec::new();
-    while !r.is_end() {
-        let doc_id  = r.get_document_id();
-        let doc_len = store.get_doc_len(doc_id);
-        let score   = r.get_bm25_score(s, doc_len) + store.get_doc_importance(doc_id);
+    while !r.IsEnd() {
+        let doc_id  = r.GetDocumentID();
+        let doc_len = store.GetDocLen(doc_id);
+        let score   = r.GetScore(s, doc_len) + store.GetDocImportance(doc_id);
         out.push(SearchResult { doc_id, score });
-        r.go_next();
+        r.GoNext();
     }
     out
 }

@@ -57,7 +57,8 @@ pub struct PostingStore {
 impl PostingStore {
     pub fn new() -> Self { Self::default() }
 
-    pub fn add_posting(&mut self, stream_key: &str, doc_id: u64, tf: u32) {
+    #[allow(non_snake_case)]
+    pub fn AddPosting(&mut self, stream_key: &str, doc_id: u64, tf: u32) {
         let pl = self.postings.entry(stream_key.to_string()).or_default();
         match pl.entries.binary_search_by_key(&doc_id, |e| e.ie_doc_id) {
             Ok(i)  => pl.entries[i].ie_term_frequency = tf,
@@ -65,27 +66,32 @@ impl PostingStore {
         }
     }
 
-    pub fn add_doc_tokens(&mut self, doc_id: u64, count: u32) {
+    #[allow(non_snake_case)]
+    pub fn AddDocTokens(&mut self, doc_id: u64, count: u32) {
         self.doc_stats.entry(doc_id).or_default().doc_len += count;
         self.total_terms += count as u64;
     }
 
-    pub fn set_doc_importance(&mut self, doc_id: u64, score: f32) {
+    #[allow(non_snake_case)]
+    pub fn SetDocImportance(&mut self, doc_id: u64, score: f32) {
         self.doc_stats.entry(doc_id).or_default().importance = score;
     }
 
-    pub fn set_doc_path(&mut self, doc_id: u64, path: String) {
+    #[allow(non_snake_case)]
+    pub fn SetDocPath(&mut self, doc_id: u64, path: String) {
         self.doc_stats.entry(doc_id).or_default().path = path;
     }
 
-    pub fn set_doc_vector(&mut self, doc_id: u64, vector: Vec<f32>) -> bool {
+    #[allow(non_snake_case)]
+    pub fn SetDocVector(&mut self, doc_id: u64, vector: Vec<f32>) -> bool {
         if vector.len() != DOC_VECTOR_DIM { return false; }
         self.doc_stats.entry(doc_id).or_default();
         self.doc_vectors.insert(doc_id, quantize_vector(&vector));
         true
     }
 
-    pub fn set_doc_vector_bytes(&mut self, doc_id: u64, vector: &[u8]) -> bool {
+    #[allow(non_snake_case)]
+    pub fn SetDocVectorBytes(&mut self, doc_id: u64, vector: &[u8]) -> bool {
         self.doc_stats.entry(doc_id).or_default();
         let mut bytes = [0i8; DOC_VECTOR_DIM];
         for i in 0..DOC_VECTOR_DIM {
@@ -95,47 +101,59 @@ impl PostingStore {
         true
     }
 
-    pub fn get_doc_vector(&self, doc_id: u64) -> &[i8; DOC_VECTOR_DIM] {
+    #[allow(non_snake_case)]
+    pub fn GetDocVector(&self, doc_id: u64) -> &[i8; DOC_VECTOR_DIM] {
         self.doc_vectors.get(&doc_id).expect("fixed DocData vector is required")
     }
 
-    pub fn get_doc_path(&self, doc_id: u64) -> &str {
+    #[allow(non_snake_case)]
+    pub fn GetDocPath(&self, doc_id: u64) -> &str {
         self.doc_stats.get(&doc_id).map(|s| s.path.as_str()).unwrap_or("")
     }
 
-    pub fn get_posting_list(&self, key: &str) -> Option<&PostingList> {
+    #[allow(non_snake_case)]
+    pub fn GetPostingList(&self, key: &str) -> Option<&PostingList> {
         self.postings.get(key)
     }
 
-    pub fn get_doc_len(&self, doc_id: u64) -> u32 {
+    #[allow(non_snake_case)]
+    pub fn GetDocLen(&self, doc_id: u64) -> u32 {
         self.doc_stats.get(&doc_id).map(|s| s.doc_len).unwrap_or(1)
     }
 
-    pub fn get_doc_importance(&self, doc_id: u64) -> f32 {
+    #[allow(non_snake_case)]
+    pub fn GetDocImportance(&self, doc_id: u64) -> f32 {
         self.doc_stats.get(&doc_id).map(|s| s.importance).unwrap_or(0.0)
     }
 
-    pub fn total_docs(&self)  -> u64 { self.doc_stats.len() as u64 }
-    pub fn total_terms(&self) -> u64 { self.total_terms }
+    #[allow(non_snake_case)]
+    pub fn TotalDocs(&self)  -> u64 { self.doc_stats.len() as u64 }
+    #[allow(non_snake_case)]
+    pub fn TotalTerms(&self) -> u64 { self.total_terms }
 
-    pub fn avg_doc_len(&self) -> f32 {
+    #[allow(non_snake_case)]
+    pub fn AvgDocLen(&self) -> f32 {
         if self.doc_stats.is_empty() { return 1.0; }
         self.total_terms as f32 / self.doc_stats.len() as f32
     }
 
-    pub fn doc_freq(&self, key: &str) -> u32 {
+    #[allow(non_snake_case)]
+    pub fn DocFreq(&self, key: &str) -> u32 {
         self.postings.get(key).map(|pl| pl.doc_freq()).unwrap_or(0)
     }
 
-    pub fn all_postings(&self) -> &HashMap<String, PostingList> {
+    #[allow(non_snake_case)]
+    pub fn AllPostings(&self) -> &HashMap<String, PostingList> {
         &self.postings
     }
 
-    pub fn all_postings_mut(&mut self) -> &mut HashMap<String, PostingList> {
+    #[allow(non_snake_case)]
+    pub fn AllPostingsMut(&mut self) -> &mut HashMap<String, PostingList> {
         &mut self.postings
     }
 
-    pub fn all_doc_stats(&self) -> &HashMap<u64, DocStats> {
+    #[allow(non_snake_case)]
+    pub fn AllDocStats(&self) -> &HashMap<u64, DocStats> {
         &self.doc_stats
     }
 }

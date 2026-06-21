@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use rustblade::index_writer::IndexWriter;
 use rustblade::tokenizer::Tokenizer;
 use rustblade::vector_index::build_hashed_embedding;
+use rustblade::executor::IndexSearchExecutor;
 use rustblade::{IndexContext, SmartTokenizer};
 
 fn home_dir() -> PathBuf {
@@ -44,25 +45,25 @@ fn index_path(path: &Path) -> io::Result<()> {
 
     let mut context = IndexContext::new();
     let tokenizer = SmartTokenizer::new();
-    let mut writer = context.get_writer();
+    let mut writer = context.GetWriter();
 
     for (doc_id, file) in files.iter().enumerate() {
         let Ok(body) = fs::read_to_string(file) else { continue; };
         let title = file.file_stem().and_then(|stem| stem.to_str()).unwrap_or("");
-        let title_tokens = tokenizer.tokenize(title);
-        let body_tokens = tokenizer.tokenize(&body);
+        let title_tokens = tokenizer.Tokenize(title);
+        let body_tokens = tokenizer.Tokenize(&body);
         let mut embedding_tokens = title_tokens.clone();
         embedding_tokens.extend(body_tokens.iter().cloned());
-        writer.write(title_tokens, doc_id as u64, "Title");
-        writer.write(body_tokens, doc_id as u64, "Body");
-        writer.set_doc_importance(doc_id as u64, 0.1);
-        writer.set_doc_vector(doc_id as u64, build_hashed_embedding(&embedding_tokens));
+        writer.Write(title_tokens, doc_id as u64, "Title");
+        writer.Write(body_tokens, doc_id as u64, "Body");
+        writer.SetDocImportance(doc_id as u64, 0.1);
+        writer.SetDocVector(doc_id as u64, build_hashed_embedding(&embedding_tokens));
         let abs = file.canonicalize().unwrap_or_else(|_| file.clone());
-        writer.set_doc_path(doc_id as u64, abs.to_string_lossy().to_string());
+        writer.SetDocPath(doc_id as u64, abs.to_string_lossy().to_string());
     }
 
     let idx = default_idx_path();
-    context.save_index(idx.to_string_lossy().as_ref()).map_err(|err| io::Error::new(io::ErrorKind::Other, format!("{err:?}")))?;
+    context.SaveIndex(idx.to_string_lossy().as_ref()).map_err(|err| io::Error::new(io::ErrorKind::Other, format!("{err:?}")))?;
     println!("Rebuilt index with {} readable document(s)", files.len());
     println!("Indexed input: {}", path.display());
     println!("Total:   {} document(s) in {}", files.len(), idx.display());
@@ -72,8 +73,8 @@ fn index_path(path: &Path) -> io::Result<()> {
 fn interactive() -> io::Result<()> {
     let idx = default_idx_path();
     let mut context = IndexContext::new();
-    let loaded = context.load_index(idx.to_string_lossy().as_ref()).is_ok();
-    let docs = context.document_count();
+    let loaded = context.LoadIndex(idx.to_string_lossy().as_ref()).is_ok();
+    let docs = context.DocumentCount();
     if !loaded {
         eprintln!("Failed to load index: {}", idx.display());
     }
@@ -93,14 +94,19 @@ fn interactive() -> io::Result<()> {
             println!("(no results)");
             continue;
         }
-        let results = context.search(query, 0, "AUTB");
+        let tree = context.Compile(query, "AUTB");
+        let mut reader = context.GetReader(tree);
+        let store = context.GetStore();
+        let store = store.lock().unwrap();
+        let executor = IndexSearchExecutor::new(&store);
+        let results = executor.Execute(reader.as_mut(), 0);
         if results.is_empty() {
             println!("(no results)");
             continue;
         }
         println!("{} result(s)", results.len());
         for result in results.iter().take(20) {
-            let path = context.doc_path(result.doc_id);
+            let path = context.GetDocPath(result.doc_id);
             println!("{}", if path.is_empty() { "[unknown]".to_string() } else { path });
         }
     }

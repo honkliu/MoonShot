@@ -13,6 +13,7 @@ use crate::block_table::{
     DOC_REC_SIZE,
 };
 use crate::index_context::IndexContext;
+use crate::executor::IndexSearchExecutor;
 use crate::posting_store::PostingStore;
 use crate::serializer::IndexSerializer;
 
@@ -139,7 +140,7 @@ fn parse_index_inner(data: &[u8]) -> Result<String, String> {
     out.push_str("]},");
 
     out.push_str(r#""docdata":["#);
-    let mut docs: Vec<_> = store.all_doc_stats().iter().collect();
+    let mut docs: Vec<_> = store.AllDocStats().iter().collect();
     docs.sort_by_key(|(doc_id, _)| *doc_id);
     for (index, (doc_id, stats)) in docs.iter().enumerate() {
         if index > 0 { out.push(','); }
@@ -249,14 +250,19 @@ fn decode_postings(data: &[u8]) -> Vec<(u64, u32)> {
 #[wasm_bindgen]
 pub fn search_index(data: &[u8], query: &str, streams: &str) -> String {
     let mut context = IndexContext::new();
-    if context.load_from_bytes(data).is_err() {
+    if context.LoadFromBytes(data).is_err() {
         return r#"{"error":"Failed to load index"}"#.to_string();
     }
-    let results = context.search(query, 0, streams);
+    let tree = context.Compile(query, streams);
+    let mut reader = context.GetReader(tree);
+    let store = context.GetStore();
+    let store = store.lock().unwrap();
+    let executor = IndexSearchExecutor::new(&store);
+    let results = executor.Execute(reader.as_mut(), 0);
     let mut out = String::from("[");
     for (index, result) in results.iter().enumerate() {
         if index > 0 { out.push(','); }
-        let path = context.doc_path(result.doc_id);
+        let path = context.GetDocPath(result.doc_id);
         out.push_str(&format!(
             r#"{{"doc_id":"{}","score":{:.4},"path":{}}}"#,
             result.doc_id,

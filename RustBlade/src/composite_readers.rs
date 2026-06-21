@@ -23,19 +23,19 @@ impl AndIndexReader {
 
     fn align_to_pivot(&mut self) {
         loop {
-            if self.children.iter().any(|c| c.is_end()) { return; }
+            if self.children.iter().any(|c| c.IsEnd()) { return; }
 
             let pivot = self.children.iter()
-                .map(|c| c.get_document_id())
+                .map(|c| c.GetDocumentID())
                 .max()
                 .unwrap_or(NO_MORE_DOCS);
 
             let mut aligned = true;
             for c in &mut self.children {
-                if c.get_document_id() != pivot {
-                    c.go_until(pivot);
-                    if c.is_end()                    { return; }
-                    if c.get_document_id() != pivot  { aligned = false; break; }
+                if c.GetDocumentID() != pivot {
+                    c.GoUntil(pivot);
+                    if c.IsEnd()                    { return; }
+                    if c.GetDocumentID() != pivot  { aligned = false; break; }
                 }
             }
 
@@ -51,41 +51,41 @@ impl AndIndexReader {
 }
 
 impl IndexReader for AndIndexReader {
-    fn go_next(&mut self) {
-        if self.is_end() { return; }
-        let doc = self.get_document_id();
+    fn GoNext(&mut self) {
+        if self.IsEnd() { return; }
+        let doc = self.GetDocumentID();
         for c in &mut self.children {
-            if !c.is_end() && c.get_document_id() == doc { c.go_next(); }
+            if !c.IsEnd() && c.GetDocumentID() == doc { c.GoNext(); }
         }
         self.align_to_pivot();
     }
 
-    fn go_until(&mut self, target: u64) {
-        for c in &mut self.children { c.go_until(target); }
+    fn GoUntil(&mut self, target: u64) {
+        for c in &mut self.children { c.GoUntil(target); }
         self.align_to_pivot();
     }
 
-    fn is_end(&self) -> bool {
-        self.children.is_empty() || self.children.iter().any(|c| c.is_end())
+    fn IsEnd(&self) -> bool {
+        self.children.is_empty() || self.children.iter().any(|c| c.IsEnd())
     }
 
-    fn get_document_id(&self) -> u64 {
-        if self.is_end() { NO_MORE_DOCS } else { self.children[0].get_document_id() }
+    fn GetDocumentID(&self) -> u64 {
+        if self.IsEnd() { NO_MORE_DOCS } else { self.children[0].GetDocumentID() }
     }
 
-    fn get_term_freq(&self) -> u32 {
-        self.children.iter().map(|c| c.get_term_freq()).sum()
+    fn GetTermFreq(&self) -> u32 {
+        self.children.iter().map(|c| c.GetTermFreq()).sum()
     }
 
-    fn get_bm25_score(&self, scorer: &Bm25Scorer, doc_len: u32) -> f32 {
-        self.children.iter().map(|c| c.get_bm25_score(scorer, doc_len)).sum()
+    fn GetScore(&self, scorer: &Bm25Scorer, doc_len: u32) -> f32 {
+        self.children.iter().map(|c| c.GetScore(scorer, doc_len)).sum()
     }
 
-    fn set_debug(&mut self, label: &str, depth: usize) {
+    fn SetDebug(&mut self, label: &str, depth: usize) {
         self.debug       = true;
         self.debug_depth = depth;
         println!("{}[AND]", " ".repeat(depth * 2));
-        for c in &mut self.children { c.set_debug(label, depth + 1); }
+        for c in &mut self.children { c.SetDebug(label, depth + 1); }
     }
 }
 
@@ -113,14 +113,14 @@ impl OrIndexReader {
 }
 
 impl IndexReader for OrIndexReader {
-    fn go_next(&mut self) {
+    fn GoNext(&mut self) {
         if self.active_count == 0 { return; }
-        let doc = self.get_document_id();
+        let doc = self.GetDocumentID();
         let mut i = 0;
         while i < self.active_count {
-            if self.children[i].get_document_id() == doc {
-                self.children[i].go_next();
-                if self.children[i].is_end() {
+            if self.children[i].GetDocumentID() == doc {
+                self.children[i].GoNext();
+                if self.children[i].IsEnd() {
                     self.active_count -= 1;
                     self.children.swap(i, self.active_count);
                     continue;
@@ -130,12 +130,12 @@ impl IndexReader for OrIndexReader {
         }
     }
 
-    fn go_until(&mut self, target: u64) {
+    fn GoUntil(&mut self, target: u64) {
         let mut i = 0;
         while i < self.active_count {
-            if self.children[i].get_document_id() < target {
-                self.children[i].go_until(target);
-                if self.children[i].is_end() {
+            if self.children[i].GetDocumentID() < target {
+                self.children[i].GoUntil(target);
+                if self.children[i].IsEnd() {
                     self.active_count -= 1;
                     self.children.swap(i, self.active_count);
                     continue;
@@ -145,36 +145,36 @@ impl IndexReader for OrIndexReader {
         }
     }
 
-    fn is_end(&self) -> bool { self.active_count == 0 }
+    fn IsEnd(&self) -> bool { self.active_count == 0 }
 
-    fn get_document_id(&self) -> u64 {
+    fn GetDocumentID(&self) -> u64 {
         (0..self.active_count)
-            .map(|i| self.children[i].get_document_id())
+            .map(|i| self.children[i].GetDocumentID())
             .min()
             .unwrap_or(NO_MORE_DOCS)
     }
 
-    fn get_term_freq(&self) -> u32 {
-        let doc = self.get_document_id();
+    fn GetTermFreq(&self) -> u32 {
+        let doc = self.GetDocumentID();
         (0..self.active_count)
-            .filter(|&i| self.children[i].get_document_id() == doc)
-            .map(|i| self.children[i].get_term_freq())
+            .filter(|&i| self.children[i].GetDocumentID() == doc)
+            .map(|i| self.children[i].GetTermFreq())
             .sum()
     }
 
-    fn get_bm25_score(&self, scorer: &Bm25Scorer, doc_len: u32) -> f32 {
-        let doc = self.get_document_id();
+    fn GetScore(&self, scorer: &Bm25Scorer, doc_len: u32) -> f32 {
+        let doc = self.GetDocumentID();
         (0..self.active_count)
-            .filter(|&i| self.children[i].get_document_id() == doc)
-            .map(|i| self.children[i].get_bm25_score(scorer, doc_len))
+            .filter(|&i| self.children[i].GetDocumentID() == doc)
+            .map(|i| self.children[i].GetScore(scorer, doc_len))
             .sum()
     }
 
-    fn set_debug(&mut self, label: &str, depth: usize) {
+    fn SetDebug(&mut self, label: &str, depth: usize) {
         self.debug       = true;
         self.debug_depth = depth;
         println!("{}[OR]", " ".repeat(depth * 2));
-        for c in &mut self.children { c.set_debug(label, depth + 1); }
+        for c in &mut self.children { c.SetDebug(label, depth + 1); }
     }
 }
 
@@ -199,15 +199,15 @@ impl NotIndexReader {
     }
 
     fn skip_excluded(&mut self) {
-        while !self.base.is_end() {
-            let doc = self.base.get_document_id();
-            self.exclude.go_until(doc);
-            if !self.exclude.is_end() && self.exclude.get_document_id() == doc {
+        while !self.base.IsEnd() {
+            let doc = self.base.GetDocumentID();
+            self.exclude.GoUntil(doc);
+            if !self.exclude.IsEnd() && self.exclude.GetDocumentID() == doc {
                 if self.debug {
                     let ind = " ".repeat(self.debug_depth * 2);
                     println!("{}NOT excluded  doc {}", ind, doc);
                 }
-                self.base.go_next();
+                self.base.GoNext();
             } else {
                 break;
             }
@@ -216,24 +216,24 @@ impl NotIndexReader {
 }
 
 impl IndexReader for NotIndexReader {
-    fn go_next(&mut self)             { self.base.go_next(); self.skip_excluded(); }
-    fn go_until(&mut self, t: u64)    { self.base.go_until(t); self.skip_excluded(); }
-    fn is_end(&self)                  -> bool  { self.base.is_end() }
-    fn get_document_id(&self)         -> u64   { self.base.get_document_id() }
-    fn get_term_freq(&self)           -> u32   { self.base.get_term_freq() }
+    fn GoNext(&mut self)             { self.base.GoNext(); self.skip_excluded(); }
+    fn GoUntil(&mut self, t: u64)    { self.base.GoUntil(t); self.skip_excluded(); }
+    fn IsEnd(&self)                  -> bool  { self.base.IsEnd() }
+    fn GetDocumentID(&self)         -> u64   { self.base.GetDocumentID() }
+    fn GetTermFreq(&self)           -> u32   { self.base.GetTermFreq() }
 
-    fn get_bm25_score(&self, scorer: &Bm25Scorer, doc_len: u32) -> f32 {
-        self.base.get_bm25_score(scorer, doc_len)
+    fn GetScore(&self, scorer: &Bm25Scorer, doc_len: u32) -> f32 {
+        self.base.GetScore(scorer, doc_len)
     }
 
-    fn set_debug(&mut self, label: &str, depth: usize) {
+    fn SetDebug(&mut self, label: &str, depth: usize) {
         self.debug       = true;
         self.debug_depth = depth;
         let ind = " ".repeat(depth * 2);
         println!("{}[NOT]", ind);
         println!("{}  + base:", ind);
-        self.base.set_debug(label, depth + 2);
+        self.base.SetDebug(label, depth + 2);
         println!("{}  - excl:", ind);
-        self.exclude.set_debug(label, depth + 2);
+        self.exclude.SetDebug(label, depth + 2);
     }
 }
