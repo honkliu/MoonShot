@@ -376,10 +376,23 @@ public:
             avgDocLength = mergedDocs ? static_cast<float>(totalDocLength) / static_cast<float>(mergedDocs) : 1.0f;
         }
 
-        // Step 3: Merge base/delta LeafTermEntry streams in sorted order and
-        // write merged posting bytes into an IndexBlock temp stream. Delta
-        // postings already contain final doc ids, so equal-term postings are
-        // raw-appended after base postings.
+        // Step 3: Do a 3-way physical merge: base LeafTermEntry stream + delta
+        // LeafTermEntry stream -> merged leaf/index/head temp streams. The two
+        // input streams are walked in term order directly from their resident
+        // LeafTermBlock pages; no full term table and no decoded PostingStore is
+        // built. For each output term, mergedPostingBytes is the only posting
+        // buffer in memory: base-only and delta-only terms copy that term's raw
+        // posting bytes into it, while equal terms append base bytes then delta
+        // bytes. Delta postings already use final doc ids, so there is no doc-id
+        // remap and no varbyte decode/re-encode.
+        //
+        // The merged posting bytes are immediately packed into indexTempPath,
+        // and the corresponding merged LeafTermEntry is packed into leafTempPath.
+        // HeadTermEntry records are produced from completed merged LeafTermBlock
+        // pages; at most MERGED_LEAF_PAGE_BATCH_LIMIT (100) completed leaf pages'
+        // head records stay in memory before being dumped to headTempPath. The
+        // partially filled IndexBlock is intentionally kept in memory across
+        // terms and across these head batches so tail space can be reused.
         uint64_t headEntryCount = 0;
         uint64_t totalTerms = 0;
         uint32_t indexBlockCount = 0;
@@ -395,6 +408,10 @@ public:
             std::vector<uint8_t> mergedPostingBytes;
             constexpr size_t MERGED_LEAF_PAGE_BATCH_LIMIT = 100;
 
+            auto termOf = [](const LeafTermEntry* entry) -> std::string_view {
+                return entry ? std::string_view(entry->LTE_Term, entry->LTE_TermLength) : std::string_view();
+            };
+
             auto flushHeadBatch = [&]() -> bool {
                 if (writer->HeadEntries.empty()) return true;
                 const uint64_t bytes = static_cast<uint64_t>(writer->HeadEntries.size()) * sizeof(HeadTermEntry);
@@ -404,11 +421,13 @@ public:
                 return true;
             };
 
-            while (!baseCursor.IsEnd() || !deltaCursor.IsEnd()) {
-                const bool takeBase = deltaCursor.IsEnd()
-                    || (!baseCursor.IsEnd() && baseCursor.CurrentTerm() < deltaCursor.CurrentTerm());
-                const bool takeDelta = baseCursor.IsEnd()
-                    || (!deltaCursor.IsEnd() && deltaCursor.CurrentTerm() < baseCursor.CurrentTerm());
+            while (baseCursor.Current() || deltaCursor.Current()) {
+                const auto* baseCurrent = baseCursor.Current();
+                const auto* deltaCurrent = deltaCursor.Current();
+                const std::string_view baseTerm = termOf(baseCurrent);
+                const std::string_view deltaTerm = termOf(deltaCurrent);
+                const bool takeBase = !deltaCurrent || (baseCurrent && baseTerm < deltaTerm);
+                const bool takeDelta = !baseCurrent || (deltaCurrent && deltaTerm < baseTerm);
 
                 std::string_view term;
                 mergedPostingBytes.clear();
@@ -417,23 +436,19 @@ public:
                 bool advanceDelta = false;
 
                 if (takeBase) {
-                    const auto* current = baseCursor.Current();
-                    term = baseCursor.CurrentTerm();
-                    if (!ReadRuntimePostingBytes(current, mergedPostingBytes)) { cleanupTempFiles(); return false; }
-                    docFreq = current->LTE_DocFreq;
+                    term = baseTerm;
+                    if (!ReadPostingBytes(baseCurrent, mergedPostingBytes)) { cleanupTempFiles(); return false; }
+                    docFreq = baseCurrent->LTE_DocFreq;
                     advanceBase = true;
                 } else if (takeDelta) {
-                    const auto* current = deltaCursor.Current();
-                    term = deltaCursor.CurrentTerm();
-                    if (!delta.ReadRuntimePostingBytes(current, mergedPostingBytes)) { cleanupTempFiles(); return false; }
-                    docFreq = current->LTE_DocFreq;
+                    term = deltaTerm;
+                    if (!delta.ReadPostingBytes(deltaCurrent, mergedPostingBytes)) { cleanupTempFiles(); return false; }
+                    docFreq = deltaCurrent->LTE_DocFreq;
                     advanceDelta = true;
                 } else {
-                    const auto* baseCurrent = baseCursor.Current();
-                    const auto* deltaCurrent = deltaCursor.Current();
-                    term = baseCursor.CurrentTerm();
-                    if (!ReadRuntimePostingBytes(baseCurrent, mergedPostingBytes)) { cleanupTempFiles(); return false; }
-                    if (!delta.ReadRuntimePostingBytes(deltaCurrent, mergedPostingBytes)) { cleanupTempFiles(); return false; }
+                    term = baseTerm;
+                    if (!ReadPostingBytes(baseCurrent, mergedPostingBytes)) { cleanupTempFiles(); return false; }
+                    if (!delta.ReadPostingBytes(deltaCurrent, mergedPostingBytes)) { cleanupTempFiles(); return false; }
                     docFreq = baseCurrent->LTE_DocFreq + deltaCurrent->LTE_DocFreq;
                     advanceBase = true;
                     advanceDelta = true;
@@ -878,13 +893,11 @@ private:
             ReleaseCurrentLeaf();
         }
 
-        bool IsEnd() const { return m_CurrentEntry == nullptr; }
         const LeafTermEntry* Current() const { return m_CurrentEntry; }
-        std::string_view CurrentTerm() const { return TermView(m_CurrentEntry); }
 
         void Advance()
         {
-            if (IsEnd()) return;
+            if (!m_CurrentEntry) return;
             ++m_EntryIndex;
             ReadCurrent();
         }
@@ -896,11 +909,6 @@ private:
         uint32_t m_LeafBlockID = 0;
         uint32_t m_EntryIndex = 0;
         uint32_t m_LeafSlot = UINT32_MAX;
-
-        static std::string_view TermView(const LeafTermEntry* entry)
-        {
-            return entry ? std::string_view(entry->LTE_Term, entry->LTE_TermLength) : std::string_view();
-        }
 
         void ReleaseCurrentLeaf()
         {
@@ -935,7 +943,7 @@ private:
         }
     };
 
-    bool ReadRuntimePostingBytes(const LeafTermEntry* entry,
+    bool ReadPostingBytes(const LeafTermEntry* entry,
                                  std::vector<uint8_t>& bytes)
     {
         if (!entry) return false;
