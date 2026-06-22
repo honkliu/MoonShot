@@ -2,8 +2,10 @@
  * moon — personal document search tool
  *
  * Usage:
- *   moon -name <filepath>   Index a .txt or .md file
- *   moon -i                 Interactive search mode
+ *   moon -file <filepath>              Index one file
+ *   moon -dir <directory> -ext md,txt  Index matching files in one directory
+ *   moon -dir <directory> -ext md -r   Index matching files recursively
+ *   moon -i                               Interactive search mode
  *
  * Index stored at:
  *   Linux   : ~/moon.idx  (+ ~/moon.idx.meta)
@@ -104,6 +106,15 @@ static std::string DefaultIdxPath()
     return HomeDir() + PathSep() + "moon.idx";
 }
 
+static std::string DeltaIndexPath(const std::string& path)
+{
+    const size_t slash = path.find_last_of("/\\");
+    const size_t dot = path.find_last_of('.');
+    if (dot != std::string::npos && (slash == std::string::npos || dot > slash))
+        return path.substr(0, dot) + ".delta" + path.substr(dot);
+    return path + ".delta.idx";
+}
+
 // ─── path→id map: loaded from existing .idx DocData ───────────────────────────
 
 using PathMap = std::map<std::string, uint64_t>;  // filepath → sequential id
@@ -116,25 +127,18 @@ struct FileItem {
 
 static std::filesystem::path FsPathFromUtf8(const std::string& path);
 
-static std::string ManifestPath(const std::string& idxPath)
-{
-    return idxPath + ".manifest";
-}
-
-static PathMap LoadPathMap(const std::string& idxPath, uint64_t& max_id)
+static PathMap LoadPathMapFromIndex(const std::string& idxPath, uint64_t& nextId)
 {
     PathMap m;
-    max_id = 0;
-    std::error_code ec;
-    if (!std::filesystem::exists(FsPathFromUtf8(idxPath), ec))
+    if (!IndexSerializer::IsValidIndex(idxPath.c_str()))
         return m;
 
-    IndexContext ctx("", idxPath.c_str());
+    IndexContext ctx("", idxPath.c_str(), false);
     for (uint64_t id = 0; id < ctx.DocumentCount(); ++id) {
         const std::string path = ctx.GetDocPath(id);
         if (!path.empty()) {
             m[path] = id;
-            max_id = std::max(max_id, id + 1);
+            nextId = std::max(nextId, id + 1);
         }
     }
     return m;
@@ -190,7 +194,49 @@ static std::filesystem::path FsPathFromUtf8(const std::string& path)
 #endif
 }
 
-static bool IsIndexableTextFile(const std::filesystem::path& path)
+static std::string PathToUtf8(const std::filesystem::path& path)
+{
+#ifdef _WIN32
+    return WideToUtf8(path.wstring().c_str());
+#else
+    return path.string();
+#endif
+}
+
+static std::string Trim(std::string text)
+{
+    while (!text.empty() && std::isspace(static_cast<unsigned char>(text.front())))
+        text.erase(text.begin());
+    while (!text.empty() && std::isspace(static_cast<unsigned char>(text.back())))
+        text.pop_back();
+    return text;
+}
+
+static std::string NormalizeExtension(std::string ext)
+{
+    ext = Trim(std::move(ext));
+    while (!ext.empty() && ext.front() == '.')
+        ext.erase(ext.begin());
+    std::transform(ext.begin(), ext.end(), ext.begin(),
+                   [](unsigned char c){ return static_cast<char>(std::tolower(c)); });
+    return ext;
+}
+
+static std::vector<std::string> ParseExtensions(const std::string& text)
+{
+    std::vector<std::string> extensions;
+    std::stringstream ss(text);
+    std::string item;
+    while (std::getline(ss, item, ',')) {
+        item = NormalizeExtension(std::move(item));
+        if (!item.empty())
+            extensions.push_back(std::move(item));
+    }
+    return extensions;
+}
+
+static bool IsIndexableTextFile(const std::filesystem::path& path,
+                                const std::vector<std::string>& extensions)
 {
     std::wstring extw = path.extension().wstring();
     std::string ext;
@@ -199,56 +245,49 @@ static bool IsIndexableTextFile(const std::filesystem::path& path)
 #else
     ext = path.extension().string();
 #endif
-    std::transform(ext.begin(), ext.end(), ext.begin(),
-                   [](unsigned char c){ return static_cast<char>(std::tolower(c)); });
-    return ext == ".txt" || ext == ".md";
+    ext = NormalizeExtension(std::move(ext));
+    return std::find(extensions.begin(), extensions.end(), ext) != extensions.end();
 }
 
-static bool ShouldSkipDirectory(const std::filesystem::path& path)
+static void AddFileIfIndexable(const std::filesystem::path& path,
+                               const std::vector<std::string>& extensions,
+                               bool checkExtension,
+                               std::vector<FileItem>& files)
 {
-    std::wstring namew = path.filename().wstring();
-    std::string name;
-#ifdef _WIN32
-    name = WideToUtf8(namew.c_str());
-#else
-    name = path.filename().string();
-#endif
-    std::transform(name.begin(), name.end(), name.begin(),
-                   [](unsigned char c){ return static_cast<char>(std::tolower(c)); });
-
-    return name == ".git"
-        || name == ".vs"
-        || name == ".vscode"
-        || name == ".tools"
-        || name == "node_modules"
-        || name == ".npm"
-        || name == ".nuget"
-        || name == "packages"
-        || name == "build"
-        || name == "build_debug"
-        || name == "debug"
-        || name == "release"
-        || name == "target"
-        || name == "cxcache";
+    std::error_code ec;
+    if (!std::filesystem::is_regular_file(path, ec) || ec) return;
+    if (checkExtension && !IsIndexableTextFile(path, extensions)) return;
+    uintmax_t size = std::filesystem::file_size(path, ec);
+    if (ec || size > MAX_INDEX_FILE_BYTES) return;
+    files.push_back({AbsolutePath(PathToUtf8(path)), size});
 }
 
-static std::vector<FileItem> CollectIndexableFiles(const std::string& path)
+static std::vector<FileItem> CollectSingleFile(const std::string& path)
+{
+    std::vector<FileItem> files;
+    AddFileIfIndexable(FsPathFromUtf8(path), {}, false, files);
+    return files;
+}
+
+static std::vector<FileItem> CollectDirectoryFiles(const std::string& path,
+                                                   const std::vector<std::string>& extensions,
+                                                   bool recursive)
 {
     std::vector<FileItem> files;
     std::error_code ec;
     std::filesystem::path root = FsPathFromUtf8(path);
+    if (!std::filesystem::is_directory(root, ec))
+        return files;
 
-    if (std::filesystem::is_regular_file(root, ec)) {
-        if (IsIndexableTextFile(root)) {
-            uintmax_t size = std::filesystem::file_size(root, ec);
-            if (!ec && size <= MAX_INDEX_FILE_BYTES)
-                files.push_back({AbsolutePath(path), size});
+    if (!recursive) {
+        std::filesystem::directory_iterator it(root, std::filesystem::directory_options::skip_permission_denied, ec);
+        std::filesystem::directory_iterator end;
+        for (; it != end; it.increment(ec)) {
+            if (ec) { ec.clear(); continue; }
+            AddFileIfIndexable(it->path(), extensions, true, files);
         }
         return files;
     }
-
-    if (!std::filesystem::is_directory(root, ec))
-        return files;
 
     std::filesystem::recursive_directory_iterator it(
         root,
@@ -257,22 +296,8 @@ static std::vector<FileItem> CollectIndexableFiles(const std::string& path)
     std::filesystem::recursive_directory_iterator end;
     for (; it != end; it.increment(ec)) {
         if (ec) { ec.clear(); continue; }
-        if (it->is_directory(ec)) {
-            if (!ec && ShouldSkipDirectory(it->path()))
-                it.disable_recursion_pending();
-            ec.clear();
-            continue;
-        }
-        if (!it->is_regular_file(ec) || ec) { ec.clear(); continue; }
-        if (!IsIndexableTextFile(it->path())) continue;
-        uintmax_t size = it->file_size(ec);
-        if (ec) { ec.clear(); continue; }
-        if (size > MAX_INDEX_FILE_BYTES) continue;
-#ifdef _WIN32
-    files.push_back({AbsolutePath(WideToUtf8(it->path().wstring().c_str())), size});
-#else
-    files.push_back({AbsolutePath(it->path().string()), size});
-#endif
+        if (it->is_directory(ec) || ec) { ec.clear(); continue; }
+        AddFileIfIndexable(it->path(), extensions, true, files);
     }
     return files;
 }
@@ -288,13 +313,21 @@ static std::string Stem(const std::string& path)
 
 // ─── index: rebuild from all known files ─────────────────────────────────────
 
-static void Rebuild(const std::string& idxPath, const PathMap& pathMap)
+static bool BuildIndexFile(const std::string& baseIdxPath,
+                           const std::string& savePath,
+                           const PathMap& pathMap,
+                           bool saveAsDelta,
+                           uint64_t& kept,
+                           uint64_t& skipped)
 {
-    IndexContext   ctx;
-    uint64_t       kept = 0;
-    uint64_t       skipped = 0;
+    IndexContext   ctx("", saveAsDelta ? baseIdxPath.c_str() : "", false);
+    kept = 0;
+    skipped = 0;
+    const uint64_t total = static_cast<uint64_t>(pathMap.size());
+    uint64_t processed = 0;
 
     for (auto& [fp, id] : pathMap) {
+        ++processed;
         std::string content = ReadFile(fp);
         if (content.empty()) {
             std::cerr << "  skipping (unreadable): " << fp << "\n";
@@ -308,12 +341,15 @@ static void Rebuild(const std::string& idxPath, const PathMap& pathMap)
         doc.body = std::move(content);
         ctx.AddDocument(doc);
         ++kept;
+
+        if (processed == total || processed % 25 == 0) {
+            std::cout << "  indexed " << processed << "/" << total
+                      << " file(s) into memory\n";
+        }
     }
 
-    ctx.SaveIndex(idxPath.c_str());
-    std::cout << "Rebuilt index with " << kept << " readable document(s)";
-    if (skipped) std::cout << " (skipped " << skipped << ")";
-    std::cout << "\n";
+    std::cout << "  writing index: " << savePath << "\n";
+    return kept > 0 && ctx.SaveIndex(savePath.c_str());
 }
 
 // ─── search ──────────────────────────────────────────────────────────────────
@@ -387,12 +423,71 @@ static void Search(IndexContext& ctx, const std::string& query)
 
 // ─── main ─────────────────────────────────────────────────────────────────────
 
+struct IndexOptions {
+    std::string filePath;
+    std::string dirPath;
+    std::vector<std::string> extensions = ParseExtensions("md,txt");
+    bool recursive = false;
+};
+
+static bool IsIndexCommand(const std::string& arg)
+{
+    return arg == "-file"
+        || arg == "-dir"
+        || arg == "-ext"
+        || arg == "-r";
+}
+
+static bool ParseIndexOptions(const std::vector<std::string>& args,
+                              IndexOptions& options,
+                              std::string& error)
+{
+    for (size_t i = 0; i < args.size(); ++i) {
+        const std::string& arg = args[i];
+        if (arg == "-file") {
+            if (i + 1 >= args.size()) { error = "Usage: moon -file <filename>"; return false; }
+            options.filePath = args[++i];
+        } else if (arg == "-dir") {
+            if (i + 1 >= args.size()) { error = "Usage: moon -dir <directory> [-ext md,txt] [-r]"; return false; }
+            options.dirPath = args[++i];
+        } else if (arg == "-ext") {
+            if (i + 1 >= args.size()) { error = "Usage: moon -ext md,txt,cpp,h"; return false; }
+            options.extensions = ParseExtensions(args[++i]);
+            if (options.extensions.empty()) { error = "-ext must include at least one extension"; return false; }
+        } else if (arg == "-r") {
+            options.recursive = true;
+        } else {
+            error = "Unknown option: " + arg;
+            return false;
+        }
+    }
+
+    if (!options.filePath.empty())
+        return true;
+    if (!options.dirPath.empty())
+        return true;
+    error = "Usage: moon -file <filename> | moon -dir <directory> [-ext md,txt] [-r]";
+    return false;
+}
+
+static std::string JoinExtensions(const std::vector<std::string>& extensions)
+{
+    std::string text;
+    for (size_t i = 0; i < extensions.size(); ++i) {
+        if (i) text += ",";
+        text += extensions[i];
+    }
+    return text;
+}
+
 static void PrintHelp(const std::string& idxPath)
 {
     std::cout
         << "moon — personal document search\n\n"
-        << "  moon -name <file>   Index a .txt or .md file\n"
-        << "  moon -i             Interactive search\n\n"
+        << "  moon -file <file>               Index one file\n"
+        << "  moon -dir <dir> -ext md,txt     Index files in one directory\n"
+        << "  moon -dir <dir> -ext md -r      Index files recursively\n"
+        << "  moon -i                             Interactive search\n\n"
         << "Index: " << idxPath << "\n";
 }
 
@@ -402,65 +497,107 @@ int main(int argc, char* argv[])
 
     // On Windows, argv uses the ANSI codepage and drops non-ASCII characters.
     // Use CommandLineToArgvW to get the real Unicode arguments instead.
-    std::string cmd, filePath;
+    std::vector<std::string> args;
 #ifdef _WIN32
     SetConsoleOutputCP(CP_UTF8);
     SetConsoleCP(CP_UTF8);
     int wargc = 0;
     LPWSTR* wargv = CommandLineToArgvW(GetCommandLineW(), &wargc);
     if (wargv) {
-        if (wargc >= 2) cmd      = WideToUtf8(wargv[1]);
-        if (wargc >= 3) filePath = WideToUtf8(wargv[2]);
+        for (int i = 1; i < wargc; ++i)
+            args.push_back(WideToUtf8(wargv[i]));
         LocalFree(wargv);
     }
 #else
-    if (argc >= 2) cmd      = argv[1];
-    if (argc >= 3) filePath = argv[2];
+    for (int i = 1; i < argc; ++i)
+        args.push_back(argv[i]);
 #endif
 
+    const std::string cmd = args.empty() ? std::string() : args[0];
     if (cmd.empty()) {
         PrintHelp(idxPath);
         return 0;
     }
 
-    // ── index a file ──────────────────────────────────────────────────────────
-    if (cmd == "-name") {
-        if (filePath.empty()) {
-            std::cerr << "Usage: moon -name <filepath>\n";
+    // ── index files ───────────────────────────────────────────────────────────
+    if (IsIndexCommand(cmd)) {
+        IndexOptions options;
+        std::string error;
+        if (!ParseIndexOptions(args, options, error)) {
+            std::cerr << error << "\n";
             return 1;
         }
-        auto files = CollectIndexableFiles(filePath);
+
+        std::vector<FileItem> files;
+        std::string inputPath;
+        if (!options.filePath.empty()) {
+            inputPath = options.filePath;
+            files = CollectSingleFile(options.filePath);
+        } else {
+            inputPath = options.dirPath;
+            files = CollectDirectoryFiles(options.dirPath, options.extensions, options.recursive);
+        }
+
         if (files.empty()) {
-            std::cerr << "No readable .txt/.md files found: " << filePath << "\n";
+            std::cerr << "No readable indexable files found: " << inputPath << "\n";
             return 1;
         }
 
-        std::cout << "Collected " << files.size() << " .txt/.md file(s) <= "
-                  << (MAX_INDEX_FILE_BYTES / (1024 * 1024)) << "MB under "
-                  << filePath << "\n";
+        std::cout << "Collected " << files.size() << " file(s) <= "
+                  << (MAX_INDEX_FILE_BYTES / (1024 * 1024)) << "MB from "
+                  << inputPath;
+        if (options.filePath.empty())
+            std::cout << " (ext=" << JoinExtensions(options.extensions)
+                      << ", recur=" << (options.recursive ? "true" : "false") << ")";
+        std::cout << "\n";
 
-        std::error_code ec;
-        std::filesystem::remove(FsPathFromUtf8(ManifestPath(idxPath)), ec);
-        uint64_t max_id = 0;
-        PathMap  pathMap = LoadPathMap(idxPath, max_id);
+        const std::string deltaPath = DeltaIndexPath(idxPath);
+        const bool baseValid = IndexSerializer::IsValidIndex(idxPath.c_str());
+
+        uint64_t baseNextId = 0;
+        uint64_t deltaNextId = 0;
+        PathMap baseMap = LoadPathMapFromIndex(idxPath, baseNextId);
+        PathMap deltaMap = baseValid ? LoadPathMapFromIndex(deltaPath, deltaNextId) : PathMap{};
+        PathMap knownMap = baseMap;
+        if (baseValid) {
+            for (const auto& [path, id] : deltaMap)
+                knownMap.emplace(path, id);
+        }
 
         uint64_t added = 0, existing = 0;
+        PathMap targetMap = baseValid ? deltaMap : PathMap{};
+        uint64_t nextId = baseValid ? deltaNextId : 0;
         for (const auto& file : files) {
-            if (pathMap.count(file.path)) {
+            if (knownMap.count(file.path)) {
                 ++existing;
             } else {
-                pathMap[file.path] = max_id++;
+                targetMap[file.path] = nextId++;
+                knownMap[file.path] = targetMap[file.path];
                 ++added;
             }
         }
 
-        Rebuild(idxPath, pathMap);
+        if (added == 0) {
+            std::cout << "No new files to index\n";
+            return 0;
+        }
 
-        std::cout << "Indexed input: " << filePath << "\n"
+        const std::string savePath = baseValid ? deltaPath : idxPath;
+        uint64_t kept = 0;
+        uint64_t skipped = 0;
+        if (!BuildIndexFile(idxPath, savePath, targetMap, baseValid, kept, skipped)) {
+            std::cerr << "Failed to save index: " << savePath << "\n";
+            return 1;
+        }
+
+        std::cout << "Indexed input: " << inputPath << "\n"
                   << "Files:   " << files.size()
                   << " (new " << added << ", existing " << existing << ")\n"
-                  << "Total:   " << pathMap.size()
-                  << " document(s) in " << idxPath << "\n";
+                  << "Saved:   " << kept << " document(s)";
+        if (skipped) std::cout << " (skipped " << skipped << ")";
+        std::cout << " to " << savePath << "\n"
+                  << "Total:   " << knownMap.size()
+                  << " known document(s)\n";
 
     // ── interactive search ────────────────────────────────────────────────────
     } else if (cmd == "-i") {
