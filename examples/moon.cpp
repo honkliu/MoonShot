@@ -21,6 +21,7 @@
 #include <fstream>
 #include <iostream>
 #include <map>
+#include <set>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -318,7 +319,8 @@ static bool BuildIndexFile(const std::string& baseIdxPath,
                            const PathMap& pathMap,
                            bool saveAsDelta,
                            uint64_t& kept,
-                           uint64_t& skipped)
+                           uint64_t& skipped,
+                           std::set<std::string>* reportedSkippedPaths = nullptr)
 {
     IndexContext   ctx("", saveAsDelta ? baseIdxPath.c_str() : "", false);
     kept = 0;
@@ -330,7 +332,8 @@ static bool BuildIndexFile(const std::string& baseIdxPath,
         ++processed;
         std::string content = ReadFile(fp);
         if (content.empty()) {
-            std::cerr << "  skipping (unreadable): " << fp << "\n";
+            if (!reportedSkippedPaths || reportedSkippedPaths->insert(fp).second)
+                std::cerr << "  skipping (empty/unreadable): " << fp << "\n";
             ++skipped;
             continue;
         }
@@ -427,14 +430,26 @@ struct IndexOptions {
     std::string filePath;
     std::string dirPath;
     std::vector<std::string> extensions = ParseExtensions("md,txt");
+    uint64_t batchSize = 200;
     bool recursive = false;
 };
+
+static bool ParseBatchSize(const std::string& text, uint64_t& batchSize)
+{
+    if (text.empty()) return false;
+    char* end = nullptr;
+    unsigned long long value = std::strtoull(text.c_str(), &end, 10);
+    if (!end || *end != '\0' || value == 0) return false;
+    batchSize = static_cast<uint64_t>(value);
+    return true;
+}
 
 static bool IsIndexCommand(const std::string& arg)
 {
     return arg == "-file"
         || arg == "-dir"
         || arg == "-ext"
+        || arg == "-b"
         || arg == "-r";
 }
 
@@ -454,6 +469,9 @@ static bool ParseIndexOptions(const std::vector<std::string>& args,
             if (i + 1 >= args.size()) { error = "Usage: moon -ext md,txt,cpp,h"; return false; }
             options.extensions = ParseExtensions(args[++i]);
             if (options.extensions.empty()) { error = "-ext must include at least one extension"; return false; }
+        } else if (arg == "-b") {
+            if (i + 1 >= args.size()) { error = "Usage: moon -b 200"; return false; }
+            if (!ParseBatchSize(args[++i], options.batchSize)) { error = "-b must be a positive integer"; return false; }
         } else if (arg == "-r") {
             options.recursive = true;
         } else {
@@ -466,7 +484,7 @@ static bool ParseIndexOptions(const std::vector<std::string>& args,
         return true;
     if (!options.dirPath.empty())
         return true;
-    error = "Usage: moon -file <filename> | moon -dir <directory> [-ext md,txt] [-r]";
+    error = "Usage: moon -file <filename> | moon -dir <directory> [-ext md,txt] [-r] [-b 200]";
     return false;
 }
 
@@ -487,6 +505,7 @@ static void PrintHelp(const std::string& idxPath)
         << "  moon -file <file>               Index one file\n"
         << "  moon -dir <dir> -ext md,txt     Index files in one directory\n"
         << "  moon -dir <dir> -ext md -r      Index files recursively\n"
+        << "  moon -b 200                     Batch size for new files (default 200)\n"
         << "  moon -i                             Interactive search\n\n"
         << "Index: " << idxPath << "\n";
 }
@@ -552,27 +571,28 @@ int main(int argc, char* argv[])
         std::cout << "\n";
 
         const std::string deltaPath = DeltaIndexPath(idxPath);
-        const bool baseValid = IndexSerializer::IsValidIndex(idxPath.c_str());
 
         uint64_t baseNextId = 0;
         uint64_t deltaNextId = 0;
         PathMap baseMap = LoadPathMapFromIndex(idxPath, baseNextId);
-        PathMap deltaMap = baseValid ? LoadPathMapFromIndex(deltaPath, deltaNextId) : PathMap{};
-        PathMap knownMap = baseMap;
-        if (baseValid) {
-            for (const auto& [path, id] : deltaMap)
-                knownMap.emplace(path, id);
+        PathMap deltaMap = LoadPathMapFromIndex(deltaPath, deltaNextId);
+        PathMap indexedMap = baseMap;
+        uint64_t nextId = baseNextId;
+        for (const auto& [path, _] : deltaMap) {
+            if (!indexedMap.count(path))
+                indexedMap[path] = nextId++;
         }
+        PathMap knownMap = indexedMap;
 
         uint64_t added = 0, existing = 0;
-        PathMap targetMap = baseValid ? deltaMap : PathMap{};
-        uint64_t nextId = baseValid ? deltaNextId : 0;
+        std::vector<std::pair<std::string, uint64_t>> pendingFiles;
         for (const auto& file : files) {
             if (knownMap.count(file.path)) {
                 ++existing;
             } else {
-                targetMap[file.path] = nextId++;
-                knownMap[file.path] = targetMap[file.path];
+                const uint64_t docId = nextId++;
+                pendingFiles.push_back({file.path, docId});
+                knownMap[file.path] = docId;
                 ++added;
             }
         }
@@ -582,22 +602,43 @@ int main(int argc, char* argv[])
             return 0;
         }
 
-        const std::string savePath = baseValid ? deltaPath : idxPath;
-        uint64_t kept = 0;
-        uint64_t skipped = 0;
-        if (!BuildIndexFile(idxPath, savePath, targetMap, baseValid, kept, skipped)) {
-            std::cerr << "Failed to save index: " << savePath << "\n";
-            return 1;
+        uint64_t totalKept = 0;
+        uint64_t totalSkipped = 0;
+        uint64_t savedBatches = 0;
+        std::set<std::string> reportedSkippedPaths;
+        for (size_t offset = 0; offset < pendingFiles.size(); offset += static_cast<size_t>(options.batchSize)) {
+            const size_t end = std::min(offset + static_cast<size_t>(options.batchSize), pendingFiles.size());
+            const size_t batchNewCount = end - offset;
+            for (size_t i = offset; i < end; ++i)
+                indexedMap[pendingFiles[i].first] = pendingFiles[i].second;
+
+            uint64_t kept = 0;
+            uint64_t skipped = 0;
+            std::cout << "Batch " << (savedBatches + 1) << ": adding "
+                      << batchNewCount << " new file(s), rebuilding "
+                      << indexedMap.size() << " total document(s) into " << idxPath << "\n";
+            if (!BuildIndexFile(idxPath, idxPath, indexedMap, false, kept, skipped, &reportedSkippedPaths)) {
+                std::cerr << "Failed to save index: " << idxPath << "\n";
+                return 1;
+            }
+            totalKept = kept;
+            totalSkipped = skipped;
+            ++savedBatches;
         }
+
+        std::error_code removeError;
+        std::filesystem::remove(FsPathFromUtf8(deltaPath), removeError);
 
         std::cout << "Indexed input: " << inputPath << "\n"
                   << "Files:   " << files.size()
                   << " (new " << added << ", existing " << existing << ")\n"
-                  << "Saved:   " << kept << " document(s)";
-        if (skipped) std::cout << " (skipped " << skipped << ")";
-        std::cout << " to " << savePath << "\n"
-                  << "Total:   " << knownMap.size()
-                  << " known document(s)\n";
+                  << "Batch size: " << options.batchSize << "\n"
+                  << "Saved batches: " << savedBatches << "\n"
+                  << "Saved:   " << totalKept << " document(s)";
+        if (totalSkipped) std::cout << " (skipped " << totalSkipped << ")";
+        std::cout << " to " << idxPath << "\n"
+                  << "Total:   " << totalKept
+                  << " indexed document(s)\n";
 
     // ── interactive search ────────────────────────────────────────────────────
     } else if (cmd == "-i") {
