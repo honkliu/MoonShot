@@ -14,12 +14,15 @@
 #include "Embeddings.h"
 #include "FileAccess.h"
 #include "MemOperation.h"
+#include "UnifiedDecoder.h"
 
 #include <memory>
 #include <string>
 #include <algorithm>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <iostream>
 #include <limits>
 #include <utility>
@@ -72,6 +75,7 @@ public:
         , m_Built(false)
         , m_LoadedFromDisk(false)
         , m_LoadDelta(loadDelta)
+        , m_VectorBuilt(false)
     {
         if (!m_IndexPath.empty())
             LoadIndex();
@@ -145,8 +149,10 @@ public:
     {
         if (m_Built) return;
 
-        if (BuildRuntime(m_BlockTable, m_VectorIndex, m_IndexFileHeader, m_DocData, m_Built))
+        if (BuildRuntime(m_BlockTable, m_VectorIndex, m_IndexFileHeader, m_DocData, m_Built)) {
             m_LoadedFromDisk = false;
+            m_VectorBuilt = true;
+        }
     }
 
     /*
@@ -235,10 +241,11 @@ public:
                                                  VectorMetric metric = VectorMetric::Cosine,
                                                  size_t efSearch = 200)
     {
+        EnsureVectorIndexBuilt();
         return m_VectorIndex.Search(query, topK, metric, efSearch);
     }
 
-    size_t VectorCount() const { return m_VectorIndex.Size(); }
+    size_t VectorCount() { EnsureVectorIndexBuilt(); return m_VectorIndex.Size(); }
     size_t VectorDimension() const { return m_VectorIndex.Dimension(); }
 
     bool HasDelta() const
@@ -290,6 +297,7 @@ public:
         delta->m_DocData = m_WriteDocData;
         delta->m_Built = true;
         delta->m_LoadedFromDisk = true;
+        delta->m_VectorBuilt = true;
         delta->m_Executor = IndexSearchExecutor(delta.get());
 
         m_WriteDocData = nullptr;
@@ -299,6 +307,193 @@ public:
 
         m_DeltaContext.reset();
         m_DeltaContext = std::move(delta);
+        return true;
+    }
+
+    bool Merge(const char* outputPath)
+    {
+        if (!outputPath || !*outputPath) return false;
+        if (!m_Built || !m_DocData) return false;
+        if (!HasDelta()) return false;
+        if (!m_DeltaContext->m_Built || !m_DeltaContext->m_DocData) return false;
+
+        // Step 1: Prepare the merge inputs and final temp file.
+        // The base index is this loaded context. The delta index is the hidden
+        // delta context loaded from <base>.delta.idx. The final output is first
+        // written to <output>.tmp so the old index is not destroyed by a failed
+        // merge.
+        const std::string tempPath = std::string(outputPath) + ".tmp";
+        const std::string prefix(outputPath);
+        const std::string leafTempPath = prefix + ".leaf.tmp";
+        const std::string indexTempPath = prefix + ".blocks.tmp";
+        const std::string docDataTempPath = prefix + ".docdata.tmp";
+        std::remove(tempPath.c_str());
+        std::remove(leafTempPath.c_str());
+        std::remove(indexTempPath.c_str());
+        std::remove(docDataTempPath.c_str());
+
+        auto cleanupTempFiles = [&]() {
+            std::remove(tempPath.c_str());
+            std::remove(leafTempPath.c_str());
+            std::remove(indexTempPath.c_str());
+            std::remove(docDataTempPath.c_str());
+        };
+
+        IndexContext& delta = *m_DeltaContext;
+
+        // Step 2: Write DocData to a temp stream by appending resident base
+        // DocData first and resident delta DocData second. No old raw source
+        // file is opened here.
+        uint64_t mergedDocs = 0;
+        float avgDocLength = 1.0f;
+        {
+            FileAccess docFile(docDataTempPath.c_str());
+            if (!docFile.InitWrite()) { cleanupTempFiles(); return false; }
+
+            const uint64_t baseDocCount = m_IndexFileHeader.IFH_NumDocuments;
+            const uint64_t deltaFirstDocId = baseDocCount;
+            const uint64_t deltaDocLimit = delta.m_IndexFileHeader.IFH_NumDocuments;
+            if (deltaDocLimit < deltaFirstDocId) { cleanupTempFiles(); return false; }
+            const uint64_t deltaDocCount = deltaDocLimit - deltaFirstDocId;
+            mergedDocs = deltaFirstDocId + deltaDocCount;
+
+            uint64_t totalDocLength = static_cast<uint64_t>(static_cast<double>(m_IndexFileHeader.IFH_AvgDocLength) * static_cast<double>(baseDocCount));
+
+            const uint64_t baseDocBytes = baseDocCount * DOC_REC_SIZE;
+            if (baseDocBytes > 0 && !docFile.PutData(m_DocData, baseDocBytes)) { cleanupTempFiles(); return false; }
+
+            if (deltaDocCount > 0) {
+                const uint64_t deltaDocBytes = deltaDocCount * DOC_REC_SIZE;
+                const uint8_t* deltaDocData = delta.m_DocData + deltaFirstDocId * DOC_REC_SIZE;
+                if (!docFile.PutData(deltaDocData, deltaDocBytes)) { cleanupTempFiles(); return false; }
+
+                totalDocLength += static_cast<uint64_t>(static_cast<double>(delta.m_IndexFileHeader.IFH_AvgDocLength) * static_cast<double>(deltaDocLimit));
+            }
+
+            avgDocLength = mergedDocs ? static_cast<float>(totalDocLength) / static_cast<float>(mergedDocs) : 1.0f;
+        }
+
+        // Step 3: Merge base/delta LeafTermEntry streams in sorted order and
+        // write merged posting bytes into an IndexBlock temp stream. Delta
+        // postings already contain final doc ids, so equal-term postings are
+        // raw-appended after base postings.
+        std::vector<HeadTermEntry> headEntries;
+        uint64_t totalTerms = 0;
+        uint32_t indexBlockCount = 0;
+        {
+            auto indexFile = std::make_unique<FileAccess>(indexTempPath.c_str());
+            auto leafFile = std::make_unique<FileAccess>(leafTempPath.c_str());
+            if (!indexFile->InitWrite() || !leafFile->InitWrite()) { cleanupTempFiles(); return false; }
+
+            auto writer = std::make_unique<StreamingMergeWriter>(*indexFile, *leafFile);
+            RuntimeTermCursor baseCursor(*this);
+            RuntimeTermCursor deltaCursor(delta);
+            std::vector<uint8_t> baseBytes;
+            std::vector<uint8_t> deltaBytes;
+            std::vector<uint8_t> mergedPostingBytes;
+            constexpr size_t LEAF_PAGE_CHUNK_LIMIT = 100;
+            size_t chunkStartLeafPages = writer->HeadEntries.size();
+
+            while (!baseCursor.IsEnd() || !deltaCursor.IsEnd()) {
+                const bool takeBase = deltaCursor.IsEnd()
+                    || (!baseCursor.IsEnd() && baseCursor.Current().Term < deltaCursor.Current().Term);
+                const bool takeDelta = baseCursor.IsEnd()
+                    || (!deltaCursor.IsEnd() && deltaCursor.Current().Term < baseCursor.Current().Term);
+
+                std::string term;
+                mergedPostingBytes.clear();
+                uint32_t docFreq = 0;
+
+                if (takeBase) {
+                    const auto& current = baseCursor.Current();
+                    term = current.Term;
+                    if (!ReadRuntimePostingBytes(current, baseBytes)) { cleanupTempFiles(); return false; }
+                    mergedPostingBytes = baseBytes;
+                    docFreq = current.DocFreq;
+                    baseCursor.Advance();
+                } else if (takeDelta) {
+                    const auto& current = deltaCursor.Current();
+                    term = current.Term;
+                    if (!delta.ReadRuntimePostingBytes(current, deltaBytes)) { cleanupTempFiles(); return false; }
+                    mergedPostingBytes = deltaBytes;
+                    docFreq = current.DocFreq;
+                    deltaCursor.Advance();
+                } else {
+                    const auto& baseCurrent = baseCursor.Current();
+                    const auto& deltaCurrent = deltaCursor.Current();
+                    term = baseCurrent.Term;
+                    if (!ReadRuntimePostingBytes(baseCurrent, baseBytes)) { cleanupTempFiles(); return false; }
+                    if (!delta.ReadRuntimePostingBytes(deltaCurrent, deltaBytes)) { cleanupTempFiles(); return false; }
+                    mergedPostingBytes = baseBytes;
+                    mergedPostingBytes.insert(mergedPostingBytes.end(), deltaBytes.begin(), deltaBytes.end());
+                    docFreq = baseCurrent.DocFreq + deltaCurrent.DocFreq;
+                    baseCursor.Advance();
+                    deltaCursor.Advance();
+                }
+
+                if (!writer->WriteTerm(term, mergedPostingBytes, docFreq)) { cleanupTempFiles(); return false; }
+
+                if (writer->HeadEntries.size() - chunkStartLeafPages >= LEAF_PAGE_CHUNK_LIMIT)
+                    chunkStartLeafPages = writer->HeadEntries.size();
+            }
+
+            if (!writer->Finish()) { cleanupTempFiles(); return false; }
+            headEntries = writer->HeadEntries;
+            totalTerms = writer->TotalTerms;
+            indexBlockCount = writer->IndexBlockCount;
+            writer.reset();
+            indexFile.reset();
+            leafFile.reset();
+        }
+
+        // Step 4: Build HeadTermEntry records from the first term of each
+        // completed leaf page produced by Step 3.
+        // Step 5: Assemble <output>.tmp in v12 physical order, patch the header,
+        // release old file handles, then rename <output>.tmp to the final path.
+        {
+            FileAccess output(tempPath.c_str());
+            if (!output.InitWrite()) { cleanupTempFiles(); return false; }
+
+            IndexFileHeader header{};
+            if (!output.PutData(&header, sizeof(header))) { cleanupTempFiles(); return false; }
+            if (!headEntries.empty()
+                && !output.PutData(headEntries.data(), static_cast<uint64_t>(headEntries.size()) * sizeof(HeadTermEntry))) {
+                cleanupTempFiles();
+                return false;
+            }
+            if (!AppendFile(output, leafTempPath)) { cleanupTempFiles(); return false; }
+            if (!AppendFile(output, docDataTempPath)) { cleanupTempFiles(); return false; }
+            if (!AppendFile(output, indexTempPath)) { cleanupTempFiles(); return false; }
+
+            std::memcpy(header.IFH_Magic, INDEX_FILE_MAGIC, sizeof(INDEX_FILE_MAGIC));
+            header.IFH_Version = INDEX_FORMAT_VERSION;
+            header.IFH_NumDocuments = mergedDocs;
+            header.IFH_NumTerms = totalTerms;
+            header.IFH_AvgDocLength = avgDocLength;
+            header.IFH_HeadTermEntryOffset = sizeof(IndexFileHeader);
+            header.IFH_HeadTermEntryCount = static_cast<uint64_t>(headEntries.size());
+            header.IFH_LeafTermBlockOffset = header.IFH_HeadTermEntryOffset + header.IFH_HeadTermEntryCount * sizeof(HeadTermEntry);
+            header.IFH_LeafTermBlockCount = headEntries.size();
+            header.IFH_DocDataOffset = header.IFH_LeafTermBlockOffset + header.IFH_LeafTermBlockCount * sizeof(LeafTermBlock);
+            header.IFH_IndexBlockOffset = header.IFH_DocDataOffset + mergedDocs * DOC_REC_SIZE;
+            header.IFH_IndexBlockCount = indexBlockCount;
+
+            if (!output.SetPosition(0) || !output.PutData(&header, sizeof(header))) {
+                cleanupTempFiles();
+                return false;
+            }
+        }
+
+        std::remove(leafTempPath.c_str());
+        std::remove(indexTempPath.c_str());
+        std::remove(docDataTempPath.c_str());
+
+        ResetLoadedRuntimeState();
+        std::remove(outputPath);
+        if (std::rename(tempPath.c_str(), outputPath) != 0) {
+            cleanupTempFiles();
+            return false;
+        }
         return true;
     }
 
@@ -428,8 +623,7 @@ public:
         }
 
         m_VectorIndex.SetDocData(m_DocData);
-        for (uint64_t docId = 0; docId < m_IndexFileHeader.IFH_NumDocuments; ++docId)
-            m_VectorIndex.Add(docId);
+        m_VectorBuilt = false;
 
         m_Executor = IndexSearchExecutor(this);
         m_Built    = true;
@@ -456,6 +650,7 @@ private:
     bool                         m_Built;
     bool                         m_LoadedFromDisk;
     bool                         m_LoadDelta;
+    bool                         m_VectorBuilt;
     IndexFileHeader              m_IndexFileHeader{};
     uint8_t*                     m_DocData = nullptr;
     std::unique_ptr<IndexContext> m_DeltaContext;
@@ -465,6 +660,8 @@ private:
     IndexFileHeader              m_WriteIndexFileHeader{};
     uint8_t*                     m_WriteDocData = nullptr;
     bool                         m_WriteBuilt = false;
+    std::unique_ptr<FileAccess>  m_MergeTempIndexFile;
+    std::unique_ptr<FileAccess>  m_MergeTempLeafFile;
 
     static constexpr uint32_t INDEX_BLOCK_CACHE_SLOT_COUNT =
         static_cast<uint32_t>(INDEX_BLOCK_CACHE_BYTES / sizeof(IndexBlock));
@@ -489,6 +686,7 @@ private:
         ClearDocDataOnly();
         ClearBlockPageDataOnly();
         m_IndexFileHeader = {};
+        m_VectorBuilt = false;
     }
 
     void ClearWritePinnedIndexData()
@@ -511,6 +709,19 @@ private:
         m_Executor = IndexSearchExecutor(this);
         m_Built = false;
         m_LoadedFromDisk = false;
+        m_VectorBuilt = false;
+    }
+
+    void EnsureVectorIndexBuilt()
+    {
+        if (m_VectorBuilt) return;
+        m_VectorIndex.Clear();
+        m_VectorIndex.SetDocData(m_DocData);
+        if (m_DocData) {
+            for (uint64_t docId = 0; docId < m_IndexFileHeader.IFH_NumDocuments; ++docId)
+                m_VectorIndex.Add(docId);
+        }
+        m_VectorBuilt = true;
     }
 
     static std::string DeltaIndexPath(const std::string& path)
@@ -572,6 +783,9 @@ private:
             ResetRuntimeState(blockTable, vectorIndex, header, docData, built);
             return false;
         }
+        std::memset(docData, 0, static_cast<size_t>((maxDocId + 1) * DOC_REC_SIZE));
+        for (uint64_t docId = 0; docId <= maxDocId; ++docId)
+            reinterpret_cast<DocDataEntry*>(docData + docId * DOC_REC_SIZE)->DDE_DocID = UINT64_MAX;
 
         uint64_t totalLen = 0;
         for (const auto& [docId, stats] : m_Store->AllDocStats()) {
@@ -646,6 +860,347 @@ private:
         built = true;
         return true;
     }
+
+    struct RuntimeTermEntry {
+        std::string Term;
+        uint32_t DocFreq = 0;
+        uint32_t IndexBlockID = 0;
+        uint32_t IndexOffset = 0;
+        uint32_t IndexLength = 0;
+        uint32_t ContinuationBlockCount = 0;
+    };
+
+    class RuntimeTermCursor {
+    public:
+        explicit RuntimeTermCursor(IndexContext& context)
+            : m_Context(context)
+        {
+            ReadCurrent();
+        }
+
+        bool IsEnd() const { return m_End; }
+        const RuntimeTermEntry& Current() const { return m_Current; }
+
+        void Advance()
+        {
+            if (m_End) return;
+            ++m_EntryIndex;
+            ReadCurrent();
+        }
+
+    private:
+        IndexContext& m_Context;
+        RuntimeTermEntry m_Current;
+        uint32_t m_LeafBlockID = 0;
+        uint32_t m_EntryIndex = 0;
+        bool m_End = false;
+
+        void ReadCurrent()
+        {
+            while (m_LeafBlockID < m_Context.m_IndexFileHeader.IFH_LeafTermBlockCount) {
+                uint32_t slot = UINT32_MAX;
+                const auto* leaf = static_cast<const LeafTermBlock*>(m_Context.m_BlockTable.GetBlock(BlockKind::LeafTerm, m_LeafBlockID, &slot));
+                if (!leaf) {
+                    m_End = true;
+                    return;
+                }
+
+                const uint8_t* blockBase = reinterpret_cast<const uint8_t*>(leaf);
+                const uint32_t entryCount = leaf->LTB_Directory[LEAF_TERM_DIRECTORY_COUNT - 1];
+                if (m_EntryIndex < entryCount && m_EntryIndex < LEAF_TERM_DIRECTORY_COUNT - 1) {
+                    const auto* entry = reinterpret_cast<const LeafTermEntry*>(blockBase + leaf->LTB_Directory[m_EntryIndex]);
+                    m_Current.Term.assign(entry->LTE_Term, entry->LTE_TermLength);
+                    m_Current.DocFreq = entry->LTE_DocFreq;
+                    m_Current.IndexBlockID = entry->LTE_IndexBlockID;
+                    m_Current.IndexOffset = entry->LTE_IndexOffset;
+                    m_Current.IndexLength = entry->LTE_IndexLength;
+                    m_Current.ContinuationBlockCount = entry->LTE_ContinuationBlockCount;
+                    m_Context.m_BlockTable.ReleaseBlock(BlockKind::LeafTerm, slot);
+                    return;
+                }
+
+                m_Context.m_BlockTable.ReleaseBlock(BlockKind::LeafTerm, slot);
+                ++m_LeafBlockID;
+                m_EntryIndex = 0;
+            }
+            m_End = true;
+            m_Current = {};
+        }
+    };
+
+    void CollectRuntimeTerms(std::vector<RuntimeTermEntry>& terms)
+    {
+        for (uint32_t leafId = 0; leafId < m_IndexFileHeader.IFH_LeafTermBlockCount; ++leafId) {
+            uint32_t slot = UINT32_MAX;
+            const auto* leaf = static_cast<const LeafTermBlock*>(m_BlockTable.GetBlock(BlockKind::LeafTerm, leafId, &slot));
+            if (!leaf) continue;
+            const uint8_t* blockBase = reinterpret_cast<const uint8_t*>(leaf);
+            const uint32_t entryCount = leaf->LTB_Directory[LEAF_TERM_DIRECTORY_COUNT - 1];
+            for (uint32_t i = 0; i < entryCount && i < LEAF_TERM_DIRECTORY_COUNT - 1; ++i) {
+                const auto* entry = reinterpret_cast<const LeafTermEntry*>(blockBase + leaf->LTB_Directory[i]);
+                RuntimeTermEntry item;
+                item.Term.assign(entry->LTE_Term, entry->LTE_TermLength);
+                item.DocFreq = entry->LTE_DocFreq;
+                item.IndexBlockID = entry->LTE_IndexBlockID;
+                item.IndexOffset = entry->LTE_IndexOffset;
+                item.IndexLength = entry->LTE_IndexLength;
+                item.ContinuationBlockCount = entry->LTE_ContinuationBlockCount;
+                terms.push_back(std::move(item));
+            }
+            m_BlockTable.ReleaseBlock(BlockKind::LeafTerm, slot);
+        }
+    }
+
+    bool ReadRuntimePostingBytes(const RuntimeTermEntry& entry,
+                                 std::vector<uint8_t>& bytes)
+    {
+        bytes.clear();
+        if (entry.IndexOffset > PAGE_SIZE || entry.IndexLength > PAGE_SIZE - entry.IndexOffset)
+            return false;
+
+        uint32_t slot = UINT32_MAX;
+        const auto* block = static_cast<const IndexBlock*>(m_BlockTable.GetBlock(BlockKind::Index, entry.IndexBlockID, &slot));
+        if (!block) return false;
+        bytes.insert(bytes.end(),
+                     block->IB_Data + entry.IndexOffset,
+                     block->IB_Data + entry.IndexOffset + entry.IndexLength);
+        m_BlockTable.ReleaseBlock(BlockKind::Index, slot);
+
+        for (uint32_t i = 0; i < entry.ContinuationBlockCount; ++i) {
+            slot = UINT32_MAX;
+            const auto* continuation = static_cast<const IndexBlock*>(m_BlockTable.GetBlock(BlockKind::Index, entry.IndexBlockID + 1 + i, &slot));
+            if (!continuation) return false;
+            const auto* header = reinterpret_cast<const IndexBlockContinuationHeader*>(continuation->IB_Data);
+            if (header->IBCH_DataLength > PAGE_SIZE - sizeof(IndexBlockContinuationHeader)) {
+                m_BlockTable.ReleaseBlock(BlockKind::Index, slot);
+                return false;
+            }
+            const uint8_t* begin = continuation->IB_Data + sizeof(IndexBlockContinuationHeader);
+            bytes.insert(bytes.end(), begin, begin + header->IBCH_DataLength);
+            m_BlockTable.ReleaseBlock(BlockKind::Index, slot);
+        }
+
+        return true;
+    }
+
+    static bool ReadVbPairEnd(const uint8_t* data, size_t size, size_t& offset)
+    {
+        auto readOne = [&]() -> bool {
+            while (offset < size) {
+                const uint8_t byte = data[offset++];
+                if ((byte & 0x80u) == 0)
+                    return true;
+            }
+            return false;
+        };
+        return readOne() && readOne();
+    }
+
+    static size_t PostingPrefixBytes(const uint8_t* data, size_t size, size_t capacity)
+    {
+        size_t cursor = 0;
+        size_t lastPairEnd = 0;
+        const size_t limit = std::min(size, capacity);
+        while (cursor < limit) {
+            const size_t before = cursor;
+            if (!ReadVbPairEnd(data, size, cursor) || cursor > limit) {
+                cursor = before;
+                break;
+            }
+            lastPairEnd = cursor;
+        }
+        return lastPairEnd;
+    }
+
+    static bool AppendFile(FileAccess& output, const std::string& path)
+    {
+        FileAccess input(path.c_str());
+        if (!input.Init()) return false;
+
+        uint8_t buffer[PAGE_SIZE * 16];
+        while (true) {
+            const int bytes = input.GetData(buffer, static_cast<int>(sizeof(buffer)));
+            if (bytes < 0) return false;
+            if (bytes == 0) return true;
+            if (!output.PutData(buffer, static_cast<uint64_t>(bytes))) return false;
+        }
+    }
+
+    struct StreamingMergeWriter {
+        // This writer streams merged posting data into an index block temp file
+        // and merged leaf entries into a leaf temp file. The
+        // CurrentBlock/IndexWriteOffset pair is intentionally preserved across
+        // terms and across chunk boundaries so a partially filled IndexBlock can
+        // receive the next term's posting bytes.
+        FileAccess& IndexFile;
+        FileAccess& LeafFile;
+        IndexBlock CurrentBlock{};
+        LeafTermBlock LeafBlock{};
+        std::vector<HeadTermEntry> HeadEntries;
+        size_t IndexWriteOffset = 0;
+        size_t LeafWriteOffset = 0;
+        uint32_t IndexBlockCount = 0;
+        uint32_t LeafEntryCount = 0;
+        uint64_t TotalTerms = 0;
+        char FirstLeafTerm[HEAD_TERM_KEY_MAX] = {};
+        uint16_t FirstLeafTermLength = 0;
+
+        StreamingMergeWriter(FileAccess& indexFile, FileAccess& leafFile)
+            : IndexFile(indexFile)
+            , LeafFile(leafFile)
+        {}
+
+        bool FlushIndexBlock()
+        {
+            if (!IndexFile.PutData(&CurrentBlock, sizeof(CurrentBlock))) return false;
+            CurrentBlock = {};
+            IndexWriteOffset = 0;
+            ++IndexBlockCount;
+            return true;
+        }
+
+        bool FlushLeafBlock()
+        {
+            if (LeafEntryCount == 0) return true;
+
+            LeafBlock.LTB_Directory[LEAF_TERM_DIRECTORY_COUNT - 1] = static_cast<uint16_t>(LeafEntryCount);
+
+            // Record the first term of each completed leaf block. After all leaf
+            // blocks have been streamed, these records become the HeadTermEntry
+            // table in the final index file.
+            HeadTermEntry head{};
+            head.HTE_LeafTermBlockID = static_cast<uint32_t>(HeadEntries.size());
+            head.HTE_FirstTermLength = FirstLeafTermLength;
+            std::memcpy(head.HTE_FirstTerm, FirstLeafTerm, head.HTE_FirstTermLength);
+            HeadEntries.push_back(head);
+
+            if (!LeafFile.PutData(&LeafBlock, sizeof(LeafBlock))) return false;
+            LeafBlock = {};
+            LeafWriteOffset = 0;
+            LeafEntryCount = 0;
+            FirstLeafTermLength = 0;
+            std::memset(FirstLeafTerm, 0, sizeof(FirstLeafTerm));
+            return true;
+        }
+
+        bool WriteLeafEntry(const std::string& term,
+                            uint32_t docFreq,
+                            uint32_t indexBlockID,
+                            uint32_t indexOffset,
+                            uint32_t indexLength,
+                            uint32_t continuationBlockCount)
+        {
+            if (term.size() > HEAD_TERM_KEY_MAX) return true;
+            const uint8_t termLength = static_cast<uint8_t>(term.size());
+            const size_t entryBytes = sizeof(LeafTermEntry) + termLength;
+            if (LeafEntryCount > 0
+                && (LeafEntryCount >= LEAF_TERM_DIRECTORY_COUNT - 1
+                    || LeafWriteOffset + entryBytes > sizeof(LeafBlock.LTB_Data))) {
+                if (!FlushLeafBlock()) return false;
+            }
+
+            if (LeafEntryCount == 0) {
+                FirstLeafTermLength = termLength;
+                std::memcpy(FirstLeafTerm, term.data(), termLength);
+            }
+
+            LeafBlock.LTB_Directory[LeafEntryCount] = static_cast<uint16_t>(LEAF_TERM_DATA_OFFSET + LeafWriteOffset);
+            auto* entry = reinterpret_cast<LeafTermEntry*>(LeafBlock.LTB_Data + LeafWriteOffset);
+            entry->LTE_DocFreq = docFreq;
+            entry->LTE_IndexBlockID = indexBlockID;
+            entry->LTE_IndexOffset = indexOffset;
+            entry->LTE_IndexLength = indexLength;
+            entry->LTE_ContinuationBlockCount = continuationBlockCount;
+            entry->LTE_Flags = 0;
+            entry->LTE_TermLength = termLength;
+            std::memcpy(entry->LTE_Term, term.data(), termLength);
+            LeafWriteOffset += entryBytes;
+            ++LeafEntryCount;
+            ++TotalTerms;
+            return true;
+        }
+
+        bool WriteTerm(const std::string& term, const std::vector<uint8_t>& postingBytes, uint32_t docFreq)
+        {
+            if (term.size() > HEAD_TERM_KEY_MAX || postingBytes.empty()) return true;
+
+            constexpr size_t DATA_CAP = sizeof(IndexBlock::IB_Data);
+            const uint8_t* src = postingBytes.data();
+            size_t remaining = postingBytes.size();
+
+            if (IndexWriteOffset >= DATA_CAP && !FlushIndexBlock()) return false;
+
+            size_t dataOffset = IndexWriteOffset;
+            size_t dataHere = PostingPrefixBytes(src, remaining, DATA_CAP - IndexWriteOffset);
+            if (dataHere == 0) {
+                if (!FlushIndexBlock()) return false;
+                dataOffset = IndexWriteOffset;
+                dataHere = PostingPrefixBytes(src, remaining, DATA_CAP);
+                if (dataHere == 0) return false;
+            }
+
+            const uint32_t indexBlockID = IndexBlockCount;
+            std::memcpy(CurrentBlock.IB_Data + IndexWriteOffset, src, dataHere);
+            IndexWriteOffset += dataHere;
+            src += dataHere;
+            remaining -= dataHere;
+
+            uint32_t continuationBlockCount = 0;
+            if (remaining > 0) {
+                if (!FlushIndexBlock()) return false;
+
+                while (remaining > 0) {
+                    constexpr size_t CONT_HDR = sizeof(IndexBlockContinuationHeader);
+                    const size_t contHere = PostingPrefixBytes(src, remaining, DATA_CAP - CONT_HDR);
+                    if (contHere == 0) return false;
+                    const bool moreCont = contHere < remaining;
+
+                    size_t cursor = 0;
+                    uint64_t contMaxDocId = 0;
+                    while (cursor < contHere) {
+                        contMaxDocId = 0;
+                        uint8_t shift = 0;
+                        while (true) {
+                            const uint8_t byte = src[cursor++];
+                            contMaxDocId |= static_cast<uint64_t>(byte & 0x7Fu) << shift;
+                            if ((byte & 0x80u) == 0) break;
+                            shift += 7;
+                        }
+                        while (src[cursor++] & 0x80u) {}
+                    }
+
+                    auto* header = reinterpret_cast<IndexBlockContinuationHeader*>(CurrentBlock.IB_Data + IndexWriteOffset);
+                    header->IBCH_MaxDocID = contMaxDocId;
+                    header->IBCH_DataLength = static_cast<uint32_t>(contHere);
+                    IndexWriteOffset += sizeof(IndexBlockContinuationHeader);
+                    std::memcpy(CurrentBlock.IB_Data + IndexWriteOffset, src, contHere);
+                    IndexWriteOffset += contHere;
+                    src += contHere;
+                    remaining -= contHere;
+                    ++continuationBlockCount;
+
+                    // Preserve the partially used final continuation block so
+                    // the next leaf term can start in its tail. Only force a
+                    // flush when this same term still needs another continuation
+                    // page.
+                    if (moreCont && !FlushIndexBlock()) return false;
+                }
+            }
+
+            return WriteLeafEntry(term,
+                                  docFreq,
+                                  indexBlockID,
+                                  static_cast<uint32_t>(dataOffset),
+                                  static_cast<uint32_t>(dataHere),
+                                  continuationBlockCount);
+        }
+
+        bool Finish()
+        {
+            if (IndexWriteOffset > 0 && !FlushIndexBlock()) return false;
+            return FlushLeafBlock();
+        }
+    };
 
     /*
     * Recursively convert EvalNode → ISR tree.
@@ -732,6 +1287,7 @@ private:
     shared_ptr<IndexReader> BuildVectorIndexReader(const std::vector<float>& queryVector,
                                                    size_t efSearch = 200)
     {
+        EnsureVectorIndexBuilt();
         if (queryVector.empty() || m_VectorIndex.Empty()) {
             auto empty = make_shared<AdvancedIndexReader>();
             return empty;

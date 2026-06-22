@@ -634,7 +634,155 @@ void TestDeltaRuntimeHandoff()
 } // namespace IndexAccessTests
 
 // ============================================================
-// Test 13: bigram indexing and query
+// Test 13: merge base and delta into one index
+// ============================================================
+namespace IndexAccessTests {
+
+void TestIndexContextMerge()
+{
+    const char* INDEX_FILE = "test_moonshot_merge_base.bin";
+    const char* DELTA_FILE = "test_moonshot_merge_base.delta.bin";
+    std::remove(INDEX_FILE);
+    std::remove(DELTA_FILE);
+
+    {
+        IndexContext base;
+        Document doc;
+        doc.doc_id = 0;
+        doc.path = "base.txt";
+        doc.title = "base apple";
+        doc.body = "base sharedtoken";
+        base.AddDocument(doc);
+        assert(base.SaveIndex(INDEX_FILE));
+    }
+
+    {
+        IndexContext delta("", INDEX_FILE);
+        Document doc;
+        doc.doc_id = 1;
+        doc.path = "delta.txt";
+        doc.title = "delta banana";
+        doc.body = "delta sharedtoken";
+        delta.AddDocument(doc);
+        assert(delta.SaveIndex(DELTA_FILE));
+    }
+
+    {
+        IndexContext merged("", INDEX_FILE);
+        assert(merged.Merge(INDEX_FILE));
+    }
+
+    {
+        IndexContext merged("", INDEX_FILE, false);
+        assert(merged.DocumentCount() == 2);
+        assert(merged.GetDocPath(0) == "base.txt");
+        assert(merged.GetDocPath(1) == "delta.txt");
+
+        std::unique_ptr<IndexSearchExecutor> exec(merged.GetExecutor());
+        {
+            std::unique_ptr<EvalTree> tree(merged.Compile("apple", "AUTB"));
+            auto results = exec->Execute(merged.GetReader(tree.get()), 5);
+            AssertContains(results, 0, "merged base doc");
+        }
+        {
+            std::unique_ptr<EvalTree> tree(merged.Compile("banana", "AUTB"));
+            auto results = exec->Execute(merged.GetReader(tree.get()), 5);
+            AssertContains(results, 1, "merged delta doc");
+        }
+        {
+            std::unique_ptr<EvalTree> tree(merged.Compile("sharedtoken", "AUTB"));
+            auto results = exec->Execute(merged.GetReader(tree.get()), 5);
+            AssertContains(results, 0, "merged shared base");
+            AssertContains(results, 1, "merged shared delta");
+        }
+    }
+
+    std::remove(INDEX_FILE);
+    std::remove(DELTA_FILE);
+}
+
+} // namespace IndexAccessTests
+
+namespace IndexAccessTests {
+
+void TestIndexContextMergeContinuationPostings()
+{
+    const char* INDEX_FILE = "test_moonshot_merge_continuation.bin";
+    const char* DELTA_FILE = "test_moonshot_merge_continuation.delta.bin";
+    std::remove(INDEX_FILE);
+    std::remove(DELTA_FILE);
+
+    constexpr uint32_t BASE_DOCS = 760;
+    constexpr uint32_t DELTA_DOCS = 760;
+    const auto vector = BuildHashedEmbedding(g_tokenizer.Tokenize("longmerge zzzafter"));
+
+    {
+        IndexContext base;
+        auto writer = base.GetWriter();
+        for (uint32_t docId = 0; docId < BASE_DOCS; ++docId) {
+            writer->Write(g_tokenizer.Tokenize("longmerge"), docId, "Title");
+            writer->SetDocImportance(docId, 0.1f);
+            writer->SetDocVector(docId, vector);
+        }
+        writer->Write(g_tokenizer.Tokenize("zzzafter"), BASE_DOCS, "Title");
+        writer->SetDocImportance(BASE_DOCS, 0.1f);
+        writer->SetDocVector(BASE_DOCS, vector);
+        assert(base.SaveIndex(INDEX_FILE));
+        std::cout << "  base continuation index saved\n";
+    }
+
+    {
+        IndexContext delta;
+        auto writer = delta.GetWriter();
+        for (uint32_t docId = 0; docId < DELTA_DOCS; ++docId) {
+            const uint64_t finalDocId = BASE_DOCS + 1 + docId;
+            writer->Write(g_tokenizer.Tokenize("longmerge"), finalDocId, "Title");
+            writer->SetDocImportance(finalDocId, 0.1f);
+            writer->SetDocVector(finalDocId, vector);
+        }
+        assert(delta.SaveIndex(DELTA_FILE));
+        std::cout << "  delta continuation index saved\n";
+    }
+
+    {
+        IndexContext merged("", INDEX_FILE);
+        assert(merged.Merge(INDEX_FILE));
+        std::cout << "  continuation index merged\n";
+    }
+
+    {
+        IndexContext merged("", INDEX_FILE, false);
+        assert(merged.DocumentCount() == static_cast<uint64_t>(BASE_DOCS + 1 + DELTA_DOCS));
+        std::cout << "  continuation index loaded for readback\n";
+
+        auto reader = merged.GetStreamReader("longmergeT");
+        uint32_t seen = 0;
+        while (!reader->IsEnd()) {
+            if (seen < BASE_DOCS)
+                assert(reader->GetDocumentID() == seen);
+            else
+                assert(reader->GetDocumentID() == static_cast<uint64_t>(BASE_DOCS + 1 + (seen - BASE_DOCS)));
+            ++seen;
+            reader->GoNext();
+        }
+        assert(seen == BASE_DOCS + DELTA_DOCS);
+
+        auto afterReader = merged.GetStreamReader("zzzafterT");
+        assert(!afterReader->IsEnd());
+        assert(afterReader->GetDocumentID() == BASE_DOCS);
+        afterReader->GoNext();
+        assert(afterReader->IsEnd());
+        std::cout << "  merged continuation postings traversed: " << seen << "\n";
+    }
+
+    std::remove(INDEX_FILE);
+    std::remove(DELTA_FILE);
+}
+
+} // namespace IndexAccessTests
+
+// ============================================================
+// Test 14: bigram indexing and query
 // ============================================================
 namespace IndexAccessTests {
 
@@ -816,6 +964,8 @@ std::map<std::string, std::function<void()>> testRegistry = {
     {"TestEndToEnd",         IndexAccessTests::TestEndToEnd},
     {"TestDiskPersistence",  IndexAccessTests::TestDiskPersistence},
     {"TestDeltaRuntimeHandoff", IndexAccessTests::TestDeltaRuntimeHandoff},
+    {"TestIndexContextMerge", IndexAccessTests::TestIndexContextMerge},
+    {"TestIndexContextMergeContinuationPostings", IndexAccessTests::TestIndexContextMergeContinuationPostings},
     {"TestBigram",           IndexAccessTests::TestBigram},
     {"TestContinuationPostings", IndexAccessTests::TestContinuationPostings},
     {"TestHeadTermMaxKeyBoundary", IndexAccessTests::TestHeadTermMaxKeyBoundary},

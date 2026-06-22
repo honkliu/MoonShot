@@ -116,6 +116,11 @@ static std::string DeltaIndexPath(const std::string& path)
     return path + ".delta.idx";
 }
 
+static std::string BatchIndexPath(const std::string& path)
+{
+    return path + ".batch.tmp";
+}
+
 // ─── path→id map: loaded from existing .idx DocData ───────────────────────────
 
 using PathMap = std::map<std::string, uint64_t>;  // filepath → sequential id
@@ -312,17 +317,15 @@ static std::string Stem(const std::string& path)
     return (dot == std::string::npos) ? name : name.substr(0, dot);
 }
 
-// ─── index: rebuild from all known files ─────────────────────────────────────
+// ─── index: build one batch delta ─────────────────────────────────────────────
 
-static bool BuildIndexFile(const std::string& baseIdxPath,
-                           const std::string& savePath,
+static bool BuildIndexFile(const std::string& savePath,
                            const PathMap& pathMap,
-                           bool saveAsDelta,
                            uint64_t& kept,
                            uint64_t& skipped,
                            std::set<std::string>* reportedSkippedPaths = nullptr)
 {
-    IndexContext   ctx("", saveAsDelta ? baseIdxPath.c_str() : "", false);
+    IndexContext   ctx("", "", false);
     kept = 0;
     skipped = 0;
     const uint64_t total = static_cast<uint64_t>(pathMap.size());
@@ -606,28 +609,62 @@ int main(int argc, char* argv[])
         uint64_t totalSkipped = 0;
         uint64_t savedBatches = 0;
         std::set<std::string> reportedSkippedPaths;
+        const std::string batchPath = BatchIndexPath(idxPath);
         for (size_t offset = 0; offset < pendingFiles.size(); offset += static_cast<size_t>(options.batchSize)) {
             const size_t end = std::min(offset + static_cast<size_t>(options.batchSize), pendingFiles.size());
             const size_t batchNewCount = end - offset;
-            for (size_t i = offset; i < end; ++i)
+            PathMap batchMap;
+            for (size_t i = offset; i < end; ++i) {
+                batchMap[pendingFiles[i].first] = pendingFiles[i].second;
                 indexedMap[pendingFiles[i].first] = pendingFiles[i].second;
+            }
 
             uint64_t kept = 0;
             uint64_t skipped = 0;
             std::cout << "Batch " << (savedBatches + 1) << ": adding "
-                      << batchNewCount << " new file(s), rebuilding "
+                      << batchNewCount << " new file(s), merging "
                       << indexedMap.size() << " total document(s) into " << idxPath << "\n";
-            if (!BuildIndexFile(idxPath, idxPath, indexedMap, false, kept, skipped, &reportedSkippedPaths)) {
-                std::cerr << "Failed to save index: " << idxPath << "\n";
+            if (!BuildIndexFile(batchPath, batchMap, kept, skipped, &reportedSkippedPaths)) {
+                std::cerr << "Failed to save batch index: " << batchPath << "\n";
                 return 1;
             }
-            totalKept = kept;
+
+            if (!IndexSerializer::IsValidIndex(idxPath.c_str())) {
+                std::error_code replaceError;
+                std::filesystem::rename(FsPathFromUtf8(batchPath), FsPathFromUtf8(idxPath), replaceError);
+                if (replaceError) {
+                    std::cerr << "Failed to create index: " << idxPath << "\n";
+                    return 1;
+                }
+            } else {
+                // Build each batch as a compact delta, then release the batch file
+                // handle before loading/merging so Windows can replace the final idx.
+                std::error_code deltaReplaceError;
+                std::filesystem::remove(FsPathFromUtf8(deltaPath), deltaReplaceError);
+                deltaReplaceError.clear();
+                std::filesystem::rename(FsPathFromUtf8(batchPath), FsPathFromUtf8(deltaPath), deltaReplaceError);
+                if (deltaReplaceError) {
+                    std::cerr << "Failed to stage delta index: " << deltaPath << "\n";
+                    return 1;
+                }
+
+                IndexContext mergeContext("", idxPath.c_str());
+                if (!mergeContext.Merge(idxPath.c_str())) {
+                    std::cerr << "Failed to merge delta into index: " << idxPath << "\n";
+                    return 1;
+                }
+            }
+
+            baseNextId = 0;
+            baseMap = LoadPathMapFromIndex(idxPath, baseNextId);
+            indexedMap = baseMap;
+            std::error_code removeError;
+            std::filesystem::remove(FsPathFromUtf8(deltaPath), removeError);
+
+            totalKept = static_cast<uint64_t>(baseMap.size());
             totalSkipped = skipped;
             ++savedBatches;
         }
-
-        std::error_code removeError;
-        std::filesystem::remove(FsPathFromUtf8(deltaPath), removeError);
 
         std::cout << "Indexed input: " << inputPath << "\n"
                   << "Files:   " << files.size()
