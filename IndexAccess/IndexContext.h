@@ -406,12 +406,8 @@ public:
             LeafTermBlockView baseCursor(*this);
             LeafTermBlockView deltaCursor(delta);
             std::vector<uint8_t> mergedPostingBytes;
+            LeafTermBlockView mergedCursor(mergedPostingBytes);
             constexpr size_t MERGED_LEAF_PAGE_BATCH_LIMIT = 100;
-
-            auto termOf = [](const LeafTermBlockView& cursor) -> std::string_view {
-                const auto* entry = cursor.Current();
-                return entry ? std::string_view(entry->LTE_Term, entry->LTE_TermLength) : std::string_view();
-            };
 
             auto flushHeadBatch = [&]() -> bool {
                 if (writer->HeadEntries.empty()) return true;
@@ -425,33 +421,20 @@ public:
             while (baseCursor.Current() || deltaCursor.Current()) {
                 const auto* baseCurrent = baseCursor.Current();
                 const auto* deltaCurrent = deltaCursor.Current();
-                const std::string_view baseTerm = termOf(baseCursor);
-                const std::string_view deltaTerm = termOf(deltaCursor);
                 const bool takeBase = baseCurrent && (!deltaCurrent || !(deltaCursor < baseCursor));
                 const bool takeDelta = deltaCurrent && (!baseCurrent || !(baseCursor < deltaCursor));
-
-                std::string_view term;
-                mergedPostingBytes.clear();
-                uint32_t docFreq = 0;
                 bool advanceBase = false;
                 bool advanceDelta = false;
 
                 if (takeBase && takeDelta) {
-                    term = baseTerm;
-                    if (!ReadPostingBytes(baseCurrent, mergedPostingBytes)) { cleanupTempFiles(); return false; }
-                    if (!delta.ReadPostingBytes(deltaCurrent, mergedPostingBytes)) { cleanupTempFiles(); return false; }
-                    docFreq = baseCurrent->LTE_DocFreq + deltaCurrent->LTE_DocFreq;
+                    mergedCursor.ReadFrom(baseCursor, deltaCursor);
                     advanceBase = true;
                     advanceDelta = true;
                 } else if (takeBase) {
-                    term = baseTerm;
-                    if (!ReadPostingBytes(baseCurrent, mergedPostingBytes)) { cleanupTempFiles(); return false; }
-                    docFreq = baseCurrent->LTE_DocFreq;
+                    mergedCursor.ReadFrom(baseCursor);
                     advanceBase = true;
                 } else if (takeDelta) {
-                    term = deltaTerm;
-                    if (!delta.ReadPostingBytes(deltaCurrent, mergedPostingBytes)) { cleanupTempFiles(); return false; }
-                    docFreq = deltaCurrent->LTE_DocFreq;
+                    mergedCursor.ReadFrom(deltaCursor);
                     advanceDelta = true;
                 } else {
                     // Never hit here: loop condition guarantees at least one cursor has data.
@@ -459,7 +442,7 @@ public:
                     return false;
                 }
 
-                if (!writer->WriteTerm(term, mergedPostingBytes, docFreq)) { cleanupTempFiles(); return false; }
+                if (!mergedCursor.OK() || !writer->WriteTerm(mergedCursor.Term(), mergedCursor.PostingBytes(), mergedCursor.DocFreq())) { cleanupTempFiles(); return false; }
                 if (advanceBase) ++baseCursor;
                 if (advanceDelta) ++deltaCursor;
 
@@ -893,12 +876,22 @@ private:
             ReadCurrent();
         }
 
+        explicit LeafTermBlockView(std::vector<uint8_t>& postingBytes)
+            : m_PostingBytes(&postingBytes)
+        {
+        }
+
         ~LeafTermBlockView()
         {
             ReleaseCurrentLeaf();
         }
 
         const LeafTermEntry* Current() const { return m_CurrentEntry; }
+
+        std::string_view Term() const { return m_PostingBytes ? m_Term : CurrentTerm(); }
+        const std::vector<uint8_t>& PostingBytes() const { return *m_PostingBytes; }
+        uint32_t DocFreq() const { return m_PostingBytes ? m_DocFreq : (m_CurrentEntry ? m_CurrentEntry->LTE_DocFreq : 0); }
+        bool OK() const { return m_OK; }
 
         void Advance()
         {
@@ -913,39 +906,42 @@ private:
             return *this;
         }
 
-        LeafTermBlockView& operator=(const LeafTermBlockView& other)
+        bool ReadFrom(const LeafTermBlockView& cursor)
         {
-            if (this == &other) return *this;
-
-            ReleaseCurrentLeaf();
-            m_Context = other.m_Context;
-            m_LeafBlockID = other.m_LeafBlockID;
-            m_EntryIndex = other.m_EntryIndex;
-
-            if (!other.m_CurrentEntry || !m_Context) {
-                m_CurrentEntry = nullptr;
-                return *this;
+            if (!m_PostingBytes) {
+                m_OK = false;
+                return false;
             }
 
-            m_CurrentLeaf = static_cast<const LeafTermBlock*>(m_Context->m_BlockTable.GetBlock(BlockKind::LeafTerm, m_LeafBlockID, &m_LeafSlot));
-            if (!m_CurrentLeaf) {
-                m_CurrentEntry = nullptr;
-                return *this;
+            m_PostingBytes->clear();
+            if (!cursor.m_CurrentEntry || !cursor.m_Context) {
+                m_OK = false;
+                return false;
             }
 
-            const uint8_t* blockBase = reinterpret_cast<const uint8_t*>(m_CurrentLeaf);
-            const uint32_t entryCount = std::min<uint32_t>(m_CurrentLeaf->LTB_Directory[LEAF_TERM_DIRECTORY_COUNT - 1], LEAF_TERM_DIRECTORY_COUNT - 1);
-            if (m_EntryIndex < entryCount)
-                m_CurrentEntry = reinterpret_cast<const LeafTermEntry*>(blockBase + m_CurrentLeaf->LTB_Directory[m_EntryIndex]);
-            else
-                m_CurrentEntry = nullptr;
-
-            return *this;
+            m_Term = cursor.CurrentTerm();
+            m_DocFreq = cursor.m_CurrentEntry->LTE_DocFreq;
+            m_OK = cursor.m_Context->ReadPostingBytes(cursor.m_CurrentEntry, *m_PostingBytes);
+            return m_OK;
         }
 
-        bool operator<(const LeafTermBlockView& other) const { return Term() < other.Term(); }
+        bool ReadFrom(const LeafTermBlockView& smallCursor, const LeafTermBlockView& bigCursor)
+        {
+            if (!ReadFrom(smallCursor)) return false;
+
+            if (!bigCursor.m_CurrentEntry || !bigCursor.m_Context || m_Term != bigCursor.CurrentTerm()) {
+                m_OK = false;
+                return false;
+            }
+
+            m_DocFreq += bigCursor.m_CurrentEntry->LTE_DocFreq;
+            m_OK = bigCursor.m_Context->ReadPostingBytes(bigCursor.m_CurrentEntry, *m_PostingBytes);
+            return m_OK;
+        }
+
+        bool operator<(const LeafTermBlockView& other) const { return CurrentTerm() < other.CurrentTerm(); }
         bool operator>(const LeafTermBlockView& other) const { return other < *this; }
-        bool operator==(const LeafTermBlockView& other) const { return Term() == other.Term(); }
+        bool operator==(const LeafTermBlockView& other) const { return CurrentTerm() == other.CurrentTerm(); }
 
     private:
         IndexContext* m_Context = nullptr;
@@ -954,8 +950,12 @@ private:
         uint32_t m_LeafBlockID = 0;
         uint32_t m_EntryIndex = 0;
         uint32_t m_LeafSlot = UINT32_MAX;
+        std::vector<uint8_t>* m_PostingBytes = nullptr;
+        std::string_view m_Term;
+        uint32_t m_DocFreq = 0;
+        bool m_OK = true;
 
-        std::string_view Term() const
+        std::string_view CurrentTerm() const
         {
             return m_CurrentEntry ? std::string_view(m_CurrentEntry->LTE_Term, m_CurrentEntry->LTE_TermLength) : std::string_view();
         }
