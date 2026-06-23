@@ -425,16 +425,17 @@ public:
                 const bool takeDelta = deltaCurrent && (!baseCurrent || !(baseCursor < deltaCursor));
                 bool advanceBase = false;
                 bool advanceDelta = false;
+                bool readMerged = false;
 
                 if (takeBase && takeDelta) {
-                    mergedCursor.ReadFrom(baseCursor, deltaCursor);
+                    readMerged = mergedCursor.ReadFrom(baseCursor, deltaCursor);
                     advanceBase = true;
                     advanceDelta = true;
                 } else if (takeBase) {
-                    mergedCursor.ReadFrom(baseCursor);
+                    readMerged = mergedCursor.ReadFrom(baseCursor);
                     advanceBase = true;
                 } else if (takeDelta) {
-                    mergedCursor.ReadFrom(deltaCursor);
+                    readMerged = mergedCursor.ReadFrom(deltaCursor);
                     advanceDelta = true;
                 } else {
                     // Never hit here: loop condition guarantees at least one cursor has data.
@@ -442,7 +443,13 @@ public:
                     return false;
                 }
 
-                if (!mergedCursor.OK() || !writer->WriteTerm(mergedCursor.Term(), mergedCursor.PostingBytes(), mergedCursor.DocFreq())) { cleanupTempFiles(); return false; }
+                if (!readMerged) {
+                    // TODO: flush/advance merged cursor storage and retry this term when the output view is full.
+                    cleanupTempFiles();
+                    return false;
+                }
+
+                if (!writer->WriteTerm(mergedCursor.Term(), mergedCursor.PostingBytes(), mergedCursor.DocFreq())) { cleanupTempFiles(); return false; }
                 if (advanceBase) ++baseCursor;
                 if (advanceDelta) ++deltaCursor;
 
@@ -891,7 +898,6 @@ private:
         std::string_view Term() const { return m_PostingBytes ? m_Term : CurrentTerm(); }
         const std::vector<uint8_t>& PostingBytes() const { return *m_PostingBytes; }
         uint32_t DocFreq() const { return m_PostingBytes ? m_DocFreq : (m_CurrentEntry ? m_CurrentEntry->LTE_DocFreq : 0); }
-        bool OK() const { return m_OK; }
 
         void Advance()
         {
@@ -908,35 +914,36 @@ private:
 
         bool ReadFrom(const LeafTermBlockView& cursor)
         {
-            if (!m_PostingBytes) {
-                m_OK = false;
-                return false;
+            size_t bytesNeeded = cursor.m_CurrentEntry->LTE_IndexLength;
+            for (uint32_t i = 0; i < cursor.m_CurrentEntry->LTE_ContinuationBlockCount; ++i) {
+                uint32_t slot = UINT32_MAX;
+                const auto* continuation = static_cast<const IndexBlock*>(cursor.m_Context->m_BlockTable.GetBlock(BlockKind::Index, cursor.m_CurrentEntry->LTE_IndexBlockID + 1 + i, &slot));
+                const auto* header = reinterpret_cast<const IndexBlockContinuationHeader*>(continuation->IB_Data);
+                bytesNeeded += header->IBCH_DataLength;
+                cursor.m_Context->m_BlockTable.ReleaseBlock(BlockKind::Index, slot);
+            }
+
+            if (m_PostingBytes->capacity() < bytesNeeded) {
+                try {
+                    m_PostingBytes->reserve(bytesNeeded);
+                } catch (...) {
+                    return false;
+                }
             }
 
             m_PostingBytes->clear();
-            if (!cursor.m_CurrentEntry || !cursor.m_Context) {
-                m_OK = false;
-                return false;
-            }
-
             m_Term = cursor.CurrentTerm();
             m_DocFreq = cursor.m_CurrentEntry->LTE_DocFreq;
-            m_OK = cursor.m_Context->ReadPostingBytes(cursor.m_CurrentEntry, *m_PostingBytes);
-            return m_OK;
+            cursor.m_Context->ReadPostingBytes(cursor.m_CurrentEntry, *m_PostingBytes);
+            return true;
         }
 
         bool ReadFrom(const LeafTermBlockView& smallCursor, const LeafTermBlockView& bigCursor)
         {
             if (!ReadFrom(smallCursor)) return false;
-
-            if (!bigCursor.m_CurrentEntry || !bigCursor.m_Context || m_Term != bigCursor.CurrentTerm()) {
-                m_OK = false;
-                return false;
-            }
-
             m_DocFreq += bigCursor.m_CurrentEntry->LTE_DocFreq;
-            m_OK = bigCursor.m_Context->ReadPostingBytes(bigCursor.m_CurrentEntry, *m_PostingBytes);
-            return m_OK;
+            bigCursor.m_Context->ReadPostingBytes(bigCursor.m_CurrentEntry, *m_PostingBytes);
+            return true;
         }
 
         bool operator<(const LeafTermBlockView& other) const { return CurrentTerm() < other.CurrentTerm(); }
@@ -953,7 +960,6 @@ private:
         std::vector<uint8_t>* m_PostingBytes = nullptr;
         std::string_view m_Term;
         uint32_t m_DocFreq = 0;
-        bool m_OK = true;
 
         std::string_view CurrentTerm() const
         {
