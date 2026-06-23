@@ -403,8 +403,8 @@ public:
             if (!headFile->InitWrite() || !indexFile->InitWrite() || !leafFile->InitWrite()) { cleanupTempFiles(); return false; }
 
             auto writer = std::make_unique<StreamingMergeWriter>(*indexFile, *leafFile);
-            LeafTermBlockView baseCursor(m_BlockTable, m_IndexFileHeader.IFH_LeafTermBlockCount);
-            LeafTermBlockView deltaCursor(delta.m_BlockTable, delta.m_IndexFileHeader.IFH_LeafTermBlockCount);
+            LeafTermBlockView baseCursor(m_BlockTable);
+            LeafTermBlockView deltaCursor(delta.m_BlockTable);
             constexpr uint32_t MERGED_LEAF_BLOCK_LIMIT = 100;
             constexpr uint32_t MERGED_INDEX_BLOCK_LIMIT = 200;
             IndexBlockTable mergedBlockTable;
@@ -416,7 +416,7 @@ public:
             }
             std::memset(mergedIndexBlocks, 0, static_cast<size_t>(MERGED_INDEX_BLOCK_LIMIT) * sizeof(IndexBlock));
             std::memset(mergedLeafBlocks, 0, static_cast<size_t>(MERGED_LEAF_BLOCK_LIMIT) * sizeof(LeafTermBlock));
-            LeafTermBlockView mergedCursor(mergedBlockTable, MERGED_LEAF_BLOCK_LIMIT, MERGED_INDEX_BLOCK_LIMIT);
+            LeafTermBlockView mergedCursor(mergedBlockTable);
 
             auto flushHeadBatch = [&]() -> bool {
                 if (writer->HeadEntries.empty()) return true;
@@ -878,21 +878,12 @@ private:
 
     class LeafTermBlockView {
     public:
-        explicit LeafTermBlockView(IndexBlockTable& blockTable, uint64_t leafTermBlockCount)
+        explicit LeafTermBlockView(IndexBlockTable& blockTable)
             : m_BlockTable(&blockTable)
-            , m_LeafTermBlockCount(leafTermBlockCount)
+            , m_LeafTermBlockCount(blockTable.m_LeafTermPool.BCP_TotalBlockCount)
+            , m_IndexBlockCount(blockTable.m_IndexPool.BCP_SlotCount)
         {
-            ReadCurrent();
-        }
-
-        explicit LeafTermBlockView(IndexBlockTable& blockTable,
-                                   uint64_t leafTermBlockCount,
-                                   uint64_t indexBlockCount)
-            : m_BlockTable(&blockTable)
-            , m_LeafTermBlockCount(leafTermBlockCount)
-            , m_IndexBlockCount(indexBlockCount)
-        {
-            m_PostingBytes = static_cast<IndexBlock*>(m_BlockTable->GetBlock(BlockKind::Index, 0, &m_PostingSlot))->IB_Data;
+            GoCurrent();
         }
 
         ~LeafTermBlockView()
@@ -911,7 +902,7 @@ private:
         {
             if (!m_CurrentEntry) return;
             ++m_EntryIndex;
-            ReadCurrent();
+            GoCurrent();
         }
 
         LeafTermBlockView& operator++()
@@ -925,6 +916,8 @@ private:
             const size_t bytesNeeded = cursor.PostingBytesSize();
             if (bytesNeeded > PostingCapacity())
                 return false;
+            if (!m_PostingBytes)
+                m_PostingBytes = static_cast<IndexBlock*>(m_BlockTable->GetBlock(BlockKind::Index, 0, &m_PostingSlot))->IB_Data;
 
             m_PostingByteCount = 0;
             m_Term = cursor.CurrentTerm();
@@ -938,6 +931,8 @@ private:
             const size_t bytesNeeded = smallCursor.PostingBytesSize() + bigCursor.PostingBytesSize();
             if (bytesNeeded > PostingCapacity())
                 return false;
+            if (!m_PostingBytes)
+                m_PostingBytes = static_cast<IndexBlock*>(m_BlockTable->GetBlock(BlockKind::Index, 0, &m_PostingSlot))->IB_Data;
 
             m_PostingByteCount = 0;
             m_Term = smallCursor.CurrentTerm();
@@ -985,7 +980,7 @@ private:
             m_CurrentEntry = nullptr;
         }
 
-        void ReadCurrent()
+        void GoCurrent()
         {
             if (!m_BlockTable) return;
 
