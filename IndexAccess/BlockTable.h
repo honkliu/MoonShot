@@ -423,7 +423,7 @@ class IndexBlockTable
             StartBlockThread(m_LeafTermPool);
         }
 
-        void Init(BlockKind kind,
+        uint8_t* Init(BlockKind kind,
                   const char* path,
                   uint64_t baseOffset,
                   uint32_t blockCount,
@@ -457,6 +457,7 @@ class IndexBlockTable
             }
             pool->BCP_TotalBlockCount = blockCount;
             pool->BCP_SlotCount = std::min(slotCount, blockCount);
+            pool->BCP_Pages = pool->BCP_SlotCount ? static_cast<uint8_t*>(PinnedMemAlloc(static_cast<uint64_t>(pool->BCP_SlotCount) * PAGE_SIZE)) : nullptr;
             pool->BCP_LogicTable = pool->BCP_TotalBlockCount ? static_cast<uint32_t*>(PinnedMemAlloc(static_cast<uint64_t>(pool->BCP_TotalBlockCount) * sizeof(uint32_t))) : nullptr;
             pool->BCP_SlotTable = pool->BCP_SlotCount ? static_cast<IndexSlotEntry*>(PinnedMemAlloc(static_cast<uint64_t>(pool->BCP_SlotCount) * sizeof(IndexSlotEntry))) : nullptr;
 
@@ -473,6 +474,8 @@ class IndexBlockTable
                 pool->BCP_SlotTable[block].BlockID = block;
             }
             pool->BCP_EvictSlot = pool->BCP_SlotCount;
+            StartBlockThread(*pool);
+            return pool->BCP_Pages;
         }
 
         std::shared_ptr<ElementFilter>           m_ElementFilter;

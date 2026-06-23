@@ -380,11 +380,11 @@ public:
         // LeafTermEntry stream -> merged leaf/index/head temp streams. The two
         // input streams are walked in term order directly from their resident
         // LeafTermBlock pages; no full term table and no decoded PostingStore is
-        // built. For each output term, mergedPostingBytes is the only posting
-        // buffer in memory: base-only and delta-only terms copy that term's raw
-        // posting bytes into it, while equal terms append base bytes then delta
-        // bytes. Delta postings already use final doc ids, so there is no doc-id
-        // remap and no varbyte decode/re-encode.
+        // built. For each output term, mergedCursor uses a bounded merge-local
+        // IndexBlockTable as its posting byte view: base-only and delta-only
+        // terms copy that term's raw posting bytes into it, while equal terms
+        // append base bytes then delta bytes. Delta postings already use final
+        // doc ids, so there is no doc-id remap and no varbyte decode/re-encode.
         //
         // The merged posting bytes are immediately packed into indexTempPath,
         // and the corresponding merged LeafTermEntry is packed into leafTempPath.
@@ -403,11 +403,20 @@ public:
             if (!headFile->InitWrite() || !indexFile->InitWrite() || !leafFile->InitWrite()) { cleanupTempFiles(); return false; }
 
             auto writer = std::make_unique<StreamingMergeWriter>(*indexFile, *leafFile);
-            LeafTermBlockView baseCursor(*this);
-            LeafTermBlockView deltaCursor(delta);
-            std::vector<uint8_t> mergedPostingBytes;
-            LeafTermBlockView mergedCursor(mergedPostingBytes);
-            constexpr size_t MERGED_LEAF_PAGE_BATCH_LIMIT = 100;
+            LeafTermBlockView baseCursor(m_BlockTable, m_IndexFileHeader.IFH_LeafTermBlockCount);
+            LeafTermBlockView deltaCursor(delta.m_BlockTable, delta.m_IndexFileHeader.IFH_LeafTermBlockCount);
+            constexpr uint32_t MERGED_LEAF_BLOCK_LIMIT = 100;
+            constexpr uint32_t MERGED_INDEX_BLOCK_LIMIT = 200;
+            IndexBlockTable mergedBlockTable;
+            auto* mergedIndexBlocks = mergedBlockTable.Init(BlockKind::Index, nullptr, 0, MERGED_INDEX_BLOCK_LIMIT, MERGED_INDEX_BLOCK_LIMIT);
+            auto* mergedLeafBlocks = mergedBlockTable.Init(BlockKind::LeafTerm, nullptr, 0, MERGED_LEAF_BLOCK_LIMIT, MERGED_LEAF_BLOCK_LIMIT);
+            if (!mergedIndexBlocks || !mergedLeafBlocks) {
+                cleanupTempFiles();
+                return false;
+            }
+            std::memset(mergedIndexBlocks, 0, static_cast<size_t>(MERGED_INDEX_BLOCK_LIMIT) * sizeof(IndexBlock));
+            std::memset(mergedLeafBlocks, 0, static_cast<size_t>(MERGED_LEAF_BLOCK_LIMIT) * sizeof(LeafTermBlock));
+            LeafTermBlockView mergedCursor(mergedBlockTable, MERGED_LEAF_BLOCK_LIMIT, MERGED_INDEX_BLOCK_LIMIT);
 
             auto flushHeadBatch = [&]() -> bool {
                 if (writer->HeadEntries.empty()) return true;
@@ -449,11 +458,11 @@ public:
                     return false;
                 }
 
-                if (!writer->WriteTerm(mergedCursor.Term(), mergedCursor.PostingBytes(), mergedCursor.DocFreq())) { cleanupTempFiles(); return false; }
+                if (!writer->WriteTerm(mergedCursor.Term(), mergedCursor.PostingBytes(), mergedCursor.PostingByteCount(), mergedCursor.DocFreq())) { cleanupTempFiles(); return false; }
                 if (advanceBase) ++baseCursor;
                 if (advanceDelta) ++deltaCursor;
 
-                if (writer->HeadEntries.size() >= MERGED_LEAF_PAGE_BATCH_LIMIT && !flushHeadBatch()) { cleanupTempFiles(); return false; }
+                if (writer->HeadEntries.size() >= MERGED_LEAF_BLOCK_LIMIT && !flushHeadBatch()) { cleanupTempFiles(); return false; }
             }
 
             if (!writer->Finish() || !flushHeadBatch()) { cleanupTempFiles(); return false; }
@@ -573,8 +582,10 @@ public:
         const uint32_t indexBlockLoadCount = std::min(indexBlockCount, INDEX_BLOCK_CACHE_SLOT_COUNT);
         const uint32_t leafTermBlockLoadCount = std::min(leafTermBlockCount, LEAF_TERM_BLOCK_CACHE_SLOT_COUNT);
 
-        auto* indexBlocks = indexBlockLoadCount ? static_cast<uint8_t*>(PinnedMemAlloc(static_cast<uint64_t>(indexBlockLoadCount) * sizeof(IndexBlock))) : nullptr;
-        auto* leafTermBlocks = leafTermBlockLoadCount ? static_cast<uint8_t*>(PinnedMemAlloc(static_cast<uint64_t>(leafTermBlockLoadCount) * sizeof(LeafTermBlock))) : nullptr;
+        auto* indexBlocks = m_BlockTable.Init(BlockKind::Index, m_IndexPath.c_str(),
+                  m_IndexFileHeader.IFH_IndexBlockOffset, indexBlockCount, indexBlockLoadCount);
+        auto* leafTermBlocks = m_BlockTable.Init(BlockKind::LeafTerm, m_IndexPath.c_str(),
+                  m_IndexFileHeader.IFH_LeafTermBlockOffset, leafTermBlockCount, leafTermBlockLoadCount);
         if ((indexBlockLoadCount && !indexBlocks) || (leafTermBlockLoadCount && !leafTermBlocks)) {
             std::cerr << "Failed to allocate pinned index/leaf runtime cache memory for: " << m_IndexPath << "\n";
             ResetLoadedRuntimeState();
@@ -603,11 +614,6 @@ public:
             return;
         }
 
-        m_BlockTable.Init(BlockKind::Index, m_IndexPath.c_str(),
-                  m_IndexFileHeader.IFH_IndexBlockOffset, indexBlockCount, indexBlockLoadCount);
-        m_BlockTable.Init(BlockKind::LeafTerm, m_IndexPath.c_str(),
-                  m_IndexFileHeader.IFH_LeafTermBlockOffset, leafTermBlockCount, leafTermBlockLoadCount);
-        m_BlockTable.SetBlockMemory(indexBlocks, leafTermBlocks);
         m_BlockTable.SetHeadTermEntries(std::move(headTermEntries), static_cast<uint32_t>(m_IndexFileHeader.IFH_HeadTermEntryCount));
 
         ClearDocDataOnly();
@@ -842,11 +848,9 @@ private:
         header.IFH_IndexBlockOffset = header.IFH_DocDataOffset + header.IFH_NumDocuments * DOC_REC_SIZE;
         header.IFH_IndexBlockCount = indexBlockCount;
 
-        auto* indexBlocks = static_cast<uint8_t*>(PinnedMemAlloc(static_cast<uint64_t>(indexBlockCount) * sizeof(IndexBlock)));
-        auto* leafTermBlocks = static_cast<uint8_t*>(PinnedMemAlloc(static_cast<uint64_t>(leafTermBlockCount) * sizeof(LeafTermBlock)));
+        auto* indexBlocks = blockTable.Init(BlockKind::Index, nullptr, 0, indexBlockCount, indexBlockCount);
+        auto* leafTermBlocks = blockTable.Init(BlockKind::LeafTerm, nullptr, 0, leafTermBlockCount, leafTermBlockCount);
         if ((indexBlockCount > 0 && !indexBlocks) || (leafTermBlockCount > 0 && !leafTermBlocks)) {
-            if (indexBlocks) PinnedMemFree(indexBlocks);
-            if (leafTermBlocks) PinnedMemFree(leafTermBlocks);
             ResetRuntimeState(blockTable, vectorIndex, header, docData, built);
             return false;
         }
@@ -862,9 +866,6 @@ private:
             std::memcpy(headTermEntries.get(), br.BBR_HeadTermEntries.data(), static_cast<size_t>(headCount) * sizeof(HeadTermEntry));
         }
 
-        blockTable.Init(BlockKind::Index, nullptr, 0, indexBlockCount, indexBlockCount);
-        blockTable.Init(BlockKind::LeafTerm, nullptr, 0, leafTermBlockCount, leafTermBlockCount);
-        blockTable.SetBlockMemory(indexBlocks, leafTermBlocks);
         blockTable.SetHeadTermEntries(std::move(headTermEntries), headCount);
 
         vectorIndex.SetDocData(docData);
@@ -877,15 +878,21 @@ private:
 
     class LeafTermBlockView {
     public:
-        explicit LeafTermBlockView(IndexContext& context)
-            : m_Context(&context)
+        explicit LeafTermBlockView(IndexBlockTable& blockTable, uint64_t leafTermBlockCount)
+            : m_BlockTable(&blockTable)
+            , m_LeafTermBlockCount(leafTermBlockCount)
         {
             ReadCurrent();
         }
 
-        explicit LeafTermBlockView(std::vector<uint8_t>& postingBytes)
-            : m_PostingBytes(&postingBytes)
+        explicit LeafTermBlockView(IndexBlockTable& blockTable,
+                                   uint64_t leafTermBlockCount,
+                                   uint64_t indexBlockCount)
+            : m_BlockTable(&blockTable)
+            , m_LeafTermBlockCount(leafTermBlockCount)
+            , m_IndexBlockCount(indexBlockCount)
         {
+            m_PostingBytes = static_cast<IndexBlock*>(m_BlockTable->GetBlock(BlockKind::Index, 0, &m_PostingSlot))->IB_Data;
         }
 
         ~LeafTermBlockView()
@@ -896,7 +903,8 @@ private:
         const LeafTermEntry* Current() const { return m_CurrentEntry; }
 
         std::string_view Term() const { return m_PostingBytes ? m_Term : CurrentTerm(); }
-        const std::vector<uint8_t>& PostingBytes() const { return *m_PostingBytes; }
+        const uint8_t* PostingBytes() const { return m_PostingBytes; }
+        size_t PostingByteCount() const { return m_PostingByteCount; }
         uint32_t DocFreq() const { return m_PostingBytes ? m_DocFreq : (m_CurrentEntry ? m_CurrentEntry->LTE_DocFreq : 0); }
 
         void Advance()
@@ -914,35 +922,28 @@ private:
 
         bool ReadFrom(const LeafTermBlockView& cursor)
         {
-            size_t bytesNeeded = cursor.m_CurrentEntry->LTE_IndexLength;
-            for (uint32_t i = 0; i < cursor.m_CurrentEntry->LTE_ContinuationBlockCount; ++i) {
-                uint32_t slot = UINT32_MAX;
-                const auto* continuation = static_cast<const IndexBlock*>(cursor.m_Context->m_BlockTable.GetBlock(BlockKind::Index, cursor.m_CurrentEntry->LTE_IndexBlockID + 1 + i, &slot));
-                const auto* header = reinterpret_cast<const IndexBlockContinuationHeader*>(continuation->IB_Data);
-                bytesNeeded += header->IBCH_DataLength;
-                cursor.m_Context->m_BlockTable.ReleaseBlock(BlockKind::Index, slot);
-            }
+            const size_t bytesNeeded = cursor.PostingBytesSize();
+            if (bytesNeeded > PostingCapacity())
+                return false;
 
-            if (m_PostingBytes->capacity() < bytesNeeded) {
-                try {
-                    m_PostingBytes->reserve(bytesNeeded);
-                } catch (...) {
-                    return false;
-                }
-            }
-
-            m_PostingBytes->clear();
+            m_PostingByteCount = 0;
             m_Term = cursor.CurrentTerm();
             m_DocFreq = cursor.m_CurrentEntry->LTE_DocFreq;
-            cursor.m_Context->ReadPostingBytes(cursor.m_CurrentEntry, *m_PostingBytes);
+            cursor.ReadPostingBytesTo(m_PostingBytes, m_PostingByteCount);
             return true;
         }
 
         bool ReadFrom(const LeafTermBlockView& smallCursor, const LeafTermBlockView& bigCursor)
         {
-            if (!ReadFrom(smallCursor)) return false;
-            m_DocFreq += bigCursor.m_CurrentEntry->LTE_DocFreq;
-            bigCursor.m_Context->ReadPostingBytes(bigCursor.m_CurrentEntry, *m_PostingBytes);
+            const size_t bytesNeeded = smallCursor.PostingBytesSize() + bigCursor.PostingBytesSize();
+            if (bytesNeeded > PostingCapacity())
+                return false;
+
+            m_PostingByteCount = 0;
+            m_Term = smallCursor.CurrentTerm();
+            m_DocFreq = smallCursor.m_CurrentEntry->LTE_DocFreq + bigCursor.m_CurrentEntry->LTE_DocFreq;
+            smallCursor.ReadPostingBytesTo(m_PostingBytes, m_PostingByteCount);
+            bigCursor.ReadPostingBytesTo(m_PostingBytes, m_PostingByteCount);
             return true;
         }
 
@@ -951,13 +952,17 @@ private:
         bool operator==(const LeafTermBlockView& other) const { return CurrentTerm() == other.CurrentTerm(); }
 
     private:
-        IndexContext* m_Context = nullptr;
+        IndexBlockTable* m_BlockTable = nullptr;
+        uint64_t m_LeafTermBlockCount = 0;
+        uint64_t m_IndexBlockCount = 0;
         const LeafTermBlock* m_CurrentLeaf = nullptr;
         const LeafTermEntry* m_CurrentEntry = nullptr;
         uint32_t m_LeafBlockID = 0;
         uint32_t m_EntryIndex = 0;
         uint32_t m_LeafSlot = UINT32_MAX;
-        std::vector<uint8_t>* m_PostingBytes = nullptr;
+        uint8_t* m_PostingBytes = nullptr;
+        size_t m_PostingByteCount = 0;
+        uint32_t m_PostingSlot = UINT32_MAX;
         std::string_view m_Term;
         uint32_t m_DocFreq = 0;
 
@@ -968,21 +973,25 @@ private:
 
         void ReleaseCurrentLeaf()
         {
-            if (m_CurrentLeaf && m_Context) {
-                m_Context->m_BlockTable.ReleaseBlock(BlockKind::LeafTerm, m_LeafSlot);
+            if (m_CurrentLeaf && m_BlockTable) {
+                m_BlockTable->ReleaseBlock(BlockKind::LeafTerm, m_LeafSlot);
                 m_CurrentLeaf = nullptr;
                 m_LeafSlot = UINT32_MAX;
+            }
+            if (m_PostingSlot != UINT32_MAX && m_BlockTable) {
+                m_BlockTable->ReleaseBlock(BlockKind::Index, m_PostingSlot);
+                m_PostingSlot = UINT32_MAX;
             }
             m_CurrentEntry = nullptr;
         }
 
         void ReadCurrent()
         {
-            if (!m_Context) return;
+            if (!m_BlockTable) return;
 
-            while (m_LeafBlockID < m_Context->m_IndexFileHeader.IFH_LeafTermBlockCount) {
+            while (m_LeafBlockID < m_LeafTermBlockCount) {
                 if (!m_CurrentLeaf) {
-                    m_CurrentLeaf = static_cast<const LeafTermBlock*>(m_Context->m_BlockTable.GetBlock(BlockKind::LeafTerm, m_LeafBlockID, &m_LeafSlot));
+                    m_CurrentLeaf = static_cast<const LeafTermBlock*>(m_BlockTable->GetBlock(BlockKind::LeafTerm, m_LeafBlockID, &m_LeafSlot));
                     if (!m_CurrentLeaf) return;
                 }
 
@@ -999,39 +1008,44 @@ private:
             }
             ReleaseCurrentLeaf();
         }
-    };
 
-    bool ReadPostingBytes(const LeafTermEntry* entry,
-                                 std::vector<uint8_t>& bytes)
-    {
-        if (!entry) return false;
-        if (entry->LTE_IndexOffset > PAGE_SIZE || entry->LTE_IndexLength > PAGE_SIZE - entry->LTE_IndexOffset)
-            return false;
-
-        uint32_t slot = UINT32_MAX;
-        const auto* block = static_cast<const IndexBlock*>(m_BlockTable.GetBlock(BlockKind::Index, entry->LTE_IndexBlockID, &slot));
-        if (!block) return false;
-        bytes.insert(bytes.end(),
-                     block->IB_Data + entry->LTE_IndexOffset,
-                     block->IB_Data + entry->LTE_IndexOffset + entry->LTE_IndexLength);
-        m_BlockTable.ReleaseBlock(BlockKind::Index, slot);
-
-        for (uint32_t i = 0; i < entry->LTE_ContinuationBlockCount; ++i) {
-            slot = UINT32_MAX;
-            const auto* continuation = static_cast<const IndexBlock*>(m_BlockTable.GetBlock(BlockKind::Index, entry->LTE_IndexBlockID + 1 + i, &slot));
-            if (!continuation) return false;
-            const auto* header = reinterpret_cast<const IndexBlockContinuationHeader*>(continuation->IB_Data);
-            if (header->IBCH_DataLength > PAGE_SIZE - sizeof(IndexBlockContinuationHeader)) {
-                m_BlockTable.ReleaseBlock(BlockKind::Index, slot);
-                return false;
+        size_t PostingBytesSize() const
+        {
+            size_t bytesNeeded = m_CurrentEntry->LTE_IndexLength;
+            for (uint32_t i = 0; i < m_CurrentEntry->LTE_ContinuationBlockCount; ++i) {
+                uint32_t slot = UINT32_MAX;
+                const auto* continuation = static_cast<const IndexBlock*>(m_BlockTable->GetBlock(BlockKind::Index, m_CurrentEntry->LTE_IndexBlockID + 1 + i, &slot));
+                const auto* header = reinterpret_cast<const IndexBlockContinuationHeader*>(continuation->IB_Data);
+                bytesNeeded += header->IBCH_DataLength;
+                m_BlockTable->ReleaseBlock(BlockKind::Index, slot);
             }
-            const uint8_t* begin = continuation->IB_Data + sizeof(IndexBlockContinuationHeader);
-            bytes.insert(bytes.end(), begin, begin + header->IBCH_DataLength);
-            m_BlockTable.ReleaseBlock(BlockKind::Index, slot);
+            return bytesNeeded;
         }
 
-        return true;
-    }
+        size_t PostingCapacity() const
+        {
+            return static_cast<size_t>(m_IndexBlockCount) * sizeof(IndexBlock::IB_Data);
+        }
+
+        void ReadPostingBytesTo(uint8_t* bytes, size_t& bytesWritten) const
+        {
+            uint32_t slot = UINT32_MAX;
+            const auto* block = static_cast<const IndexBlock*>(m_BlockTable->GetBlock(BlockKind::Index, m_CurrentEntry->LTE_IndexBlockID, &slot));
+            std::memcpy(bytes + bytesWritten, block->IB_Data + m_CurrentEntry->LTE_IndexOffset, m_CurrentEntry->LTE_IndexLength);
+            bytesWritten += m_CurrentEntry->LTE_IndexLength;
+            m_BlockTable->ReleaseBlock(BlockKind::Index, slot);
+
+            for (uint32_t i = 0; i < m_CurrentEntry->LTE_ContinuationBlockCount; ++i) {
+                slot = UINT32_MAX;
+                const auto* continuation = static_cast<const IndexBlock*>(m_BlockTable->GetBlock(BlockKind::Index, m_CurrentEntry->LTE_IndexBlockID + 1 + i, &slot));
+                const auto* header = reinterpret_cast<const IndexBlockContinuationHeader*>(continuation->IB_Data);
+                const uint8_t* begin = continuation->IB_Data + sizeof(IndexBlockContinuationHeader);
+                std::memcpy(bytes + bytesWritten, begin, header->IBCH_DataLength);
+                bytesWritten += header->IBCH_DataLength;
+                m_BlockTable->ReleaseBlock(BlockKind::Index, slot);
+            }
+        }
+    };
 
     static bool ReadVbPairEnd(const uint8_t* data, size_t size, size_t& offset)
     {
@@ -1171,13 +1185,13 @@ private:
             return true;
         }
 
-        bool WriteTerm(std::string_view term, const std::vector<uint8_t>& postingBytes, uint32_t docFreq)
+        bool WriteTerm(std::string_view term, const uint8_t* postingBytes, size_t postingByteCount, uint32_t docFreq)
         {
-            if (term.size() > HEAD_TERM_KEY_MAX || postingBytes.empty()) return true;
+            if (term.size() > HEAD_TERM_KEY_MAX || !postingBytes || postingByteCount == 0) return true;
 
             constexpr size_t DATA_CAP = sizeof(IndexBlock::IB_Data);
-            const uint8_t* src = postingBytes.data();
-            size_t remaining = postingBytes.size();
+            const uint8_t* src = postingBytes;
+            size_t remaining = postingByteCount;
 
             if (IndexWriteOffset >= DATA_CAP && !FlushIndexBlock()) return false;
 
