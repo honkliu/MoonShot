@@ -386,13 +386,9 @@ public:
         // append base bytes then delta bytes. Delta postings already use final
         // doc ids, so there is no doc-id remap and no varbyte decode/re-encode.
         //
-        // The merged posting bytes are immediately packed into indexTempPath,
-        // and the corresponding merged LeafTermEntry is packed into leafTempPath.
-        // HeadTermEntry records are produced from completed merged LeafTermBlock
-        // pages; at most MERGED_LEAF_PAGE_BATCH_LIMIT (100) completed leaf pages'
-        // head records stay in memory before being dumped to headTempPath. The
-        // partially filled IndexBlock is intentionally kept in memory across
-        // terms and across these head batches so tail space can be reused.
+        // The merged posting bytes and LeafTermEntry records are first packed
+        // into the merge-local block table, then dumped to temp streams after
+        // the term walk is complete.
         uint64_t headEntryCount = 0;
         uint64_t totalTerms = 0;
         uint32_t indexBlockCount = 0;
@@ -402,7 +398,6 @@ public:
             auto leafFile = std::make_unique<FileAccess>(leafTempPath.c_str());
             if (!headFile->InitWrite() || !indexFile->InitWrite() || !leafFile->InitWrite()) { cleanupTempFiles(); return false; }
 
-            auto writer = std::make_unique<StreamingMergeWriter>(*indexFile, *leafFile);
             LeafTermBlockView baseCursor(m_BlockTable);
             LeafTermBlockView deltaCursor(delta.m_BlockTable);
             constexpr uint32_t MERGED_LEAF_BLOCK_LIMIT = 100;
@@ -416,16 +411,7 @@ public:
             }
             std::memset(mergedIndexBlocks, 0, static_cast<size_t>(MERGED_INDEX_BLOCK_LIMIT) * sizeof(IndexBlock));
             std::memset(mergedLeafBlocks, 0, static_cast<size_t>(MERGED_LEAF_BLOCK_LIMIT) * sizeof(LeafTermBlock));
-            LeafTermBlockView mergedCursor(mergedBlockTable);
-
-            auto flushHeadBatch = [&]() -> bool {
-                if (writer->HeadEntries.empty()) return true;
-                const uint64_t bytes = static_cast<uint64_t>(writer->HeadEntries.size()) * sizeof(HeadTermEntry);
-                if (!headFile->PutData(writer->HeadEntries.data(), bytes)) return false;
-                headEntryCount += static_cast<uint64_t>(writer->HeadEntries.size());
-                writer->HeadEntries.clear();
-                return true;
-            };
+            LeafTermBlockView mergedCursor(mergedBlockTable, false);
 
             while (baseCursor.Current() || deltaCursor.Current()) {
                 const auto* baseCurrent = baseCursor.Current();
@@ -434,49 +420,66 @@ public:
                 const bool takeDelta = deltaCurrent && (!baseCurrent || !(baseCursor < deltaCursor));
                 bool advanceBase = false;
                 bool advanceDelta = false;
-                bool readMerged = false;
 
                 if (takeBase && takeDelta) {
-                    readMerged = mergedCursor.ReadFrom(baseCursor, deltaCursor);
+                    if (!mergedCursor.CanAddLeafTermEntry(baseCursor)) { cleanupTempFiles(); return false; }
+                    if (!mergedCursor.AddIndex(baseCursor, deltaCursor)) { cleanupTempFiles(); return false; }
+                    if (!mergedCursor.AddLeafTermEntry(baseCursor)) { cleanupTempFiles(); return false; }
                     advanceBase = true;
                     advanceDelta = true;
                 } else if (takeBase) {
-                    readMerged = mergedCursor.ReadFrom(baseCursor);
+                    if (!mergedCursor.CanAddLeafTermEntry(baseCursor)) { cleanupTempFiles(); return false; }
+                    if (!mergedCursor.AddIndex(baseCursor)) { cleanupTempFiles(); return false; }
+                    if (!mergedCursor.AddLeafTermEntry(baseCursor)) { cleanupTempFiles(); return false; }
                     advanceBase = true;
                 } else if (takeDelta) {
-                    readMerged = mergedCursor.ReadFrom(deltaCursor);
+                    if (!mergedCursor.CanAddLeafTermEntry(deltaCursor)) { cleanupTempFiles(); return false; }
+                    if (!mergedCursor.AddIndex(deltaCursor)) { cleanupTempFiles(); return false; }
+                    if (!mergedCursor.AddLeafTermEntry(deltaCursor)) { cleanupTempFiles(); return false; }
                     advanceDelta = true;
                 } else {
                     // Never hit here: loop condition guarantees at least one cursor has data.
                     cleanupTempFiles();
                     return false;
                 }
-
-                if (!readMerged) {
-                    // TODO: flush/advance merged cursor storage and retry this term when the output view is full.
-                    cleanupTempFiles();
-                    return false;
-                }
-
-                if (!writer->WriteTerm(mergedCursor.Term(), mergedCursor.PostingBytes(), mergedCursor.PostingByteCount(), mergedCursor.DocFreq())) { cleanupTempFiles(); return false; }
                 if (advanceBase) ++baseCursor;
                 if (advanceDelta) ++deltaCursor;
-
-                if (writer->HeadEntries.size() >= MERGED_LEAF_BLOCK_LIMIT && !flushHeadBatch()) { cleanupTempFiles(); return false; }
             }
 
-            if (!writer->Finish() || !flushHeadBatch()) { cleanupTempFiles(); return false; }
-            totalTerms = writer->TotalTerms;
-            indexBlockCount = writer->IndexBlockCount;
-            writer.reset();
+            const auto* leafBlocks = reinterpret_cast<const LeafTermBlock*>(mergedLeafBlocks);
+            for (uint32_t leafBlockID = 0; leafBlockID < MERGED_LEAF_BLOCK_LIMIT; ++leafBlockID) {
+                const auto& leaf = leafBlocks[leafBlockID];
+                const uint32_t entryCount = std::min<uint32_t>(leaf.LTB_Directory[LEAF_TERM_DIRECTORY_COUNT - 1], LEAF_TERM_DIRECTORY_COUNT - 1);
+                if (entryCount == 0) break;
+
+                const auto* leafBase = reinterpret_cast<const uint8_t*>(&leaf);
+                const auto* firstEntry = reinterpret_cast<const LeafTermEntry*>(leafBase + leaf.LTB_Directory[0]);
+                HeadTermEntry head{};
+                head.HTE_LeafTermBlockID = leafBlockID;
+                head.HTE_FirstTermLength = firstEntry->LTE_TermLength;
+                std::memcpy(head.HTE_FirstTerm, firstEntry->LTE_Term, firstEntry->LTE_TermLength);
+                if (!headFile->PutData(&head, sizeof(head))) { cleanupTempFiles(); return false; }
+                if (!leafFile->PutData(&leaf, sizeof(leaf))) { cleanupTempFiles(); return false; }
+
+                ++headEntryCount;
+                totalTerms += entryCount;
+                for (uint32_t entryIndex = 0; entryIndex < entryCount; ++entryIndex) {
+                    const auto* entry = reinterpret_cast<const LeafTermEntry*>(leafBase + leaf.LTB_Directory[entryIndex]);
+                    indexBlockCount = std::max(indexBlockCount, entry->LTE_IndexBlockID + entry->LTE_ContinuationBlockCount + 1);
+                }
+            }
+
+            if (indexBlockCount > 0
+                && !indexFile->PutData(mergedIndexBlocks, static_cast<uint64_t>(indexBlockCount) * sizeof(IndexBlock))) {
+                cleanupTempFiles();
+                return false;
+            }
             headFile.reset();
             indexFile.reset();
             leafFile.reset();
         }
 
-        // Step 4: Build HeadTermEntry records from the first term of each
-        // completed leaf page produced by Step 3.
-        // Step 5: Assemble <output>.tmp in v12 physical order, patch the header,
+        // Step 4: Assemble <output>.tmp in v12 physical order, patch the header,
         // release old file handles, then rename <output>.tmp to the final path.
         {
             FileAccess output(tempPath.c_str());
@@ -878,13 +881,14 @@ private:
 
     class LeafTermBlockView {
     public:
-        explicit LeafTermBlockView(IndexBlockTable& blockTable)
+        explicit LeafTermBlockView(IndexBlockTable& blockTable, bool readCurrent = true)
             : m_BlockTable(&blockTable)
             , m_LeafTermBlockCount(blockTable.m_LeafTermPool.BCP_TotalBlockCount)
             , m_IndexBlockCount(blockTable.m_IndexPool.BCP_SlotCount)
         {
             m_IndexBuffer = static_cast<uint8_t*>(PinnedMemAlloc(POSTING_SCRATCH_BYTES));
-            GoCurrent();
+            if (readCurrent)
+                GoCurrent();
         }
 
         ~LeafTermBlockView()
