@@ -984,46 +984,55 @@ private:
             return true;
         }
 
+        // Writes locate the target buffer the same way reads do: m_IndexBlockID
+        // selects the IndexBlock page, and m_IndexOffsetInBlock is the byte
+        // offset inside that 4096-byte block.
         bool AddIndex(const LeafTermBlockView& cursor)
         {
             constexpr size_t DATA_CAP = sizeof(IndexBlock::IB_Data);
             const auto* source = cursor.Current();
+            if (source->LTE_IndexLength > DATA_CAP) return false;
 
             uint32_t indexBlockID = m_IndexBlockID;
-            size_t indexWriteOffset = m_IndexWriteOffset;
-            if (indexWriteOffset + source->LTE_IndexLength > DATA_CAP) {
+            size_t indexOffset = m_IndexOffsetInBlock;
+            if (indexOffset > DATA_CAP) return false;
+            if (source->LTE_IndexLength > DATA_CAP - indexOffset) {
                 ++indexBlockID;
-                indexWriteOffset = 0;
+                indexOffset = 0;
             }
-            if (indexBlockID >= m_IndexBlockCount || indexBlockID + source->LTE_ContinuationBlockCount >= m_IndexBlockCount)
+            if (indexBlockID >= m_IndexBlockCount)
+                return false;
+            const uint64_t blocksNeeded = 1ull + source->LTE_ContinuationBlockCount;
+            if (blocksNeeded > m_IndexBlockCount - indexBlockID)
                 return false;
 
             m_IndexBlockID = indexBlockID;
-            m_IndexWriteOffset = indexWriteOffset;
+            m_IndexOffsetInBlock = indexOffset;
             m_PostingIndexBlockID = m_IndexBlockID;
-            m_PostingIndexOffset = static_cast<uint32_t>(m_IndexWriteOffset);
+            m_PostingIndexOffset = static_cast<uint32_t>(m_IndexOffsetInBlock);
             m_PostingIndexLength = source->LTE_IndexLength;
             m_PostingContinuationBlockCount = source->LTE_ContinuationBlockCount;
             m_PostingByteCount = 0;
+            m_DocFreq = source->LTE_DocFreq;
 
             uint32_t sourceSlot = UINT32_MAX;
             const auto* sourceBlock = static_cast<const IndexBlock*>(cursor.m_BlockTable->GetBlock(BlockKind::Index, source->LTE_IndexBlockID, &sourceSlot));
             auto* targetBlock = reinterpret_cast<IndexBlock*>(m_BlockTable->m_IndexPool.BCP_Pages + static_cast<size_t>(m_IndexBlockID) * sizeof(IndexBlock));
-            std::memcpy(targetBlock->IB_Data + m_IndexWriteOffset, sourceBlock->IB_Data + source->LTE_IndexOffset, source->LTE_IndexLength);
-            m_IndexWriteOffset += source->LTE_IndexLength;
+            std::memcpy(targetBlock->IB_Data + m_IndexOffsetInBlock, sourceBlock->IB_Data + source->LTE_IndexOffset, source->LTE_IndexLength);
+            m_IndexOffsetInBlock += source->LTE_IndexLength;
             m_PostingByteCount += source->LTE_IndexLength;
             cursor.m_BlockTable->ReleaseBlock(BlockKind::Index, sourceSlot);
 
             for (uint32_t i = 0; i < source->LTE_ContinuationBlockCount; ++i) {
                 ++m_IndexBlockID;
-                m_IndexWriteOffset = 0;
+                m_IndexOffsetInBlock = 0;
                 sourceSlot = UINT32_MAX;
                 const auto* sourceContinuation = static_cast<const IndexBlock*>(cursor.m_BlockTable->GetBlock(BlockKind::Index, source->LTE_IndexBlockID + 1 + i, &sourceSlot));
                 const auto* header = reinterpret_cast<const IndexBlockContinuationHeader*>(sourceContinuation->IB_Data);
                 const size_t bytes = sizeof(IndexBlockContinuationHeader) + header->IBCH_DataLength;
                 targetBlock = reinterpret_cast<IndexBlock*>(m_BlockTable->m_IndexPool.BCP_Pages + static_cast<size_t>(m_IndexBlockID) * sizeof(IndexBlock));
                 std::memcpy(targetBlock->IB_Data, sourceContinuation->IB_Data, bytes);
-                m_IndexWriteOffset = bytes;
+                m_IndexOffsetInBlock = bytes;
                 m_PostingByteCount += header->IBCH_DataLength;
                 cursor.m_BlockTable->ReleaseBlock(BlockKind::Index, sourceSlot);
             }
@@ -1072,7 +1081,7 @@ private:
         size_t m_LeafWriteOffset = 0;
         uint32_t m_LeafEntryCount = 0;
         uint32_t m_IndexBlockID = 0;
-        size_t m_IndexWriteOffset = 0;
+        size_t m_IndexOffsetInBlock = 0;
 
         std::string_view CurrentTerm() const
         {
