@@ -913,11 +913,6 @@ private:
 
         const LeafTermEntry* Current() const { return m_CurrentEntry; }
 
-        std::string_view Term() const { return m_PostingBytes ? m_Term : CurrentTerm(); }
-        const uint8_t* PostingBytes() const { return m_PostingBytes; }
-        size_t PostingByteCount() const { return m_PostingByteCount; }
-        uint32_t DocFreq() const { return m_PostingBytes ? m_DocFreq : (m_CurrentEntry ? m_CurrentEntry->LTE_DocFreq : 0); }
-
         void Advance()
         {
             if (!m_CurrentEntry) return;
@@ -929,41 +924,6 @@ private:
         {
             Advance();
             return *this;
-        }
-
-        bool ReadFrom(const LeafTermBlockView& cursor)
-        {
-            const size_t bytesNeeded = cursor.PostingBytesSize();
-            if (bytesNeeded > PostingCapacity())
-                return false;
-            if (!m_PostingBytes)
-                m_PostingBytes = static_cast<IndexBlock*>(m_BlockTable->GetBlock(BlockKind::Index, 0, &m_PostingSlot))->IB_Data;
-
-            m_PostingByteCount = 0;
-            m_PostingIndexBlockID = 0;
-            m_PostingIndexOffset = 0;
-            m_Term = cursor.CurrentTerm();
-            m_DocFreq = cursor.m_CurrentEntry->LTE_DocFreq;
-            cursor.ReadPostingBytesTo(m_PostingBytes, m_PostingByteCount);
-            return true;
-        }
-
-        bool ReadFrom(const LeafTermBlockView& smallCursor, const LeafTermBlockView& bigCursor)
-        {
-            const size_t bytesNeeded = smallCursor.PostingBytesSize() + bigCursor.PostingBytesSize();
-            if (bytesNeeded > PostingCapacity())
-                return false;
-            if (!m_PostingBytes)
-                m_PostingBytes = static_cast<IndexBlock*>(m_BlockTable->GetBlock(BlockKind::Index, 0, &m_PostingSlot))->IB_Data;
-
-            m_PostingByteCount = 0;
-            m_PostingIndexBlockID = 0;
-            m_PostingIndexOffset = 0;
-            m_Term = smallCursor.CurrentTerm();
-            m_DocFreq = smallCursor.m_CurrentEntry->LTE_DocFreq + bigCursor.m_CurrentEntry->LTE_DocFreq;
-            smallCursor.ReadPostingBytesTo(m_PostingBytes, m_PostingByteCount);
-            bigCursor.ReadPostingBytesTo(m_PostingBytes, m_PostingByteCount);
-            return true;
         }
 
         bool CanAddLeafTermEntry(const LeafTermBlockView& cursor) const
@@ -1014,8 +974,6 @@ private:
             m_LeafWriteOffset += entryBytes;
             ++m_LeafEntryCount;
             leaf->LTB_Directory[LEAF_TERM_DIRECTORY_COUNT - 1] = static_cast<uint16_t>(m_LeafEntryCount);
-            m_PostingBytes = nullptr;
-            m_PostingByteCount = 0;
             m_PostingIndexLength = 0;
             m_PostingContinuationBlockCount = 0;
             return true;
@@ -1038,13 +996,10 @@ private:
 
         void ResetWrite(uint32_t indexBlockBase)
         {
-            m_PostingBytes = nullptr;
-            m_PostingByteCount = 0;
             m_PostingIndexBlockID = 0;
             m_PostingIndexOffset = 0;
             m_PostingIndexLength = 0;
             m_PostingContinuationBlockCount = 0;
-            m_Term = {};
             m_DocFreq = 0;
             m_LeafBlockID = 0;
             m_LeafWriteOffset = 0;
@@ -1118,14 +1073,10 @@ private:
         uint32_t m_LeafBlockID = 0;
         uint32_t m_EntryIndex = 0;
         uint32_t m_LeafSlot = UINT32_MAX;
-        uint8_t* m_PostingBytes = nullptr;
-        size_t m_PostingByteCount = 0;
         uint32_t m_PostingIndexBlockID = 0;
         uint32_t m_PostingIndexOffset = 0;
         uint32_t m_PostingIndexLength = 0;
         uint32_t m_PostingContinuationBlockCount = 0;
-        uint32_t m_PostingSlot = UINT32_MAX;
-        std::string_view m_Term;
         uint32_t m_DocFreq = 0;
         size_t m_LeafWriteOffset = 0;
         uint32_t m_LeafEntryCount = 0;
@@ -1233,8 +1184,6 @@ private:
             m_PostingIndexOffset = static_cast<uint32_t>(targetOffset);
             m_PostingIndexLength = static_cast<uint32_t>(splitLength);
             m_PostingContinuationBlockCount = static_cast<uint32_t>(continuations.size());
-            m_PostingByteCount = len;
-            m_PostingBytes = nullptr;
             m_HasIndexWrite = true;
             return true;
         }
@@ -1245,10 +1194,6 @@ private:
                 m_BlockTable->ReleaseBlock(BlockKind::LeafTerm, m_LeafSlot);
                 m_CurrentLeaf = nullptr;
                 m_LeafSlot = UINT32_MAX;
-            }
-            if (m_PostingSlot != UINT32_MAX && m_BlockTable) {
-                m_BlockTable->ReleaseBlock(BlockKind::Index, m_PostingSlot);
-                m_PostingSlot = UINT32_MAX;
             }
             m_CurrentEntry = nullptr;
         }
@@ -1288,11 +1233,6 @@ private:
                 m_BlockTable->ReleaseBlock(BlockKind::Index, slot);
             }
             return bytesNeeded;
-        }
-
-        size_t PostingCapacity() const
-        {
-            return static_cast<size_t>(m_IndexBlockCount) * sizeof(IndexBlock::IB_Data);
         }
 
         void ReadPostingBytesTo(uint8_t* bytes, size_t& bytesWritten) const
@@ -1360,183 +1300,6 @@ private:
             if (!output.PutData(buffer, static_cast<uint64_t>(bytes))) return false;
         }
     }
-
-    struct StreamingMergeWriter {
-        // This writer streams merged posting data into an index block temp file
-        // and merged leaf entries into a leaf temp file. The
-        // CurrentBlock/IndexWriteOffset pair is intentionally preserved across
-        // terms and across chunk boundaries so a partially filled IndexBlock can
-        // receive the next term's posting bytes.
-        FileAccess& IndexFile;
-        FileAccess& LeafFile;
-        IndexBlock CurrentBlock{};
-        LeafTermBlock LeafBlock{};
-        std::vector<HeadTermEntry> HeadEntries;
-        size_t IndexWriteOffset = 0;
-        size_t LeafWriteOffset = 0;
-        uint32_t IndexBlockCount = 0;
-        uint32_t LeafBlockCount = 0;
-        uint32_t LeafEntryCount = 0;
-        uint64_t TotalTerms = 0;
-        char FirstLeafTerm[HEAD_TERM_KEY_MAX] = {};
-        uint16_t FirstLeafTermLength = 0;
-
-        StreamingMergeWriter(FileAccess& indexFile, FileAccess& leafFile)
-            : IndexFile(indexFile)
-            , LeafFile(leafFile)
-        {}
-
-        bool FlushIndexBlock()
-        {
-            if (!IndexFile.PutData(&CurrentBlock, sizeof(CurrentBlock))) return false;
-            CurrentBlock = {};
-            IndexWriteOffset = 0;
-            ++IndexBlockCount;
-            return true;
-        }
-
-        bool FlushLeafBlock()
-        {
-            if (LeafEntryCount == 0) return true;
-
-            LeafBlock.LTB_Directory[LEAF_TERM_DIRECTORY_COUNT - 1] = static_cast<uint16_t>(LeafEntryCount);
-
-            // Record the first term of each completed leaf block. After all leaf
-            // blocks have been streamed, these records become the HeadTermEntry
-            // table in the final index file.
-            HeadTermEntry head{};
-            head.HTE_LeafTermBlockID = LeafBlockCount++;
-            head.HTE_FirstTermLength = FirstLeafTermLength;
-            std::memcpy(head.HTE_FirstTerm, FirstLeafTerm, head.HTE_FirstTermLength);
-            HeadEntries.push_back(head);
-
-            if (!LeafFile.PutData(&LeafBlock, sizeof(LeafBlock))) return false;
-            LeafBlock = {};
-            LeafWriteOffset = 0;
-            LeafEntryCount = 0;
-            FirstLeafTermLength = 0;
-            std::memset(FirstLeafTerm, 0, sizeof(FirstLeafTerm));
-            return true;
-        }
-
-        bool WriteLeafEntry(std::string_view term,
-                            uint32_t docFreq,
-                            uint32_t indexBlockID,
-                            uint32_t indexOffset,
-                            uint32_t indexLength,
-                            uint32_t continuationBlockCount)
-        {
-            if (term.size() > HEAD_TERM_KEY_MAX) return true;
-            const uint8_t termLength = static_cast<uint8_t>(term.size());
-            const size_t entryBytes = sizeof(LeafTermEntry) + termLength;
-            if (LeafEntryCount > 0
-                && (LeafEntryCount >= LEAF_TERM_DIRECTORY_COUNT - 1
-                    || LeafWriteOffset + entryBytes > sizeof(LeafBlock.LTB_Data))) {
-                if (!FlushLeafBlock()) return false;
-            }
-
-            if (LeafEntryCount == 0) {
-                FirstLeafTermLength = termLength;
-                std::memcpy(FirstLeafTerm, term.data(), termLength);
-            }
-
-            LeafBlock.LTB_Directory[LeafEntryCount] = static_cast<uint16_t>(LEAF_TERM_DATA_OFFSET + LeafWriteOffset);
-            auto* entry = reinterpret_cast<LeafTermEntry*>(LeafBlock.LTB_Data + LeafWriteOffset);
-            entry->LTE_DocFreq = docFreq;
-            entry->LTE_IndexBlockID = indexBlockID;
-            entry->LTE_IndexOffset = indexOffset;
-            entry->LTE_IndexLength = indexLength;
-            entry->LTE_ContinuationBlockCount = continuationBlockCount;
-            entry->LTE_Flags = 0;
-            entry->LTE_TermLength = termLength;
-            std::memcpy(entry->LTE_Term, term.data(), termLength);
-            LeafWriteOffset += entryBytes;
-            ++LeafEntryCount;
-            ++TotalTerms;
-            return true;
-        }
-
-        bool WriteTerm(std::string_view term, const uint8_t* postingBytes, size_t postingByteCount, uint32_t docFreq)
-        {
-            if (term.size() > HEAD_TERM_KEY_MAX || !postingBytes || postingByteCount == 0) return true;
-
-            constexpr size_t DATA_CAP = sizeof(IndexBlock::IB_Data);
-            const uint8_t* src = postingBytes;
-            size_t remaining = postingByteCount;
-
-            if (IndexWriteOffset >= DATA_CAP && !FlushIndexBlock()) return false;
-
-            size_t dataOffset = IndexWriteOffset;
-            size_t splitLength = PostingSplitLength(src, remaining, DATA_CAP - IndexWriteOffset);
-            if (splitLength == 0) {
-                if (!FlushIndexBlock()) return false;
-                dataOffset = IndexWriteOffset;
-                splitLength = PostingSplitLength(src, remaining, DATA_CAP);
-                if (splitLength == 0) return false;
-            }
-
-            const uint32_t indexBlockID = IndexBlockCount;
-            std::memcpy(CurrentBlock.IB_Data + IndexWriteOffset, src, splitLength);
-            IndexWriteOffset += splitLength;
-            src += splitLength;
-            remaining -= splitLength;
-
-            uint32_t continuationBlockCount = 0;
-            if (remaining > 0) {
-                if (!FlushIndexBlock()) return false;
-
-                while (remaining > 0) {
-                    constexpr size_t CONT_HDR = sizeof(IndexBlockContinuationHeader);
-                    const size_t continuationSplitLength = PostingSplitLength(src, remaining, DATA_CAP - CONT_HDR);
-                    if (continuationSplitLength == 0) return false;
-                    const bool moreCont = continuationSplitLength < remaining;
-
-                    size_t cursor = 0;
-                    uint64_t contMaxDocId = 0;
-                    while (cursor < continuationSplitLength) {
-                        contMaxDocId = 0;
-                        uint8_t shift = 0;
-                        while (true) {
-                            const uint8_t byte = src[cursor++];
-                            contMaxDocId |= static_cast<uint64_t>(byte & 0x7Fu) << shift;
-                            if ((byte & 0x80u) == 0) break;
-                            shift += 7;
-                        }
-                        while (src[cursor++] & 0x80u) {}
-                    }
-
-                    auto* header = reinterpret_cast<IndexBlockContinuationHeader*>(CurrentBlock.IB_Data + IndexWriteOffset);
-                    header->IBCH_MaxDocID = contMaxDocId;
-                    header->IBCH_DataLength = static_cast<uint32_t>(continuationSplitLength);
-                    IndexWriteOffset += sizeof(IndexBlockContinuationHeader);
-                    std::memcpy(CurrentBlock.IB_Data + IndexWriteOffset, src, continuationSplitLength);
-                    IndexWriteOffset += continuationSplitLength;
-                    src += continuationSplitLength;
-                    remaining -= continuationSplitLength;
-                    ++continuationBlockCount;
-
-                    // Preserve the partially used final continuation block so
-                    // the next leaf term can start in its tail. Only force a
-                    // flush when this same term still needs another continuation
-                    // page.
-                    if (moreCont && !FlushIndexBlock()) return false;
-                }
-            }
-
-            return WriteLeafEntry(term,
-                                  docFreq,
-                                  indexBlockID,
-                                  static_cast<uint32_t>(dataOffset),
-                                  static_cast<uint32_t>(splitLength),
-                                  continuationBlockCount);
-        }
-
-        bool Finish()
-        {
-            if (IndexWriteOffset > 0 && !FlushIndexBlock()) return false;
-            return FlushLeafBlock();
-        }
-    };
 
     /*
     * Recursively convert EvalNode → ISR tree.
