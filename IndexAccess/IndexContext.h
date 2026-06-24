@@ -413,6 +413,37 @@ public:
             std::memset(mergedLeafBlocks, 0, static_cast<size_t>(MERGED_LEAF_BLOCK_LIMIT) * sizeof(LeafTermBlock));
             LeafTermBlockView mergedCursor(mergedBlockTable, false);
 
+            auto dumpBatch = [&]() -> bool {
+                const uint32_t usedLeafBlocks = mergedCursor.UsedLeafBlockCount();
+                const uint32_t usedIndexBlocks = mergedCursor.UsedIndexBlockCount();
+                if (usedLeafBlocks == 0 && usedIndexBlocks == 0) return true;
+
+                HeadTermEntry heads[MERGED_LEAF_BLOCK_LIMIT]{};
+                const auto* leafBlocks = reinterpret_cast<const LeafTermBlock*>(mergedLeafBlocks);
+                for (uint32_t leafBlockID = 0; leafBlockID < usedLeafBlocks; ++leafBlockID) {
+                    const auto& leaf = leafBlocks[leafBlockID];
+                    const uint32_t entryCount = std::min<uint32_t>(leaf.LTB_Directory[LEAF_TERM_DIRECTORY_COUNT - 1], LEAF_TERM_DIRECTORY_COUNT - 1);
+                    const auto* leafBase = reinterpret_cast<const uint8_t*>(&leaf);
+                    const auto* firstEntry = reinterpret_cast<const LeafTermEntry*>(leafBase + leaf.LTB_Directory[0]);
+                    heads[leafBlockID].HTE_LeafTermBlockID = static_cast<uint32_t>(headEntryCount + leafBlockID);
+                    heads[leafBlockID].HTE_FirstTermLength = firstEntry->LTE_TermLength;
+                    std::memcpy(heads[leafBlockID].HTE_FirstTerm, firstEntry->LTE_Term, firstEntry->LTE_TermLength);
+                    totalTerms += entryCount;
+                }
+
+                if (!headFile->PutData(heads, static_cast<uint64_t>(usedLeafBlocks) * sizeof(HeadTermEntry))) return false;
+                if (!leafFile->PutData(mergedLeafBlocks, static_cast<uint64_t>(usedLeafBlocks) * sizeof(LeafTermBlock))) return false;
+                headEntryCount += usedLeafBlocks;
+
+                if (!indexFile->PutData(mergedIndexBlocks, static_cast<uint64_t>(usedIndexBlocks) * sizeof(IndexBlock))) return false;
+                indexBlockCount += usedIndexBlocks;
+
+                std::memset(mergedIndexBlocks, 0, static_cast<size_t>(MERGED_INDEX_BLOCK_LIMIT) * sizeof(IndexBlock));
+                std::memset(mergedLeafBlocks, 0, static_cast<size_t>(MERGED_LEAF_BLOCK_LIMIT) * sizeof(LeafTermBlock));
+                mergedCursor.ResetWrite(indexBlockCount);
+                return true;
+            };
+
             while (baseCursor.Current() || deltaCursor.Current()) {
                 const auto* baseCurrent = baseCursor.Current();
                 const auto* deltaCurrent = deltaCursor.Current();
@@ -422,21 +453,30 @@ public:
                 bool advanceDelta = false;
 
                 if (takeBase && takeDelta) {
-                    if (!mergedCursor.CanAddLeafTermEntry(baseCursor)) { cleanupTempFiles(); return false; }
-                    if (!mergedCursor.AddIndex(baseCursor, deltaCursor)) { cleanupTempFiles(); return false; }
-                    if (!mergedCursor.AddLeafTermEntry(baseCursor)) { cleanupTempFiles(); return false; }
-                    advanceBase = true;
-                    advanceDelta = true;
+                    if (mergedCursor.CanAddLeafTermEntry(baseCursor)
+                        && mergedCursor.AddIndex(baseCursor, deltaCursor)
+                        && mergedCursor.AddLeafTermEntry(baseCursor)) {
+                        advanceBase = true;
+                        advanceDelta = true;
+                    } else {
+                        if (!dumpBatch()) { cleanupTempFiles(); return false; }
+                    }
                 } else if (takeBase) {
-                    if (!mergedCursor.CanAddLeafTermEntry(baseCursor)) { cleanupTempFiles(); return false; }
-                    if (!mergedCursor.AddIndex(baseCursor)) { cleanupTempFiles(); return false; }
-                    if (!mergedCursor.AddLeafTermEntry(baseCursor)) { cleanupTempFiles(); return false; }
-                    advanceBase = true;
+                    if (mergedCursor.CanAddLeafTermEntry(baseCursor)
+                        && mergedCursor.AddIndex(baseCursor)
+                        && mergedCursor.AddLeafTermEntry(baseCursor)) {
+                        advanceBase = true;
+                    } else {
+                        if (!dumpBatch()) { cleanupTempFiles(); return false; }
+                    }
                 } else if (takeDelta) {
-                    if (!mergedCursor.CanAddLeafTermEntry(deltaCursor)) { cleanupTempFiles(); return false; }
-                    if (!mergedCursor.AddIndex(deltaCursor)) { cleanupTempFiles(); return false; }
-                    if (!mergedCursor.AddLeafTermEntry(deltaCursor)) { cleanupTempFiles(); return false; }
-                    advanceDelta = true;
+                    if (mergedCursor.CanAddLeafTermEntry(deltaCursor)
+                        && mergedCursor.AddIndex(deltaCursor)
+                        && mergedCursor.AddLeafTermEntry(deltaCursor)) {
+                        advanceDelta = true;
+                    } else {
+                        if (!dumpBatch()) { cleanupTempFiles(); return false; }
+                    }
                 } else {
                     // Never hit here: loop condition guarantees at least one cursor has data.
                     cleanupTempFiles();
@@ -446,34 +486,7 @@ public:
                 if (advanceDelta) ++deltaCursor;
             }
 
-            const auto* leafBlocks = reinterpret_cast<const LeafTermBlock*>(mergedLeafBlocks);
-            for (uint32_t leafBlockID = 0; leafBlockID < MERGED_LEAF_BLOCK_LIMIT; ++leafBlockID) {
-                const auto& leaf = leafBlocks[leafBlockID];
-                const uint32_t entryCount = std::min<uint32_t>(leaf.LTB_Directory[LEAF_TERM_DIRECTORY_COUNT - 1], LEAF_TERM_DIRECTORY_COUNT - 1);
-                if (entryCount == 0) break;
-
-                const auto* leafBase = reinterpret_cast<const uint8_t*>(&leaf);
-                const auto* firstEntry = reinterpret_cast<const LeafTermEntry*>(leafBase + leaf.LTB_Directory[0]);
-                HeadTermEntry head{};
-                head.HTE_LeafTermBlockID = leafBlockID;
-                head.HTE_FirstTermLength = firstEntry->LTE_TermLength;
-                std::memcpy(head.HTE_FirstTerm, firstEntry->LTE_Term, firstEntry->LTE_TermLength);
-                if (!headFile->PutData(&head, sizeof(head))) { cleanupTempFiles(); return false; }
-                if (!leafFile->PutData(&leaf, sizeof(leaf))) { cleanupTempFiles(); return false; }
-
-                ++headEntryCount;
-                totalTerms += entryCount;
-                for (uint32_t entryIndex = 0; entryIndex < entryCount; ++entryIndex) {
-                    const auto* entry = reinterpret_cast<const LeafTermEntry*>(leafBase + leaf.LTB_Directory[entryIndex]);
-                    indexBlockCount = std::max(indexBlockCount, entry->LTE_IndexBlockID + entry->LTE_ContinuationBlockCount + 1);
-                }
-            }
-
-            if (indexBlockCount > 0
-                && !indexFile->PutData(mergedIndexBlocks, static_cast<uint64_t>(indexBlockCount) * sizeof(IndexBlock))) {
-                cleanupTempFiles();
-                return false;
-            }
+            if (!dumpBatch()) { cleanupTempFiles(); return false; }
             headFile.reset();
             indexFile.reset();
             leafFile.reset();
@@ -994,7 +1007,7 @@ private:
             auto* entry = reinterpret_cast<LeafTermEntry*>(leaf->LTB_Data + m_LeafWriteOffset);
             std::memcpy(entry, source, entryBytes);
             entry->LTE_DocFreq = m_DocFreq;
-            entry->LTE_IndexBlockID = m_PostingIndexBlockID;
+            entry->LTE_IndexBlockID = m_IndexBlockBase + m_PostingIndexBlockID;
             entry->LTE_IndexOffset = m_PostingIndexOffset;
             entry->LTE_IndexLength = m_PostingIndexLength;
             entry->LTE_ContinuationBlockCount = m_PostingContinuationBlockCount;
@@ -1006,6 +1019,40 @@ private:
             m_PostingIndexLength = 0;
             m_PostingContinuationBlockCount = 0;
             return true;
+        }
+
+        bool HasWriteData() const
+        {
+            return UsedLeafBlockCount() > 0 || UsedIndexBlockCount() > 0;
+        }
+
+        uint32_t UsedLeafBlockCount() const
+        {
+            return m_LeafEntryCount > 0 ? m_LeafBlockID + 1 : m_LeafBlockID;
+        }
+
+        uint32_t UsedIndexBlockCount() const
+        {
+            return m_HasIndexWrite ? m_IndexBlockID + 1 : 0;
+        }
+
+        void ResetWrite(uint32_t indexBlockBase)
+        {
+            m_PostingBytes = nullptr;
+            m_PostingByteCount = 0;
+            m_PostingIndexBlockID = 0;
+            m_PostingIndexOffset = 0;
+            m_PostingIndexLength = 0;
+            m_PostingContinuationBlockCount = 0;
+            m_Term = {};
+            m_DocFreq = 0;
+            m_LeafBlockID = 0;
+            m_LeafWriteOffset = 0;
+            m_LeafEntryCount = 0;
+            m_IndexBlockID = 0;
+            m_IndexOffsetInBlock = 0;
+            m_IndexBlockBase = indexBlockBase;
+            m_HasIndexWrite = false;
         }
 
         /*
@@ -1084,6 +1131,8 @@ private:
         uint32_t m_LeafEntryCount = 0;
         uint32_t m_IndexBlockID = 0;
         size_t m_IndexOffsetInBlock = 0;
+        uint32_t m_IndexBlockBase = 0;
+        bool m_HasIndexWrite = false;
         uint8_t* m_IndexBuffer = nullptr;
 
         std::string_view CurrentTerm() const
@@ -1186,6 +1235,7 @@ private:
             m_PostingContinuationBlockCount = static_cast<uint32_t>(continuations.size());
             m_PostingByteCount = len;
             m_PostingBytes = nullptr;
+            m_HasIndexWrite = true;
             return true;
         }
 
