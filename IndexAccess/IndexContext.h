@@ -984,58 +984,75 @@ private:
             return true;
         }
 
-        // Writes locate the target buffer the same way reads do: m_IndexBlockID
-        // selects the IndexBlock page, and m_IndexOffsetInBlock is the byte
-        // offset inside that 4096-byte block.
+        /*
+        * Writes locate the target buffer the same way reads do: m_IndexBlockID
+        * selects the IndexBlock page, and m_IndexOffsetInBlock is the byte
+        * offset inside that 4096-byte block.
+        */
         bool AddIndex(const LeafTermBlockView& cursor)
         {
             constexpr size_t DATA_CAP = sizeof(IndexBlock::IB_Data);
             const auto* source = cursor.Current();
-            if (source->LTE_IndexLength > DATA_CAP) return false;
 
-            uint32_t indexBlockID = m_IndexBlockID;
-            size_t indexOffset = m_IndexOffsetInBlock;
-            if (indexOffset > DATA_CAP) return false;
-            if (source->LTE_IndexLength > DATA_CAP - indexOffset) {
-                ++indexBlockID;
-                indexOffset = 0;
+            /*
+            * Choose the target main-block position. The main segment stays
+            * contiguous; if it does not fit in the current tail, skip that tail
+            * and start at offset 0 in the next block.
+            */
+            uint32_t targetBlockID = m_IndexBlockID;
+            size_t targetOffset = m_IndexOffsetInBlock;
+            if (source->LTE_IndexLength > DATA_CAP - targetOffset) {
+                ++targetBlockID;
+                targetOffset = 0;
             }
-            if (indexBlockID >= m_IndexBlockCount)
+            if (targetBlockID >= m_IndexBlockCount)
                 return false;
             const uint64_t blocksNeeded = 1ull + source->LTE_ContinuationBlockCount;
-            if (blocksNeeded > m_IndexBlockCount - indexBlockID)
+            if (blocksNeeded > m_IndexBlockCount - targetBlockID)
                 return false;
-
-            m_IndexBlockID = indexBlockID;
-            m_IndexOffsetInBlock = indexOffset;
-            m_PostingIndexBlockID = m_IndexBlockID;
-            m_PostingIndexOffset = static_cast<uint32_t>(m_IndexOffsetInBlock);
-            m_PostingIndexLength = source->LTE_IndexLength;
-            m_PostingContinuationBlockCount = source->LTE_ContinuationBlockCount;
-            m_PostingByteCount = 0;
-            m_DocFreq = source->LTE_DocFreq;
 
             uint32_t sourceSlot = UINT32_MAX;
             const auto* sourceBlock = static_cast<const IndexBlock*>(cursor.m_BlockTable->GetBlock(BlockKind::Index, source->LTE_IndexBlockID, &sourceSlot));
-            auto* targetBlock = reinterpret_cast<IndexBlock*>(m_BlockTable->m_IndexPool.BCP_Pages + static_cast<size_t>(m_IndexBlockID) * sizeof(IndexBlock));
-            std::memcpy(targetBlock->IB_Data + m_IndexOffsetInBlock, sourceBlock->IB_Data + source->LTE_IndexOffset, source->LTE_IndexLength);
-            m_IndexOffsetInBlock += source->LTE_IndexLength;
-            m_PostingByteCount += source->LTE_IndexLength;
+
+            /*
+            * Copy the source main segment and page-shaped continuation blocks.
+            * Continuation blocks must immediately follow the main block because
+            * readers advance by IndexBlockID + 1, +2, ...
+            */
+            auto* targetBlock = reinterpret_cast<IndexBlock*>(m_BlockTable->m_IndexPool.BCP_Pages + static_cast<size_t>(targetBlockID) * sizeof(IndexBlock));
+            std::memcpy(targetBlock->IB_Data + targetOffset, sourceBlock->IB_Data + source->LTE_IndexOffset, source->LTE_IndexLength);
             cursor.m_BlockTable->ReleaseBlock(BlockKind::Index, sourceSlot);
 
+            uint32_t newIndexBlockID = targetBlockID;
+            size_t newIndexOffsetInBlock = targetOffset + source->LTE_IndexLength;
+            size_t newPostingByteCount = source->LTE_IndexLength;
             for (uint32_t i = 0; i < source->LTE_ContinuationBlockCount; ++i) {
-                ++m_IndexBlockID;
-                m_IndexOffsetInBlock = 0;
+                ++newIndexBlockID;
                 sourceSlot = UINT32_MAX;
                 const auto* sourceContinuation = static_cast<const IndexBlock*>(cursor.m_BlockTable->GetBlock(BlockKind::Index, source->LTE_IndexBlockID + 1 + i, &sourceSlot));
                 const auto* header = reinterpret_cast<const IndexBlockContinuationHeader*>(sourceContinuation->IB_Data);
                 const size_t bytes = sizeof(IndexBlockContinuationHeader) + header->IBCH_DataLength;
-                targetBlock = reinterpret_cast<IndexBlock*>(m_BlockTable->m_IndexPool.BCP_Pages + static_cast<size_t>(m_IndexBlockID) * sizeof(IndexBlock));
+                targetBlock = reinterpret_cast<IndexBlock*>(m_BlockTable->m_IndexPool.BCP_Pages + static_cast<size_t>(newIndexBlockID) * sizeof(IndexBlock));
                 std::memcpy(targetBlock->IB_Data, sourceContinuation->IB_Data, bytes);
-                m_IndexOffsetInBlock = bytes;
-                m_PostingByteCount += header->IBCH_DataLength;
+                newIndexOffsetInBlock = DATA_CAP;
+                newPostingByteCount += header->IBCH_DataLength;
                 cursor.m_BlockTable->ReleaseBlock(BlockKind::Index, sourceSlot);
             }
+
+            /*
+            * Commit write cursor state only after every source block has been
+            * read and copied. If this function returned false earlier, copied
+            * bytes may remain in memory, but no metadata points at them.
+            */
+            m_IndexBlockID = newIndexBlockID;
+            m_IndexOffsetInBlock = newIndexOffsetInBlock;
+            m_PostingIndexBlockID = targetBlockID;
+            m_PostingIndexOffset = static_cast<uint32_t>(targetOffset);
+            m_PostingIndexLength = source->LTE_IndexLength;
+            m_PostingContinuationBlockCount = source->LTE_ContinuationBlockCount;
+            m_PostingByteCount = newPostingByteCount;
+            m_PostingBytes = nullptr;
+            m_DocFreq = source->LTE_DocFreq;
             return true;
         }
 
