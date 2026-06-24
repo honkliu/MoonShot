@@ -1248,7 +1248,7 @@ private:
         void ReleaseCurrentLeaf()
         {
             if (m_CurrentLeaf && m_BlockTable) {
-                m_BlockTable->ReleaseBlock(BlockKind::LeafTerm, m_LeafSlot);
+                m_BlockTable->ReleaseBlock(BlockKind::LeafTerm, m_LeafSlot, true);
                 m_CurrentLeaf = nullptr;
                 m_LeafSlot = UINT32_MAX;
             }
@@ -1261,7 +1261,7 @@ private:
 
             while (m_LeafBlockID < m_LeafTermBlockCount) {
                 if (!m_CurrentLeaf) {
-                    m_CurrentLeaf = static_cast<const LeafTermBlock*>(m_BlockTable->GetBlock(BlockKind::LeafTerm, m_LeafBlockID, &m_LeafSlot));
+                    m_CurrentLeaf = static_cast<const LeafTermBlock*>(m_BlockTable->GetBlock(BlockKind::LeafTerm, m_LeafBlockID, &m_LeafSlot, true));
                     if (!m_CurrentLeaf) return;
                 }
 
@@ -1284,10 +1284,10 @@ private:
             size_t bytesNeeded = m_CurrentEntry->LTE_IndexLength;
             for (uint32_t i = 0; i < m_CurrentEntry->LTE_ContinuationBlockCount; ++i) {
                 uint32_t slot = UINT32_MAX;
-                const auto* continuation = static_cast<const IndexBlock*>(m_BlockTable->GetBlock(BlockKind::Index, m_CurrentEntry->LTE_IndexBlockID + 1 + i, &slot));
+                const auto* continuation = static_cast<const IndexBlock*>(m_BlockTable->GetBlock(BlockKind::Index, m_CurrentEntry->LTE_IndexBlockID + 1 + i, &slot, true));
                 const auto* header = reinterpret_cast<const IndexBlockContinuationHeader*>(continuation->IB_Data);
                 bytesNeeded += header->IBCH_DataLength;
-                m_BlockTable->ReleaseBlock(BlockKind::Index, slot);
+                m_BlockTable->ReleaseBlock(BlockKind::Index, slot, true);
             }
             return bytesNeeded;
         }
@@ -1295,19 +1295,19 @@ private:
         void ReadPostingBytesTo(uint8_t* bytes, size_t& bytesWritten) const
         {
             uint32_t slot = UINT32_MAX;
-            const auto* block = static_cast<const IndexBlock*>(m_BlockTable->GetBlock(BlockKind::Index, m_CurrentEntry->LTE_IndexBlockID, &slot));
+            const auto* block = static_cast<const IndexBlock*>(m_BlockTable->GetBlock(BlockKind::Index, m_CurrentEntry->LTE_IndexBlockID, &slot, true));
             std::memcpy(bytes + bytesWritten, block->IB_Data + m_CurrentEntry->LTE_IndexOffset, m_CurrentEntry->LTE_IndexLength);
             bytesWritten += m_CurrentEntry->LTE_IndexLength;
-            m_BlockTable->ReleaseBlock(BlockKind::Index, slot);
+            m_BlockTable->ReleaseBlock(BlockKind::Index, slot, true);
 
             for (uint32_t i = 0; i < m_CurrentEntry->LTE_ContinuationBlockCount; ++i) {
                 slot = UINT32_MAX;
-                const auto* continuation = static_cast<const IndexBlock*>(m_BlockTable->GetBlock(BlockKind::Index, m_CurrentEntry->LTE_IndexBlockID + 1 + i, &slot));
+                const auto* continuation = static_cast<const IndexBlock*>(m_BlockTable->GetBlock(BlockKind::Index, m_CurrentEntry->LTE_IndexBlockID + 1 + i, &slot, true));
                 const auto* header = reinterpret_cast<const IndexBlockContinuationHeader*>(continuation->IB_Data);
                 const uint8_t* begin = continuation->IB_Data + sizeof(IndexBlockContinuationHeader);
                 std::memcpy(bytes + bytesWritten, begin, header->IBCH_DataLength);
                 bytesWritten += header->IBCH_DataLength;
-                m_BlockTable->ReleaseBlock(BlockKind::Index, slot);
+                m_BlockTable->ReleaseBlock(BlockKind::Index, slot, true);
             }
         }
     };

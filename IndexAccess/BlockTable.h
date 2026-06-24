@@ -344,16 +344,23 @@ class IndexBlockTable
             return true;
         }
 
-        void* GetBlock(BlockKind kind, uint32_t block_seq, uint32_t* slotOut)
+        void* GetBlock(BlockKind kind, uint32_t block_seq, uint32_t* slotOut, bool sequential = false)
         {
             BlockCachePool& pool = kind == BlockKind::Index ? m_IndexPool : m_LeafTermPool;
-            if (pool.BCP_Pages && block_seq < pool.BCP_TotalBlockCount && pool.BCP_LogicTable) {
+            if (sequential && pool.BCP_Pages && pool.BCP_LogicTable && pool.BCP_SlotTable && block_seq < pool.BCP_TotalBlockCount) {
                 const uint32_t slot = pool.BCP_LogicTable[block_seq];
                 if (slot != UINT32_MAX && slot < pool.BCP_SlotCount) {
                     ++pool.BCP_SlotTable[slot].Ref;
                     *slotOut = slot;
                     return pool.BCP_Pages + static_cast<size_t>(slot) * PAGE_SIZE;
                 }
+            }
+
+            if (sequential && LoadSequentialWindow(pool, block_seq)) {
+                const uint32_t slot = pool.BCP_LogicTable[block_seq];
+                ++pool.BCP_SlotTable[slot].Ref;
+                *slotOut = slot;
+                return pool.BCP_Pages + static_cast<size_t>(slot) * PAGE_SIZE;
             }
 
             BlockRequest request;
@@ -369,11 +376,11 @@ class IndexBlockTable
             return request.Address;
         }
 
-        void ReleaseBlock(BlockKind kind, uint32_t slot)
+        void ReleaseBlock(BlockKind kind, uint32_t slot, bool sequential = false)
         {
             if (slot == UINT32_MAX) return;
             BlockCachePool& pool = kind == BlockKind::Index ? m_IndexPool : m_LeafTermPool;
-            if (pool.BCP_SlotTable && slot < pool.BCP_SlotCount && pool.BCP_SlotTable[slot].Ref > 0) {
+            if (sequential && pool.BCP_SlotTable && slot < pool.BCP_SlotCount && pool.BCP_SlotTable[slot].Ref > 0) {
                 --pool.BCP_SlotTable[slot].Ref;
                 return;
             }
@@ -546,6 +553,48 @@ class IndexBlockTable
             }
             pool.BCP_RequestCv.notify_one();
             pool.BCP_Thread.join();
+        }
+
+        bool LoadSequentialWindow(BlockCachePool& pool, uint32_t startBlock)
+        {
+            if (!pool.BCP_File || !pool.BCP_Pages || !pool.BCP_LogicTable || !pool.BCP_SlotTable)
+                return false;
+            if (startBlock >= pool.BCP_TotalBlockCount || pool.BCP_SlotCount == 0)
+                return false;
+
+            const uint32_t blockCount = std::min(pool.BCP_SlotCount, pool.BCP_TotalBlockCount - startBlock);
+
+            for (uint32_t slot = 0; slot < pool.BCP_SlotCount; ++slot) {
+                if (pool.BCP_SlotTable[slot].Ref > 0)
+                    return false;
+            }
+
+            for (uint32_t slot = 0; slot < pool.BCP_SlotCount; ++slot) {
+                if (pool.BCP_SlotTable[slot].BlockID != UINT32_MAX)
+                    pool.BCP_LogicTable[pool.BCP_SlotTable[slot].BlockID] = UINT32_MAX;
+                pool.BCP_SlotTable[slot].BlockID = UINT32_MAX;
+                pool.BCP_SlotTable[slot].Ref = 0;
+            }
+
+            const uint64_t bytes = static_cast<uint64_t>(blockCount) * PAGE_SIZE;
+            if (bytes > static_cast<uint64_t>(std::numeric_limits<int>::max()))
+                return false;
+            if (!pool.BCP_File->SetPosition(pool.BCP_BaseOffset + static_cast<uint64_t>(startBlock) * PAGE_SIZE)
+                || pool.BCP_File->GetData(pool.BCP_Pages, static_cast<int>(bytes)) != static_cast<int>(bytes)) {
+                return false;
+            }
+
+            for (uint32_t offset = 0; offset < blockCount; ++offset) {
+                const uint32_t block = startBlock + offset;
+                const uint32_t slot = offset;
+                pool.BCP_SlotTable[slot].BlockID = block;
+                pool.BCP_SlotTable[slot].Ref = 0;
+                pool.BCP_LogicTable[block] = slot;
+            }
+
+            pool.BCP_EvictSlot = blockCount;
+
+            return pool.BCP_LogicTable[startBlock] != UINT32_MAX;
         }
 
         void BlockThreadMain(BlockCachePool& pool)
