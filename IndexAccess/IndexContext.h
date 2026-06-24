@@ -883,11 +883,14 @@ private:
             , m_LeafTermBlockCount(blockTable.m_LeafTermPool.BCP_TotalBlockCount)
             , m_IndexBlockCount(blockTable.m_IndexPool.BCP_SlotCount)
         {
+            m_IndexBuffer = static_cast<uint8_t*>(PinnedMemAlloc(POSTING_SCRATCH_BYTES));
             GoCurrent();
         }
 
         ~LeafTermBlockView()
         {
+            if (m_IndexBuffer)
+                PinnedMemFree(m_IndexBuffer);
             ReleaseCurrentLeaf();
         }
 
@@ -991,107 +994,100 @@ private:
         */
         bool AddIndex(const LeafTermBlockView& cursor)
         {
-            constexpr size_t DATA_CAP = sizeof(IndexBlock::IB_Data);
-            const auto* source = cursor.Current();
-
             /*
-            * Choose the target main-block position. The main segment stays
-            * contiguous; if it does not fit in the current tail, skip that tail
-            * and start at offset 0 in the next block. Size the first segment
-            * against the remaining bytes in the selected block.
+            * Read the logical posting stream into reusable pinned scratch before
+            * any output metadata is committed. Scratch bytes are overwritten on
+            * each call and are disposable on failure.
             */
-            uint32_t targetBlockID = m_IndexBlockID;
-            size_t targetOffset = m_IndexOffsetInBlock;
-            if (source->LTE_IndexLength > DATA_CAP - targetOffset) {
-                ++targetBlockID;
-                targetOffset = 0;
-            }
-            if (targetBlockID >= m_IndexBlockCount)
-                return false;
-            const uint64_t blocksNeeded = 1ull + source->LTE_ContinuationBlockCount;
-            if (blocksNeeded > m_IndexBlockCount - targetBlockID)
-                return false;
+            const size_t bytesNeeded = cursor.PostingBytesSize();
+            if (!m_IndexBuffer || bytesNeeded > POSTING_SCRATCH_BYTES) return false;
 
-            uint32_t sourceSlot = UINT32_MAX;
-            const auto* sourceBlock = static_cast<const IndexBlock*>(cursor.m_BlockTable->GetBlock(BlockKind::Index, source->LTE_IndexBlockID, &sourceSlot));
+            size_t bytesWritten = 0;
+            cursor.ReadPostingBytesTo(m_IndexBuffer, bytesWritten);
+            if (!AddIndex(bytesWritten)) return false;
 
-            /*
-            * Copy the source main segment and page-shaped continuation blocks.
-            * Continuation blocks must immediately follow the main block because
-            * readers advance by IndexBlockID + 1, +2, ...
-            */
-            auto* targetBlock = reinterpret_cast<IndexBlock*>(m_BlockTable->m_IndexPool.BCP_Pages + static_cast<size_t>(targetBlockID) * sizeof(IndexBlock));
-            std::memcpy(targetBlock->IB_Data + targetOffset, sourceBlock->IB_Data + source->LTE_IndexOffset, source->LTE_IndexLength);
-            cursor.m_BlockTable->ReleaseBlock(BlockKind::Index, sourceSlot);
-
-            uint32_t newIndexBlockID = targetBlockID;
-            size_t newIndexOffsetInBlock = targetOffset + source->LTE_IndexLength;
-            size_t newPostingByteCount = source->LTE_IndexLength;
-            for (uint32_t i = 0; i < source->LTE_ContinuationBlockCount; ++i) {
-                ++newIndexBlockID;
-                sourceSlot = UINT32_MAX;
-                const auto* sourceContinuation = static_cast<const IndexBlock*>(cursor.m_BlockTable->GetBlock(BlockKind::Index, source->LTE_IndexBlockID + 1 + i, &sourceSlot));
-                const auto* header = reinterpret_cast<const IndexBlockContinuationHeader*>(sourceContinuation->IB_Data);
-                const size_t bytes = sizeof(IndexBlockContinuationHeader) + header->IBCH_DataLength;
-                targetBlock = reinterpret_cast<IndexBlock*>(m_BlockTable->m_IndexPool.BCP_Pages + static_cast<size_t>(newIndexBlockID) * sizeof(IndexBlock));
-                std::memcpy(targetBlock->IB_Data, sourceContinuation->IB_Data, bytes);
-                newIndexOffsetInBlock = DATA_CAP;
-                newPostingByteCount += header->IBCH_DataLength;
-                cursor.m_BlockTable->ReleaseBlock(BlockKind::Index, sourceSlot);
-            }
-
-            /*
-            * Commit write cursor state only after every source block has been
-            * read and copied. If this function returned false earlier, copied
-            * bytes may remain in memory, but no metadata points at them.
-            */
-            m_IndexBlockID = newIndexBlockID;
-            m_IndexOffsetInBlock = newIndexOffsetInBlock;
-            m_PostingIndexBlockID = targetBlockID;
-            m_PostingIndexOffset = static_cast<uint32_t>(targetOffset);
-            m_PostingIndexLength = source->LTE_IndexLength;
-            m_PostingContinuationBlockCount = source->LTE_ContinuationBlockCount;
-            m_PostingByteCount = newPostingByteCount;
-            m_PostingBytes = nullptr;
-            m_DocFreq = source->LTE_DocFreq;
+            m_DocFreq = cursor.Current()->LTE_DocFreq;
             return true;
         }
 
         bool AddIndex(const LeafTermBlockView& smallCursor, const LeafTermBlockView& bigCursor)
         {
-            constexpr size_t DATA_CAP = sizeof(IndexBlock::IB_Data);
-            constexpr size_t CONT_HDR = sizeof(IndexBlockContinuationHeader);
             const size_t smallBytes = smallCursor.PostingBytesSize();
             const size_t bigBytes = bigCursor.PostingBytesSize();
-            const size_t bytesNeeded = smallBytes + bigBytes;
+            if (!m_IndexBuffer || smallBytes > POSTING_SCRATCH_BYTES || bigBytes > POSTING_SCRATCH_BYTES - smallBytes) return false;
 
             /*
             * Build the merged logical posting stream in source order. The two
             * cursors already point at the same term; this function only shapes
             * their raw bytes into destination index blocks.
             */
-            std::vector<uint8_t> mergedBytes(bytesNeeded);
             size_t mergedBytesWritten = 0;
             /*
             * ReadPostingBytesTo appends at mergedBytesWritten and advances it,
             * so the big postings are placed immediately after the small postings.
             */
-            smallCursor.ReadPostingBytesTo(mergedBytes.data(), mergedBytesWritten);
-            bigCursor.ReadPostingBytesTo(mergedBytes.data(), mergedBytesWritten);
+            smallCursor.ReadPostingBytesTo(m_IndexBuffer, mergedBytesWritten);
+            bigCursor.ReadPostingBytesTo(m_IndexBuffer, mergedBytesWritten);
+            if (!AddIndex(mergedBytesWritten)) return false;
+
+            m_DocFreq = smallCursor.Current()->LTE_DocFreq + bigCursor.Current()->LTE_DocFreq;
+            return true;
+        }
+
+        bool operator<(const LeafTermBlockView& other) const { return CurrentTerm() < other.CurrentTerm(); }
+        bool operator>(const LeafTermBlockView& other) const { return other < *this; }
+        bool operator==(const LeafTermBlockView& other) const { return CurrentTerm() == other.CurrentTerm(); }
+
+    private:
+        static constexpr size_t POSTING_SCRATCH_PAGE_COUNT = 100;
+        static constexpr size_t POSTING_SCRATCH_BYTES = POSTING_SCRATCH_PAGE_COUNT * PAGE_SIZE;
+
+        IndexBlockTable* m_BlockTable = nullptr;
+        uint64_t m_LeafTermBlockCount = 0;
+        uint64_t m_IndexBlockCount = 0;
+        const LeafTermBlock* m_CurrentLeaf = nullptr;
+        const LeafTermEntry* m_CurrentEntry = nullptr;
+        uint32_t m_LeafBlockID = 0;
+        uint32_t m_EntryIndex = 0;
+        uint32_t m_LeafSlot = UINT32_MAX;
+        uint8_t* m_PostingBytes = nullptr;
+        size_t m_PostingByteCount = 0;
+        uint32_t m_PostingIndexBlockID = 0;
+        uint32_t m_PostingIndexOffset = 0;
+        uint32_t m_PostingIndexLength = 0;
+        uint32_t m_PostingContinuationBlockCount = 0;
+        uint32_t m_PostingSlot = UINT32_MAX;
+        std::string_view m_Term;
+        uint32_t m_DocFreq = 0;
+        size_t m_LeafWriteOffset = 0;
+        uint32_t m_LeafEntryCount = 0;
+        uint32_t m_IndexBlockID = 0;
+        size_t m_IndexOffsetInBlock = 0;
+        uint8_t* m_IndexBuffer = nullptr;
+
+        std::string_view CurrentTerm() const
+        {
+            return m_CurrentEntry ? std::string_view(m_CurrentEntry->LTE_Term, m_CurrentEntry->LTE_TermLength) : std::string_view();
+        }
+
+        bool AddIndex(size_t len)
+        {
+            constexpr size_t DATA_CAP = sizeof(IndexBlock::IB_Data);
+            constexpr size_t CONT_HDR = sizeof(IndexBlockContinuationHeader);
 
             /*
             * Choose the target main-block position. The main segment stays
-            * contiguous; if it does not fit in the current tail, skip that tail
-            * and start at offset 0 in the next block.
+            * contiguous; if no complete posting pair fits in the current tail,
+            * skip that tail and start at offset 0 in the next block.
             */
-            const uint8_t* sourceBytes = mergedBytes.data();
+            const uint8_t* sourceBytes = m_IndexBuffer;
             uint32_t targetBlockID = m_IndexBlockID;
             size_t targetOffset = m_IndexOffsetInBlock;
-            size_t mainLength = PostingPrefixBytes(sourceBytes, bytesNeeded, DATA_CAP - targetOffset);
+            size_t mainLength = PostingPrefixBytes(sourceBytes, len, DATA_CAP - targetOffset);
             if (mainLength == 0) {
                 ++targetBlockID;
                 targetOffset = 0;
-                mainLength = PostingPrefixBytes(sourceBytes, bytesNeeded, DATA_CAP);
+                mainLength = PostingPrefixBytes(sourceBytes, len, DATA_CAP);
                 if (mainLength == 0) return false;
             }
             if (targetBlockID >= m_IndexBlockCount)
@@ -1126,8 +1122,8 @@ private:
             */
             std::vector<ContinuationSegment> continuations;
             size_t sourceOffset = mainLength;
-            while (sourceOffset < bytesNeeded) {
-                const size_t remaining = bytesNeeded - sourceOffset;
+            while (sourceOffset < len) {
+                const size_t remaining = len - sourceOffset;
                 const size_t continuationLength = PostingPrefixBytes(sourceBytes + sourceOffset, remaining, DATA_CAP - CONT_HDR);
                 if (continuationLength == 0) return false;
                 continuations.push_back({ sourceOffset, continuationLength, maxDocId(sourceBytes + sourceOffset, continuationLength) });
@@ -1157,7 +1153,7 @@ private:
             }
 
             /*
-            * Commit write cursor state only after the full merged layout is
+            * Commit write cursor state only after the full scratch layout is
             * copied. If this function returned false earlier, copied bytes may
             * remain in memory, but no metadata points at them.
             */
@@ -1167,42 +1163,9 @@ private:
             m_PostingIndexOffset = static_cast<uint32_t>(targetOffset);
             m_PostingIndexLength = static_cast<uint32_t>(mainLength);
             m_PostingContinuationBlockCount = static_cast<uint32_t>(continuations.size());
-            m_PostingByteCount = bytesNeeded;
+            m_PostingByteCount = len;
             m_PostingBytes = nullptr;
-            m_DocFreq = smallCursor.Current()->LTE_DocFreq + bigCursor.Current()->LTE_DocFreq;
             return true;
-        }
-
-        bool operator<(const LeafTermBlockView& other) const { return CurrentTerm() < other.CurrentTerm(); }
-        bool operator>(const LeafTermBlockView& other) const { return other < *this; }
-        bool operator==(const LeafTermBlockView& other) const { return CurrentTerm() == other.CurrentTerm(); }
-
-    private:
-        IndexBlockTable* m_BlockTable = nullptr;
-        uint64_t m_LeafTermBlockCount = 0;
-        uint64_t m_IndexBlockCount = 0;
-        const LeafTermBlock* m_CurrentLeaf = nullptr;
-        const LeafTermEntry* m_CurrentEntry = nullptr;
-        uint32_t m_LeafBlockID = 0;
-        uint32_t m_EntryIndex = 0;
-        uint32_t m_LeafSlot = UINT32_MAX;
-        uint8_t* m_PostingBytes = nullptr;
-        size_t m_PostingByteCount = 0;
-        uint32_t m_PostingIndexBlockID = 0;
-        uint32_t m_PostingIndexOffset = 0;
-        uint32_t m_PostingIndexLength = 0;
-        uint32_t m_PostingContinuationBlockCount = 0;
-        uint32_t m_PostingSlot = UINT32_MAX;
-        std::string_view m_Term;
-        uint32_t m_DocFreq = 0;
-        size_t m_LeafWriteOffset = 0;
-        uint32_t m_LeafEntryCount = 0;
-        uint32_t m_IndexBlockID = 0;
-        size_t m_IndexOffsetInBlock = 0;
-
-        std::string_view CurrentTerm() const
-        {
-            return m_CurrentEntry ? std::string_view(m_CurrentEntry->LTE_Term, m_CurrentEntry->LTE_TermLength) : std::string_view();
         }
 
         void ReleaseCurrentLeaf()
