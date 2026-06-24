@@ -997,7 +997,8 @@ private:
             /*
             * Choose the target main-block position. The main segment stays
             * contiguous; if it does not fit in the current tail, skip that tail
-            * and start at offset 0 in the next block.
+            * and start at offset 0 in the next block. Size the first segment
+            * against the remaining bytes in the selected block.
             */
             uint32_t targetBlockID = m_IndexBlockID;
             size_t targetOffset = m_IndexOffsetInBlock;
@@ -1058,18 +1059,117 @@ private:
 
         bool AddIndex(const LeafTermBlockView& smallCursor, const LeafTermBlockView& bigCursor)
         {
-            const size_t bytesNeeded = smallCursor.PostingBytesSize() + bigCursor.PostingBytesSize();
-            if (bytesNeeded > PostingCapacity()) return false;
-            if (!m_PostingBytes)
-                m_PostingBytes = static_cast<IndexBlock*>(m_BlockTable->GetBlock(BlockKind::Index, 0, &m_PostingSlot))->IB_Data;
+            constexpr size_t DATA_CAP = sizeof(IndexBlock::IB_Data);
+            constexpr size_t CONT_HDR = sizeof(IndexBlockContinuationHeader);
+            const size_t smallBytes = smallCursor.PostingBytesSize();
+            const size_t bigBytes = bigCursor.PostingBytesSize();
+            const size_t bytesNeeded = smallBytes + bigBytes;
 
-            m_PostingIndexBlockID = 0;
-            m_PostingIndexOffset = 0;
-            m_PostingIndexLength = static_cast<uint32_t>(bytesNeeded);
-            m_PostingContinuationBlockCount = 0;
-            m_PostingByteCount = 0;
-            smallCursor.ReadPostingBytesTo(m_PostingBytes, m_PostingByteCount);
-            bigCursor.ReadPostingBytesTo(m_PostingBytes, m_PostingByteCount);
+            /*
+            * Build the merged logical posting stream in source order. The two
+            * cursors already point at the same term; this function only shapes
+            * their raw bytes into destination index blocks.
+            */
+            std::vector<uint8_t> mergedBytes(bytesNeeded);
+            size_t mergedBytesWritten = 0;
+            /*
+            * ReadPostingBytesTo appends at mergedBytesWritten and advances it,
+            * so the big postings are placed immediately after the small postings.
+            */
+            smallCursor.ReadPostingBytesTo(mergedBytes.data(), mergedBytesWritten);
+            bigCursor.ReadPostingBytesTo(mergedBytes.data(), mergedBytesWritten);
+
+            /*
+            * Choose the target main-block position. The main segment stays
+            * contiguous; if it does not fit in the current tail, skip that tail
+            * and start at offset 0 in the next block.
+            */
+            const uint8_t* sourceBytes = mergedBytes.data();
+            uint32_t targetBlockID = m_IndexBlockID;
+            size_t targetOffset = m_IndexOffsetInBlock;
+            size_t mainLength = PostingPrefixBytes(sourceBytes, bytesNeeded, DATA_CAP - targetOffset);
+            if (mainLength == 0) {
+                ++targetBlockID;
+                targetOffset = 0;
+                mainLength = PostingPrefixBytes(sourceBytes, bytesNeeded, DATA_CAP);
+                if (mainLength == 0) return false;
+            }
+            if (targetBlockID >= m_IndexBlockCount)
+                return false;
+
+            auto maxDocId = [](const uint8_t* data, size_t size) {
+                size_t cursor = 0;
+                uint64_t docId = 0;
+                while (cursor < size) {
+                    docId = 0;
+                    uint8_t shift = 0;
+                    while (true) {
+                        const uint8_t byte = data[cursor++];
+                        docId |= static_cast<uint64_t>(byte & 0x7Fu) << shift;
+                        if ((byte & 0x80u) == 0) break;
+                        shift += 7;
+                    }
+                    while (data[cursor++] & 0x80u) {}
+                }
+                return docId;
+            };
+
+            struct ContinuationSegment {
+                size_t Offset;
+                size_t Length;
+                uint64_t MaxDocID;
+            };
+
+            /*
+            * Pre-shape continuation pages before copying. If capacity is not
+            * enough, return false before committing any cursor or metadata state.
+            */
+            std::vector<ContinuationSegment> continuations;
+            size_t sourceOffset = mainLength;
+            while (sourceOffset < bytesNeeded) {
+                const size_t remaining = bytesNeeded - sourceOffset;
+                const size_t continuationLength = PostingPrefixBytes(sourceBytes + sourceOffset, remaining, DATA_CAP - CONT_HDR);
+                if (continuationLength == 0) return false;
+                continuations.push_back({ sourceOffset, continuationLength, maxDocId(sourceBytes + sourceOffset, continuationLength) });
+                sourceOffset += continuationLength;
+            }
+
+            const uint64_t blocksNeeded = 1ull + static_cast<uint64_t>(continuations.size());
+            if (blocksNeeded > m_IndexBlockCount - targetBlockID)
+                return false;
+
+            /*
+            * Copy the main segment and page-shaped continuation blocks.
+            * Continuation blocks must immediately follow the main block because
+            * readers advance by IndexBlockID + 1, +2, ...
+            */
+            auto* targetBlock = reinterpret_cast<IndexBlock*>(m_BlockTable->m_IndexPool.BCP_Pages + static_cast<size_t>(targetBlockID) * sizeof(IndexBlock));
+            std::memcpy(targetBlock->IB_Data + targetOffset, sourceBytes, mainLength);
+
+            for (size_t i = 0; i < continuations.size(); ++i) {
+                const auto& continuation = continuations[i];
+                const uint32_t continuationBlockID = targetBlockID + 1 + static_cast<uint32_t>(i);
+                targetBlock = reinterpret_cast<IndexBlock*>(m_BlockTable->m_IndexPool.BCP_Pages + static_cast<size_t>(continuationBlockID) * sizeof(IndexBlock));
+                auto* header = reinterpret_cast<IndexBlockContinuationHeader*>(targetBlock->IB_Data);
+                header->IBCH_MaxDocID = continuation.MaxDocID;
+                header->IBCH_DataLength = static_cast<uint32_t>(continuation.Length);
+                std::memcpy(targetBlock->IB_Data + CONT_HDR, sourceBytes + continuation.Offset, continuation.Length);
+            }
+
+            /*
+            * Commit write cursor state only after the full merged layout is
+            * copied. If this function returned false earlier, copied bytes may
+            * remain in memory, but no metadata points at them.
+            */
+            m_IndexBlockID = targetBlockID + static_cast<uint32_t>(continuations.size());
+            m_IndexOffsetInBlock = continuations.empty() ? targetOffset + mainLength : DATA_CAP;
+            m_PostingIndexBlockID = targetBlockID;
+            m_PostingIndexOffset = static_cast<uint32_t>(targetOffset);
+            m_PostingIndexLength = static_cast<uint32_t>(mainLength);
+            m_PostingContinuationBlockCount = static_cast<uint32_t>(continuations.size());
+            m_PostingByteCount = bytesNeeded;
+            m_PostingBytes = nullptr;
+            m_DocFreq = smallCursor.Current()->LTE_DocFreq + bigCursor.Current()->LTE_DocFreq;
             return true;
         }
 
