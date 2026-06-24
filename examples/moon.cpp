@@ -2,9 +2,13 @@
  * moon — personal document search tool
  *
  * Usage:
+ *   moon -idx <index> -file <filepath>       Index one file into <index>
+ *   moon -idx <index> -dir <directory> -r    Index files recursively into <index>
+ *   moon -idx <index> -i                     Search <index>
  *   moon -file <filepath>              Index one file
  *   moon -dir <directory> -ext md,txt  Index matching files in one directory
  *   moon -dir <directory> -ext md -r   Index matching files recursively
+ *   moon -sample-merge -dir <root> -out <index-path> [-ext cpp,h,rs]
  *   moon -i                               Interactive search mode
  *
  * Index stored at:
@@ -308,6 +312,16 @@ static std::vector<FileItem> CollectDirectoryFiles(const std::string& path,
     return files;
 }
 
+static std::vector<FileItem> CollectSampleMergeFiles(const std::string& path,
+                                                     const std::vector<std::string>& extensions)
+{
+    auto files = CollectDirectoryFiles(path, extensions, true);
+    std::sort(files.begin(), files.end(), [](const FileItem& left, const FileItem& right) {
+        return left.path < right.path;
+    });
+    return files;
+}
+
 // Returns the filename without extension — used as the Title stream.
 static std::string Stem(const std::string& path)
 {
@@ -356,6 +370,33 @@ static bool BuildIndexFile(const std::string& savePath,
 
     std::cout << "  writing index: " << savePath << "\n";
     return kept > 0 && ctx.SaveIndex(savePath.c_str());
+}
+
+static bool AddFileDocument(IndexContext& ctx,
+                            const FileItem& file,
+                            uint64_t docId,
+                            uint64_t& kept,
+                            uint64_t& skipped,
+                            std::string* firstContent)
+{
+    std::string content = ReadFile(file.path);
+    if (content.empty()) {
+        std::cerr << "  skipping (empty/unreadable): " << file.path << "\n";
+        ++skipped;
+        return false;
+    }
+
+    if (firstContent && firstContent->empty())
+        *firstContent = content;
+
+    Document doc;
+    doc.doc_id = docId;
+    doc.path = file.path;
+    doc.title = Stem(file.path);
+    doc.body = std::move(content);
+    ctx.AddDocument(doc);
+    ++kept;
+    return true;
 }
 
 // ─── search ──────────────────────────────────────────────────────────────────
@@ -437,6 +478,12 @@ struct IndexOptions {
     bool recursive = false;
 };
 
+struct SampleMergeOptions {
+    std::string dirPath;
+    std::string outPath;
+    std::vector<std::string> extensions = ParseExtensions("cpp,h,rs");
+};
+
 static bool ParseBatchSize(const std::string& text, uint64_t& batchSize)
 {
     if (text.empty()) return false;
@@ -491,6 +538,35 @@ static bool ParseIndexOptions(const std::vector<std::string>& args,
     return false;
 }
 
+static bool ParseSampleMergeOptions(const std::vector<std::string>& args,
+                                    SampleMergeOptions& options,
+                                    std::string& error)
+{
+    for (size_t i = 1; i < args.size(); ++i) {
+        const std::string& arg = args[i];
+        if (arg == "-dir") {
+            if (i + 1 >= args.size()) { error = "Usage: moon -sample-merge -dir <root> -out <index-path> [-ext cpp,h,rs]"; return false; }
+            options.dirPath = args[++i];
+        } else if (arg == "-out") {
+            if (i + 1 >= args.size()) { error = "Usage: moon -sample-merge -dir <root> -out <index-path> [-ext cpp,h,rs]"; return false; }
+            options.outPath = args[++i];
+        } else if (arg == "-ext") {
+            if (i + 1 >= args.size()) { error = "Usage: moon -sample-merge -dir <root> -out <index-path> [-ext cpp,h,rs]"; return false; }
+            options.extensions = ParseExtensions(args[++i]);
+            if (options.extensions.empty()) { error = "-ext must include at least one extension"; return false; }
+        } else {
+            error = "Unknown sample merge option: " + arg;
+            return false;
+        }
+    }
+
+    if (options.dirPath.empty() || options.outPath.empty()) {
+        error = "Usage: moon -sample-merge -dir <root> -out <index-path> [-ext cpp,h,rs]";
+        return false;
+    }
+    return true;
+}
+
 static std::string JoinExtensions(const std::vector<std::string>& extensions)
 {
     std::string text;
@@ -504,13 +580,175 @@ static std::string JoinExtensions(const std::vector<std::string>& extensions)
 static void PrintHelp(const std::string& idxPath)
 {
     std::cout
-        << "moon — personal document search\n\n"
-        << "  moon -file <file>               Index one file\n"
-        << "  moon -dir <dir> -ext md,txt     Index files in one directory\n"
-        << "  moon -dir <dir> -ext md -r      Index files recursively\n"
-        << "  moon -b 200                     Batch size for new files (default 200)\n"
-        << "  moon -i                             Interactive search\n\n"
-        << "Index: " << idxPath << "\n";
+        << "moon — MoonShot command-line sample\n\n"
+        << "Global option:\n"
+        << "  -idx <index-path>                  Use this index instead of the default\n"
+        << "                                     Default: " << idxPath << "\n\n"
+        << "Build or update an index:\n"
+        << "  moon [-idx <index>] -file <file>\n"
+        << "      Index one file.\n\n"
+        << "  moon [-idx <index>] -dir <dir> -ext md,txt [-r] [-b 200]\n"
+        << "      Index files under <dir>. Use -r for recursive traversal.\n"
+        << "      -ext is a comma-separated extension list without or with dots.\n"
+        << "      -b controls how many new files are saved per delta batch.\n\n"
+        << "Search an index:\n"
+        << "  moon [-idx <index>] -i\n"
+        << "      Open an interactive search prompt for the selected index.\n\n"
+        << "Base/delta/merge sample:\n"
+        << "  moon -sample-merge -dir <root> -out <merged-index> [-ext cpp,h,rs]\n"
+        << "      Recursively indexes matching files, builds a base index and delta\n"
+        << "      index, merges them, reloads the merged output, and runs a sanity\n"
+        << "      query. This is the simplest end-to-end MoonShot merge sample.\n\n"
+        << "Examples:\n"
+        << "  moon -idx .\\notes.idx -dir .\\docs -ext md,txt -r\n"
+        << "  moon -idx .\\notes.idx -i\n"
+        << "  moon -sample-merge -dir . -out .\\build\\moonshot-source-merge.idx -ext cpp,h,rs\n";
+}
+
+static bool ApplyGlobalOptions(std::vector<std::string>& args,
+                               std::string& idxPath,
+                               std::string& error)
+{
+    std::vector<std::string> filtered;
+    for (size_t i = 0; i < args.size(); ++i) {
+        if (args[i] == "-idx") {
+            if (i + 1 >= args.size()) {
+                error = "Usage: moon -idx <index-path> <command>";
+                return false;
+            }
+            idxPath = AbsolutePath(args[++i]);
+        } else {
+            filtered.push_back(args[i]);
+        }
+    }
+    args = std::move(filtered);
+    return true;
+}
+
+static std::string FirstUsableQueryToken(const std::string& text)
+{
+    SmartTokenizer tokenizer;
+    auto tokens = tokenizer.Tokenize(text.c_str());
+    for (const auto& token : tokens) {
+        if (!token.empty())
+            return token;
+    }
+    return {};
+}
+
+static bool HasSearchResults(IndexContext& ctx, const std::string& query)
+{
+    if (query.empty() || ctx.DocumentCount() == 0)
+        return false;
+
+    std::unique_ptr<EvalTree> tree(ctx.Compile(query.c_str(), "AUTB"));
+    if (!tree || tree->IsEmpty())
+        return false;
+
+    std::unique_ptr<IndexSearchExecutor> exec(ctx.GetExecutor());
+    auto results = exec->Execute(ctx.GetReader(tree.get()), 5);
+    return !results.empty();
+}
+
+static int RunSampleMerge(const SampleMergeOptions& options)
+{
+    const std::string outPath = AbsolutePath(options.outPath);
+    const std::string basePath = outPath + ".base.tmp";
+    const std::string deltaPath = DeltaIndexPath(basePath);
+
+    std::error_code removeError;
+    std::filesystem::remove(FsPathFromUtf8(outPath), removeError);
+    removeError.clear();
+    std::filesystem::remove(FsPathFromUtf8(basePath), removeError);
+    removeError.clear();
+    std::filesystem::remove(FsPathFromUtf8(deltaPath), removeError);
+
+    auto files = CollectSampleMergeFiles(options.dirPath, options.extensions);
+    if (files.empty()) {
+        std::cerr << "No readable indexable files found under " << options.dirPath
+                  << " (ext=" << JoinExtensions(options.extensions) << ")\n";
+        return 1;
+    }
+
+    const size_t split = (files.size() + 1) / 2;
+    std::cout << "sample-merge: collected " << files.size() << " file(s) <= "
+              << (MAX_INDEX_FILE_BYTES / (1024 * 1024)) << "MB from " << options.dirPath
+              << " (ext=" << JoinExtensions(options.extensions) << ")\n";
+    std::cout << "sample-merge: staging base=" << basePath << " delta=" << deltaPath << "\n";
+
+    uint64_t baseKept = 0;
+    uint64_t baseSkipped = 0;
+    uint64_t deltaKept = 0;
+    uint64_t deltaSkipped = 0;
+    std::string firstContent;
+
+    {
+        IndexContext base("", "", false);
+        uint64_t nextDocId = 0;
+        for (size_t i = 0; i < split; ++i) {
+            if (AddFileDocument(base, files[i], nextDocId, baseKept, baseSkipped, &firstContent))
+                ++nextDocId;
+        }
+
+        if (baseKept == 0 || !base.SaveIndex(basePath.c_str())) {
+            std::cerr << "sample-merge: failed to save base index: " << basePath << "\n";
+            return 1;
+        }
+        std::cout << "sample-merge: saved base docs=" << baseKept;
+        if (baseSkipped) std::cout << " skipped=" << baseSkipped;
+        std::cout << "\n";
+    }
+
+    {
+        IndexContext delta("", basePath.c_str(), false);
+        uint64_t nextDocId = delta.DocumentCount();
+        for (size_t i = split; i < files.size(); ++i) {
+            if (AddFileDocument(delta, files[i], nextDocId, deltaKept, deltaSkipped, &firstContent))
+                ++nextDocId;
+        }
+
+        if (deltaKept == 0 || !delta.SaveIndex(deltaPath.c_str())) {
+            std::cerr << "sample-merge: failed to save delta index: " << deltaPath << "\n";
+            return 1;
+        }
+        std::cout << "sample-merge: saved delta docs=" << deltaKept;
+        if (deltaSkipped) std::cout << " skipped=" << deltaSkipped;
+        std::cout << "\n";
+    }
+
+    {
+        IndexContext mergeContext("", basePath.c_str());
+        if (!mergeContext.Merge(outPath.c_str())) {
+            std::cerr << "sample-merge: merge failed: " << outPath << "\n";
+            return 1;
+        }
+        std::cout << "sample-merge: merged output=" << outPath << "\n";
+    }
+
+    IndexContext merged("", outPath.c_str(), false);
+    const uint64_t expectedDocs = baseKept + deltaKept;
+    if (merged.DocumentCount() != expectedDocs) {
+        std::cerr << "sample-merge: verification failed, expected " << expectedDocs
+                  << " docs but loaded " << merged.DocumentCount() << "\n";
+        return 1;
+    }
+
+    std::string sanityQuery = "include";
+    if (!HasSearchResults(merged, sanityQuery)) {
+        sanityQuery = "class";
+        if (!HasSearchResults(merged, sanityQuery)) {
+            sanityQuery = FirstUsableQueryToken(firstContent);
+            if (!HasSearchResults(merged, sanityQuery)) {
+                std::cerr << "sample-merge: verification failed, no search results for sanity query\n";
+                return 1;
+            }
+        }
+    }
+
+    std::cout << "sample-merge: verified docs=" << expectedDocs
+              << " query=\"" << sanityQuery << "\"\n"
+              << "sample-merge: success\n";
+    return 0;
 }
 
 int main(int argc, char* argv[])
@@ -535,6 +773,12 @@ int main(int argc, char* argv[])
         args.push_back(argv[i]);
 #endif
 
+    std::string error;
+    if (!ApplyGlobalOptions(args, idxPath, error)) {
+        std::cerr << error << "\n";
+        return 1;
+    }
+
     const std::string cmd = args.empty() ? std::string() : args[0];
     if (cmd.empty()) {
         PrintHelp(idxPath);
@@ -544,7 +788,6 @@ int main(int argc, char* argv[])
     // ── index files ───────────────────────────────────────────────────────────
     if (IsIndexCommand(cmd)) {
         IndexOptions options;
-        std::string error;
         if (!ParseIndexOptions(args, options, error)) {
             std::cerr << error << "\n";
             return 1;
@@ -676,6 +919,15 @@ int main(int argc, char* argv[])
         std::cout << " to " << idxPath << "\n"
                   << "Total:   " << totalKept
                   << " indexed document(s)\n";
+
+    // ── sample base/delta merge ──────────────────────────────────────────────
+    } else if (cmd == "-sample-merge") {
+        SampleMergeOptions options;
+        if (!ParseSampleMergeOptions(args, options, error)) {
+            std::cerr << error << "\n";
+            return 1;
+        }
+        return RunSampleMerge(options);
 
     // ── interactive search ────────────────────────────────────────────────────
     } else if (cmd == "-i") {

@@ -386,9 +386,9 @@ public:
         // append base bytes then delta bytes. Delta postings already use final
         // doc ids, so there is no doc-id remap and no varbyte decode/re-encode.
         //
-        // The merged posting bytes and LeafTermEntry records are first packed
-        // into the merge-local block table, then dumped to temp streams after
-        // the term walk is complete.
+        // The merged posting bytes and LeafTermEntry records are packed into a
+        // fixed merge-local block table. When either side fills, the current
+        // batch is appended to the temp streams and the same term is retried.
         uint64_t headEntryCount = 0;
         uint64_t totalTerms = 0;
         uint32_t indexBlockCount = 0;
@@ -977,11 +977,6 @@ private:
             m_PostingIndexLength = 0;
             m_PostingContinuationBlockCount = 0;
             return true;
-        }
-
-        bool HasWriteData() const
-        {
-            return UsedLeafBlockCount() > 0 || UsedIndexBlockCount() > 0;
         }
 
         uint32_t UsedLeafBlockCount() const
