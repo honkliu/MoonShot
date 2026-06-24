@@ -949,10 +949,27 @@ private:
             return true;
         }
 
+        bool CanAddLeafTermEntry(const LeafTermBlockView& cursor) const
+        {
+            const auto* source = cursor.Current();
+            if (source->LTE_TermLength > HEAD_TERM_KEY_MAX) return true;
+
+            const size_t entryBytes = sizeof(LeafTermEntry) + source->LTE_TermLength;
+            if (entryBytes > sizeof(LeafTermBlock::LTB_Data)) return false;
+
+            uint32_t leafBlockID = m_LeafBlockID;
+            if (m_LeafEntryCount > 0
+                && (m_LeafEntryCount >= LEAF_TERM_DIRECTORY_COUNT - 1 || m_LeafWriteOffset + entryBytes > sizeof(LeafTermBlock::LTB_Data))) {
+                ++leafBlockID;
+            }
+            return leafBlockID < m_LeafTermBlockCount;
+        }
+
         bool AddLeafTermEntry(const LeafTermBlockView& cursor)
         {
             const auto* source = cursor.Current();
             if (source->LTE_TermLength > HEAD_TERM_KEY_MAX) return true;
+
             const uint8_t termLength = source->LTE_TermLength;
             const size_t entryBytes = sizeof(LeafTermEntry) + termLength;
 
