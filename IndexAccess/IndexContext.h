@@ -1083,12 +1083,12 @@ private:
             const uint8_t* sourceBytes = m_IndexBuffer;
             uint32_t targetBlockID = m_IndexBlockID;
             size_t targetOffset = m_IndexOffsetInBlock;
-            size_t mainLength = PostingPrefixBytes(sourceBytes, len, DATA_CAP - targetOffset);
-            if (mainLength == 0) {
+            size_t splitLength = PostingSplitLength(sourceBytes, len, DATA_CAP - targetOffset);
+            if (splitLength == 0) {
                 ++targetBlockID;
                 targetOffset = 0;
-                mainLength = PostingPrefixBytes(sourceBytes, len, DATA_CAP);
-                if (mainLength == 0) return false;
+                splitLength = PostingSplitLength(sourceBytes, len, DATA_CAP);
+                if (splitLength == 0) return false;
             }
             if (targetBlockID >= m_IndexBlockCount)
                 return false;
@@ -1121,10 +1121,10 @@ private:
             * enough, return false before committing any cursor or metadata state.
             */
             std::vector<ContinuationSegment> continuations;
-            size_t sourceOffset = mainLength;
+            size_t sourceOffset = splitLength;
             while (sourceOffset < len) {
                 const size_t remaining = len - sourceOffset;
-                const size_t continuationLength = PostingPrefixBytes(sourceBytes + sourceOffset, remaining, DATA_CAP - CONT_HDR);
+                const size_t continuationLength = PostingSplitLength(sourceBytes + sourceOffset, remaining, DATA_CAP - CONT_HDR);
                 if (continuationLength == 0) return false;
                 continuations.push_back({ sourceOffset, continuationLength, maxDocId(sourceBytes + sourceOffset, continuationLength) });
                 sourceOffset += continuationLength;
@@ -1140,7 +1140,7 @@ private:
             * readers advance by IndexBlockID + 1, +2, ...
             */
             auto* targetBlock = reinterpret_cast<IndexBlock*>(m_BlockTable->m_IndexPool.BCP_Pages + static_cast<size_t>(targetBlockID) * sizeof(IndexBlock));
-            std::memcpy(targetBlock->IB_Data + targetOffset, sourceBytes, mainLength);
+            std::memcpy(targetBlock->IB_Data + targetOffset, sourceBytes, splitLength);
 
             for (size_t i = 0; i < continuations.size(); ++i) {
                 const auto& continuation = continuations[i];
@@ -1158,10 +1158,10 @@ private:
             * remain in memory, but no metadata points at them.
             */
             m_IndexBlockID = targetBlockID + static_cast<uint32_t>(continuations.size());
-            m_IndexOffsetInBlock = continuations.empty() ? targetOffset + mainLength : DATA_CAP;
+            m_IndexOffsetInBlock = continuations.empty() ? targetOffset + splitLength : DATA_CAP;
             m_PostingIndexBlockID = targetBlockID;
             m_PostingIndexOffset = static_cast<uint32_t>(targetOffset);
-            m_PostingIndexLength = static_cast<uint32_t>(mainLength);
+            m_PostingIndexLength = static_cast<uint32_t>(splitLength);
             m_PostingContinuationBlockCount = static_cast<uint32_t>(continuations.size());
             m_PostingByteCount = len;
             m_PostingBytes = nullptr;
@@ -1257,7 +1257,7 @@ private:
         return readOne() && readOne();
     }
 
-    static size_t PostingPrefixBytes(const uint8_t* data, size_t size, size_t capacity)
+    static size_t PostingSplitLength(const uint8_t* data, size_t size, size_t capacity)
     {
         if (size <= capacity)
             return size;
@@ -1396,19 +1396,19 @@ private:
             if (IndexWriteOffset >= DATA_CAP && !FlushIndexBlock()) return false;
 
             size_t dataOffset = IndexWriteOffset;
-            size_t dataHere = PostingPrefixBytes(src, remaining, DATA_CAP - IndexWriteOffset);
-            if (dataHere == 0) {
+            size_t splitLength = PostingSplitLength(src, remaining, DATA_CAP - IndexWriteOffset);
+            if (splitLength == 0) {
                 if (!FlushIndexBlock()) return false;
                 dataOffset = IndexWriteOffset;
-                dataHere = PostingPrefixBytes(src, remaining, DATA_CAP);
-                if (dataHere == 0) return false;
+                splitLength = PostingSplitLength(src, remaining, DATA_CAP);
+                if (splitLength == 0) return false;
             }
 
             const uint32_t indexBlockID = IndexBlockCount;
-            std::memcpy(CurrentBlock.IB_Data + IndexWriteOffset, src, dataHere);
-            IndexWriteOffset += dataHere;
-            src += dataHere;
-            remaining -= dataHere;
+            std::memcpy(CurrentBlock.IB_Data + IndexWriteOffset, src, splitLength);
+            IndexWriteOffset += splitLength;
+            src += splitLength;
+            remaining -= splitLength;
 
             uint32_t continuationBlockCount = 0;
             if (remaining > 0) {
@@ -1416,13 +1416,13 @@ private:
 
                 while (remaining > 0) {
                     constexpr size_t CONT_HDR = sizeof(IndexBlockContinuationHeader);
-                    const size_t contHere = PostingPrefixBytes(src, remaining, DATA_CAP - CONT_HDR);
-                    if (contHere == 0) return false;
-                    const bool moreCont = contHere < remaining;
+                    const size_t continuationSplitLength = PostingSplitLength(src, remaining, DATA_CAP - CONT_HDR);
+                    if (continuationSplitLength == 0) return false;
+                    const bool moreCont = continuationSplitLength < remaining;
 
                     size_t cursor = 0;
                     uint64_t contMaxDocId = 0;
-                    while (cursor < contHere) {
+                    while (cursor < continuationSplitLength) {
                         contMaxDocId = 0;
                         uint8_t shift = 0;
                         while (true) {
@@ -1436,12 +1436,12 @@ private:
 
                     auto* header = reinterpret_cast<IndexBlockContinuationHeader*>(CurrentBlock.IB_Data + IndexWriteOffset);
                     header->IBCH_MaxDocID = contMaxDocId;
-                    header->IBCH_DataLength = static_cast<uint32_t>(contHere);
+                    header->IBCH_DataLength = static_cast<uint32_t>(continuationSplitLength);
                     IndexWriteOffset += sizeof(IndexBlockContinuationHeader);
-                    std::memcpy(CurrentBlock.IB_Data + IndexWriteOffset, src, contHere);
-                    IndexWriteOffset += contHere;
-                    src += contHere;
-                    remaining -= contHere;
+                    std::memcpy(CurrentBlock.IB_Data + IndexWriteOffset, src, continuationSplitLength);
+                    IndexWriteOffset += continuationSplitLength;
+                    src += continuationSplitLength;
+                    remaining -= continuationSplitLength;
                     ++continuationBlockCount;
 
                     // Preserve the partially used final continuation block so
@@ -1456,7 +1456,7 @@ private:
                                   docFreq,
                                   indexBlockID,
                                   static_cast<uint32_t>(dataOffset),
-                                  static_cast<uint32_t>(dataHere),
+                                  static_cast<uint32_t>(splitLength),
                                   continuationBlockCount);
         }
 
