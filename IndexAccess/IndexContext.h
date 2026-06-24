@@ -19,6 +19,7 @@
 #include <string>
 #include <string_view>
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -103,7 +104,7 @@ public:
         return maxId + 1;
     }
 
-    uint64_t AddDocument(const Document& doc)
+    uint64_t AddDocument(const Document& doc, bool buildVector = true)
     {
         const uint64_t docId = doc.doc_id == UINT64_MAX ? AllocateDocumentID() : doc.doc_id;
         auto writer = GetWriter();
@@ -115,22 +116,22 @@ public:
         auto bodyTokens = m_Tokenizer.Tokenize(doc.body.c_str());
         auto metaTokens = m_Tokenizer.Tokenize(doc.meta.c_str());
 
-        std::vector<std::string> embeddingTokens;
-        embeddingTokens.reserve(titleTokens.size() + urlTokens.size() + anchorTokens.size() + bodyTokens.size() + metaTokens.size());
-        embeddingTokens.insert(embeddingTokens.end(), titleTokens.begin(), titleTokens.end());
-        embeddingTokens.insert(embeddingTokens.end(), urlTokens.begin(), urlTokens.end());
-        embeddingTokens.insert(embeddingTokens.end(), anchorTokens.begin(), anchorTokens.end());
-        embeddingTokens.insert(embeddingTokens.end(), bodyTokens.begin(), bodyTokens.end());
-        embeddingTokens.insert(embeddingTokens.end(), metaTokens.begin(), metaTokens.end());
-
         writer->Write(titleTokens, docId, "Title");
         writer->Write(urlTokens, docId, "URL");
         writer->Write(anchorTokens, docId, "Anchor");
         writer->Write(bodyTokens, docId, "Body");
         writer->Write(metaTokens, docId, "Meta");
         writer->SetDocImportance(docId, doc.importance);
-        if (!embeddingTokens.empty())
+        if (buildVector) {
+            std::vector<std::string> embeddingTokens;
+            embeddingTokens.reserve(titleTokens.size() + urlTokens.size() + anchorTokens.size() + bodyTokens.size() + metaTokens.size());
+            embeddingTokens.insert(embeddingTokens.end(), titleTokens.begin(), titleTokens.end());
+            embeddingTokens.insert(embeddingTokens.end(), urlTokens.begin(), urlTokens.end());
+            embeddingTokens.insert(embeddingTokens.end(), anchorTokens.begin(), anchorTokens.end());
+            embeddingTokens.insert(embeddingTokens.end(), bodyTokens.begin(), bodyTokens.end());
+            embeddingTokens.insert(embeddingTokens.end(), metaTokens.begin(), metaTokens.end());
             writer->SetDocVector(docId, m_VectorIndex.GetModel()->Embed(embeddingTokens));
+        }
         if (!doc.path.empty())
             m_Store->SetDocPath(docId, doc.path);
 
@@ -273,7 +274,7 @@ public:
         if (!savingDeltaIndex)
             m_IndexPath = savePath;
 
-        if (!BuildRuntime(m_WriteBlockTable, m_WriteVectorIndex, m_WriteIndexFileHeader, m_WriteDocData, m_WriteBuilt))
+        if (!BuildRuntime(m_WriteBlockTable, m_WriteVectorIndex, m_WriteIndexFileHeader, m_WriteDocData, m_WriteBuilt, false))
             return false;
 
         if (overwritingLoadedIndex) {
@@ -322,6 +323,7 @@ public:
         // delta context loaded from <base>.delta.idx. The final output is first
         // written to <output>.tmp so the old index is not destroyed by a failed
         // merge.
+        const auto mergeStart = std::chrono::steady_clock::now();
         const std::string tempPath = std::string(outputPath) + ".tmp";
         const std::string prefix(outputPath);
         const std::string headTempPath = prefix + ".head.tmp";
@@ -343,6 +345,13 @@ public:
         };
 
         IndexContext& delta = *m_DeltaContext;
+        std::cout << "  merge input: baseDocs=" << m_IndexFileHeader.IFH_NumDocuments
+              << " deltaDocs=" << delta.m_IndexFileHeader.IFH_NumDocuments
+              << " baseLeafBlocks=" << m_IndexFileHeader.IFH_LeafTermBlockCount
+              << " deltaLeafBlocks=" << delta.m_IndexFileHeader.IFH_LeafTermBlockCount
+              << " baseIndexBlocks=" << m_IndexFileHeader.IFH_IndexBlockCount
+              << " deltaIndexBlocks=" << delta.m_IndexFileHeader.IFH_IndexBlockCount
+              << "\n";
 
         // Step 2: Write DocData to a temp stream by appending resident base
         // DocData first and resident delta DocData second. No old raw source
@@ -350,6 +359,7 @@ public:
         uint64_t mergedDocs = 0;
         float avgDocLength = 1.0f;
         {
+            auto stepStart = std::chrono::steady_clock::now();
             FileAccess docFile(docDataTempPath.c_str());
             if (!docFile.InitWrite()) { cleanupTempFiles(); return false; }
 
@@ -374,6 +384,10 @@ public:
             }
 
             avgDocLength = mergedDocs ? static_cast<float>(totalDocLength) / static_cast<float>(mergedDocs) : 1.0f;
+            std::cout << "  merge step2 wrote docdata bytes=" << (mergedDocs * DOC_REC_SIZE)
+                      << " docs=" << mergedDocs
+                      << " in " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - stepStart).count()
+                      << " ms\n";
         }
 
         // Step 3: Do a 3-way physical merge: base LeafTermEntry stream + delta
@@ -393,6 +407,14 @@ public:
         uint64_t totalTerms = 0;
         uint32_t indexBlockCount = 0;
         {
+            auto stepStart = std::chrono::steady_clock::now();
+            uint64_t baseOnlyTerms = 0;
+            uint64_t deltaOnlyTerms = 0;
+            uint64_t mergedPairTerms = 0;
+            uint64_t retryDumps = 0;
+            uint64_t finalDumps = 0;
+            uint64_t dumpedLeafBlocks = 0;
+            uint64_t dumpedIndexBlocks = 0;
             auto headFile = std::make_unique<FileAccess>(headTempPath.c_str());
             auto indexFile = std::make_unique<FileAccess>(indexTempPath.c_str());
             auto leafFile = std::make_unique<FileAccess>(leafTempPath.c_str());
@@ -400,8 +422,8 @@ public:
 
             LeafTermBlockView baseCursor(m_BlockTable);
             LeafTermBlockView deltaCursor(delta.m_BlockTable);
-            constexpr uint32_t MERGED_LEAF_BLOCK_LIMIT = 100;
-            constexpr uint32_t MERGED_INDEX_BLOCK_LIMIT = 200;
+            constexpr uint32_t MERGED_LEAF_BLOCK_LIMIT = 32 * 1024;
+            constexpr uint32_t MERGED_INDEX_BLOCK_LIMIT = 32 * 1024;
             IndexBlockTable mergedBlockTable;
             auto* mergedIndexBlocks = mergedBlockTable.Init(BlockKind::Index, nullptr, 0, MERGED_INDEX_BLOCK_LIMIT, MERGED_INDEX_BLOCK_LIMIT);
             auto* mergedLeafBlocks = mergedBlockTable.Init(BlockKind::LeafTerm, nullptr, 0, MERGED_LEAF_BLOCK_LIMIT, MERGED_LEAF_BLOCK_LIMIT);
@@ -418,7 +440,7 @@ public:
                 const uint32_t usedIndexBlocks = mergedCursor.UsedIndexBlockCount();
                 if (usedLeafBlocks == 0 && usedIndexBlocks == 0) return true;
 
-                HeadTermEntry heads[MERGED_LEAF_BLOCK_LIMIT]{};
+                std::vector<HeadTermEntry> heads(usedLeafBlocks);
                 const auto* leafBlocks = reinterpret_cast<const LeafTermBlock*>(mergedLeafBlocks);
                 for (uint32_t leafBlockID = 0; leafBlockID < usedLeafBlocks; ++leafBlockID) {
                     const auto& leaf = leafBlocks[leafBlockID];
@@ -431,12 +453,14 @@ public:
                     totalTerms += entryCount;
                 }
 
-                if (!headFile->PutData(heads, static_cast<uint64_t>(usedLeafBlocks) * sizeof(HeadTermEntry))) return false;
+                if (!headFile->PutData(heads.data(), static_cast<uint64_t>(usedLeafBlocks) * sizeof(HeadTermEntry))) return false;
                 if (!leafFile->PutData(mergedLeafBlocks, static_cast<uint64_t>(usedLeafBlocks) * sizeof(LeafTermBlock))) return false;
                 headEntryCount += usedLeafBlocks;
 
                 if (!indexFile->PutData(mergedIndexBlocks, static_cast<uint64_t>(usedIndexBlocks) * sizeof(IndexBlock))) return false;
                 indexBlockCount += usedIndexBlocks;
+                dumpedLeafBlocks += usedLeafBlocks;
+                dumpedIndexBlocks += usedIndexBlocks;
 
                 std::memset(mergedIndexBlocks, 0, static_cast<size_t>(MERGED_INDEX_BLOCK_LIMIT) * sizeof(IndexBlock));
                 std::memset(mergedLeafBlocks, 0, static_cast<size_t>(MERGED_LEAF_BLOCK_LIMIT) * sizeof(LeafTermBlock));
@@ -458,7 +482,9 @@ public:
                         && mergedCursor.AddLeafTermEntry(baseCursor)) {
                         advanceBase = true;
                         advanceDelta = true;
+                        ++mergedPairTerms;
                     } else {
+                        ++retryDumps;
                         if (!dumpBatch()) { cleanupTempFiles(); return false; }
                     }
                 } else if (takeBase) {
@@ -466,7 +492,9 @@ public:
                         && mergedCursor.AddIndex(baseCursor)
                         && mergedCursor.AddLeafTermEntry(baseCursor)) {
                         advanceBase = true;
+                        ++baseOnlyTerms;
                     } else {
+                        ++retryDumps;
                         if (!dumpBatch()) { cleanupTempFiles(); return false; }
                     }
                 } else if (takeDelta) {
@@ -474,7 +502,9 @@ public:
                         && mergedCursor.AddIndex(deltaCursor)
                         && mergedCursor.AddLeafTermEntry(deltaCursor)) {
                         advanceDelta = true;
+                        ++deltaOnlyTerms;
                     } else {
+                        ++retryDumps;
                         if (!dumpBatch()) { cleanupTempFiles(); return false; }
                     }
                 } else {
@@ -486,15 +516,30 @@ public:
                 if (advanceDelta) ++deltaCursor;
             }
 
+            if (mergedCursor.UsedLeafBlockCount() > 0 || mergedCursor.UsedIndexBlockCount() > 0)
+                ++finalDumps;
             if (!dumpBatch()) { cleanupTempFiles(); return false; }
             headFile.reset();
             indexFile.reset();
             leafFile.reset();
+            std::cout << "  merge step3 wrote leaf/index batches in "
+                      << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - stepStart).count()
+                      << " ms"
+                      << " terms(base=" << baseOnlyTerms
+                      << ", delta=" << deltaOnlyTerms
+                      << ", equal=" << mergedPairTerms
+                      << ", total=" << totalTerms
+                      << ") dumps(retry=" << retryDumps
+                      << ", final=" << finalDumps
+                      << ") blocks(leaf=" << dumpedLeafBlocks
+                      << ", index=" << dumpedIndexBlocks
+                      << ")\n";
         }
 
         // Step 4: Assemble <output>.tmp in v12 physical order, patch the header,
         // release old file handles, then rename <output>.tmp to the final path.
         {
+            auto stepStart = std::chrono::steady_clock::now();
             FileAccess output(tempPath.c_str());
             if (!output.InitWrite()) { cleanupTempFiles(); return false; }
 
@@ -522,6 +567,14 @@ public:
                 cleanupTempFiles();
                 return false;
             }
+            const uint64_t outputBytes = header.IFH_IndexBlockOffset + static_cast<uint64_t>(indexBlockCount) * sizeof(IndexBlock);
+            std::cout << "  merge step4 assembled final index in "
+                      << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - stepStart).count()
+                      << " ms bytes=" << outputBytes
+                      << " head=" << headEntryCount
+                      << " leaf=" << header.IFH_LeafTermBlockCount
+                      << " index=" << indexBlockCount
+                      << "\n";
         }
 
         std::remove(headTempPath.c_str());
@@ -535,6 +588,9 @@ public:
             cleanupTempFiles();
             return false;
         }
+        std::cout << "  merge total completed in "
+                  << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - mergeStart).count()
+                  << " ms\n";
         return true;
     }
 
@@ -800,7 +856,8 @@ private:
                       FreshDiskAnnVectorIndex& vectorIndex,
                       IndexFileHeader& header,
                       uint8_t*& docData,
-                      bool& built)
+                      bool& built,
+                      bool buildVectorIndex = true)
     {
         if (built) return true;
 
@@ -831,7 +888,8 @@ private:
             entry->DDE_DocLength = stats.doc_len;
             entry->DDE_VectorDim = static_cast<uint16_t>(DOC_VECTOR_DIM);
             entry->DDE_VectorFormat = 1;
-            std::memcpy(entry->DDE_VectorData, m_Store->GetDocVector(docId), DOC_VECTOR_DIM);
+            if (m_Store->HasDocVector(docId))
+                std::memcpy(entry->DDE_VectorData, m_Store->GetDocVector(docId), DOC_VECTOR_DIM);
             entry->DDE_PathLength = static_cast<uint16_t>(std::min(stats.path.size(), DOC_PATH_MAX));
             if (entry->DDE_PathLength > 0)
                 std::memcpy(entry->DDE_Path, stats.path.data(), entry->DDE_PathLength);
@@ -884,9 +942,13 @@ private:
 
         blockTable.SetHeadTermEntries(std::move(headTermEntries), headCount);
 
-        vectorIndex.SetDocData(docData);
-        for (uint64_t docId = 0; docId < header.IFH_NumDocuments; ++docId)
-            vectorIndex.Add(docId);
+        if (buildVectorIndex) {
+            vectorIndex.SetDocData(docData);
+            for (const auto& [docId, _] : m_Store->AllDocStats()) {
+                if (m_Store->HasDocVector(docId))
+                    vectorIndex.Add(docId);
+            }
+        }
 
         built = true;
         return true;

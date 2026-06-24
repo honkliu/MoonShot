@@ -57,6 +57,7 @@ public:
     {
         m_Dim = DOC_VECTOR_DIM;
         m_Nodes.clear();
+        m_DocIds.clear();
         m_DocData = nullptr;
         m_EntryPoint = npos();
         m_MaxLevel = 0;
@@ -97,7 +98,7 @@ public:
 
         results.reserve(candidates.size());
         for (const auto& candidate : candidates)
-            results.push_back({candidate.second, Score(candidate.second, query, metric)});
+            results.push_back({m_DocIds[static_cast<size_t>(candidate.second)], Score(candidate.second, query, metric)});
 
         std::sort(results.begin(), results.end(), [](const auto& a, const auto& b) {
             if (a.score != b.score) return a.score > b.score;
@@ -110,17 +111,16 @@ public:
 private:
     bool AddNode(uint64_t docId)
     {
-        if (docId < m_Nodes.size()) {
+        if (std::find(m_DocIds.begin(), m_DocIds.end(), docId) != m_DocIds.end()) {
             return true;
         }
-        if (docId != m_Nodes.size())
-            return false;
 
         Node node;
         node.level = RandomLevel(docId);
         node.neighbors.resize(node.level + 1);
 
-        const NodeID newNodeID = docId;
+        const NodeID newNodeID = static_cast<NodeID>(m_Nodes.size());
+        m_DocIds.push_back(docId);
         m_Nodes.push_back(std::move(node));
 
         if (m_EntryPoint == npos()) {
@@ -130,7 +130,7 @@ private:
         }
 
         NodeID entry = m_EntryPoint;
-        const int8_t* newVector = GetDocVector(newNodeID);
+        const int8_t* newVector = GetNodeVector(newNodeID);
         for (int level = static_cast<int>(m_MaxLevel); level > static_cast<int>(m_Nodes[static_cast<size_t>(newNodeID)].level); --level)
             entry = GreedySearchLayer(newVector, entry, static_cast<size_t>(level));
 
@@ -173,6 +173,11 @@ private:
     const int8_t* GetDocVector(uint64_t docId) const
     {
         return reinterpret_cast<const int8_t*>(m_DocData + docId * DOC_REC_SIZE + DOC_VECTOR_OFFSET);
+    }
+
+    const int8_t* GetNodeVector(NodeID nodeID) const
+    {
+        return GetDocVector(m_DocIds[static_cast<size_t>(nodeID)]);
     }
 
     static float ScoreQueryToDoc(const std::vector<float>& query,
@@ -250,12 +255,12 @@ private:
 
     float Score(NodeID nodeID, const std::vector<float>& query, VectorMetric metric = VectorMetric::Cosine) const
     {
-        return ScoreQueryToDoc(query, GetDocVector(nodeID), metric);
+        return ScoreQueryToDoc(query, GetNodeVector(nodeID), metric);
     }
 
     float Score(NodeID nodeID, const int8_t* query, VectorMetric metric = VectorMetric::Cosine) const
     {
-        return ScoreDocToDoc(query, GetDocVector(nodeID), metric);
+        return ScoreDocToDoc(query, GetNodeVector(nodeID), metric);
     }
 
     template <typename QueryVector>
@@ -355,7 +360,7 @@ private:
         if (std::find(links.begin(), links.end(), neighbor) == links.end())
             links.push_back(neighbor);
         if (links.size() > m_MaxNeighbors) {
-            const int8_t* query = GetDocVector(node);
+            const int8_t* query = GetNodeVector(node);
             std::sort(links.begin(), links.end(), [&](NodeID a, NodeID b) {
                 float sa = Score(a, query);
                 float sb = Score(b, query);
@@ -370,6 +375,7 @@ private:
     size_t m_MaxNeighbors = 32;
     size_t m_EfConstruction = 200;
     std::vector<Node> m_Nodes;
+    std::vector<uint64_t> m_DocIds;
     const uint8_t* m_DocData = nullptr;
     NodeID m_EntryPoint = npos();
     size_t m_MaxLevel = 0;

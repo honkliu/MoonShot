@@ -184,6 +184,8 @@ public:
 
     const int8_t* GetDocVector(uint64_t doc_id) const { return m_DocVectors.at(doc_id).data(); }
 
+    bool HasDocVector(uint64_t doc_id) const { return m_DocVectors.find(doc_id) != m_DocVectors.end(); }
+
     uint64_t TotalTerms() const { return m_TotalTerms; }
 
     uint64_t TotalPostingEntries() const { return m_PostingEntries; }

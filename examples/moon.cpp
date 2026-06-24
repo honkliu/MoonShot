@@ -359,7 +359,7 @@ static bool BuildIndexFile(const std::string& savePath,
         doc.path = fp;
         doc.title = Stem(fp);
         doc.body = std::move(content);
-        ctx.AddDocument(doc);
+        ctx.AddDocument(doc, false);
         ++kept;
 
         if (processed == total || processed % 25 == 0) {
@@ -369,7 +369,12 @@ static bool BuildIndexFile(const std::string& savePath,
     }
 
     std::cout << "  writing index: " << savePath << "\n";
-    return kept > 0 && ctx.SaveIndex(savePath.c_str());
+    auto saveStart = std::chrono::steady_clock::now();
+    const bool saved = kept > 0 && ctx.SaveIndex(savePath.c_str());
+    const auto saveMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - saveStart).count();
+    std::cout << "  wrote index in " << saveMs << " ms\n";
+    return saved;
 }
 
 static bool AddFileDocument(IndexContext& ctx,
@@ -394,7 +399,7 @@ static bool AddFileDocument(IndexContext& ctx,
     doc.path = file.path;
     doc.title = Stem(file.path);
     doc.body = std::move(content);
-    ctx.AddDocument(doc);
+    ctx.AddDocument(doc, false);
     ++kept;
     return true;
 }
@@ -650,6 +655,16 @@ static bool HasSearchResults(IndexContext& ctx, const std::string& query)
     return !results.empty();
 }
 
+static uint64_t CountStoredDocuments(IndexContext& ctx, uint64_t firstDocId = 0)
+{
+    uint64_t count = 0;
+    for (uint64_t docId = firstDocId; docId < ctx.DocumentCount(); ++docId) {
+        if (!ctx.GetDocPath(docId).empty())
+            ++count;
+    }
+    return count;
+}
+
 static int RunSampleMerge(const SampleMergeOptions& options)
 {
     const std::string outPath = AbsolutePath(options.outPath);
@@ -818,6 +833,17 @@ int main(int argc, char* argv[])
 
         const std::string deltaPath = DeltaIndexPath(idxPath);
 
+        if (IndexSerializer::IsValidIndex(idxPath.c_str()) && IndexSerializer::IsValidIndex(deltaPath.c_str())) {
+            std::cout << "Merging pending delta into " << idxPath << "\n";
+            IndexContext mergeContext("", idxPath.c_str());
+            if (!mergeContext.Merge(idxPath.c_str())) {
+                std::cerr << "Failed to merge pending delta into index: " << idxPath << "\n";
+                return 1;
+            }
+            std::error_code removeError;
+            std::filesystem::remove(FsPathFromUtf8(deltaPath), removeError);
+        }
+
         uint64_t baseNextId = 0;
         uint64_t deltaNextId = 0;
         PathMap baseMap = LoadPathMapFromIndex(idxPath, baseNextId);
@@ -882,6 +908,7 @@ int main(int argc, char* argv[])
             } else {
                 // Build each batch as a compact delta, then release the batch file
                 // handle before loading/merging so Windows can replace the final idx.
+                std::cout << "  staging delta: " << deltaPath << "\n";
                 std::error_code deltaReplaceError;
                 std::filesystem::remove(FsPathFromUtf8(deltaPath), deltaReplaceError);
                 deltaReplaceError.clear();
@@ -891,11 +918,16 @@ int main(int argc, char* argv[])
                     return 1;
                 }
 
+                std::cout << "  merging delta into: " << idxPath << "\n";
+                auto mergeStart = std::chrono::steady_clock::now();
                 IndexContext mergeContext("", idxPath.c_str());
                 if (!mergeContext.Merge(idxPath.c_str())) {
                     std::cerr << "Failed to merge delta into index: " << idxPath << "\n";
                     return 1;
                 }
+                const auto mergeMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - mergeStart).count();
+                std::cout << "  merged in " << mergeMs << " ms\n";
             }
 
             baseNextId = 0;
@@ -935,9 +967,9 @@ int main(int argc, char* argv[])
         IndexContext ctx("", idxPath.c_str());
         auto loadMs = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - loadStart).count();
-        uint64_t totalDocuments = ctx.DocumentCount();
+        uint64_t totalDocuments = CountStoredDocuments(ctx);
         if (auto* delta = ctx.GetDeltaContext())
-            totalDocuments += delta->DocumentCount();
+            totalDocuments += CountStoredDocuments(*delta, ctx.DocumentCount());
 
         std::cout << "moon search — "
                   << totalDocuments
