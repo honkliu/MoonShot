@@ -346,10 +346,19 @@ class IndexBlockTable
 
         void* GetBlock(BlockKind kind, uint32_t block_seq, uint32_t* slotOut)
         {
+            BlockCachePool& pool = kind == BlockKind::Index ? m_IndexPool : m_LeafTermPool;
+            if (pool.BCP_Pages && block_seq < pool.BCP_TotalBlockCount && pool.BCP_LogicTable) {
+                const uint32_t slot = pool.BCP_LogicTable[block_seq];
+                if (slot != UINT32_MAX && slot < pool.BCP_SlotCount) {
+                    ++pool.BCP_SlotTable[slot].Ref;
+                    *slotOut = slot;
+                    return pool.BCP_Pages + static_cast<size_t>(slot) * PAGE_SIZE;
+                }
+            }
+
             BlockRequest request;
             request.Type = BlockRequestType::Get;
             request.BlockSeq = block_seq;
-            BlockCachePool& pool = kind == BlockKind::Index ? m_IndexPool : m_LeafTermPool;
             {
                 std::lock_guard<std::mutex> lock(pool.BCP_RequestMutex);
                 pool.BCP_Requests.push_back(&request);
@@ -362,10 +371,16 @@ class IndexBlockTable
 
         void ReleaseBlock(BlockKind kind, uint32_t slot)
         {
+            if (slot == UINT32_MAX) return;
+            BlockCachePool& pool = kind == BlockKind::Index ? m_IndexPool : m_LeafTermPool;
+            if (pool.BCP_SlotTable && slot < pool.BCP_SlotCount && pool.BCP_SlotTable[slot].Ref > 0) {
+                --pool.BCP_SlotTable[slot].Ref;
+                return;
+            }
+
             BlockRequest request;
             request.Type = BlockRequestType::Release;
             request.Slot = slot;
-            BlockCachePool& pool = kind == BlockKind::Index ? m_IndexPool : m_LeafTermPool;
             {
                 std::lock_guard<std::mutex> lock(pool.BCP_RequestMutex);
                 pool.BCP_Requests.push_back(&request);
