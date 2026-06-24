@@ -920,6 +920,8 @@ private:
                 m_PostingBytes = static_cast<IndexBlock*>(m_BlockTable->GetBlock(BlockKind::Index, 0, &m_PostingSlot))->IB_Data;
 
             m_PostingByteCount = 0;
+            m_PostingIndexBlockID = 0;
+            m_PostingIndexOffset = 0;
             m_Term = cursor.CurrentTerm();
             m_DocFreq = cursor.m_CurrentEntry->LTE_DocFreq;
             cursor.ReadPostingBytesTo(m_PostingBytes, m_PostingByteCount);
@@ -935,8 +937,111 @@ private:
                 m_PostingBytes = static_cast<IndexBlock*>(m_BlockTable->GetBlock(BlockKind::Index, 0, &m_PostingSlot))->IB_Data;
 
             m_PostingByteCount = 0;
+            m_PostingIndexBlockID = 0;
+            m_PostingIndexOffset = 0;
             m_Term = smallCursor.CurrentTerm();
             m_DocFreq = smallCursor.m_CurrentEntry->LTE_DocFreq + bigCursor.m_CurrentEntry->LTE_DocFreq;
+            smallCursor.ReadPostingBytesTo(m_PostingBytes, m_PostingByteCount);
+            bigCursor.ReadPostingBytesTo(m_PostingBytes, m_PostingByteCount);
+            return true;
+        }
+
+        bool AddLeafTermEntry(const LeafTermBlockView& cursor)
+        {
+            const auto* source = cursor.Current();
+            if (source->LTE_TermLength > HEAD_TERM_KEY_MAX) return true;
+            const uint8_t termLength = source->LTE_TermLength;
+            const size_t entryBytes = sizeof(LeafTermEntry) + termLength;
+
+            if (m_LeafEntryCount > 0
+                && (m_LeafEntryCount >= LEAF_TERM_DIRECTORY_COUNT - 1 || m_LeafWriteOffset + entryBytes > sizeof(LeafTermBlock::LTB_Data))) {
+                auto* currentLeaf = reinterpret_cast<LeafTermBlock*>(m_BlockTable->m_LeafTermPool.BCP_Pages + m_LeafBlockID * sizeof(LeafTermBlock));
+                currentLeaf->LTB_Directory[LEAF_TERM_DIRECTORY_COUNT - 1] = static_cast<uint16_t>(m_LeafEntryCount);
+                ++m_LeafBlockID;
+                m_LeafWriteOffset = 0;
+                m_LeafEntryCount = 0;
+            }
+
+            if (m_LeafBlockID >= m_LeafTermBlockCount || entryBytes > sizeof(LeafTermBlock::LTB_Data))
+                return false;
+
+            auto* leaf = reinterpret_cast<LeafTermBlock*>(m_BlockTable->m_LeafTermPool.BCP_Pages + m_LeafBlockID * sizeof(LeafTermBlock));
+            leaf->LTB_Directory[m_LeafEntryCount] = static_cast<uint16_t>(LEAF_TERM_DATA_OFFSET + m_LeafWriteOffset);
+            auto* entry = reinterpret_cast<LeafTermEntry*>(leaf->LTB_Data + m_LeafWriteOffset);
+            std::memcpy(entry, source, entryBytes);
+            entry->LTE_DocFreq = m_DocFreq;
+            entry->LTE_IndexBlockID = m_PostingIndexBlockID;
+            entry->LTE_IndexOffset = m_PostingIndexOffset;
+            entry->LTE_IndexLength = m_PostingIndexLength;
+            entry->LTE_ContinuationBlockCount = m_PostingContinuationBlockCount;
+            m_LeafWriteOffset += entryBytes;
+            ++m_LeafEntryCount;
+            leaf->LTB_Directory[LEAF_TERM_DIRECTORY_COUNT - 1] = static_cast<uint16_t>(m_LeafEntryCount);
+            m_PostingBytes = nullptr;
+            m_PostingByteCount = 0;
+            m_PostingIndexLength = 0;
+            m_PostingContinuationBlockCount = 0;
+            return true;
+        }
+
+        bool AddIndex(const LeafTermBlockView& cursor)
+        {
+            constexpr size_t DATA_CAP = sizeof(IndexBlock::IB_Data);
+            const auto* source = cursor.Current();
+
+            uint32_t indexBlockID = m_IndexBlockID;
+            size_t indexWriteOffset = m_IndexWriteOffset;
+            if (indexWriteOffset + source->LTE_IndexLength > DATA_CAP) {
+                ++indexBlockID;
+                indexWriteOffset = 0;
+            }
+            if (indexBlockID >= m_IndexBlockCount || indexBlockID + source->LTE_ContinuationBlockCount >= m_IndexBlockCount)
+                return false;
+
+            m_IndexBlockID = indexBlockID;
+            m_IndexWriteOffset = indexWriteOffset;
+            m_PostingIndexBlockID = m_IndexBlockID;
+            m_PostingIndexOffset = static_cast<uint32_t>(m_IndexWriteOffset);
+            m_PostingIndexLength = source->LTE_IndexLength;
+            m_PostingContinuationBlockCount = source->LTE_ContinuationBlockCount;
+            m_PostingByteCount = 0;
+
+            uint32_t sourceSlot = UINT32_MAX;
+            const auto* sourceBlock = static_cast<const IndexBlock*>(cursor.m_BlockTable->GetBlock(BlockKind::Index, source->LTE_IndexBlockID, &sourceSlot));
+            auto* targetBlock = reinterpret_cast<IndexBlock*>(m_BlockTable->m_IndexPool.BCP_Pages + static_cast<size_t>(m_IndexBlockID) * sizeof(IndexBlock));
+            std::memcpy(targetBlock->IB_Data + m_IndexWriteOffset, sourceBlock->IB_Data + source->LTE_IndexOffset, source->LTE_IndexLength);
+            m_IndexWriteOffset += source->LTE_IndexLength;
+            m_PostingByteCount += source->LTE_IndexLength;
+            cursor.m_BlockTable->ReleaseBlock(BlockKind::Index, sourceSlot);
+
+            for (uint32_t i = 0; i < source->LTE_ContinuationBlockCount; ++i) {
+                ++m_IndexBlockID;
+                m_IndexWriteOffset = 0;
+                sourceSlot = UINT32_MAX;
+                const auto* sourceContinuation = static_cast<const IndexBlock*>(cursor.m_BlockTable->GetBlock(BlockKind::Index, source->LTE_IndexBlockID + 1 + i, &sourceSlot));
+                const auto* header = reinterpret_cast<const IndexBlockContinuationHeader*>(sourceContinuation->IB_Data);
+                const size_t bytes = sizeof(IndexBlockContinuationHeader) + header->IBCH_DataLength;
+                targetBlock = reinterpret_cast<IndexBlock*>(m_BlockTable->m_IndexPool.BCP_Pages + static_cast<size_t>(m_IndexBlockID) * sizeof(IndexBlock));
+                std::memcpy(targetBlock->IB_Data, sourceContinuation->IB_Data, bytes);
+                m_IndexWriteOffset = bytes;
+                m_PostingByteCount += header->IBCH_DataLength;
+                cursor.m_BlockTable->ReleaseBlock(BlockKind::Index, sourceSlot);
+            }
+            return true;
+        }
+
+        bool AddIndex(const LeafTermBlockView& smallCursor, const LeafTermBlockView& bigCursor)
+        {
+            const size_t bytesNeeded = smallCursor.PostingBytesSize() + bigCursor.PostingBytesSize();
+            if (bytesNeeded > PostingCapacity()) return false;
+            if (!m_PostingBytes)
+                m_PostingBytes = static_cast<IndexBlock*>(m_BlockTable->GetBlock(BlockKind::Index, 0, &m_PostingSlot))->IB_Data;
+
+            m_PostingIndexBlockID = 0;
+            m_PostingIndexOffset = 0;
+            m_PostingIndexLength = static_cast<uint32_t>(bytesNeeded);
+            m_PostingContinuationBlockCount = 0;
+            m_PostingByteCount = 0;
             smallCursor.ReadPostingBytesTo(m_PostingBytes, m_PostingByteCount);
             bigCursor.ReadPostingBytesTo(m_PostingBytes, m_PostingByteCount);
             return true;
@@ -957,9 +1062,17 @@ private:
         uint32_t m_LeafSlot = UINT32_MAX;
         uint8_t* m_PostingBytes = nullptr;
         size_t m_PostingByteCount = 0;
+        uint32_t m_PostingIndexBlockID = 0;
+        uint32_t m_PostingIndexOffset = 0;
+        uint32_t m_PostingIndexLength = 0;
+        uint32_t m_PostingContinuationBlockCount = 0;
         uint32_t m_PostingSlot = UINT32_MAX;
         std::string_view m_Term;
         uint32_t m_DocFreq = 0;
+        size_t m_LeafWriteOffset = 0;
+        uint32_t m_LeafEntryCount = 0;
+        uint32_t m_IndexBlockID = 0;
+        size_t m_IndexWriteOffset = 0;
 
         std::string_view CurrentTerm() const
         {
