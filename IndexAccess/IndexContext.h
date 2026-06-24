@@ -1259,16 +1259,19 @@ private:
 
     static size_t PostingPrefixBytes(const uint8_t* data, size_t size, size_t capacity)
     {
-        size_t cursor = 0;
+        if (size <= capacity)
+            return size;
+
+        size_t byteOffset = 0;
         size_t lastPairEnd = 0;
         const size_t limit = std::min(size, capacity);
-        while (cursor < limit) {
-            const size_t before = cursor;
-            if (!ReadVbPairEnd(data, size, cursor) || cursor > limit) {
-                cursor = before;
+        while (byteOffset < limit) {
+            const size_t pairStart = byteOffset;
+            if (!ReadVbPairEnd(data, size, byteOffset) || byteOffset > limit) {
+                byteOffset = pairStart;
                 break;
             }
-            lastPairEnd = cursor;
+            lastPairEnd = byteOffset;
         }
         return lastPairEnd;
     }
