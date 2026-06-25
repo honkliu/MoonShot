@@ -4,7 +4,9 @@
  * Usage:
  *   moon -idx <index> -file <filepath>       Index one file into <index>
  *   moon -idx <index> -dir <directory> -r    Index files recursively into <index>
- *   moon -idx <index> -i                     Search <index>
+ *   moon -idx <index> -i                     Search <index> with inverted index
+ *   moon -idx <index> -v                     Search <index> with vector index
+ *   moon -idx <index> -i -v                  Search <index> with both
  *   moon -file <filepath>              Index one file
  *   moon -dir <directory> -ext md,txt  Index matching files in one directory
  *   moon -dir <directory> -ext md -r   Index matching files recursively
@@ -28,6 +30,7 @@
 #include <set>
 #include <sstream>
 #include <string>
+#include <unordered_map>
 #include <vector>
 #include <filesystem>
 #include <chrono>
@@ -359,7 +362,7 @@ static bool BuildIndexFile(const std::string& savePath,
         doc.path = fp;
         doc.title = Stem(fp);
         doc.body = std::move(content);
-        ctx.AddDocument(doc, false);
+        ctx.AddDocument(doc);
         ++kept;
 
         if (processed == total || processed % 25 == 0) {
@@ -399,7 +402,7 @@ static bool AddFileDocument(IndexContext& ctx,
     doc.path = file.path;
     doc.title = Stem(file.path);
     doc.body = std::move(content);
-    ctx.AddDocument(doc, false);
+    ctx.AddDocument(doc);
     ++kept;
     return true;
 }
@@ -409,34 +412,79 @@ static bool AddFileDocument(IndexContext& ctx,
 struct SearchHit {
     const IndexContext* context = nullptr;
     SearchResult result;
+    uint8_t recallMask = 0;
 };
+
+static constexpr uint8_t RECALL_INVERTED = 1;
+static constexpr uint8_t RECALL_VECTOR = 2;
+
+struct SearchOptions {
+    bool inverted = false;
+    bool vector = false;
+};
+
+static std::vector<SearchResult> ExecuteQuery(IndexContext& ctx,
+                                              const std::string& query,
+                                              const char* streams)
+{
+    std::unique_ptr<IndexSearchExecutor> executor(ctx.GetExecutor());
+    return executor->Execute(ctx.GetReader(query.c_str(), streams), 0);
+}
+
+static float StaticRankForDoc(const IndexContext& ctx, uint64_t docId)
+{
+    const auto* entry = ctx.GetDocDataEntry(docId);
+    return entry ? entry->DDE_StaticRank : 0.0f;
+}
+
+static const char* RecallPrefix(uint8_t recallMask)
+{
+    switch (recallMask) {
+        case RECALL_INVERTED | RECALL_VECTOR: return "++";
+        case RECALL_INVERTED: return "+-";
+        case RECALL_VECTOR: return "-+";
+        default: return "--";
+    }
+}
 
 static void CollectSearchResults(IndexContext& ctx,
                                  const std::string& query,
+                                 const SearchOptions& options,
                                  std::vector<SearchHit>& hits)
 {
     if (ctx.DocumentCount() == 0)
         return;
 
-    std::unique_ptr<EvalTree> tree(ctx.Compile(query.c_str(), "AUTB"));
+    std::unordered_map<uint64_t, size_t> hitByDocId;
 
-    if (!tree || tree->IsEmpty())
-        return;
+    auto addResults = [&](const std::vector<SearchResult>& results, uint8_t recallMask) {
+        for (const auto& result : results) {
+            auto [it, inserted] = hitByDocId.emplace(result.doc_id, hits.size());
+            if (inserted) {
+                hits.push_back({&ctx, result, recallMask});
+                continue;
+            }
 
-    auto reader = ctx.GetReader(tree.get());
-    std::unique_ptr<IndexSearchExecutor> executor(ctx.GetExecutor());
-    auto results = executor->Execute(reader, 0);
+            auto& hit = hits[it->second];
+            if ((hit.recallMask & recallMask) == 0) {
+                hit.result.score += result.score - StaticRankForDoc(ctx, result.doc_id);
+                hit.recallMask |= recallMask;
+            }
+        }
+    };
 
-    for (const auto& result : results)
-        hits.push_back({&ctx, result});
+    if (options.inverted)
+        addResults(ExecuteQuery(ctx, query, "AUTB"), RECALL_INVERTED);
+    if (options.vector)
+        addResults(ExecuteQuery(ctx, query, "V"), RECALL_VECTOR);
 }
 
-static void Search(IndexContext& ctx, const std::string& query)
+static void Search(IndexContext& ctx, const std::string& query, const SearchOptions& options)
 {
     std::vector<SearchHit> results;
-    CollectSearchResults(ctx, query, results);
+    CollectSearchResults(ctx, query, options, results);
     if (auto* delta = ctx.GetDeltaContext())
-        CollectSearchResults(*delta, query, results);
+        CollectSearchResults(*delta, query, options, results);
 
     std::sort(results.begin(), results.end(), [](const SearchHit& left, const SearchHit& right) {
         if (left.result.score != right.result.score)
@@ -461,7 +509,8 @@ static void Search(IndexContext& ctx, const std::string& query)
         for (size_t i = offset; i < end; ++i) {
             const auto& hit = results[i];
             const std::string path = hit.context->GetDocPath(hit.result.doc_id);
-            std::cout << (path.empty() ? "[unknown]" : path) << "\n";
+            std::cout << RecallPrefix(hit.recallMask) << " "
+                      << (path.empty() ? "[unknown]" : path) << "\n";
         }
 
         if (end < results.size()) {
@@ -496,6 +545,29 @@ static bool ParseBatchSize(const std::string& text, uint64_t& batchSize)
     unsigned long long value = std::strtoull(text.c_str(), &end, 10);
     if (!end || *end != '\0' || value == 0) return false;
     batchSize = static_cast<uint64_t>(value);
+    return true;
+}
+
+static bool ParseSearchOptions(const std::vector<std::string>& args,
+                               SearchOptions& options,
+                               std::string& error)
+{
+    for (const auto& arg : args) {
+        if (arg == "-i") {
+            options.inverted = true;
+        } else if (arg == "-v") {
+            options.vector = true;
+        } else {
+            error = "Unknown search option: " + arg;
+            return false;
+        }
+    }
+
+    if (!options.inverted && !options.vector) {
+        error = "Usage: moon [-idx <index>] -i [-v] | moon [-idx <index>] -v";
+        return false;
+    }
+
     return true;
 }
 
@@ -598,7 +670,12 @@ static void PrintHelp(const std::string& idxPath)
         << "      -b controls how many new files are saved per delta batch.\n\n"
         << "Search an index:\n"
         << "  moon [-idx <index>] -i\n"
-        << "      Open an interactive search prompt for the selected index.\n\n"
+        << "      Open an interactive inverted-index search prompt.\n\n"
+        << "  moon [-idx <index>] -v\n"
+        << "      Open an interactive vector search prompt.\n\n"
+        << "  moon [-idx <index>] -i -v\n"
+        << "      Open an interactive hybrid search prompt. Prefixes show recall path:\n"
+        << "      ++ both, +- inverted only, -+ vector only.\n\n"
         << "Base/delta/merge sample:\n"
         << "  moon -sample-merge -dir <root> -out <merged-index> [-ext cpp,h,rs]\n"
         << "      Recursively indexes matching files, builds a base index and delta\n"
@@ -607,6 +684,8 @@ static void PrintHelp(const std::string& idxPath)
         << "Examples:\n"
         << "  moon -idx .\\notes.idx -dir .\\docs -ext md,txt -r\n"
         << "  moon -idx .\\notes.idx -i\n"
+        << "  moon -idx .\\notes.idx -v\n"
+        << "  moon -idx .\\notes.idx -i -v\n"
         << "  moon -sample-merge -dir . -out .\\build\\moonshot-source-merge.idx -ext cpp,h,rs\n";
 }
 
@@ -646,7 +725,7 @@ static bool HasSearchResults(IndexContext& ctx, const std::string& query)
     if (query.empty() || ctx.DocumentCount() == 0)
         return false;
 
-    std::unique_ptr<EvalTree> tree(ctx.Compile(query.c_str(), "AUTB"));
+    std::unique_ptr<EvalTree> tree(ctx.Compile(query.c_str(), "AUTBV"));
     if (!tree || tree->IsEmpty())
         return false;
 
@@ -962,7 +1041,13 @@ int main(int argc, char* argv[])
         return RunSampleMerge(options);
 
     // ── interactive search ────────────────────────────────────────────────────
-    } else if (cmd == "-i") {
+    } else if (cmd == "-i" || cmd == "-v") {
+        SearchOptions searchOptions;
+        if (!ParseSearchOptions(args, searchOptions, error)) {
+            std::cerr << error << "\n";
+            return 1;
+        }
+
         auto loadStart = std::chrono::steady_clock::now();
         IndexContext ctx("", idxPath.c_str());
         auto loadMs = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -975,7 +1060,24 @@ int main(int argc, char* argv[])
                   << totalDocuments
                   << " document(s)"
                   << " (loaded in " << loadMs << " ms)\n"
-                  << "Type a query, or 'quit' to exit.\n";
+                  << "Mode: "
+                  << (searchOptions.inverted && searchOptions.vector ? "inverted+vector"
+                      : searchOptions.inverted ? "inverted"
+                      : "vector") << "\n"
+                  << std::flush;
+
+        if (searchOptions.vector) {
+            auto vectorStart = std::chrono::steady_clock::now();
+            std::cout << "Building vector graph..." << std::flush;
+            size_t vectorCount = ctx.VectorCount();
+            if (auto* delta = ctx.GetDeltaContext())
+                vectorCount += delta->VectorCount();
+            const auto vectorMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - vectorStart).count();
+            std::cout << " " << vectorCount << " vector(s) in " << vectorMs << " ms\n";
+        }
+
+        std::cout << "Type a query, or 'quit' to exit.\n";
 
         std::string line;
         while (true) {
@@ -984,7 +1086,7 @@ int main(int argc, char* argv[])
             if (!std::getline(std::cin, line)) break;
             if (line == "quit" || line == "exit" || line == "q") break;
             if (line.empty()) continue;
-            Search(ctx, line);
+            Search(ctx, line, searchOptions);
         }
 
     } else {

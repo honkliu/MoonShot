@@ -810,8 +810,11 @@ private:
         m_VectorIndex.Clear();
         m_VectorIndex.SetDocData(m_DocData);
         if (m_DocData) {
-            for (uint64_t docId = 0; docId < m_IndexFileHeader.IFH_NumDocuments; ++docId)
-                m_VectorIndex.Add(docId);
+            for (uint64_t docId = 0; docId < m_IndexFileHeader.IFH_NumDocuments; ++docId) {
+                const auto* entry = reinterpret_cast<const DocDataEntry*>(m_DocData + docId * DOC_REC_SIZE);
+                if (entry->DDE_DocID == docId && entry->DDE_VectorFlags != 0)
+                    m_VectorIndex.Add(docId);
+            }
         }
         m_VectorBuilt = true;
     }
@@ -886,10 +889,12 @@ private:
             entry->DDE_DocID = docId;
             entry->DDE_StaticRank = stats.importance;
             entry->DDE_DocLength = stats.doc_len;
-            entry->DDE_VectorDim = static_cast<uint16_t>(DOC_VECTOR_DIM);
-            entry->DDE_VectorFormat = 1;
-            if (m_Store->HasDocVector(docId))
+            if (m_Store->HasDocVector(docId)) {
+                entry->DDE_VectorFlags = 1;
+                entry->DDE_VectorDim = static_cast<uint16_t>(DOC_VECTOR_DIM);
+                entry->DDE_VectorFormat = 1;
                 std::memcpy(entry->DDE_VectorData, m_Store->GetDocVector(docId), DOC_VECTOR_DIM);
+            }
             entry->DDE_PathLength = static_cast<uint16_t>(std::min(stats.path.size(), DOC_PATH_MAX));
             if (entry->DDE_PathLength > 0)
                 std::memcpy(entry->DDE_Path, stats.path.data(), entry->DDE_PathLength);
@@ -1449,8 +1454,9 @@ private:
             return empty;
         }
 
+        const size_t vectorTopK = std::max<size_t>(1, efSearch);
         return make_shared<VectorIndexReader>(
-            m_VectorIndex.Search(queryVector, 0, VectorMetric::Cosine, efSearch));
+            m_VectorIndex.Search(queryVector, vectorTopK, VectorMetric::Cosine, efSearch));
     }
 };
 
