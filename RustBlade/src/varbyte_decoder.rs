@@ -6,10 +6,8 @@ use crate::block_table::{IndexBlock, PinnedBlock};
 #[allow(non_snake_case)]
 pub struct VarByteDecoder {
     m_Block:       Option<PinnedBlock<IndexBlock>>,
-    m_RawData:    Vec<u8>,
     m_CurrentPtr: usize,
     m_BlockEnd:   usize,
-    m_RawMode:    bool,
     m_CurrentDoc: u64,
     m_CurrentTf:  u32,
     m_HasCurrent: bool,
@@ -19,8 +17,8 @@ pub struct VarByteDecoder {
 impl VarByteDecoder {
     pub fn new() -> Self {
         Self {
-            m_Block: None, m_RawData: Vec::new(),
-            m_CurrentPtr: 0, m_BlockEnd: 0, m_RawMode: false,
+            m_Block: None,
+            m_CurrentPtr: 0, m_BlockEnd: 0,
             m_CurrentDoc: 0, m_CurrentTf: 0, m_HasCurrent: false,
         }
     }
@@ -30,11 +28,9 @@ impl VarByteDecoder {
     #[allow(non_snake_case)]
     pub fn OpenRaw(&mut self, block: PinnedBlock<IndexBlock>, offset: usize, len: usize, last_doc: u64) {
         let end = (offset + len).min(block.IB_Data.len());
-        self.m_RawData    = block.IB_Data[offset..end].to_vec();
         self.m_Block       = Some(block);
-        self.m_RawMode    = true;
-        self.m_CurrentPtr         = 0;
-        self.m_BlockEnd         = self.m_RawData.len();
+        self.m_CurrentPtr = offset;
+        self.m_BlockEnd   = end;
         self.m_CurrentDoc = last_doc;
         self.m_CurrentTf  = 0;
         self.m_HasCurrent = false;
@@ -50,13 +46,17 @@ impl VarByteDecoder {
             self.m_HasCurrent = false;
             return;
         }
-        let (docID, n) = VbRead(&self.m_RawData, self.m_CurrentPtr);
+        let Some(block) = self.m_Block.as_ref() else {
+            self.m_HasCurrent = false;
+            return;
+        };
+        let (docID, n) = VbRead(&block.IB_Data, self.m_CurrentPtr);
         self.m_CurrentPtr += n;
         if self.m_CurrentPtr >= self.m_BlockEnd && n == 0 {
             self.m_HasCurrent = false;
             return;
         }
-        let (tf, m) = VbRead(&self.m_RawData, self.m_CurrentPtr);
+        let (tf, m) = VbRead(&block.IB_Data, self.m_CurrentPtr);
         self.m_CurrentPtr += m;
 
         self.m_CurrentDoc  = docID;
@@ -78,6 +78,13 @@ impl VarByteDecoder {
     pub fn GetTermFrequency(&self) -> u32   { self.m_CurrentTf }
     #[allow(non_snake_case)]
     pub fn GetCurrentBlock(&self)  -> Option<&PinnedBlock<IndexBlock>> { self.m_Block.as_ref() }
+    #[allow(non_snake_case)]
+    pub fn Close(&mut self) {
+        self.m_Block = None;
+        self.m_CurrentPtr = 0;
+        self.m_BlockEnd = 0;
+        self.m_HasCurrent = false;
+    }
 }
 
 impl Default for VarByteDecoder {

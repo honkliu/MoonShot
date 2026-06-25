@@ -111,7 +111,6 @@ impl IndexReader for AndIndexReader {
 #[allow(non_snake_case)]
 pub struct OrIndexReader {
     m_Children:    Vec<Box<dyn IndexReader>>,
-    m_ActiveCount: usize,
     m_Debug:        bool,
     m_DebugDepth:  usize,
 }
@@ -119,74 +118,62 @@ pub struct OrIndexReader {
 #[allow(non_snake_case)]
 impl OrIndexReader {
     pub fn new(children: Vec<Box<dyn IndexReader>>) -> Self {
-        let activeCount = children.len();
-        Self { m_Children: children, m_ActiveCount: activeCount, m_Debug: false, m_DebugDepth: 0 }
+        Self { m_Children: children, m_Debug: false, m_DebugDepth: 0 }
     }
 }
 
 impl IndexReader for OrIndexReader {
     fn GoNext(&mut self) {
-        if self.m_ActiveCount == 0 { return; }
+        if self.IsEnd() { return; }
         let doc = self.GetDocumentID();
-        let mut i = 0;
-        while i < self.m_ActiveCount {
-            if self.m_Children[i].GetDocumentID() == doc {
-                self.m_Children[i].GoNext();
-                if self.m_Children[i].IsEnd() {
-                    self.m_ActiveCount -= 1;
-                    self.m_Children.swap(i, self.m_ActiveCount);
-                    continue;
-                }
+        for child in &mut self.m_Children {
+            if !child.IsEnd() && child.GetDocumentID() == doc {
+                child.GoNext();
             }
-            i += 1;
         }
     }
 
     fn GoUntil(&mut self, target: u64, limit: u64) {
-        let mut i = 0;
-        while i < self.m_ActiveCount {
-            if self.m_Children[i].GetDocumentID() < target && self.m_Children[i].GetDocumentID() < limit {
-                self.m_Children[i].GoUntil(target, limit);
-                if self.m_Children[i].IsEnd() {
-                    self.m_ActiveCount -= 1;
-                    self.m_Children.swap(i, self.m_ActiveCount);
-                    continue;
-                }
+        for child in &mut self.m_Children {
+            if !child.IsEnd() && child.GetDocumentID() < target && child.GetDocumentID() < limit {
+                child.GoUntil(target, limit);
             }
-            i += 1;
         }
     }
 
-    fn IsEnd(&self) -> bool { self.m_ActiveCount == 0 }
+    fn IsEnd(&self) -> bool {
+        self.m_Children.iter().all(|child| child.IsEnd())
+    }
 
     fn GetDocumentID(&self) -> u64 {
-        (0..self.m_ActiveCount)
-            .map(|i| self.m_Children[i].GetDocumentID())
+        self.m_Children.iter()
+            .filter(|child| !child.IsEnd())
+            .map(|child| child.GetDocumentID())
             .min()
             .unwrap_or(NO_MORE_DOCS)
     }
 
     fn GetTermFreq(&self) -> u32 {
         let doc = self.GetDocumentID();
-        (0..self.m_ActiveCount)
-            .filter(|&i| self.m_Children[i].GetDocumentID() == doc)
-            .map(|i| self.m_Children[i].GetTermFreq())
+        self.m_Children.iter()
+            .filter(|child| !child.IsEnd() && child.GetDocumentID() == doc)
+            .map(|child| child.GetTermFreq())
             .sum()
     }
 
     fn GetScore(&self, scorer: &Bm25Scorer, doc_len: u32) -> f32 {
         let doc = self.GetDocumentID();
-        (0..self.m_ActiveCount)
-            .filter(|&i| self.m_Children[i].GetDocumentID() == doc)
-            .map(|i| self.m_Children[i].GetScore(scorer, doc_len))
+        self.m_Children.iter()
+            .filter(|child| !child.IsEnd() && child.GetDocumentID() == doc)
+            .map(|child| child.GetScore(scorer, doc_len))
             .sum()
     }
 
     fn GetSourceMask(&self) -> u8 {
         let doc = self.GetDocumentID();
-        (0..self.m_ActiveCount)
-            .filter(|&i| self.m_Children[i].GetDocumentID() == doc)
-            .fold(0u8, |mask, i| mask | self.m_Children[i].GetSourceMask())
+        self.m_Children.iter()
+            .filter(|child| !child.IsEnd() && child.GetDocumentID() == doc)
+            .fold(0u8, |mask, child| mask | child.GetSourceMask())
     }
 
     fn SetDebug(&mut self, label: &str, depth: usize) {

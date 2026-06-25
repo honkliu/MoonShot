@@ -289,12 +289,16 @@ impl<T: Default + Copy> BlockCachePool<T> {
     }
 
     fn read_miss(&mut self, block_seq: u32) -> Option<(u32, PinnedBlock<T>)> {
+        if block_seq >= self.total_block_count || self.slot_count == 0 { return None; }
         let path = self.path.as_ref()?.clone();
         let mut found = u32::MAX;
-        for _ in 0..self.slot_count {
-            found = self.evict_slot % self.slot_count;
+        for _scanned in 0..self.slot_count {
+            let candidate = self.evict_slot % self.slot_count;
             self.evict_slot = self.evict_slot.wrapping_add(1);
-            break;
+            if self.slot_table.as_ref()?.as_slice()[candidate as usize].ref_count == 0 {
+                found = candidate;
+                break;
+            }
         }
         if found == u32::MAX { return None; }
 
@@ -393,6 +397,18 @@ impl IndexBlockTable {
 
     pub fn SetHeadEntries(&mut self, head: Vec<HeadTermEntry>) {
         self.head_term_entries = head;
+    }
+
+    pub fn SetHeadTermEntries(&mut self, head: Vec<HeadTermEntry>) {
+        self.SetHeadEntries(head);
+    }
+
+    pub fn HandOverBlockTable(&mut self, source: &mut IndexBlockTable) {
+        if std::ptr::eq(self, source) { return; }
+        self.index_pool = std::mem::replace(&mut source.index_pool, RefCell::new(BlockCachePool::new()));
+        self.leaf_term_pool = std::mem::replace(&mut source.leaf_term_pool, RefCell::new(BlockCachePool::new()));
+        self.head_term_entries = std::mem::take(&mut source.head_term_entries);
+        self.bloom = BloomFilter;
     }
 
     pub fn HeadTermEntries(&self) -> &[HeadTermEntry] {

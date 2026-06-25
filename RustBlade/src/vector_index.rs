@@ -43,6 +43,7 @@ struct HnswNode {
 
 pub struct HnswIndex {
     nodes: Vec<HnswNode>,
+    doc_ids: Vec<u64>,
     entry_point: Option<usize>,
     max_layer: usize,
     max_neighbors: usize,
@@ -56,6 +57,7 @@ impl HnswIndex {
     pub fn new(dim: usize, max_neighbors: usize, ef_construction: usize, metric: VectorMetric) -> Self {
         Self {
             nodes: Vec::new(),
+            doc_ids: Vec::new(),
             entry_point: None,
             max_layer: 0,
             max_neighbors: max_neighbors.max(2),
@@ -101,7 +103,7 @@ impl HnswIndex {
 
         let mut out: Vec<VectorSearchResult> = candidates
             .into_iter()
-            .map(|(_, node_id)| VectorSearchResult { doc_id: node_id as u64, score: self.score_query_to_node(query, node_id) })
+            .map(|(_, node_id)| VectorSearchResult { doc_id: self.doc_ids[node_id], score: self.score_query_to_node(query, node_id) })
             .collect();
         out.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal).then(a.doc_id.cmp(&b.doc_id)));
         if k > 0 && out.len() > k { out.truncate(k); }
@@ -116,11 +118,11 @@ impl HnswIndex {
     pub fn Dimension(&self) -> usize { self.dim }
 
     fn add_node(&mut self, doc_id: u64) -> bool {
-        if doc_id < self.nodes.len() as u64 { return true; }
-        if doc_id != self.nodes.len() as u64 { return false; }
+        if self.doc_ids.contains(&doc_id) { return true; }
 
         let level = self.random_level(doc_id);
-        let new_node_id = doc_id as usize;
+        let new_node_id = self.nodes.len();
+        self.doc_ids.push(doc_id);
         self.nodes.push(HnswNode {
             neighbors: (0..=level).map(|_| Vec::new()).collect(),
         });
@@ -156,13 +158,17 @@ impl HnswIndex {
         true
     }
 
-    fn get_doc_vector(&self, doc_id: usize) -> &[u8] {
-        let offset = doc_id * DOC_REC_SIZE + DOC_VECTOR_OFFSET;
+    fn get_doc_vector(&self, doc_id: u64) -> &[u8] {
+        let offset = doc_id as usize * DOC_REC_SIZE + DOC_VECTOR_OFFSET;
         &self.docdata[offset..offset + DOC_VECTOR_DIM]
     }
 
+    fn get_node_vector(&self, node_id: usize) -> &[u8] {
+        self.get_doc_vector(self.doc_ids[node_id])
+    }
+
     fn score_query_to_node(&self, query: &[f32], node_id: usize) -> f32 {
-        let doc = self.get_doc_vector(node_id);
+        let doc = self.get_node_vector(node_id);
         let mut dot = 0.0f32;
         let mut nq = 0.0f32;
         let mut nd = 0.0f32;
@@ -184,8 +190,8 @@ impl HnswIndex {
     }
 
     fn score_doc_to_node(&self, query_doc_id: usize, node_id: usize) -> f32 {
-        let left = self.get_doc_vector(query_doc_id);
-        let right = self.get_doc_vector(node_id);
+        let left = self.get_node_vector(query_doc_id);
+        let right = self.get_node_vector(node_id);
         let mut dot = 0i32;
         let mut nl = 0i32;
         let mut nr = 0i32;

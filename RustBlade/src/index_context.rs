@@ -294,11 +294,14 @@ impl IndexContext {
         let mergedDocs = deltaFirstDocId + deltaDocCount;
 
         let mut mergedDocData = Vec::with_capacity(mergedDocs * DOC_REC_SIZE);
-        mergedDocData.extend_from_slice(&self.m_DocData[..baseDocCount * DOC_REC_SIZE]);
+        let baseDocBytes = baseDocCount * DOC_REC_SIZE;
+        if baseDocBytes > self.m_DocData.len() { return Err(RustBladeError::InvalidFormat); }
+        mergedDocData.extend_from_slice(&self.m_DocData[..baseDocBytes]);
         if deltaDocCount > 0 {
             let begin = deltaFirstDocId * DOC_REC_SIZE;
             let end = deltaDocLimit * DOC_REC_SIZE;
-            mergedDocData.extend_from_slice(&delta.m_DocData[begin..end]);
+            let deltaSlice = delta.m_DocData.get(begin..end).ok_or(RustBladeError::InvalidFormat)?;
+            mergedDocData.extend_from_slice(deltaSlice);
         }
         fs::write(&docDataTempPath, &mergedDocData)?;
 

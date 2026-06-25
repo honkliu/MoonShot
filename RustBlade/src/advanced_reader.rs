@@ -77,6 +77,9 @@ impl IndexReader for AdvancedIndexReader {
             if !self.LoadContinuation() { break; }
             self.m_Decoder.GoNext();
         }
+        if self.m_Decoder.IsEnd() && self.m_RemainingContinuationBlocks == 0 {
+            self.m_Decoder.Close();
+        }
     }
 
     fn GoUntil(&mut self, target: u64, limit: u64) {
@@ -92,6 +95,9 @@ impl IndexReader for AdvancedIndexReader {
                 continue;
             }
             self.OpenContinuation(block);
+        }
+        if self.m_Decoder.IsEnd() && self.m_RemainingContinuationBlocks == 0 {
+            self.m_Decoder.Close();
         }
     }
 
@@ -112,4 +118,5 @@ impl IndexReader for AdvancedIndexReader {
     fn GetSourceMask(&self) -> u8 { self.m_SourceMask }
 
     fn SetDebug(&mut self, _label: &str, _depth: usize) {}
+    fn Close(&mut self) { self.m_Decoder.Close(); }
 }
