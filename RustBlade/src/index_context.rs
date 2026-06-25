@@ -168,7 +168,10 @@ impl IndexContext {
     /// Pack PostingStore entries into multi-term IndexBlocks (sorted alphabetically)
     /// and populate the Head/Leaf term table. Called lazily on first search.
     pub fn Build(&mut self) {
-        if self.m_Built { return; }
+        if self.m_Built {
+            self.BuildVectorRuntime();
+            return;
+        }
 
         let store = self.m_Store.lock().unwrap();
 
@@ -184,10 +187,6 @@ impl IndexContext {
         self.m_Built = true;
     }
 
-    fn EnsureBuilt(&mut self) {
-        if !self.m_Built { self.Build(); }
-    }
-
     // ── Search ───────────────────────────────────────────────────────────────
 
     pub fn Compile(&self, query: &str, stream_set: &str) -> EvalTree {
@@ -197,13 +196,11 @@ impl IndexContext {
     pub fn GetReaderForQuery(&mut self, query: &str, stream_set: &str)
         -> Box<dyn IndexReader>
     {
-        self.EnsureBuilt();
         let tree = self.Compile(query, stream_set);
         self.BuildIndexReader(tree.root)
     }
 
     pub fn GetReader(&mut self, tree: EvalTree) -> Box<dyn IndexReader> {
-        self.EnsureBuilt();
         if tree.HasTextQuery() && tree.HasVectorQuery() {
             let children = vec![
                 self.BuildIndexReader(tree.root),
@@ -218,7 +215,6 @@ impl IndexContext {
     }
 
     pub fn GetStreamReader(&mut self, stream_key: &str) -> Box<dyn IndexReader> {
-        self.EnsureBuilt();
         let docFreq = self.m_Store.lock().unwrap().DocFreq(stream_key);
         Box::new(AdvancedIndexReader::open(
             stream_key, Arc::clone(&self.m_BlockTable), docFreq))
@@ -229,11 +225,10 @@ impl IndexContext {
     }
 
     pub fn VectorSearch(&mut self, query: &[f32], top_k: usize, ef_search: usize) -> Vec<VectorSearchResult> {
-        self.EnsureVectorIndexBuilt();
         self.m_VectorIndex.Search(query, top_k, ef_search)
     }
 
-    pub fn VectorCount(&mut self) -> usize { self.EnsureVectorIndexBuilt(); self.m_VectorIndex.Size() }
+    pub fn VectorCount(&self) -> usize { self.m_VectorIndex.Size() }
     pub fn VectorDimension(&self) -> usize { self.m_VectorIndex.Dimension() }
 
     // ── Persistence ─────────────────────────────────────────────────────────
@@ -454,7 +449,7 @@ impl IndexContext {
         (header, blockTable, vectorIndex, docData)
     }
 
-    fn EnsureVectorIndexBuilt(&mut self) {
+    fn BuildVectorRuntime(&mut self) {
         if self.m_VectorBuilt { return; }
         let mut vectorIndex = HnswIndex::new(DOC_VECTOR_DIM, 32, 200, VectorMetric::Cosine);
         vectorIndex.SetDocData(self.m_DocData.clone());

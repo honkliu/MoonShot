@@ -38,6 +38,7 @@ int main()
     writer->SetDocImportance(3, 0.6f);
 
     std::println("Indexed {} documents.\n", engine.GetStore()->TotalDocs());
+    engine.Build();
 
     /* ------------------------------------------------------------------ *
      * 3.  Search.                                                          *

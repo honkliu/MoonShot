@@ -88,6 +88,7 @@ static void BuildSharedIndex()
         writer->SetDocImportance(d.id, d.importance);
         writer->SetDocVector(d.id, BuildHashedEmbedding(g_tokenizer.Tokenize((std::string(d.title) + " " + d.body).c_str())));
     }
+    g_ctx->Build();
 
     std::cout << "Index built: "
               << g_ctx->GetStore()->TotalDocs() << " docs, avg_len="
@@ -365,6 +366,7 @@ void TestDocImportance()
     writer->SetDocImportance(1, 0.1f);
     writer->SetDocVector(0, BuildHashedEmbedding(g_tokenizer.Tokenize(same_text)));
     writer->SetDocVector(1, BuildHashedEmbedding(g_tokenizer.Tokenize(same_text)));
+    ctx->Build();
 
     auto compiler = new IndexSearchCompiler();
     auto tree     = compiler->Compile("fox", "B");
@@ -410,6 +412,7 @@ void TestEndToEnd()
     doc2.body = "The lazy fox slept all morning";
     uint64_t doc2Id = index_context->AddDocument(doc2);
     assert(doc2Id == 1);
+    index_context->Build();
 
     {
         /*
@@ -808,6 +811,7 @@ void TestBigram()
     writer->Write(tok.Tokenize("good night vietnam"),   2, "Title");
     writer->SetDocImportance(2, 0.6f);
     writer->SetDocVector(2, BuildHashedEmbedding(tok.Tokenize("good night vietnam")));
+    engine.Build();
 
     auto* store = engine.GetStore();
 
@@ -909,6 +913,7 @@ void TestContinuationPostings()
         writer->SetDocImportance(docId, 0.1f);
         writer->SetDocVector(docId, vector);
     }
+    engine.Build();
 
     auto reader = engine.GetStreamReader("continuationtermT");
     uint32_t seen = 0;
@@ -937,6 +942,7 @@ void TestHeadTermMaxKeyBoundary()
     writer->Write({tooLongToken}, 1, "Title");
     writer->SetDocImportance(1, 0.1f);
     writer->SetDocVector(1, BuildHashedEmbedding(std::vector<std::string>{tooLongToken}));
+    engine.Build();
 
     auto reader = engine.GetStreamReader((maxToken + "T").c_str());
     assert(!reader->IsEnd());

@@ -163,6 +163,7 @@ int main()
         w->Write(tok.Tokenize("identical content about search"), 11, "Body");
         w->SetDocImportance(10, 0.9f);
         w->SetDocImportance(11, 0.1f);
+        local.Build();
 
         std::unique_ptr<EvalTree>            t(compiler.Compile("search", "B"));
         std::unique_ptr<IndexSearchExecutor> e(local.GetExecutor());

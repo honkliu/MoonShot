@@ -148,7 +148,10 @@ public:
     */
     void Build()
     {
-        if (m_Built) return;
+        if (m_Built) {
+            BuildVectorRuntime();
+            return;
+        }
 
         if (BuildRuntime(m_BlockTable, m_VectorIndex, m_IndexFileHeader, m_DocData, m_Built)) {
             m_LoadedFromDisk = false;
@@ -162,8 +165,6 @@ public:
     */
     shared_ptr<IndexReader> GetReader(EvalTree* evalTree)
     {
-        Build();
-
         if (!evalTree || evalTree->IsEmpty()) {
             auto empty = make_shared<AdvancedIndexReader>();
             return empty;
@@ -203,8 +204,6 @@ public:
     /* Open a reader for one specific stream key (e.g. "raceA", "carT"). */
     shared_ptr<IndexReader> GetStreamReader(const char* streamKey)
     {
-        Build();
-
         auto reader = make_shared<AdvancedIndexReader>();
         reader->Open(streamKey, &m_BlockTable, this);
         return reader;
@@ -243,11 +242,10 @@ public:
                                                  VectorMetric metric = VectorMetric::Cosine,
                                                  size_t efSearch = 200)
     {
-        EnsureVectorIndexBuilt();
         return m_VectorIndex.Search(query, topK, metric, efSearch);
     }
 
-    size_t VectorCount() { EnsureVectorIndexBuilt(); return m_VectorIndex.Size(); }
+    size_t VectorCount() const { return m_VectorIndex.Size(); }
     size_t VectorDimension() const { return m_VectorIndex.Dimension(); }
 
     bool HasDelta() const
@@ -805,7 +803,7 @@ private:
         m_VectorBuilt = false;
     }
 
-    void EnsureVectorIndexBuilt()
+    void BuildVectorRuntime()
     {
         if (m_VectorBuilt) return;
         m_VectorIndex.Clear();
@@ -1449,7 +1447,6 @@ private:
     shared_ptr<IndexReader> BuildVectorIndexReader(const std::vector<float>& queryVector,
                                                    size_t efSearch = 200)
     {
-        EnsureVectorIndexBuilt();
         if (queryVector.empty() || m_VectorIndex.Empty()) {
             auto empty = make_shared<AdvancedIndexReader>();
             return empty;
