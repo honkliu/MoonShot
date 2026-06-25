@@ -24,16 +24,18 @@ pub trait IndexWriter {
 * Bigrams score higher than scattered unigrams in BM25 (higher TF contribution).
 * Mirrors MoonShot's AdvancedIndexWriter.
 */
+#[allow(non_snake_case)]
 pub struct AdvancedIndexWriter {
-    store: Arc<Mutex<PostingStore>>,
+    m_Store: Arc<Mutex<PostingStore>>,
 }
 
+#[allow(non_snake_case)]
 impl AdvancedIndexWriter {
     pub fn new(store: Arc<Mutex<PostingStore>>) -> Self {
-        Self { store }
+        Self { m_Store: store }
     }
 
-    fn stream_abbrev(stream: &str) -> &'static str {
+    fn StreamAbbrev(stream: &str) -> &'static str {
         match stream.chars().next().map(|c| c.to_ascii_uppercase()) {
             Some('A') => "A",
             Some('U') => "U",
@@ -55,8 +57,8 @@ impl AdvancedIndexWriter {
 impl IndexWriter for AdvancedIndexWriter {
     fn Write(&mut self, tokens: Vec<String>, doc_id: u64, stream: &str) {
         if tokens.is_empty() { return; }
-        let abbrev = Self::stream_abbrev(stream);
-        let mut store = self.store.lock().unwrap();
+        let abbrev = Self::StreamAbbrev(stream);
+        let mut store = self.m_Store.lock().unwrap();
 
         let mut term_tf: HashMap<String, u32> = HashMap::new();
         for tok in &tokens {
@@ -81,14 +83,14 @@ impl IndexWriter for AdvancedIndexWriter {
     }
 
     fn SetDocImportance(&mut self, doc_id: u64, score: f32) {
-        self.store.lock().unwrap().SetDocImportance(doc_id, score);
+        self.m_Store.lock().unwrap().SetDocImportance(doc_id, score);
     }
 
     fn SetDocPath(&mut self, doc_id: u64, path: String) {
-        self.store.lock().unwrap().SetDocPath(doc_id, path);
+        self.m_Store.lock().unwrap().SetDocPath(doc_id, path);
     }
 
     fn SetDocVector(&mut self, doc_id: u64, vector: Vec<f32>) {
-        self.store.lock().unwrap().SetDocVector(doc_id, vector);
+        self.m_Store.lock().unwrap().SetDocVector(doc_id, vector);
     }
 }

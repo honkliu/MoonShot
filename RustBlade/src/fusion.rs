@@ -1,5 +1,8 @@
 use std::collections::HashMap;
 
+// Rust-only ranking helper. C++ MoonShot currently does text/vector combination
+// through reader composition, so this module is intentionally outside the C++ file map.
+
 /// Reciprocal Rank Fusion — merges multiple ranked lists into one.
 ///
 /// RRF_score(doc) = Σ_r  1 / (k + rank(doc, r))

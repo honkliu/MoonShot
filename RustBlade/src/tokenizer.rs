@@ -15,7 +15,8 @@ pub struct SmartTokenizer;
 impl SmartTokenizer {
     pub fn new() -> Self { Self }
 
-    fn is_indexable_token(token: &str) -> bool {
+    #[allow(non_snake_case)]
+    fn IsIndexableToken(token: &str) -> bool {
         !token.is_empty()
             && token.len() <= 64
             && !token.chars().any(|ch| {
@@ -50,7 +51,7 @@ impl Tokenizer for SmartTokenizer {
                     || segment.chars().any(|ch| ch.is_alphanumeric());
                 if keep {
                     let token = segment.to_lowercase();
-                    if Self::is_indexable_token(&token) {
+                    if Self::IsIndexableToken(&token) {
                         out.push(token);
                     }
                 }

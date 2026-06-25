@@ -171,6 +171,37 @@ impl SearchService {
         body.push_str("]}");
         (200, body)
     }
+
+    #[allow(non_snake_case)]
+    fn vector_search_json(&self, params: &HashMap<String, String>) -> (u16, String) {
+        let query = params.get("q").cloned().unwrap_or_default();
+        if query.is_empty() { return (400, "{\"error\":\"missing q parameter\"}".to_string()); }
+        let offset = query_int(params, "offset", 0, 0, 1_000_000_000);
+        let limit = query_int(params, "limit", 20, 1, 1000);
+        let efSearch = query_int(params, "ef", 200, 1, 10_000);
+        let started = Instant::now();
+
+        let mut context = self.context.lock().unwrap();
+        let vectorQuery = context.CompileToVector(&query);
+        let results = context.VectorSearch(&vectorQuery, 0, efSearch);
+        let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+        let total = results.len();
+        let begin = offset.min(total);
+        let end = (begin + limit).min(total);
+
+        let mut body = format!(
+            "{{\"query\":\"{}\",\"total\":{},\"offset\":{},\"limit\":{},\"elapsed_ms\":{},\"results\":[",
+            json_escape(&query), total, begin, limit, elapsed_ms);
+        for (rank, result) in results[begin..end].iter().enumerate() {
+            if rank > 0 { body.push(','); }
+            let path = context.GetDocPath(result.doc_id);
+            body.push_str(&format!(
+                "{{\"rank\":{},\"doc_id\":{},\"score\":{},\"path\":\"{}\"}}",
+                begin + rank + 1, result.doc_id, result.score, json_escape(&path)));
+        }
+        body.push_str("]}");
+        (200, body)
+    }
 }
 
 fn http_response(status: u16, status_text: &str, body: &str) -> String {
@@ -193,8 +224,11 @@ fn handle_request(service: &SearchService, request: &str) -> String {
             let (status, body) = service.search_json(&params);
             http_response(status, if status == 200 { "OK" } else { "Bad Request" }, &body)
         }
-        "/vector-search" => http_response(400, "Bad Request", "{\"error\":\"vector-search not implemented in shennong_rs yet\"}"),
-        "/" | "/help" => http_response(200, "OK", "{\"service\":\"shennong_rs\",\"endpoints\":[\"/health\",\"/search?q=usage&offset=0&limit=20&streams=AUTB\"]}"),
+        "/vector-search" => {
+            let (status, body) = service.vector_search_json(&params);
+            http_response(status, if status == 200 { "OK" } else { "Bad Request" }, &body)
+        },
+        "/" | "/help" => http_response(200, "OK", "{\"service\":\"shennong_rs\",\"endpoints\":[\"/health\",\"/search?q=usage&offset=0&limit=20&streams=AUTB\",\"/vector-search?q=usage&offset=0&limit=20\"]}"),
         _ => http_response(404, "Not Found", "{\"error\":\"not found\"}"),
     }
 }

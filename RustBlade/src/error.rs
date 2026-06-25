@@ -1,5 +1,8 @@
 use thiserror::Error;
 
+// Rust-only counterpart to C++'s bool/exception-style failure paths.
+// Core APIs still mirror C++ names; Result<T> carries the language-specific error channel.
+
 #[derive(Error, Debug)]
 pub enum RustBladeError {
     #[error("IO error: {0}")]

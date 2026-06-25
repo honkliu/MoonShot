@@ -55,10 +55,18 @@ pub enum EvalNode {
 #[derive(Debug, Clone)]
 pub struct EvalTree {
     pub root: Option<EvalNode>,
+    pub vector_query: Vec<f32>,
+    pub vector_ef_search: usize,
 }
 
 impl EvalTree {
-    pub fn new(root: Option<EvalNode>) -> Self { Self { root } }
-    pub fn empty()                     -> Self { Self { root: None } }
-    pub fn is_empty(&self)             -> bool { self.root.is_none() }
+    pub fn new(root: Option<EvalNode>) -> Self { Self { root, vector_query: Vec::new(), vector_ef_search: 200 } }
+    pub fn empty()                     -> Self { Self::new(None) }
+    #[allow(non_snake_case)]
+    pub fn HasTextQuery(&self)         -> bool { self.root.is_some() }
+    #[allow(non_snake_case)]
+    pub fn HasVectorQuery(&self)       -> bool { !self.vector_query.is_empty() }
+    #[allow(non_snake_case)]
+    pub fn IsEmpty(&self)              -> bool { !self.HasTextQuery() && !self.HasVectorQuery() }
+    pub fn is_empty(&self)             -> bool { self.IsEmpty() }
 }

@@ -28,7 +28,7 @@ impl<T: Copy + Default> PinnedMemory<T> {
         #[cfg(not(target_arch = "wasm32"))]
         unsafe {
             let bytes = len * std::mem::size_of::<T>();
-            let raw = os_alloc(bytes);
+            let raw = PinnedMemAlloc(bytes as u64);
             let ptr = NonNull::new(raw as *mut T).expect("pinned allocation failed");
             std::ptr::write_bytes(ptr.as_ptr(), 0, len);
             Self { ptr, len, bytes, _marker: PhantomData }
@@ -67,32 +67,35 @@ impl<T: Copy> IndexMut<usize> for PinnedMemory<T> {
 impl<T: Copy> Drop for PinnedMemory<T> {
     fn drop(&mut self) {
         #[cfg(not(target_arch = "wasm32"))]
-        unsafe { os_free(self.ptr.as_ptr() as *mut u8, self.bytes); }
+        unsafe { PinnedMemFree(self.ptr.as_ptr() as *mut u8, self.bytes as u64); }
     }
 }
 
 #[cfg(windows)]
-unsafe fn os_alloc(bytes: usize) -> *mut u8 {
+#[allow(non_snake_case)]
+unsafe fn PinnedMemAlloc(bytes: u64) -> *mut u8 {
     use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualLock, MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE};
-    let ptr = VirtualAlloc(std::ptr::null_mut(), bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) as *mut u8;
+    let ptr = VirtualAlloc(std::ptr::null_mut(), bytes as usize, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) as *mut u8;
     if !ptr.is_null() {
-        let _ = VirtualLock(ptr as *const _, bytes);
+        let _ = VirtualLock(ptr as *const _, bytes as usize);
     }
     ptr
 }
 
 #[cfg(windows)]
-unsafe fn os_free(ptr: *mut u8, bytes: usize) {
+#[allow(non_snake_case)]
+unsafe fn PinnedMemFree(ptr: *mut u8, bytes: u64) {
     use windows_sys::Win32::System::Memory::{VirtualFree, VirtualUnlock, MEM_RELEASE};
-    let _ = VirtualUnlock(ptr as *const _, bytes);
+    let _ = VirtualUnlock(ptr as *const _, bytes as usize);
     let _ = VirtualFree(ptr as *mut _, 0, MEM_RELEASE);
 }
 
 #[cfg(unix)]
-unsafe fn os_alloc(bytes: usize) -> *mut u8 {
+#[allow(non_snake_case)]
+unsafe fn PinnedMemAlloc(bytes: u64) -> *mut u8 {
     let ptr = libc::mmap(
         std::ptr::null_mut(),
-        bytes,
+        bytes as usize,
         libc::PROT_READ | libc::PROT_WRITE,
         libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
         -1,
@@ -101,11 +104,12 @@ unsafe fn os_alloc(bytes: usize) -> *mut u8 {
     if ptr == libc::MAP_FAILED {
         return std::ptr::null_mut();
     }
-    let _ = libc::mlock(ptr, bytes);
+    let _ = libc::mlock(ptr, bytes as usize);
     ptr as *mut u8
 }
 
 #[cfg(unix)]
-unsafe fn os_free(ptr: *mut u8, bytes: usize) {
-    let _ = libc::munmap(ptr as *mut _, bytes);
+#[allow(non_snake_case)]
+unsafe fn PinnedMemFree(ptr: *mut u8, bytes: u64) {
+    let _ = libc::munmap(ptr as *mut _, bytes as usize);
 }

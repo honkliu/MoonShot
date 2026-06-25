@@ -19,134 +19,141 @@ pub const INDEX_FORMAT_VERSION: u32 = 12;
 pub const INDEX_BLOCK_CONTINUATION_HEADER_SIZE: usize = 12;
 
 #[derive(Clone, Copy)]
+#[allow(non_snake_case)]
 pub struct IndexBlock {
-    pub ib_data: [u8; PAGE_SIZE],
+    pub IB_Data: [u8; PAGE_SIZE],
 }
 
 impl Default for IndexBlock {
-    fn default() -> Self { Self { ib_data: [0; PAGE_SIZE] } }
+    fn default() -> Self { Self { IB_Data: [0; PAGE_SIZE] } }
 }
 
 #[derive(Clone, Copy)]
+#[allow(non_snake_case)]
 pub struct LeafTermBlock {
-    pub ltb_directory: [u16; LEAF_TERM_DIRECTORY_COUNT],
-    pub ltb_data: [u8; PAGE_SIZE - LEAF_TERM_DATA_OFFSET],
+    pub LTB_Directory: [u16; LEAF_TERM_DIRECTORY_COUNT],
+    pub LTB_Data: [u8; PAGE_SIZE - LEAF_TERM_DATA_OFFSET],
 }
 
 impl Default for LeafTermBlock {
     fn default() -> Self {
         Self {
-            ltb_directory: [0; LEAF_TERM_DIRECTORY_COUNT],
-            ltb_data: [0; PAGE_SIZE - LEAF_TERM_DATA_OFFSET],
+            LTB_Directory: [0; LEAF_TERM_DIRECTORY_COUNT],
+            LTB_Data: [0; PAGE_SIZE - LEAF_TERM_DATA_OFFSET],
         }
     }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
+#[allow(non_snake_case)]
 pub struct IndexBlockContinuationHeader {
-    pub ibch_max_doc_id: u64,
-    pub ibch_data_length: u32,
+    pub IBCH_MaxDocID: u64,
+    pub IBCH_DataLength: u32,
 }
 
 impl IndexBlockContinuationHeader {
     pub fn from_bytes(data: &[u8]) -> Option<Self> {
         if data.len() < INDEX_BLOCK_CONTINUATION_HEADER_SIZE { return None; }
         Some(Self {
-            ibch_max_doc_id: u64::from_le_bytes(data[0..8].try_into().ok()?),
-            ibch_data_length: u32::from_le_bytes(data[8..12].try_into().ok()?),
+            IBCH_MaxDocID: u64::from_le_bytes(data[0..8].try_into().ok()?),
+            IBCH_DataLength: u32::from_le_bytes(data[8..12].try_into().ok()?),
         })
     }
 
     pub fn write_to(&self, data: &mut [u8]) {
-        data[0..8].copy_from_slice(&self.ibch_max_doc_id.to_le_bytes());
-        data[8..12].copy_from_slice(&self.ibch_data_length.to_le_bytes());
+        data[0..8].copy_from_slice(&self.IBCH_MaxDocID.to_le_bytes());
+        data[8..12].copy_from_slice(&self.IBCH_DataLength.to_le_bytes());
     }
 }
 
 #[derive(Debug, Clone)]
+#[allow(non_snake_case)]
 pub struct HeadTermEntry {
-    pub hte_leaf_term_block_id: u32,
-    pub hte_first_term_length: u16,
-    pub hte_first_term: [u8; HEAD_TERM_KEY_MAX],
+    pub HTE_LeafTermBlockID: u32,
+    pub HTE_FirstTermLength: u16,
+    pub HTE_FirstTerm: [u8; HEAD_TERM_KEY_MAX],
 }
 
+#[allow(non_snake_case)]
 impl HeadTermEntry {
     pub fn new(term: &str, block_id: u32) -> Self {
         let bytes = term.as_bytes();
-        let mut hte_first_term = [0u8; HEAD_TERM_KEY_MAX];
-        hte_first_term[..bytes.len()].copy_from_slice(bytes);
+        let mut hteFirstTerm = [0u8; HEAD_TERM_KEY_MAX];
+        hteFirstTerm[..bytes.len()].copy_from_slice(bytes);
         Self {
-            hte_leaf_term_block_id: block_id,
-            hte_first_term_length: bytes.len() as u16,
-            hte_first_term,
+            HTE_LeafTermBlockID: block_id,
+            HTE_FirstTermLength: bytes.len() as u16,
+            HTE_FirstTerm: hteFirstTerm,
         }
     }
 
     pub fn first_term(&self) -> &str {
-        let len = self.hte_first_term_length as usize;
-        std::str::from_utf8(&self.hte_first_term[..len]).unwrap_or("")
+        let len = self.HTE_FirstTermLength as usize;
+        std::str::from_utf8(&self.HTE_FirstTerm[..len]).unwrap_or("")
     }
 
     pub fn to_bytes(&self) -> [u8; 32] {
         let mut out = [0u8; 32];
-        out[0..4].copy_from_slice(&self.hte_leaf_term_block_id.to_le_bytes());
-        out[4..6].copy_from_slice(&self.hte_first_term_length.to_le_bytes());
-        out[6..32].copy_from_slice(&self.hte_first_term);
+        out[0..4].copy_from_slice(&self.HTE_LeafTermBlockID.to_le_bytes());
+        out[4..6].copy_from_slice(&self.HTE_FirstTermLength.to_le_bytes());
+        out[6..32].copy_from_slice(&self.HTE_FirstTerm);
         out
     }
 
     pub fn from_bytes(data: &[u8]) -> Option<Self> {
         if data.len() < 32 { return None; }
-        let mut hte_first_term = [0u8; HEAD_TERM_KEY_MAX];
-        hte_first_term.copy_from_slice(&data[6..32]);
+        let mut hteFirstTerm = [0u8; HEAD_TERM_KEY_MAX];
+        hteFirstTerm.copy_from_slice(&data[6..32]);
         Some(Self {
-            hte_leaf_term_block_id: u32::from_le_bytes(data[0..4].try_into().ok()?),
-            hte_first_term_length: u16::from_le_bytes(data[4..6].try_into().ok()?),
-            hte_first_term,
+            HTE_LeafTermBlockID: u32::from_le_bytes(data[0..4].try_into().ok()?),
+            HTE_FirstTermLength: u16::from_le_bytes(data[4..6].try_into().ok()?),
+            HTE_FirstTerm: hteFirstTerm,
         })
     }
 }
 
 #[derive(Debug, Clone)]
+#[allow(non_snake_case)]
 pub struct LeafTermEntry {
-    pub lte_term: String,
-    pub lte_doc_freq: u32,
-    pub lte_index_block_id: u32,
-    pub lte_index_offset: u32,
-    pub lte_index_length: u32,
-    pub lte_continuation_block_count: u32,
-    pub lte_flags: u32,
+    pub LTE_Term: String,
+    pub LTE_DocFreq: u32,
+    pub LTE_IndexBlockID: u32,
+    pub LTE_IndexOffset: u32,
+    pub LTE_IndexLength: u32,
+    pub LTE_ContinuationBlockCount: u32,
+    pub LTE_Flags: u32,
 }
 
 impl LeafTermEntry {
-    pub fn byte_len(&self) -> usize { 25 + self.lte_term.len() }
+    pub fn byte_len(&self) -> usize { 25 + self.LTE_Term.len() }
 }
 
+#[allow(non_snake_case)]
 impl LeafTermBlock {
     pub fn entry_count(&self) -> usize {
-        self.ltb_directory[LEAF_TERM_DIRECTORY_COUNT - 1] as usize
+        self.LTB_Directory[LEAF_TERM_DIRECTORY_COUNT - 1] as usize
     }
 
     pub fn entry(&self, index: usize) -> Option<LeafTermEntry> {
         if index >= self.entry_count() { return None; }
-        let block_offset = self.ltb_directory[index] as usize;
+        let block_offset = self.LTB_Directory[index] as usize;
         if block_offset < LEAF_TERM_DATA_OFFSET { return None; }
         let offset = block_offset - LEAF_TERM_DATA_OFFSET;
-        if offset + 25 > self.ltb_data.len() { return None; }
+        if offset + 25 > self.LTB_Data.len() { return None; }
 
-        let data = &self.ltb_data[offset..];
+        let data = &self.LTB_Data[offset..];
         let term_len = data[24] as usize;
-        if offset + 25 + term_len > self.ltb_data.len() { return None; }
-        let lte_term = std::str::from_utf8(&data[25..25 + term_len]).ok()?.to_string();
+        if offset + 25 + term_len > self.LTB_Data.len() { return None; }
+        let lteTerm = std::str::from_utf8(&data[25..25 + term_len]).ok()?.to_string();
 
         Some(LeafTermEntry {
-            lte_doc_freq: u32::from_le_bytes(data[0..4].try_into().ok()?),
-            lte_index_block_id: u32::from_le_bytes(data[4..8].try_into().ok()?),
-            lte_index_offset: u32::from_le_bytes(data[8..12].try_into().ok()?),
-            lte_index_length: u32::from_le_bytes(data[12..16].try_into().ok()?),
-            lte_continuation_block_count: u32::from_le_bytes(data[16..20].try_into().ok()?),
-            lte_flags: u32::from_le_bytes(data[20..24].try_into().ok()?),
-            lte_term,
+            LTE_DocFreq: u32::from_le_bytes(data[0..4].try_into().ok()?),
+            LTE_IndexBlockID: u32::from_le_bytes(data[4..8].try_into().ok()?),
+            LTE_IndexOffset: u32::from_le_bytes(data[8..12].try_into().ok()?),
+            LTE_IndexLength: u32::from_le_bytes(data[12..16].try_into().ok()?),
+            LTE_ContinuationBlockCount: u32::from_le_bytes(data[16..20].try_into().ok()?),
+            LTE_Flags: u32::from_le_bytes(data[20..24].try_into().ok()?),
+            LTE_Term: lteTerm,
         })
     }
 
@@ -156,11 +163,11 @@ impl LeafTermBlock {
 
     pub fn to_bytes(&self) -> [u8; PAGE_SIZE] {
         let mut out = [0u8; PAGE_SIZE];
-        for (index, value) in self.ltb_directory.iter().enumerate() {
+        for (index, value) in self.LTB_Directory.iter().enumerate() {
             let offset = index * 2;
             out[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
         }
-        out[LEAF_TERM_DATA_OFFSET..].copy_from_slice(&self.ltb_data);
+        out[LEAF_TERM_DATA_OFFSET..].copy_from_slice(&self.LTB_Data);
         out
     }
 
@@ -169,9 +176,9 @@ impl LeafTermBlock {
         let mut block = LeafTermBlock::default();
         for index in 0..LEAF_TERM_DIRECTORY_COUNT {
             let offset = index * 2;
-            block.ltb_directory[index] = u16::from_le_bytes(data[offset..offset + 2].try_into().ok()?);
+            block.LTB_Directory[index] = u16::from_le_bytes(data[offset..offset + 2].try_into().ok()?);
         }
-        block.ltb_data.copy_from_slice(&data[LEAF_TERM_DATA_OFFSET..PAGE_SIZE]);
+        block.LTB_Data.copy_from_slice(&data[LEAF_TERM_DATA_OFFSET..PAGE_SIZE]);
         Some(block)
     }
 }
@@ -416,7 +423,7 @@ impl IndexBlockTable {
 
         let pos = self.head_term_entries.partition_point(|entry| entry.first_term() <= term);
         if pos == 0 { return None; }
-        let leaf_block_id = self.head_term_entries[pos - 1].hte_leaf_term_block_id;
+        let leaf_block_id = self.head_term_entries[pos - 1].HTE_LeafTermBlockID;
         let (_leaf_slot, leaf_block) = self.leaf_term_pool.borrow_mut().get_or_read(leaf_block_id)?;
 
         let entry_count = leaf_block.entry_count();
@@ -425,21 +432,21 @@ impl IndexBlockTable {
         while left < right {
             let mid = left + (right - left) / 2;
             let entry = leaf_block.entry(mid)?;
-            if entry.lte_term.as_str() < term { left = mid + 1; }
+            if entry.LTE_Term.as_str() < term { left = mid + 1; }
             else { right = mid; }
         }
 
         if left == entry_count { return None; }
         let entry = leaf_block.entry(left)?;
-        if entry.lte_term != term { return None; }
+        if entry.LTE_Term != term { return None; }
 
-        let (_index_slot, index_block) = self.index_pool.borrow_mut().get_or_read(entry.lte_index_block_id)?;
+        let (_index_slot, index_block) = self.index_pool.borrow_mut().get_or_read(entry.LTE_IndexBlockID)?;
         Some((IndexLocation {
-            index_block_id: entry.lte_index_block_id,
-            index_offset: entry.lte_index_offset as usize,
-            index_length: entry.lte_index_length as usize,
-            doc_freq: entry.lte_doc_freq,
-            continuation_block_count: entry.lte_continuation_block_count,
+            index_block_id: entry.LTE_IndexBlockID,
+            index_offset: entry.LTE_IndexOffset as usize,
+            index_length: entry.LTE_IndexLength as usize,
+            doc_freq: entry.LTE_DocFreq,
+            continuation_block_count: entry.LTE_ContinuationBlockCount,
         }, index_block))
     }
 
@@ -456,21 +463,21 @@ impl IndexBlockTable {
     }
 
     pub fn PostingBytes(&self, entry: &LeafTermEntry) -> Option<Vec<u8>> {
-        let first = self.GetBlockBySeq(entry.lte_index_block_id)?;
-        let begin = entry.lte_index_offset as usize;
-        let end = begin.checked_add(entry.lte_index_length as usize)?;
+        let first = self.GetBlockBySeq(entry.LTE_IndexBlockID)?;
+        let begin = entry.LTE_IndexOffset as usize;
+        let end = begin.checked_add(entry.LTE_IndexLength as usize)?;
         if end > PAGE_SIZE { return None; }
 
         let mut bytes = Vec::new();
-        bytes.extend_from_slice(&first.ib_data[begin..end]);
+        bytes.extend_from_slice(&first.IB_Data[begin..end]);
 
-        for i in 0..entry.lte_continuation_block_count {
-            let block = self.GetBlockBySeq(entry.lte_index_block_id + 1 + i)?;
-            let header = IndexBlockContinuationHeader::from_bytes(&block.ib_data)?;
+        for i in 0..entry.LTE_ContinuationBlockCount {
+            let block = self.GetBlockBySeq(entry.LTE_IndexBlockID + 1 + i)?;
+            let header = IndexBlockContinuationHeader::from_bytes(&block.IB_Data)?;
             let data_begin = INDEX_BLOCK_CONTINUATION_HEADER_SIZE;
-            let data_end = data_begin.checked_add(header.ibch_data_length as usize)?;
+            let data_end = data_begin.checked_add(header.IBCH_DataLength as usize)?;
             if data_end > PAGE_SIZE { return None; }
-            bytes.extend_from_slice(&block.ib_data[data_begin..data_end]);
+            bytes.extend_from_slice(&block.IB_Data[data_begin..data_end]);
         }
 
         Some(bytes)

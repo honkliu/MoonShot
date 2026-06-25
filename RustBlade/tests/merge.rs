@@ -155,8 +155,8 @@ fn merge_sparse_delta_preserves_docdata_slots_and_header_average() {
     merge.Merge(&base_path_text).unwrap();
 
     let header = read_header(&base_path);
-    assert_eq!(header.ifh_num_documents, 4);
-    assert_eq!(header.ifh_avg_doc_length, 1.75);
+    assert_eq!(header.IFH_NumDocuments, 4);
+    assert_eq!(header.IFH_AvgDocLength, 1.75);
 
     let mut merged = IndexContext::with_path(Some(base_path_text));
     assert_eq!(merged.DocumentCount(), 4);

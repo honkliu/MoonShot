@@ -1,4 +1,5 @@
 use crate::index_reader::IndexReader;
+use crate::index_reader::ReaderDocumentIDValue;
 use crate::bm25::Bm25Scorer;
 use crate::posting_store::PostingStore;
 
@@ -23,9 +24,9 @@ impl<'a> IndexSearchExecutor<'a> {
 
         while !reader.IsEnd() {
             let doc_id  = reader.GetDocumentID();
-            let doc_len = self.store.GetDocLen(doc_id);
+            let doc_len = self.store.GetDocLen(ReaderDocumentIDValue(doc_id));
             let score   = reader.GetScore(&scorer, doc_len)
-                        + self.store.GetDocImportance(doc_id);
+                        + self.store.GetDocImportance(ReaderDocumentIDValue(doc_id));
             results.push(SearchResult { doc_id, score });
             reader.GoNext();
         }
@@ -58,8 +59,9 @@ fn collect_results(r: &mut dyn IndexReader, s: &Bm25Scorer, store: &PostingStore
     let mut out = Vec::new();
     while !r.IsEnd() {
         let doc_id  = r.GetDocumentID();
-        let doc_len = store.GetDocLen(doc_id);
-        let score   = r.GetScore(s, doc_len) + store.GetDocImportance(doc_id);
+        let doc_id_value = ReaderDocumentIDValue(doc_id);
+        let doc_len = store.GetDocLen(doc_id_value);
+        let score   = r.GetScore(s, doc_len) + store.GetDocImportance(doc_id_value);
         out.push(SearchResult { doc_id, score });
         r.GoNext();
     }

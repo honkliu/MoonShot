@@ -1,5 +1,6 @@
 use crate::eval_tree::{EvalTree, EvalNode, TermNode, AndNode, OrNode, NotNode, BIGRAM_SEP};
 use crate::tokenizer::Tokenizer;
+use crate::vector_index::build_hashed_embedding;
 
 /*
 * IndexSearchCompiler — tokenizes a query string and builds an EvalTree.
@@ -27,11 +28,21 @@ impl IndexSearchCompiler {
     pub fn Compile(&self, query: &str, stream_set: &str) -> EvalTree {
         let streams = parse_stream_set(stream_set);
         let root = if streams.is_empty() { None } else { parse_expression(query, &streams, self.tokenizer.as_ref()) };
-        EvalTree::new(root)
+        let mut tree = EvalTree::new(root);
+        if has_vector_stream(stream_set) {
+            tree.vector_query = self.CompileToVector(query);
+        }
+        tree
+    }
+
+    #[allow(non_snake_case)]
+    pub fn CompileToVector(&self, query: &str) -> Vec<f32> {
+        build_hashed_embedding(&self.tokenizer.Tokenize(query))
     }
 }
 
 fn parse_stream_set(s: &str) -> Vec<String> {
+    let mut saw_vector_only_candidate = false;
     let mut streams: Vec<String> = s.chars()
         .filter_map(|c| match c.to_ascii_uppercase() {
             'A' => Some("A".into()),
@@ -39,11 +50,16 @@ fn parse_stream_set(s: &str) -> Vec<String> {
             'T' => Some("T".into()),
             'B' => Some("B".into()),
             'M' => Some("M".into()),
+            'V' => { saw_vector_only_candidate = true; None },
             _   => None,
         })
         .collect();
-    if streams.is_empty() { streams.push("T".into()); }
+    if streams.is_empty() && !saw_vector_only_candidate { streams.push("T".into()); }
     streams
+}
+
+fn has_vector_stream(s: &str) -> bool {
+    s.chars().any(|c| c == 'V' || c == 'v')
 }
 
 fn make_term_group(term: &str, streams: &[String], word_span: u32) -> EvalNode {

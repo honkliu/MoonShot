@@ -2,6 +2,8 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
+// Rust command-line counterpart to examples/moon.cpp.
+
 use rustblade::executor::IndexSearchExecutor;
 use rustblade::{Document, IndexContext};
 

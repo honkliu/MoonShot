@@ -8,14 +8,14 @@ use crate::index_writer::AdvancedIndexWriter;
 use crate::index_writer::IndexWriter;
 use crate::eval_tree::{EvalTree, EvalNode};
 use crate::advanced_reader::AdvancedIndexReader;
-use crate::composite_readers::{AndIndexReader, OrIndexReader, NotIndexReader};
-use crate::index_reader::IndexReader;
+use crate::composite_readers::{AndIndexReader, OrIndexReader, NotIndexReader, VectorIndexReader};
+use crate::index_reader::{IndexReader, ReaderDocumentIDValue};
 use crate::compiler::IndexSearchCompiler;
 use crate::tokenizer::{SmartTokenizer, Tokenizer};
 use crate::serializer::{IndexSerializer, IndexFileHeader};
 use crate::error::{Result, RustBladeError};
 use crate::block_table::{DOC_PATH_MAX, DOC_REC_SIZE, DOC_VECTOR_DIM, INDEX_FILE_HEADER_SIZE, PAGE_SIZE, HEAD_TERM_KEY_MAX, INDEX_BLOCK_CONTINUATION_HEADER_SIZE, LEAF_TERM_DATA_OFFSET, LEAF_TERM_DIRECTORY_COUNT, HeadTermEntry, IndexBlock, IndexBlockContinuationHeader, LeafTermEntry, LeafTermBlock, PinnedBlock};
-use crate::vector_index::{HnswIndex, Metric as VectorMetric};
+use crate::vector_index::{HnswIndex, VectorMetric, VectorSearchResult};
 use crate::vector_index::build_hashed_embedding;
 
 pub struct Document {
@@ -151,9 +151,9 @@ impl IndexContext {
     pub fn GetTokenizer(&self) -> &SmartTokenizer { &self.m_Tokenizer }
     pub fn GetCompiler(&self)  -> &IndexSearchCompiler { &self.m_Compiler }
     pub fn GetStore(&self) -> Arc<Mutex<PostingStore>> { Arc::clone(&self.m_Store) }
-    pub fn DocumentCount(&self) -> u64 { self.m_IndexFileHeader.ifh_num_documents }
-    pub fn AvgDocLen(&self) -> f32 { self.m_IndexFileHeader.ifh_avg_doc_length }
-    pub fn GetDocPath(&self, doc_id: u64) -> String { self.m_Store.lock().unwrap().GetDocPath(doc_id).to_string() }
+    pub fn DocumentCount(&self) -> u64 { self.m_IndexFileHeader.IFH_NumDocuments }
+    pub fn AvgDocLen(&self) -> f32 { self.m_IndexFileHeader.IFH_AvgDocLength }
+    pub fn GetDocPath(&self, doc_id: u64) -> String { self.m_Store.lock().unwrap().GetDocPath(ReaderDocumentIDValue(doc_id)).to_string() }
 
     pub fn HasDelta(&self) -> bool {
         self.m_DeltaContext.as_ref().map(|delta| delta.DocumentCount() > 0).unwrap_or(false)
@@ -204,6 +204,16 @@ impl IndexContext {
 
     pub fn GetReader(&mut self, tree: EvalTree) -> Box<dyn IndexReader> {
         self.EnsureBuilt();
+        if tree.HasTextQuery() && tree.HasVectorQuery() {
+            let children = vec![
+                self.BuildIndexReader(tree.root),
+                self.BuildVectorIndexReader(&tree.vector_query, tree.vector_ef_search),
+            ];
+            return Box::new(OrIndexReader::new(children));
+        }
+        if tree.HasVectorQuery() {
+            return self.BuildVectorIndexReader(&tree.vector_query, tree.vector_ef_search);
+        }
         self.BuildIndexReader(tree.root)
     }
 
@@ -214,10 +224,17 @@ impl IndexContext {
             stream_key, Arc::clone(&self.m_BlockTable), docFreq))
     }
 
-    pub fn VectorSearch(&mut self, query: &[f32], top_k: usize, ef_search: usize) -> Vec<(u64, f32)> {
+    pub fn CompileToVector(&self, query: &str) -> Vec<f32> {
+        self.m_Compiler.CompileToVector(query)
+    }
+
+    pub fn VectorSearch(&mut self, query: &[f32], top_k: usize, ef_search: usize) -> Vec<VectorSearchResult> {
         self.EnsureVectorIndexBuilt();
         self.m_VectorIndex.Search(query, top_k, ef_search)
     }
+
+    pub fn VectorCount(&mut self) -> usize { self.EnsureVectorIndexBuilt(); self.m_VectorIndex.Size() }
+    pub fn VectorDimension(&self) -> usize { self.m_VectorIndex.Dimension() }
 
     // ── Persistence ─────────────────────────────────────────────────────────
 
@@ -268,9 +285,9 @@ impl IndexContext {
         let docDataTempPath = format!("{prefix}.docdata.tmp");
         Self::CleanupTempFiles(&[&tempPath, &headTempPath, &leafTempPath, &indexTempPath, &docDataTempPath]);
 
-        let baseDocCount = self.m_IndexFileHeader.ifh_num_documents as usize;
+        let baseDocCount = self.m_IndexFileHeader.IFH_NumDocuments as usize;
         let deltaFirstDocId = baseDocCount;
-        let deltaDocLimit = delta.m_IndexFileHeader.ifh_num_documents as usize;
+        let deltaDocLimit = delta.m_IndexFileHeader.IFH_NumDocuments as usize;
         if deltaDocLimit < deltaFirstDocId { return Err(RustBladeError::InvalidFormat); }
 
         let deltaDocCount = deltaDocLimit - deltaFirstDocId;
@@ -362,21 +379,21 @@ impl IndexContext {
         let leafOffset = headOffset + headEntryCount as usize * 32;
         let docDataOffset = leafOffset + headEntryCount as usize * PAGE_SIZE;
         let indexOffset = docDataOffset + mergedDocData.len();
-        let totalDocLength = (self.m_IndexFileHeader.ifh_avg_doc_length as f64 * baseDocCount as f64)
-            + (delta.m_IndexFileHeader.ifh_avg_doc_length as f64 * deltaDocLimit as f64);
+        let totalDocLength = (self.m_IndexFileHeader.IFH_AvgDocLength as f64 * baseDocCount as f64)
+            + (delta.m_IndexFileHeader.IFH_AvgDocLength as f64 * deltaDocLimit as f64);
         let avgDocLength = if mergedDocs == 0 { 1.0 } else { (totalDocLength / mergedDocs as f64) as f32 };
 
         let header = IndexFileHeader {
-            ifh_avg_doc_length: avgDocLength,
-            ifh_num_documents: mergedDocs as u64,
-            ifh_num_terms: totalTerms,
-            ifh_head_term_entry_offset: headOffset as u64,
-            ifh_head_term_entry_count: headEntryCount,
-            ifh_leaf_term_block_offset: leafOffset as u64,
-            ifh_leaf_term_block_count: headEntryCount,
-            ifh_doc_data_offset: docDataOffset as u64,
-            ifh_index_block_offset: indexOffset as u64,
-            ifh_index_block_count: indexBlockCount as u64,
+            IFH_AvgDocLength: avgDocLength,
+            IFH_NumDocuments: mergedDocs as u64,
+            IFH_NumTerms: totalTerms,
+            IFH_HeadTermEntryOffset: headOffset as u64,
+            IFH_HeadTermEntryCount: headEntryCount,
+            IFH_LeafTermBlockOffset: leafOffset as u64,
+            IFH_LeafTermBlockCount: headEntryCount,
+            IFH_DocDataOffset: docDataOffset as u64,
+            IFH_IndexBlockOffset: indexOffset as u64,
+            IFH_IndexBlockCount: indexBlockCount as u64,
         };
 
         let _ = fs::remove_file(&tempPath);
@@ -409,16 +426,16 @@ impl IndexContext {
         let indexOffset = docDataOffset + docData.len();
 
         let header = IndexFileHeader {
-            ifh_avg_doc_length: if documentCount == 0 { 1.0 } else { store.TotalTerms() as f32 / documentCount as f32 },
-            ifh_num_documents: documentCount,
-            ifh_num_terms: blocks.BBR_TotalTerms,
-            ifh_head_term_entry_offset: headOffset as u64,
-            ifh_head_term_entry_count: blocks.BBR_HeadTermEntries.len() as u64,
-            ifh_leaf_term_block_offset: leafOffset as u64,
-            ifh_leaf_term_block_count: blocks.BBR_LeafTermBlocks.len() as u64,
-            ifh_doc_data_offset: docDataOffset as u64,
-            ifh_index_block_offset: indexOffset as u64,
-            ifh_index_block_count: blocks.BBR_IndexBlocks.len() as u64,
+            IFH_AvgDocLength: if documentCount == 0 { 1.0 } else { store.TotalTerms() as f32 / documentCount as f32 },
+            IFH_NumDocuments: documentCount,
+            IFH_NumTerms: blocks.BBR_TotalTerms,
+            IFH_HeadTermEntryOffset: headOffset as u64,
+            IFH_HeadTermEntryCount: blocks.BBR_HeadTermEntries.len() as u64,
+            IFH_LeafTermBlockOffset: leafOffset as u64,
+            IFH_LeafTermBlockCount: blocks.BBR_LeafTermBlocks.len() as u64,
+            IFH_DocDataOffset: docDataOffset as u64,
+            IFH_IndexBlockOffset: indexOffset as u64,
+            IFH_IndexBlockCount: blocks.BBR_IndexBlocks.len() as u64,
         };
 
         let mut blockTable = IndexBlockTable::new(blocks.BBR_IndexBlocks.len().max(512) + 64);
@@ -428,7 +445,7 @@ impl IndexContext {
         let mut vectorIndex = HnswIndex::new(DOC_VECTOR_DIM, 32, 200, VectorMetric::Cosine);
         vectorIndex.SetDocData(docData.clone());
         if buildVectorIndex {
-            for docId in 0..header.ifh_num_documents { vectorIndex.Add(docId); }
+            for docId in 0..header.IFH_NumDocuments { vectorIndex.Add(docId); }
         }
 
         (header, blockTable, vectorIndex, docData)
@@ -438,7 +455,7 @@ impl IndexContext {
         if self.m_VectorBuilt { return; }
         let mut vectorIndex = HnswIndex::new(DOC_VECTOR_DIM, 32, 200, VectorMetric::Cosine);
         vectorIndex.SetDocData(self.m_DocData.clone());
-        for docId in 0..self.m_IndexFileHeader.ifh_num_documents { vectorIndex.Add(docId); }
+        for docId in 0..self.m_IndexFileHeader.IFH_NumDocuments { vectorIndex.Add(docId); }
         self.m_VectorIndex = vectorIndex;
         self.m_VectorBuilt = true;
     }
@@ -472,15 +489,15 @@ impl IndexContext {
         self.m_IndexPath = Some(path.to_string());
         let mut store = PostingStore::new();
         let (header, head_term_entries, docdata) = IndexSerializer::load_file_tables(&mut store, path)?;
-        let mut table = IndexBlockTable::new(header.ifh_index_block_count as usize);
+        let mut table = IndexBlockTable::new(header.IFH_IndexBlockCount as usize);
         table.InitFileBacked(
             path,
-            header.ifh_index_block_offset,
-            header.ifh_index_block_count as u32,
-            header.ifh_index_block_count.min(25_600) as u32,
-            header.ifh_leaf_term_block_offset,
-            header.ifh_leaf_term_block_count as u32,
-            header.ifh_leaf_term_block_count.min(25_600) as u32,
+            header.IFH_IndexBlockOffset,
+            header.IFH_IndexBlockCount as u32,
+            header.IFH_IndexBlockCount.min(25_600) as u32,
+            header.IFH_LeafTermBlockOffset,
+            header.IFH_LeafTermBlockCount as u32,
+            header.IFH_LeafTermBlockCount.min(25_600) as u32,
         )?;
         table.SetHeadEntries(head_term_entries);
 
@@ -575,14 +592,14 @@ impl IndexContext {
             let leaf = &mergedCursor.m_LeafBlocks[leafBlockID];
             let entryCount = leaf.entry_count().min(LEAF_TERM_DIRECTORY_COUNT - 1);
             let firstEntry = leaf.entry(0).ok_or(RustBladeError::InvalidFormat)?;
-            let head = HeadTermEntry::new(&firstEntry.lte_term, *headEntryCount as u32 + leafBlockID as u32);
+            let head = HeadTermEntry::new(&firstEntry.LTE_Term, *headEntryCount as u32 + leafBlockID as u32);
             headFile.write_all(&head.to_bytes())?;
             leafFile.write_all(&leaf.to_bytes())?;
             *totalTerms += entryCount as u64;
         }
 
         for indexBlockID in 0..usedIndexBlocks as usize {
-            indexFile.write_all(&mergedCursor.m_IndexBlocks[indexBlockID].ib_data)?;
+            indexFile.write_all(&mergedCursor.m_IndexBlocks[indexBlockID].IB_Data)?;
         }
 
         *headEntryCount += usedLeafBlocks as u64;
@@ -632,6 +649,11 @@ impl IndexContext {
             }
         }
     }
+
+    fn BuildVectorIndexReader(&mut self, query: &[f32], efSearch: usize) -> Box<dyn IndexReader> {
+        let results = self.VectorSearch(query, 0, efSearch);
+        Box::new(VectorIndexReader::new(results))
+    }
 }
 
 #[allow(non_snake_case)]
@@ -663,16 +685,16 @@ const POSTING_SCRATCH_BYTES: usize = POSTING_SCRATCH_PAGE_COUNT * PAGE_SIZE;
 
 #[allow(non_snake_case)]
 fn WriteLeafEntry(block: &mut LeafTermBlock, entryIndex: usize, offset: usize, entry: &LeafTermEntry) {
-    block.ltb_directory[entryIndex] = (LEAF_TERM_DATA_OFFSET + offset) as u16;
-    let data = &mut block.ltb_data[offset..];
-    data[0..4].copy_from_slice(&entry.lte_doc_freq.to_le_bytes());
-    data[4..8].copy_from_slice(&entry.lte_index_block_id.to_le_bytes());
-    data[8..12].copy_from_slice(&entry.lte_index_offset.to_le_bytes());
-    data[12..16].copy_from_slice(&entry.lte_index_length.to_le_bytes());
-    data[16..20].copy_from_slice(&entry.lte_continuation_block_count.to_le_bytes());
-    data[20..24].copy_from_slice(&entry.lte_flags.to_le_bytes());
-    data[24] = entry.lte_term.len() as u8;
-    data[25..25 + entry.lte_term.len()].copy_from_slice(entry.lte_term.as_bytes());
+    block.LTB_Directory[entryIndex] = (LEAF_TERM_DATA_OFFSET + offset) as u16;
+    let data = &mut block.LTB_Data[offset..];
+    data[0..4].copy_from_slice(&entry.LTE_DocFreq.to_le_bytes());
+    data[4..8].copy_from_slice(&entry.LTE_IndexBlockID.to_le_bytes());
+    data[8..12].copy_from_slice(&entry.LTE_IndexOffset.to_le_bytes());
+    data[12..16].copy_from_slice(&entry.LTE_IndexLength.to_le_bytes());
+    data[16..20].copy_from_slice(&entry.LTE_ContinuationBlockCount.to_le_bytes());
+    data[20..24].copy_from_slice(&entry.LTE_Flags.to_le_bytes());
+    data[24] = entry.LTE_Term.len() as u8;
+    data[25..25 + entry.LTE_Term.len()].copy_from_slice(entry.LTE_Term.as_bytes());
 }
 
 #[allow(non_snake_case)]
@@ -800,13 +822,13 @@ impl<'a> LeafTermBlockView<'a> {
     }
 
     fn LessThan(&self, other: &Self) -> bool {
-        self.Current().map(|entry| entry.lte_term.as_str()).unwrap_or("")
-            < other.Current().map(|entry| entry.lte_term.as_str()).unwrap_or("")
+        self.Current().map(|entry| entry.LTE_Term.as_str()).unwrap_or("")
+            < other.Current().map(|entry| entry.LTE_Term.as_str()).unwrap_or("")
     }
 
     fn CanAddLeafTermEntry(&self, cursor: &Self) -> bool {
         let Some(source) = cursor.Current() else { return false; };
-        if source.lte_term.len() > HEAD_TERM_KEY_MAX { return true; }
+        if source.LTE_Term.len() > HEAD_TERM_KEY_MAX { return true; }
 
         let entry_bytes = source.byte_len();
         if entry_bytes > PAGE_SIZE - LEAF_TERM_DATA_OFFSET { return false; }
@@ -823,14 +845,14 @@ impl<'a> LeafTermBlockView<'a> {
 
     fn AddLeafTermEntry(&mut self, cursor: &Self) -> bool {
         let Some(source) = cursor.Current() else { return false; };
-        if source.lte_term.len() > HEAD_TERM_KEY_MAX { return true; }
+        if source.LTE_Term.len() > HEAD_TERM_KEY_MAX { return true; }
 
         let entry_bytes = source.byte_len();
         if self.m_LeafEntryCount > 0
             && (self.m_LeafEntryCount >= LEAF_TERM_DIRECTORY_COUNT - 1
                 || self.m_LeafWriteOffset + entry_bytes > PAGE_SIZE - LEAF_TERM_DATA_OFFSET)
         {
-            self.m_LeafBlocks[self.m_LeafBlockID as usize].ltb_directory[LEAF_TERM_DIRECTORY_COUNT - 1] = self.m_LeafEntryCount as u16;
+            self.m_LeafBlocks[self.m_LeafBlockID as usize].LTB_Directory[LEAF_TERM_DIRECTORY_COUNT - 1] = self.m_LeafEntryCount as u16;
             self.m_LeafBlockID += 1;
             self.m_LeafWriteOffset = 0;
             self.m_LeafEntryCount = 0;
@@ -841,19 +863,19 @@ impl<'a> LeafTermBlockView<'a> {
         }
 
         let entry = LeafTermEntry {
-            lte_term: source.lte_term.clone(),
-            lte_doc_freq: self.m_DocFreq,
-            lte_index_block_id: self.m_IndexBlockBase + self.m_PostingIndexBlockID,
-            lte_index_offset: self.m_PostingIndexOffset as u32,
-            lte_index_length: self.m_PostingIndexLength as u32,
-            lte_continuation_block_count: self.m_PostingContinuationBlockCount,
-            lte_flags: source.lte_flags,
+            LTE_Term: source.LTE_Term.clone(),
+            LTE_DocFreq: self.m_DocFreq,
+            LTE_IndexBlockID: self.m_IndexBlockBase + self.m_PostingIndexBlockID,
+            LTE_IndexOffset: self.m_PostingIndexOffset as u32,
+            LTE_IndexLength: self.m_PostingIndexLength as u32,
+            LTE_ContinuationBlockCount: self.m_PostingContinuationBlockCount,
+            LTE_Flags: source.LTE_Flags,
         };
 
         WriteLeafEntry(&mut self.m_LeafBlocks[self.m_LeafBlockID as usize], self.m_LeafEntryCount, self.m_LeafWriteOffset, &entry);
         self.m_LeafWriteOffset += entry_bytes;
         self.m_LeafEntryCount += 1;
-        self.m_LeafBlocks[self.m_LeafBlockID as usize].ltb_directory[LEAF_TERM_DIRECTORY_COUNT - 1] = self.m_LeafEntryCount as u16;
+        self.m_LeafBlocks[self.m_LeafBlockID as usize].LTB_Directory[LEAF_TERM_DIRECTORY_COUNT - 1] = self.m_LeafEntryCount as u16;
         self.m_PostingIndexLength = 0;
         self.m_PostingContinuationBlockCount = 0;
         true
@@ -864,7 +886,7 @@ impl<'a> LeafTermBlockView<'a> {
         let Some(bytes) = cursor.PostingBytes() else { return false; };
         if bytes.len() > POSTING_SCRATCH_BYTES { return false; }
         if !self.AddIndexBytes(&bytes) { return false; }
-        self.m_DocFreq = source.lte_doc_freq;
+        self.m_DocFreq = source.LTE_DocFreq;
         true
     }
 
@@ -875,7 +897,7 @@ impl<'a> LeafTermBlockView<'a> {
         if bytes.len() > POSTING_SCRATCH_BYTES || big_bytes.len() > POSTING_SCRATCH_BYTES - bytes.len() { return false; }
         bytes.extend_from_slice(&big_bytes);
         if !self.AddIndexBytes(&bytes) { return false; }
-        self.m_DocFreq = small.lte_doc_freq + big.lte_doc_freq;
+        self.m_DocFreq = small.LTE_DocFreq + big.LTE_DocFreq;
         true
     }
 
@@ -937,16 +959,16 @@ impl<'a> LeafTermBlockView<'a> {
         let blocksNeeded = 1usize + continuations.len();
         if blocksNeeded > self.m_IndexBlockCount as usize - targetBlockID as usize { return false; }
 
-        self.m_IndexBlocks[targetBlockID as usize].ib_data[targetOffset..targetOffset + splitLength]
+        self.m_IndexBlocks[targetBlockID as usize].IB_Data[targetOffset..targetOffset + splitLength]
             .copy_from_slice(&sourceBytes[..splitLength]);
 
         for (i, (offset, length, maxDocID)) in continuations.iter().copied().enumerate() {
             let continuationBlockID = targetBlockID + 1 + i as u32;
             IndexBlockContinuationHeader {
-                ibch_max_doc_id: maxDocID,
-                ibch_data_length: length as u32,
-            }.write_to(&mut self.m_IndexBlocks[continuationBlockID as usize].ib_data[..CONT_HDR]);
-            self.m_IndexBlocks[continuationBlockID as usize].ib_data[CONT_HDR..CONT_HDR + length]
+                IBCH_MaxDocID: maxDocID,
+                IBCH_DataLength: length as u32,
+            }.write_to(&mut self.m_IndexBlocks[continuationBlockID as usize].IB_Data[..CONT_HDR]);
+            self.m_IndexBlocks[continuationBlockID as usize].IB_Data[CONT_HDR..CONT_HDR + length]
                 .copy_from_slice(&sourceBytes[offset..offset + length]);
         }
 

@@ -2,6 +2,9 @@ use std::collections::HashMap;
 
 use wasm_bindgen::prelude::*;
 
+// Rust/WASM inspection surface for the C++ v12 index format. There is no native
+// C++ peer file; the binary structures below mirror BlockTable.h/IndexSerializer.h.
+
 use crate::block_table::{
     IndexBlock,
     IndexBlockContinuationHeader,
@@ -67,7 +70,7 @@ fn parse_index_inner(data: &[u8]) -> Result<String, String> {
 
     let mut block_entry_map: HashMap<u32, Vec<LeafTermEntry>> = HashMap::new();
     for entry in leaf_blocks.iter().flat_map(|block| block.entries()) {
-        block_entry_map.entry(entry.lte_index_block_id).or_default().push(entry);
+        block_entry_map.entry(entry.LTE_IndexBlockID).or_default().push(entry);
     }
 
     let mut out = String::from("{");
@@ -98,11 +101,11 @@ fn parse_index_inner(data: &[u8]) -> Result<String, String> {
     for (index, entry) in head_entries.iter().enumerate() {
         if index > 0 { out.push(','); }
         out.push_str(&format!(
-            r#"{{"hte_first_term":{},"hte_leaf_term_block_id":{},"byte_offset":{},"byte_len":32,"leaf_term_block_offset":{},"leaf_term_block_len":{}}}"#,
+            r#"{{"HTE_FirstTerm":{},"HTE_LeafTermBlockID":{},"byte_offset":{},"byte_len":32,"leaf_term_block_offset":{},"leaf_term_block_len":{}}}"#,
             serde_json::to_string(entry.first_term()).unwrap_or_default(),
-            entry.hte_leaf_term_block_id,
+            entry.HTE_LeafTermBlockID,
             header.head_term_off as usize + index * 32,
-            header.leaf_term_off as usize + entry.hte_leaf_term_block_id as usize * PAGE_SIZE,
+            header.leaf_term_off as usize + entry.HTE_LeafTermBlockID as usize * PAGE_SIZE,
             PAGE_SIZE
         ));
     }
@@ -121,16 +124,16 @@ fn parse_index_inner(data: &[u8]) -> Result<String, String> {
         for entry_index in 0..block.entry_count() {
             if entry_index > 0 { out.push(','); }
             let Some(entry) = block.entry(entry_index) else { continue; };
-            let entry_offset = block.ltb_directory[entry_index] as usize;
+            let entry_offset = block.LTB_Directory[entry_index] as usize;
             out.push_str(&format!(
-                r#"{{"lte_term":{},"lte_doc_freq":{},"lte_index_block_id":{},"lte_index_offset":{},"lte_index_length":{},"lte_continuation_block_count":{},"lte_flags":{},"byte_offset":{},"byte_len":{}}}"#,
-                serde_json::to_string(&entry.lte_term).unwrap_or_default(),
-                entry.lte_doc_freq,
-                entry.lte_index_block_id,
-                entry.lte_index_offset,
-                entry.lte_index_length,
-                entry.lte_continuation_block_count,
-                entry.lte_flags,
+                r#"{{"LTE_Term":{},"LTE_DocFreq":{},"LTE_IndexBlockID":{},"LTE_IndexOffset":{},"LTE_IndexLength":{},"LTE_ContinuationBlockCount":{},"LTE_Flags":{},"byte_offset":{},"byte_len":{}}}"#,
+                serde_json::to_string(&entry.LTE_Term).unwrap_or_default(),
+                entry.LTE_DocFreq,
+                entry.LTE_IndexBlockID,
+                entry.LTE_IndexOffset,
+                entry.LTE_IndexLength,
+                entry.LTE_ContinuationBlockCount,
+                entry.LTE_Flags,
                 block_offset + entry_offset,
                 entry.byte_len()
             ));
@@ -180,25 +183,25 @@ fn parse_index_inner(data: &[u8]) -> Result<String, String> {
 fn decode_block_terms(block: &IndexBlock, entries: &[LeafTermEntry]) -> Vec<String> {
     let mut terms = Vec::new();
 
-    if let Some(header) = IndexBlockContinuationHeader::from_bytes(&block.ib_data) {
-        let len = header.ibch_data_length as usize;
+    if let Some(header) = IndexBlockContinuationHeader::from_bytes(&block.IB_Data) {
+        let len = header.IBCH_DataLength as usize;
         if len > 0 && INDEX_BLOCK_CONTINUATION_HEADER_SIZE + len <= PAGE_SIZE {
-            let postings = decode_postings(&block.ib_data[INDEX_BLOCK_CONTINUATION_HEADER_SIZE..INDEX_BLOCK_CONTINUATION_HEADER_SIZE + len]);
+            let postings = decode_postings(&block.IB_Data[INDEX_BLOCK_CONTINUATION_HEADER_SIZE..INDEX_BLOCK_CONTINUATION_HEADER_SIZE + len]);
             terms.push(format_postings("[continuation]", 0, INDEX_BLOCK_CONTINUATION_HEADER_SIZE, len, 0, postings));
         }
     }
 
     for entry in entries {
-        let start = entry.lte_index_offset as usize;
-        let len = entry.lte_index_length as usize;
+        let start = entry.LTE_IndexOffset as usize;
+        let len = entry.LTE_IndexLength as usize;
         if start + len > PAGE_SIZE { continue; }
-        let postings = decode_postings(&block.ib_data[start..start + len]);
+        let postings = decode_postings(&block.IB_Data[start..start + len]);
         terms.push(format_postings(
-            &entry.lte_term,
-            entry.lte_doc_freq,
+            &entry.LTE_Term,
+            entry.LTE_DocFreq,
             start,
             len,
-            entry.lte_continuation_block_count,
+            entry.LTE_ContinuationBlockCount,
             postings));
     }
 
@@ -214,7 +217,7 @@ fn format_postings(term: &str,
 {
     let shown = postings.len().min(5);
     let mut out = format!(
-        r#"{{"lte_term":{},"lte_doc_freq":{},"lte_index_length":{},"lte_index_offset":{},"lte_continuation_block_count":{},"index_entries":["#,
+        r#"{{"LTE_Term":{},"LTE_DocFreq":{},"LTE_IndexLength":{},"LTE_IndexOffset":{},"LTE_ContinuationBlockCount":{},"index_entries":["#,
         serde_json::to_string(term).unwrap_or_default(),
         doc_freq,
         len,

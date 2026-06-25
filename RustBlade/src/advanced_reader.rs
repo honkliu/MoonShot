@@ -8,102 +8,108 @@ use crate::block_table::{
     PinnedBlock,
 };
 use crate::bm25::Bm25Scorer;
-use crate::index_reader::{IndexReader, NO_MORE_DOCS};
+use crate::index_reader::{IndexReader, NO_MORE_DOCS, ReaderSourceMaskForStream};
 use crate::varbyte_decoder::VarByteDecoder;
 
+#[allow(non_snake_case)]
 pub struct AdvancedIndexReader {
     #[allow(dead_code)]
-    stream_key: String,
-    block_table: Arc<IndexBlockTable>,
-    doc_freq: u32,
-    block_seq: u32,
-    remaining_continuation_blocks: u32,
-    decoder: VarByteDecoder,
+    m_Word: String,
+    m_BlockTable: Arc<IndexBlockTable>,
+    m_DocFreq: u32,
+    m_SourceMask: u8,
+    m_BlockSeqNumber: u32,
+    m_RemainingContinuationBlocks: u32,
+    m_Decoder: VarByteDecoder,
 }
 
+#[allow(non_snake_case)]
 impl AdvancedIndexReader {
     pub fn open(stream_key: &str, block_table: Arc<IndexBlockTable>, doc_freq: u32) -> Self {
         let mut reader = Self {
-            stream_key: stream_key.to_string(),
-            block_table,
-            doc_freq,
-            block_seq: 0,
-            remaining_continuation_blocks: 0,
-            decoder: VarByteDecoder::new(),
+            m_Word: stream_key.to_string(),
+            m_BlockTable: block_table,
+            m_DocFreq: doc_freq,
+            m_SourceMask: stream_key.chars().last().map(ReaderSourceMaskForStream).unwrap_or(0),
+            m_BlockSeqNumber: 0,
+            m_RemainingContinuationBlocks: 0,
+            m_Decoder: VarByteDecoder::new(),
         };
 
-        if let Some((location, block)) = reader.block_table.FindTermData(stream_key) {
-            reader.block_seq = location.index_block_id;
-            reader.remaining_continuation_blocks = location.continuation_block_count;
-            reader.doc_freq = location.doc_freq;
-            reader.decoder.OpenRaw(block, location.index_offset, location.index_length, 0);
+        if let Some((location, block)) = reader.m_BlockTable.FindTermData(stream_key) {
+            reader.m_BlockSeqNumber = location.index_block_id;
+            reader.m_RemainingContinuationBlocks = location.continuation_block_count;
+            reader.m_DocFreq = location.doc_freq;
+            reader.m_Decoder.OpenRaw(block, location.index_offset, location.index_length, 0);
         }
 
         reader.GoNext();
         reader
     }
 
-    fn load_continuation(&mut self) -> bool {
-        let next_seq = self.block_seq + 1;
-        let Some(block) = self.block_table.GetBlockBySeq(next_seq) else { return false; };
-        self.block_seq = next_seq;
-        self.open_continuation(block);
-        self.remaining_continuation_blocks = self.remaining_continuation_blocks.saturating_sub(1);
+    fn LoadContinuation(&mut self) -> bool {
+        let nextSeq = self.m_BlockSeqNumber + 1;
+        let Some(block) = self.m_BlockTable.GetBlockBySeq(nextSeq) else { return false; };
+        self.m_BlockSeqNumber = nextSeq;
+        self.OpenContinuation(block);
+        self.m_RemainingContinuationBlocks = self.m_RemainingContinuationBlocks.saturating_sub(1);
         true
     }
 
-    fn open_continuation(&mut self, block: PinnedBlock<IndexBlock>) {
-        if let Some(header) = IndexBlockContinuationHeader::from_bytes(&block.ib_data) {
-            let len = header.ibch_data_length as usize;
-            self.decoder.OpenRaw(
+    fn OpenContinuation(&mut self, block: PinnedBlock<IndexBlock>) {
+        if let Some(header) = IndexBlockContinuationHeader::from_bytes(&block.IB_Data) {
+            let len = header.IBCH_DataLength as usize;
+            self.m_Decoder.OpenRaw(
                 block,
                 INDEX_BLOCK_CONTINUATION_HEADER_SIZE,
                 len,
                 0);
         } else {
-            self.decoder.OpenRaw(block, 0, 0, 0);
+            self.m_Decoder.OpenRaw(block, 0, 0, 0);
         }
     }
 }
 
 impl IndexReader for AdvancedIndexReader {
     fn GoNext(&mut self) {
-        self.decoder.GoNext();
-        while self.decoder.IsEnd() && self.remaining_continuation_blocks > 0 {
-            if !self.load_continuation() { break; }
-            self.decoder.GoNext();
+        self.m_Decoder.GoNext();
+        while self.m_Decoder.IsEnd() && self.m_RemainingContinuationBlocks > 0 {
+            if !self.LoadContinuation() { break; }
+            self.m_Decoder.GoNext();
         }
     }
 
-    fn GoUntil(&mut self, target: u64) {
+    fn GoUntil(&mut self, target: u64, limit: u64) {
         loop {
-            self.decoder.GoUntil(target);
-            if !self.decoder.IsEnd() { break; }
-            if self.remaining_continuation_blocks == 0 { break; }
-            let Some(block) = self.block_table.GetBlockBySeq(self.block_seq + 1) else { break; };
-            let Some(header) = IndexBlockContinuationHeader::from_bytes(&block.ib_data) else { break; };
-            self.block_seq += 1;
-            self.remaining_continuation_blocks = self.remaining_continuation_blocks.saturating_sub(1);
-            if target > header.ibch_max_doc_id {
+            self.m_Decoder.GoUntil(target);
+            if !self.m_Decoder.IsEnd() || self.GetDocumentID() >= limit { break; }
+            if self.m_RemainingContinuationBlocks == 0 { break; }
+            let Some(block) = self.m_BlockTable.GetBlockBySeq(self.m_BlockSeqNumber + 1) else { break; };
+            let Some(header) = IndexBlockContinuationHeader::from_bytes(&block.IB_Data) else { break; };
+            self.m_BlockSeqNumber += 1;
+            self.m_RemainingContinuationBlocks = self.m_RemainingContinuationBlocks.saturating_sub(1);
+            if target > header.IBCH_MaxDocID {
                 continue;
             }
-            self.open_continuation(block);
+            self.OpenContinuation(block);
         }
     }
 
-    fn IsEnd(&self) -> bool { self.decoder.IsEnd() }
+    fn IsEnd(&self) -> bool { self.m_Decoder.IsEnd() }
 
     fn GetDocumentID(&self) -> u64 {
-        if self.decoder.IsEnd() { NO_MORE_DOCS } else { self.decoder.GetDocumentID() }
+        if self.m_Decoder.IsEnd() { NO_MORE_DOCS } else { self.m_Decoder.GetDocumentID() }
     }
 
     fn GetTermFreq(&self) -> u32 {
-        if self.decoder.IsEnd() { 0 } else { self.decoder.GetTermFrequency() }
+        if self.m_Decoder.IsEnd() { 0 } else { self.m_Decoder.GetTermFrequency() }
     }
 
     fn GetScore(&self, scorer: &Bm25Scorer, doc_len: u32) -> f32 {
-        scorer.score(self.GetTermFreq(), doc_len, self.doc_freq)
+        scorer.score(self.GetTermFreq(), doc_len, self.m_DocFreq)
     }
+
+    fn GetSourceMask(&self) -> u8 { self.m_SourceMask }
 
     fn SetDebug(&mut self, _label: &str, _depth: usize) {}
 }

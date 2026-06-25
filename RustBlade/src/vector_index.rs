@@ -8,10 +8,18 @@ use crate::block_table::{DOC_REC_SIZE, DOC_VECTOR_DIM};
 const DOC_VECTOR_OFFSET: usize = 256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-pub enum Metric {
+pub enum VectorMetric {
     L2,
     Cosine,
     DotProduct,
+}
+
+pub type Metric = VectorMetric;
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct VectorSearchResult {
+    pub doc_id: u64,
+    pub score: f32,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -40,12 +48,12 @@ pub struct HnswIndex {
     max_neighbors: usize,
     ef_construction: usize,
     pub dim: usize,
-    metric: Metric,
+    metric: VectorMetric,
     docdata: Vec<u8>,
 }
 
 impl HnswIndex {
-    pub fn new(dim: usize, max_neighbors: usize, ef_construction: usize, metric: Metric) -> Self {
+    pub fn new(dim: usize, max_neighbors: usize, ef_construction: usize, metric: VectorMetric) -> Self {
         Self {
             nodes: Vec::new(),
             entry_point: None,
@@ -69,7 +77,7 @@ impl HnswIndex {
     }
 
     #[allow(non_snake_case)]
-    pub fn Search(&self, query: &[f32], k: usize, ef: usize) -> Vec<(u64, f32)> {
+    pub fn Search(&self, query: &[f32], k: usize, ef: usize) -> Vec<VectorSearchResult> {
         if query.len() != DOC_VECTOR_DIM || self.nodes.is_empty() { return Vec::new(); }
 
         let mut entry = self.entry_point.unwrap();
@@ -91,11 +99,11 @@ impl HnswIndex {
             candidates.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(Ordering::Equal).then(a.1.cmp(&b.1)));
         }
 
-        let mut out: Vec<(u64, f32)> = candidates
+        let mut out: Vec<VectorSearchResult> = candidates
             .into_iter()
-            .map(|(_, node_id)| (node_id as u64, self.score_query_to_node(query, node_id)))
+            .map(|(_, node_id)| VectorSearchResult { doc_id: node_id as u64, score: self.score_query_to_node(query, node_id) })
             .collect();
-        out.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal).then(a.0.cmp(&b.0)));
+        out.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal).then(a.doc_id.cmp(&b.doc_id)));
         if k > 0 && out.len() > k { out.truncate(k); }
         out
     }
@@ -104,6 +112,8 @@ impl HnswIndex {
     pub fn Size(&self) -> usize { self.nodes.len() }
     #[allow(non_snake_case)]
     pub fn Empty(&self) -> bool { self.nodes.is_empty() }
+    #[allow(non_snake_case)]
+    pub fn Dimension(&self) -> usize { self.dim }
 
     fn add_node(&mut self, doc_id: u64) -> bool {
         if doc_id < self.nodes.len() as u64 { return true; }
@@ -335,7 +345,7 @@ impl VectorIndex {
     }
 
     #[allow(non_snake_case)]
-    pub fn Search(&self, query: &[f32], k: usize, ef: usize) -> Vec<(u64, f32)> {
+    pub fn Search(&self, query: &[f32], k: usize, ef: usize) -> Vec<VectorSearchResult> {
         match self {
             VectorIndex::Hnsw(h) => h.Search(query, k, ef),
         }
@@ -425,6 +435,6 @@ mod tests {
         query[0] = 25.0 / 128.0;
         let results = idx.Search(&query, 1, 20);
         assert!(!results.is_empty());
-        assert_eq!(results[0].0, 25);
+        assert_eq!(results[0].doc_id, 25);
     }
 }
