@@ -7,11 +7,10 @@
  *   moon -idx <index> -i                     Search <index> with inverted index
  *   moon -idx <index> -v                     Search <index> with vector index
  *   moon -idx <index> -i -v                  Search <index> with both
- *   moon -file <filepath>              Index one file
- *   moon -dir <directory> -ext md,txt  Index matching files in one directory
- *   moon -dir <directory> -ext md -r   Index matching files recursively
+ *   moon -file <filepath>                    Index one file
+ *   moon -dir <directory> -ext md,txt        Index matching files in one directory
+ *   moon -dir <directory> -ext md -r         Index matching files recursively
  *   moon -sample-merge -dir <root> -out <index-path> [-ext cpp,h,rs]
- *   moon -i                               Interactive search mode
  *
  * Index stored at:
  *   Linux   : ~/moon.idx  (+ ~/moon.idx.meta)
@@ -418,6 +417,22 @@ struct SearchOptions {
     bool vector = false;
 };
 
+static uint64_t CountStoredDocuments(IndexContext& ctx, uint64_t firstDocId);
+
+static std::string SearchStreamSet(const SearchOptions& options)
+{
+    std::string streams;
+    if (options.inverted) streams += "AUTB";
+    if (options.vector) streams += "V";
+    return streams;
+}
+
+static const char* SearchModeName(const SearchOptions& options)
+{
+    if (options.inverted && options.vector) return "inverted+vector";
+    return options.inverted ? "inverted" : "vector";
+}
+
 static std::string SourceMaskText(uint8_t sourceMask)
 {
     std::string text = "-----";
@@ -437,9 +452,9 @@ static void CollectSearchResults(IndexContext& ctx,
     if (ctx.DocumentCount() == 0)
         return;
 
-    std::string streams;
-    if (options.inverted) streams += "AUTB";
-    if (options.vector) streams += "V";
+    const std::string streams = SearchStreamSet(options);
+    if (streams.empty())
+        return;
 
     std::unique_ptr<IndexSearchExecutor> executor(ctx.GetExecutor());
     for (const auto& result : executor->Execute(ctx.GetReader(query.c_str(), streams.c_str()), 0))
@@ -487,6 +502,54 @@ static void Search(IndexContext& ctx, const std::string& query, const SearchOpti
             if (ch == 'q' || ch == 'Q') break;
         }
     }
+}
+
+static void WarmVectorGraph(IndexContext& ctx)
+{
+    auto vectorStart = std::chrono::steady_clock::now();
+    std::cout << "Building vector graph..." << std::flush;
+    size_t vectorCount = ctx.VectorCount();
+    if (auto* delta = ctx.GetDeltaContext())
+        vectorCount += delta->VectorCount();
+    const auto vectorMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - vectorStart).count();
+    std::cout << " " << vectorCount << " vector(s) in " << vectorMs << " ms\n";
+}
+
+static int RunInteractiveSearch(const std::string& idxPath, const SearchOptions& options)
+{
+    auto loadStart = std::chrono::steady_clock::now();
+    IndexContext ctx("", idxPath.c_str());
+    const auto loadMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - loadStart).count();
+
+    uint64_t totalDocuments = CountStoredDocuments(ctx, 0);
+    if (auto* delta = ctx.GetDeltaContext())
+        totalDocuments += CountStoredDocuments(*delta, ctx.DocumentCount());
+
+    std::cout << "moon search — "
+              << totalDocuments
+              << " document(s)"
+              << " (loaded in " << loadMs << " ms)\n"
+              << "Mode: " << SearchModeName(options) << "\n"
+              << std::flush;
+
+    if (options.vector)
+        WarmVectorGraph(ctx);
+
+    std::cout << "Type a query, or 'quit' to exit.\n";
+
+    std::string line;
+    while (true) {
+        std::cout << "> ";
+        std::cout.flush();
+        if (!std::getline(std::cin, line)) break;
+        if (line == "quit" || line == "exit" || line == "q") break;
+        if (line.empty()) continue;
+        Search(ctx, line, options);
+    }
+
+    return 0;
 }
 
 // ─── main ─────────────────────────────────────────────────────────────────────
@@ -574,9 +637,11 @@ static bool ParseIndexOptions(const std::vector<std::string>& args,
         }
     }
 
-    if (!options.filePath.empty())
-        return true;
-    if (!options.dirPath.empty())
+    if (!options.filePath.empty() && !options.dirPath.empty()) {
+        error = "Use either -file or -dir, not both";
+        return false;
+    }
+    if (!options.filePath.empty() || !options.dirPath.empty())
         return true;
     error = "Usage: moon -file <filename> | moon -dir <directory> [-ext md,txt] [-r] [-b 200]";
     return false;
@@ -641,8 +706,8 @@ static void PrintHelp(const std::string& idxPath)
         << "  moon [-idx <index>] -v\n"
         << "      Open an interactive vector search prompt.\n\n"
         << "  moon [-idx <index>] -i -v\n"
-        << "      Open an interactive hybrid search prompt. Prefixes show recall path:\n"
-        << "      ++ both, +- inverted only, -+ vector only.\n\n"
+        << "      Open an interactive hybrid search prompt. Prefixes use AUTBV mask:\n"
+        << "      letters mark matched sources, '-' marks sources not matched.\n\n"
         << "Base/delta/merge sample:\n"
         << "  moon -sample-merge -dir <root> -out <merged-index> [-ext cpp,h,rs]\n"
         << "      Recursively indexes matching files, builds a base index and delta\n"
@@ -730,6 +795,11 @@ static int RunSampleMerge(const SampleMergeOptions& options)
                   << " (ext=" << JoinExtensions(options.extensions) << ")\n";
         return 1;
     }
+    if (files.size() < 2) {
+        std::cerr << "sample-merge needs at least two readable files under " << options.dirPath
+                  << " (ext=" << JoinExtensions(options.extensions) << ")\n";
+        return 1;
+    }
 
     const size_t split = (files.size() + 1) / 2;
     std::cout << "sample-merge: collected " << files.size() << " file(s) <= "
@@ -812,6 +882,153 @@ static int RunSampleMerge(const SampleMergeOptions& options)
     return 0;
 }
 
+static int RunIndexCommand(const std::string& idxPath, const IndexOptions& options)
+{
+    std::vector<FileItem> files;
+    std::string inputPath;
+    if (!options.filePath.empty()) {
+        inputPath = options.filePath;
+        files = CollectSingleFile(options.filePath);
+    } else {
+        inputPath = options.dirPath;
+        files = CollectDirectoryFiles(options.dirPath, options.extensions, options.recursive);
+    }
+
+    if (files.empty()) {
+        std::cerr << "No readable indexable files found: " << inputPath << "\n";
+        return 1;
+    }
+
+    std::cout << "Collected " << files.size() << " file(s) <= "
+              << (MAX_INDEX_FILE_BYTES / (1024 * 1024)) << "MB from "
+              << inputPath;
+    if (options.filePath.empty())
+        std::cout << " (ext=" << JoinExtensions(options.extensions)
+                  << ", recur=" << (options.recursive ? "true" : "false") << ")";
+    std::cout << "\n";
+
+    const std::string deltaPath = DeltaIndexPath(idxPath);
+
+    if (IndexSerializer::IsValidIndex(idxPath.c_str()) && IndexSerializer::IsValidIndex(deltaPath.c_str())) {
+        std::cout << "Merging pending delta into " << idxPath << "\n";
+        IndexContext mergeContext("", idxPath.c_str());
+        if (!mergeContext.Merge(idxPath.c_str())) {
+            std::cerr << "Failed to merge pending delta into index: " << idxPath << "\n";
+            return 1;
+        }
+        std::error_code removeError;
+        std::filesystem::remove(FsPathFromUtf8(deltaPath), removeError);
+    }
+
+    uint64_t baseNextId = 0;
+    uint64_t deltaNextId = 0;
+    PathMap baseMap = LoadPathMapFromIndex(idxPath, baseNextId);
+    PathMap deltaMap = LoadPathMapFromIndex(deltaPath, deltaNextId);
+    PathMap indexedMap = baseMap;
+    uint64_t nextId = baseNextId;
+    for (const auto& [path, _] : deltaMap) {
+        if (!indexedMap.count(path))
+            indexedMap[path] = nextId++;
+    }
+    PathMap knownMap = indexedMap;
+
+    uint64_t added = 0, existing = 0;
+    std::vector<std::pair<std::string, uint64_t>> pendingFiles;
+    for (const auto& file : files) {
+        if (knownMap.count(file.path)) {
+            ++existing;
+        } else {
+            const uint64_t docId = nextId++;
+            pendingFiles.push_back({file.path, docId});
+            knownMap[file.path] = docId;
+            ++added;
+        }
+    }
+
+    if (added == 0) {
+        std::cout << "No new files to index\n";
+        return 0;
+    }
+
+    uint64_t totalKept = 0;
+    uint64_t totalSkipped = 0;
+    uint64_t savedBatches = 0;
+    std::set<std::string> reportedSkippedPaths;
+    const std::string batchPath = BatchIndexPath(idxPath);
+    for (size_t offset = 0; offset < pendingFiles.size(); offset += static_cast<size_t>(options.batchSize)) {
+        const size_t end = std::min(offset + static_cast<size_t>(options.batchSize), pendingFiles.size());
+        const size_t batchNewCount = end - offset;
+        PathMap batchMap;
+        for (size_t i = offset; i < end; ++i) {
+            batchMap[pendingFiles[i].first] = pendingFiles[i].second;
+            indexedMap[pendingFiles[i].first] = pendingFiles[i].second;
+        }
+
+        uint64_t kept = 0;
+        uint64_t skipped = 0;
+        std::cout << "Batch " << (savedBatches + 1) << ": adding "
+                  << batchNewCount << " new file(s), merging "
+                  << indexedMap.size() << " total document(s) into " << idxPath << "\n";
+        if (!BuildIndexFile(batchPath, batchMap, kept, skipped, &reportedSkippedPaths)) {
+            std::cerr << "Failed to save batch index: " << batchPath << "\n";
+            return 1;
+        }
+
+        if (!IndexSerializer::IsValidIndex(idxPath.c_str())) {
+            std::error_code replaceError;
+            std::filesystem::rename(FsPathFromUtf8(batchPath), FsPathFromUtf8(idxPath), replaceError);
+            if (replaceError) {
+                std::cerr << "Failed to create index: " << idxPath << "\n";
+                return 1;
+            }
+        } else {
+            std::cout << "  staging delta: " << deltaPath << "\n";
+            std::error_code deltaReplaceError;
+            std::filesystem::remove(FsPathFromUtf8(deltaPath), deltaReplaceError);
+            deltaReplaceError.clear();
+            std::filesystem::rename(FsPathFromUtf8(batchPath), FsPathFromUtf8(deltaPath), deltaReplaceError);
+            if (deltaReplaceError) {
+                std::cerr << "Failed to stage delta index: " << deltaPath << "\n";
+                return 1;
+            }
+
+            std::cout << "  merging delta into: " << idxPath << "\n";
+            auto mergeStart = std::chrono::steady_clock::now();
+            IndexContext mergeContext("", idxPath.c_str());
+            if (!mergeContext.Merge(idxPath.c_str())) {
+                std::cerr << "Failed to merge delta into index: " << idxPath << "\n";
+                return 1;
+            }
+            const auto mergeMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - mergeStart).count();
+            std::cout << "  merged in " << mergeMs << " ms\n";
+        }
+
+        baseNextId = 0;
+        baseMap = LoadPathMapFromIndex(idxPath, baseNextId);
+        indexedMap = baseMap;
+        std::error_code removeError;
+        std::filesystem::remove(FsPathFromUtf8(deltaPath), removeError);
+
+        totalKept = static_cast<uint64_t>(baseMap.size());
+        totalSkipped += skipped;
+        ++savedBatches;
+    }
+
+    std::cout << "Indexed input: " << inputPath << "\n"
+              << "Files:   " << files.size()
+              << " (new " << added << ", existing " << existing << ")\n"
+              << "Batch size: " << options.batchSize << "\n"
+              << "Saved batches: " << savedBatches << "\n"
+              << "Saved:   " << totalKept << " document(s)";
+    if (totalSkipped) std::cout << " (skipped " << totalSkipped << ")";
+    std::cout << " to " << idxPath << "\n"
+              << "Total:   " << totalKept
+              << " indexed document(s)\n";
+
+    return 0;
+}
+
 int main(int argc, char* argv[])
 {
     std::string idxPath = DefaultIdxPath();
@@ -853,150 +1070,7 @@ int main(int argc, char* argv[])
             std::cerr << error << "\n";
             return 1;
         }
-
-        std::vector<FileItem> files;
-        std::string inputPath;
-        if (!options.filePath.empty()) {
-            inputPath = options.filePath;
-            files = CollectSingleFile(options.filePath);
-        } else {
-            inputPath = options.dirPath;
-            files = CollectDirectoryFiles(options.dirPath, options.extensions, options.recursive);
-        }
-
-        if (files.empty()) {
-            std::cerr << "No readable indexable files found: " << inputPath << "\n";
-            return 1;
-        }
-
-        std::cout << "Collected " << files.size() << " file(s) <= "
-                  << (MAX_INDEX_FILE_BYTES / (1024 * 1024)) << "MB from "
-                  << inputPath;
-        if (options.filePath.empty())
-            std::cout << " (ext=" << JoinExtensions(options.extensions)
-                      << ", recur=" << (options.recursive ? "true" : "false") << ")";
-        std::cout << "\n";
-
-        const std::string deltaPath = DeltaIndexPath(idxPath);
-
-        if (IndexSerializer::IsValidIndex(idxPath.c_str()) && IndexSerializer::IsValidIndex(deltaPath.c_str())) {
-            std::cout << "Merging pending delta into " << idxPath << "\n";
-            IndexContext mergeContext("", idxPath.c_str());
-            if (!mergeContext.Merge(idxPath.c_str())) {
-                std::cerr << "Failed to merge pending delta into index: " << idxPath << "\n";
-                return 1;
-            }
-            std::error_code removeError;
-            std::filesystem::remove(FsPathFromUtf8(deltaPath), removeError);
-        }
-
-        uint64_t baseNextId = 0;
-        uint64_t deltaNextId = 0;
-        PathMap baseMap = LoadPathMapFromIndex(idxPath, baseNextId);
-        PathMap deltaMap = LoadPathMapFromIndex(deltaPath, deltaNextId);
-        PathMap indexedMap = baseMap;
-        uint64_t nextId = baseNextId;
-        for (const auto& [path, _] : deltaMap) {
-            if (!indexedMap.count(path))
-                indexedMap[path] = nextId++;
-        }
-        PathMap knownMap = indexedMap;
-
-        uint64_t added = 0, existing = 0;
-        std::vector<std::pair<std::string, uint64_t>> pendingFiles;
-        for (const auto& file : files) {
-            if (knownMap.count(file.path)) {
-                ++existing;
-            } else {
-                const uint64_t docId = nextId++;
-                pendingFiles.push_back({file.path, docId});
-                knownMap[file.path] = docId;
-                ++added;
-            }
-        }
-
-        if (added == 0) {
-            std::cout << "No new files to index\n";
-            return 0;
-        }
-
-        uint64_t totalKept = 0;
-        uint64_t totalSkipped = 0;
-        uint64_t savedBatches = 0;
-        std::set<std::string> reportedSkippedPaths;
-        const std::string batchPath = BatchIndexPath(idxPath);
-        for (size_t offset = 0; offset < pendingFiles.size(); offset += static_cast<size_t>(options.batchSize)) {
-            const size_t end = std::min(offset + static_cast<size_t>(options.batchSize), pendingFiles.size());
-            const size_t batchNewCount = end - offset;
-            PathMap batchMap;
-            for (size_t i = offset; i < end; ++i) {
-                batchMap[pendingFiles[i].first] = pendingFiles[i].second;
-                indexedMap[pendingFiles[i].first] = pendingFiles[i].second;
-            }
-
-            uint64_t kept = 0;
-            uint64_t skipped = 0;
-            std::cout << "Batch " << (savedBatches + 1) << ": adding "
-                      << batchNewCount << " new file(s), merging "
-                      << indexedMap.size() << " total document(s) into " << idxPath << "\n";
-            if (!BuildIndexFile(batchPath, batchMap, kept, skipped, &reportedSkippedPaths)) {
-                std::cerr << "Failed to save batch index: " << batchPath << "\n";
-                return 1;
-            }
-
-            if (!IndexSerializer::IsValidIndex(idxPath.c_str())) {
-                std::error_code replaceError;
-                std::filesystem::rename(FsPathFromUtf8(batchPath), FsPathFromUtf8(idxPath), replaceError);
-                if (replaceError) {
-                    std::cerr << "Failed to create index: " << idxPath << "\n";
-                    return 1;
-                }
-            } else {
-                // Build each batch as a compact delta, then release the batch file
-                // handle before loading/merging so Windows can replace the final idx.
-                std::cout << "  staging delta: " << deltaPath << "\n";
-                std::error_code deltaReplaceError;
-                std::filesystem::remove(FsPathFromUtf8(deltaPath), deltaReplaceError);
-                deltaReplaceError.clear();
-                std::filesystem::rename(FsPathFromUtf8(batchPath), FsPathFromUtf8(deltaPath), deltaReplaceError);
-                if (deltaReplaceError) {
-                    std::cerr << "Failed to stage delta index: " << deltaPath << "\n";
-                    return 1;
-                }
-
-                std::cout << "  merging delta into: " << idxPath << "\n";
-                auto mergeStart = std::chrono::steady_clock::now();
-                IndexContext mergeContext("", idxPath.c_str());
-                if (!mergeContext.Merge(idxPath.c_str())) {
-                    std::cerr << "Failed to merge delta into index: " << idxPath << "\n";
-                    return 1;
-                }
-                const auto mergeMs = std::chrono::duration_cast<std::chrono::milliseconds>(
-                    std::chrono::steady_clock::now() - mergeStart).count();
-                std::cout << "  merged in " << mergeMs << " ms\n";
-            }
-
-            baseNextId = 0;
-            baseMap = LoadPathMapFromIndex(idxPath, baseNextId);
-            indexedMap = baseMap;
-            std::error_code removeError;
-            std::filesystem::remove(FsPathFromUtf8(deltaPath), removeError);
-
-            totalKept = static_cast<uint64_t>(baseMap.size());
-            totalSkipped = skipped;
-            ++savedBatches;
-        }
-
-        std::cout << "Indexed input: " << inputPath << "\n"
-                  << "Files:   " << files.size()
-                  << " (new " << added << ", existing " << existing << ")\n"
-                  << "Batch size: " << options.batchSize << "\n"
-                  << "Saved batches: " << savedBatches << "\n"
-                  << "Saved:   " << totalKept << " document(s)";
-        if (totalSkipped) std::cout << " (skipped " << totalSkipped << ")";
-        std::cout << " to " << idxPath << "\n"
-                  << "Total:   " << totalKept
-                  << " indexed document(s)\n";
+        return RunIndexCommand(idxPath, options);
 
     // ── sample base/delta merge ──────────────────────────────────────────────
     } else if (cmd == "-sample-merge") {
@@ -1014,47 +1088,7 @@ int main(int argc, char* argv[])
             std::cerr << error << "\n";
             return 1;
         }
-
-        auto loadStart = std::chrono::steady_clock::now();
-        IndexContext ctx("", idxPath.c_str());
-        auto loadMs = std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now() - loadStart).count();
-        uint64_t totalDocuments = CountStoredDocuments(ctx);
-        if (auto* delta = ctx.GetDeltaContext())
-            totalDocuments += CountStoredDocuments(*delta, ctx.DocumentCount());
-
-        std::cout << "moon search — "
-                  << totalDocuments
-                  << " document(s)"
-                  << " (loaded in " << loadMs << " ms)\n"
-                  << "Mode: "
-                  << (searchOptions.inverted && searchOptions.vector ? "inverted+vector"
-                      : searchOptions.inverted ? "inverted"
-                      : "vector") << "\n"
-                  << std::flush;
-
-        if (searchOptions.vector) {
-            auto vectorStart = std::chrono::steady_clock::now();
-            std::cout << "Building vector graph..." << std::flush;
-            size_t vectorCount = ctx.VectorCount();
-            if (auto* delta = ctx.GetDeltaContext())
-                vectorCount += delta->VectorCount();
-            const auto vectorMs = std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::steady_clock::now() - vectorStart).count();
-            std::cout << " " << vectorCount << " vector(s) in " << vectorMs << " ms\n";
-        }
-
-        std::cout << "Type a query, or 'quit' to exit.\n";
-
-        std::string line;
-        while (true) {
-            std::cout << "> ";
-            std::cout.flush();
-            if (!std::getline(std::cin, line)) break;
-            if (line == "quit" || line == "exit" || line == "q") break;
-            if (line.empty()) continue;
-            Search(ctx, line, searchOptions);
-        }
+        return RunInteractiveSearch(idxPath, searchOptions);
 
     } else {
         std::cerr << "Unknown option: " << cmd << "\n";
