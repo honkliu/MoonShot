@@ -78,6 +78,17 @@ public:
     void AddPosting(const std::string& stream_key, uint64_t doc_id, uint32_t tf)
     {
         auto& pl = m_Postings[stream_key];
+        if (pl.entries.empty() || pl.entries.back().IE_DocID < doc_id) {
+            pl.entries.push_back(IndexEntry{doc_id, tf});
+            ++m_PostingEntries;
+            return;
+        }
+
+        if (pl.entries.back().IE_DocID == doc_id) {
+            pl.entries.back().IE_TermFrequency = tf;
+            return;
+        }
+
         auto  it = std::lower_bound(pl.entries.begin(), pl.entries.end(), doc_id,
             [](const IndexEntry& e, uint64_t d) { return e.IE_DocID < d; });
 

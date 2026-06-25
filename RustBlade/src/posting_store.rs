@@ -63,6 +63,19 @@ impl PostingStore {
     #[allow(non_snake_case)]
     pub fn AddPosting(&mut self, stream_key: &str, doc_id: u64, tf: u32) {
         let pl = self.m_Postings.entry(stream_key.to_string()).or_default();
+        if pl.entries.last().map(|entry| entry.ie_doc_id < doc_id).unwrap_or(true) {
+            pl.entries.push(IndexEntry { ie_doc_id: doc_id, ie_term_frequency: tf });
+            self.m_PostingEntries += 1;
+            return;
+        }
+
+        if let Some(entry) = pl.entries.last_mut() {
+            if entry.ie_doc_id == doc_id {
+                entry.ie_term_frequency = tf;
+                return;
+            }
+        }
+
         match pl.entries.binary_search_by_key(&doc_id, |e| e.ie_doc_id) {
             Ok(i)  => pl.entries[i].ie_term_frequency = tf,
             Err(i) => {

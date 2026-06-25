@@ -34,7 +34,8 @@ public:
         const std::string abbrev = StreamAbbrev(postingType);
 
         std::unordered_map<std::string, uint32_t> termTf;
-        for (auto& word : words) {
+        termTf.reserve(words.size() * 2);
+        for (const auto& word : words) {
             if (!word.empty())
                 ++termTf[word];
         }
