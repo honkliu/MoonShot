@@ -191,15 +191,13 @@ impl Default for IndexSlotEntry {
     fn default() -> Self { Self { block_id: u32::MAX, ref_count: 0 } }
 }
 
-#[derive(Clone)]
 pub struct PinnedBlock<T: Copy> {
-    pages: Arc<PinnedMemory<T>>,
-    slot: usize,
+    page: T,
 }
 
 impl<T: Copy> Deref for PinnedBlock<T> {
     type Target = T;
-    fn deref(&self) -> &Self::Target { &self.pages[self.slot] }
+    fn deref(&self) -> &Self::Target { &self.page }
 }
 
 struct BlockCachePool<T: Default + Copy> {
@@ -279,22 +277,17 @@ impl<T: Default + Copy> BlockCachePool<T> {
         let logic_table = self.logic_table.as_ref()?;
         let slot = *logic_table.as_slice().get(block_seq as usize)?;
         if slot == u32::MAX { return None; }
-        let entry = self.slot_table.as_mut()?.as_mut_slice().get_mut(slot as usize)?;
-        entry.ref_count += 1;
-        let pages = Arc::clone(self.pages.as_ref()?);
-        Some((slot, PinnedBlock { pages, slot: slot as usize }))
+        let page = self.pages.as_ref()?.as_slice()[slot as usize];
+        Some((slot, PinnedBlock { page }))
     }
 
     fn read_miss(&mut self, block_seq: u32) -> Option<(u32, PinnedBlock<T>)> {
         let path = self.path.as_ref()?.clone();
         let mut found = u32::MAX;
         for _ in 0..self.slot_count {
-            let candidate = self.evict_slot % self.slot_count;
+            found = self.evict_slot % self.slot_count;
             self.evict_slot = self.evict_slot.wrapping_add(1);
-            if self.slot_table.as_ref()?.as_slice()[candidate as usize].ref_count == 0 {
-                found = candidate;
-                break;
-            }
+            break;
         }
         if found == u32::MAX { return None; }
 
@@ -313,10 +306,10 @@ impl<T: Default + Copy> BlockCachePool<T> {
         file.read_exact(bytes).ok()?;
 
         self.slot_table.as_mut()?.as_mut_slice()[found as usize].block_id = block_seq;
-        self.slot_table.as_mut()?.as_mut_slice()[found as usize].ref_count = 1;
+        self.slot_table.as_mut()?.as_mut_slice()[found as usize].ref_count = 0;
         self.logic_table.as_mut()?.as_mut_slice()[block_seq as usize] = found;
-        let pages = Arc::clone(self.pages.as_ref()?);
-        Some((found, PinnedBlock { pages, slot: found as usize }))
+        let page = self.pages.as_ref()?.as_slice()[found as usize];
+        Some((found, PinnedBlock { page }))
     }
 
     fn get_or_read(&mut self, block_seq: u32) -> Option<(u32, PinnedBlock<T>)> {
@@ -452,6 +445,35 @@ impl IndexBlockTable {
 
     pub fn GetBlockBySeq(&self, seq: u32) -> Option<PinnedBlock<IndexBlock>> {
         self.index_pool.borrow_mut().get_or_read(seq).map(|(_, block)| block)
+    }
+
+    pub fn GetLeafBlockBySeq(&self, seq: u32) -> Option<PinnedBlock<LeafTermBlock>> {
+        self.leaf_term_pool.borrow_mut().get_or_read(seq).map(|(_, block)| block)
+    }
+
+    pub fn LeafTermBlockCount(&self) -> u32 {
+        self.leaf_term_pool.borrow().total_block_count
+    }
+
+    pub fn PostingBytes(&self, entry: &LeafTermEntry) -> Option<Vec<u8>> {
+        let first = self.GetBlockBySeq(entry.lte_index_block_id)?;
+        let begin = entry.lte_index_offset as usize;
+        let end = begin.checked_add(entry.lte_index_length as usize)?;
+        if end > PAGE_SIZE { return None; }
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&first.ib_data[begin..end]);
+
+        for i in 0..entry.lte_continuation_block_count {
+            let block = self.GetBlockBySeq(entry.lte_index_block_id + 1 + i)?;
+            let header = IndexBlockContinuationHeader::from_bytes(&block.ib_data)?;
+            let data_begin = INDEX_BLOCK_CONTINUATION_HEADER_SIZE;
+            let data_end = data_begin.checked_add(header.ibch_data_length as usize)?;
+            if data_end > PAGE_SIZE { return None; }
+            bytes.extend_from_slice(&block.ib_data[data_begin..data_end]);
+        }
+
+        Some(bytes)
     }
 
     pub fn AllLeafTermEntries(&self) -> Vec<LeafTermEntry> {

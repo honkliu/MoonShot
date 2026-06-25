@@ -2,11 +2,8 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
-use rustblade::index_writer::IndexWriter;
-use rustblade::tokenizer::Tokenizer;
-use rustblade::vector_index::build_hashed_embedding;
 use rustblade::executor::IndexSearchExecutor;
-use rustblade::{IndexContext, SmartTokenizer};
+use rustblade::{Document, IndexContext};
 
 fn home_dir() -> PathBuf {
     if cfg!(windows) {
@@ -38,28 +35,30 @@ fn collect_files(path: &Path, files: &mut Vec<PathBuf>) -> io::Result<()> {
     Ok(())
 }
 
-fn index_path(path: &Path) -> io::Result<()> {
+fn index_path(path: &Path, recursive: bool) -> io::Result<()> {
     let mut files = Vec::new();
-    collect_files(path, &mut files)?;
+    if recursive {
+        collect_files(path, &mut files)?;
+    } else if path.is_file() && is_indexable(path) {
+        files.push(path.to_path_buf());
+    }
     files.sort();
 
     let mut context = IndexContext::new();
-    let tokenizer = SmartTokenizer::new();
-    let mut writer = context.GetWriter();
 
     for (doc_id, file) in files.iter().enumerate() {
         let Ok(body) = fs::read_to_string(file) else { continue; };
         let title = file.file_stem().and_then(|stem| stem.to_str()).unwrap_or("");
-        let title_tokens = tokenizer.Tokenize(title);
-        let body_tokens = tokenizer.Tokenize(&body);
-        let mut embedding_tokens = title_tokens.clone();
-        embedding_tokens.extend(body_tokens.iter().cloned());
-        writer.Write(title_tokens, doc_id as u64, "Title");
-        writer.Write(body_tokens, doc_id as u64, "Body");
-        writer.SetDocImportance(doc_id as u64, 0.1);
-        writer.SetDocVector(doc_id as u64, build_hashed_embedding(&embedding_tokens));
         let abs = file.canonicalize().unwrap_or_else(|_| file.clone());
-        writer.SetDocPath(doc_id as u64, abs.to_string_lossy().to_string());
+        let doc = Document {
+            doc_id: doc_id as u64,
+            path: abs.to_string_lossy().to_string(),
+            title: title.to_string(),
+            body,
+            importance: 0.1,
+            ..Document::default()
+        };
+        context.AddDocument(&doc, true);
     }
 
     let idx = default_idx_path();
@@ -115,6 +114,8 @@ fn interactive() -> io::Result<()> {
 
 fn usage() {
     eprintln!("usage:");
+    eprintln!("  moon_rs -file <path>");
+    eprintln!("  moon_rs -dir <path>");
     eprintln!("  moon_rs -name <file-or-dir>");
     eprintln!("  moon_rs -i");
 }
@@ -122,7 +123,9 @@ fn usage() {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let result = match args.get(1).map(|arg| arg.as_str()) {
-        Some("-name") if args.len() >= 3 => index_path(Path::new(&args[2])),
+        Some("-file") if args.len() >= 3 => index_path(Path::new(&args[2]), false),
+        Some("-dir") if args.len() >= 3 => index_path(Path::new(&args[2]), true),
+        Some("-name") if args.len() >= 3 => index_path(Path::new(&args[2]), true),
         Some("-i") => interactive(),
         _ => { usage(); Ok(()) }
     };
