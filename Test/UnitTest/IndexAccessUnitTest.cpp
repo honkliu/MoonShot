@@ -512,6 +512,7 @@ void TestDiskPersistence()
 
         assert(engine2.DocumentCount() == 3 &&
                "Loaded doc count must match written doc count");
+         engine2.Build();
          assert(engine2.VectorCount() == 3 &&
              "Loaded vector count must come from DocDataEntry vectors");
          auto vectorResults = engine2.VectorSearch(BuildHashedEmbedding(g_tokenizer.Tokenize("rust systems programming")), 3);
