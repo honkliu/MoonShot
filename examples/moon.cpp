@@ -30,7 +30,6 @@
 #include <set>
 #include <sstream>
 #include <string>
-#include <unordered_map>
 #include <vector>
 #include <filesystem>
 #include <chrono>
@@ -412,39 +411,22 @@ static bool AddFileDocument(IndexContext& ctx,
 struct SearchHit {
     const IndexContext* context = nullptr;
     SearchResult result;
-    uint8_t recallMask = 0;
 };
-
-static constexpr uint8_t RECALL_INVERTED = 1;
-static constexpr uint8_t RECALL_VECTOR = 2;
 
 struct SearchOptions {
     bool inverted = false;
     bool vector = false;
 };
 
-static std::vector<SearchResult> ExecuteQuery(IndexContext& ctx,
-                                              const std::string& query,
-                                              const char* streams)
+static std::string SourceMaskText(uint8_t sourceMask)
 {
-    std::unique_ptr<IndexSearchExecutor> executor(ctx.GetExecutor());
-    return executor->Execute(ctx.GetReader(query.c_str(), streams), 0);
-}
-
-static float StaticRankForDoc(const IndexContext& ctx, uint64_t docId)
-{
-    const auto* entry = ctx.GetDocDataEntry(docId);
-    return entry ? entry->DDE_StaticRank : 0.0f;
-}
-
-static const char* RecallPrefix(uint8_t recallMask)
-{
-    switch (recallMask) {
-        case RECALL_INVERTED | RECALL_VECTOR: return "++";
-        case RECALL_INVERTED: return "+-";
-        case RECALL_VECTOR: return "-+";
-        default: return "--";
-    }
+    std::string text = "-----";
+    if (sourceMask & READER_SOURCE_ANCHOR) text[0] = 'A';
+    if (sourceMask & READER_SOURCE_URL) text[1] = 'U';
+    if (sourceMask & READER_SOURCE_TITLE) text[2] = 'T';
+    if (sourceMask & READER_SOURCE_BODY) text[3] = 'B';
+    if (sourceMask & READER_SOURCE_VECTOR) text[4] = 'V';
+    return text;
 }
 
 static void CollectSearchResults(IndexContext& ctx,
@@ -455,28 +437,13 @@ static void CollectSearchResults(IndexContext& ctx,
     if (ctx.DocumentCount() == 0)
         return;
 
-    std::unordered_map<uint64_t, size_t> hitByDocId;
+    std::string streams;
+    if (options.inverted) streams += "AUTB";
+    if (options.vector) streams += "V";
 
-    auto addResults = [&](const std::vector<SearchResult>& results, uint8_t recallMask) {
-        for (const auto& result : results) {
-            auto [it, inserted] = hitByDocId.emplace(result.doc_id, hits.size());
-            if (inserted) {
-                hits.push_back({&ctx, result, recallMask});
-                continue;
-            }
-
-            auto& hit = hits[it->second];
-            if ((hit.recallMask & recallMask) == 0) {
-                hit.result.score += result.score - StaticRankForDoc(ctx, result.doc_id);
-                hit.recallMask |= recallMask;
-            }
-        }
-    };
-
-    if (options.inverted)
-        addResults(ExecuteQuery(ctx, query, "AUTB"), RECALL_INVERTED);
-    if (options.vector)
-        addResults(ExecuteQuery(ctx, query, "V"), RECALL_VECTOR);
+    std::unique_ptr<IndexSearchExecutor> executor(ctx.GetExecutor());
+    for (const auto& result : executor->Execute(ctx.GetReader(query.c_str(), streams.c_str()), 0))
+        hits.push_back({&ctx, result});
 }
 
 static void Search(IndexContext& ctx, const std::string& query, const SearchOptions& options)
@@ -489,7 +456,7 @@ static void Search(IndexContext& ctx, const std::string& query, const SearchOpti
     std::sort(results.begin(), results.end(), [](const SearchHit& left, const SearchHit& right) {
         if (left.result.score != right.result.score)
             return left.result.score > right.result.score;
-        return left.result.doc_id < right.result.doc_id;
+        return ReaderDocumentIDValue(left.result.doc_id) < ReaderDocumentIDValue(right.result.doc_id);
     });
 
     if (results.empty()) {
@@ -509,7 +476,7 @@ static void Search(IndexContext& ctx, const std::string& query, const SearchOpti
         for (size_t i = offset; i < end; ++i) {
             const auto& hit = results[i];
             const std::string path = hit.context->GetDocPath(hit.result.doc_id);
-            std::cout << RecallPrefix(hit.recallMask) << " "
+            std::cout << SourceMaskText(ReaderDocumentIDSourceMask(hit.result.doc_id)) << " "
                       << (path.empty() ? "[unknown]" : path) << "\n";
         }
 

@@ -7,6 +7,42 @@
 
 #include "BlockTable.h"
 
+static constexpr uint64_t READER_DOCID_SOURCE_SHIFT = 59;
+static constexpr uint64_t READER_DOCID_VALUE_MASK = (1ull << READER_DOCID_SOURCE_SHIFT) - 1ull;
+static constexpr uint8_t READER_SOURCE_ANCHOR = 1u << 0;
+static constexpr uint8_t READER_SOURCE_URL = 1u << 1;
+static constexpr uint8_t READER_SOURCE_TITLE = 1u << 2;
+static constexpr uint8_t READER_SOURCE_BODY = 1u << 3;
+static constexpr uint8_t READER_SOURCE_VECTOR = 1u << 4;
+
+inline uint64_t ReaderDocumentIDValue(uint64_t docId)
+{
+    return docId & READER_DOCID_VALUE_MASK;
+}
+
+inline uint8_t ReaderDocumentIDSourceMask(uint64_t docId)
+{
+    return static_cast<uint8_t>(docId >> READER_DOCID_SOURCE_SHIFT);
+}
+
+inline uint64_t MakeReaderDocumentID(uint64_t docId, uint8_t sourceMask)
+{
+    return (static_cast<uint64_t>(sourceMask) << READER_DOCID_SOURCE_SHIFT)
+        | (docId & READER_DOCID_VALUE_MASK);
+}
+
+inline uint8_t ReaderSourceMaskForStream(char stream)
+{
+    switch (stream) {
+    case 'A': return READER_SOURCE_ANCHOR;
+    case 'U': return READER_SOURCE_URL;
+    case 'T': return READER_SOURCE_TITLE;
+    case 'B': return READER_SOURCE_BODY;
+    case 'V': return READER_SOURCE_VECTOR;
+    default: return 0;
+    }
+}
+
 class IndexReader
 {
     public:
@@ -20,6 +56,8 @@ class IndexReader
         virtual uint32_t GetTermFreq() { return 1u; }
 
         virtual float GetScore(const DocDataEntry* /*entry*/) { return 0.0f; }
+
+        virtual uint8_t GetSourceMask() { return 0; }
 
         virtual void Close() = 0;
 

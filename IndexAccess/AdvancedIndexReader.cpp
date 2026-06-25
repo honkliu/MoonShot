@@ -19,6 +19,7 @@ void AdvancedIndexReader::Open(const char*      streamKey,
     delete[] m_Word;
     m_Word = new char[std::strlen(streamKey) + 1];
     std::strcpy(m_Word, streamKey);
+    m_SourceMask = ReaderSourceMaskForStream(m_Word[std::strlen(m_Word) - 1]);
 
     m_BlockTable      = blockTable;
     m_Context         = context;

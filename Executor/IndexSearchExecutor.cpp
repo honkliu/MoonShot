@@ -25,7 +25,7 @@ std::vector<SearchResult> IndexSearchExecutor::Execute(std::shared_ptr<IndexRead
         float    score     = reader->GetScore(entry)
                    + entry->DDE_StaticRank;
 
-        results.push_back({docId, score, ""});
+        results.push_back({MakeReaderDocumentID(docId, reader->GetSourceMask()), score, ""});
         reader->GoNext();
     }
 
@@ -71,7 +71,7 @@ std::vector<SearchResult> IndexSearchExecutor::CollectResults(
         float    score     = reader->GetScore(entry)
                    + entry->DDE_StaticRank;
 
-        results.push_back({docId, score, ""});
+        results.push_back({MakeReaderDocumentID(docId, reader->GetSourceMask()), score, ""});
         reader->GoNext();
     }
 
@@ -96,8 +96,11 @@ void IndexSearchExecutor::MergeResults(std::vector<SearchResult>&       base,
         bool isDuplicate = false;
 
         for (auto& existing : base) {
-            if (existing.doc_id == result.doc_id) {
+            if (ReaderDocumentIDValue(existing.doc_id) == ReaderDocumentIDValue(result.doc_id)) {
                 existing.score = std::max(existing.score, result.score);
+                existing.doc_id = MakeReaderDocumentID(
+                    ReaderDocumentIDValue(existing.doc_id),
+                    ReaderDocumentIDSourceMask(existing.doc_id) | ReaderDocumentIDSourceMask(result.doc_id));
                 isDuplicate    = true;
                 break;
             }

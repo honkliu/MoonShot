@@ -78,6 +78,8 @@ class AdvancedIndexReader : public IndexReader
         */
         float GetScore(const DocDataEntry* entry) override;
 
+        uint8_t GetSourceMask() override { return m_SourceMask; }
+
         void Close() override;
 
     private:
@@ -85,6 +87,7 @@ class AdvancedIndexReader : public IndexReader
         uint32_t                    m_BlockSeqNumber  = 0;
         uint32_t                    m_BlockSlotNumber = UINT32_MAX;
         uint32_t                    m_DocFreq         = 0;
+        uint8_t                     m_SourceMask      = 0;
         uint32_t                    m_RemainingContinuationBlocks = 0;
         IndexBlockTable*            m_BlockTable      = nullptr;
         const IndexContext*         m_Context         = nullptr;

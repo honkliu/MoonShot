@@ -24,7 +24,7 @@ static void PrintResults(const std::vector<SearchResult>& results,
 {
     std::cout << "  [" << label << "] " << results.size() << " result(s):\n";
     for (auto& r : results)
-        std::cout << "    doc=" << r.doc_id << "  score=" << r.score << "\n";
+        std::cout << "    doc=" << ReaderDocumentIDValue(r.doc_id) << "  score=" << r.score << "\n";
 }
 
 static float AssertContains(const std::vector<SearchResult>& r,
@@ -32,7 +32,7 @@ static float AssertContains(const std::vector<SearchResult>& r,
                              const char* ctx = "")
 {
     for (auto& x : r)
-        if (x.doc_id == doc_id) return x.score;
+        if (ReaderDocumentIDValue(x.doc_id) == doc_id) return x.score;
     std::cerr << "FAIL: doc " << doc_id << " not found [" << ctx << "]\n";
     throw std::runtime_error(std::string("AssertContains failed: ") + ctx);
     return 0.0f;
@@ -43,7 +43,7 @@ static void AssertNotContains(const std::vector<SearchResult>& r,
                                const char* ctx = "")
 {
     for (auto& x : r) {
-        if (x.doc_id == doc_id) {
+        if (ReaderDocumentIDValue(x.doc_id) == doc_id) {
             std::cerr << "FAIL: doc " << doc_id << " should not be in results [" << ctx << "]\n";
             throw std::runtime_error(std::string("AssertNotContains failed: ") + ctx);
         }
@@ -229,7 +229,7 @@ void TestFieldConstraint()
             bool inTitle = false;
             if (postingList)
                 for (auto& entry : postingList->entries)
-                    if (entry.IE_DocID == result.doc_id) { inTitle = true; break; }
+                    if (entry.IE_DocID == ReaderDocumentIDValue(result.doc_id)) { inTitle = true; break; }
             assert(inTitle && "title:vietnam matched a doc not in vietnamT");
         }
         delete compiler; delete tree;
@@ -374,7 +374,7 @@ void TestDocImportance()
 
     PrintResults(results, "importance tiebreak");
     assert(results.size() == 2);
-    assert(results[0].doc_id == 0 && "doc 0 must rank first");
+    assert(ReaderDocumentIDValue(results[0].doc_id) == 0 && "doc 0 must rank first");
 
     delete ctx; delete compiler; delete tree;
 }
@@ -514,7 +514,7 @@ void TestDiskPersistence()
          auto vectorResults = engine2.VectorSearch(BuildHashedEmbedding(g_tokenizer.Tokenize("rust systems programming")), 3);
          bool foundVectorDoc0 = false;
          for (const auto& result : vectorResults)
-             if (result.doc_id == 0) foundVectorDoc0 = true;
+             if (ReaderDocumentIDValue(result.doc_id) == 0) foundVectorDoc0 = true;
          assert(foundVectorDoc0 && "DocDataEntry vectors must rebuild IndexContext vector index");
 
         /*
@@ -554,7 +554,7 @@ void TestDiskPersistence()
             auto results = exec->Execute(engine2.GetReader(tree.get()), 5);
             if (results.size() >= 2) {
                 // doc with highest importance among programming-matched docs should rank first
-                std::cout << "  search(programming): top doc=" << results[0].doc_id
+                std::cout << "  search(programming): top doc=" << ReaderDocumentIDValue(results[0].doc_id)
                           << " score=" << results[0].score << "\n";
             }
         }
@@ -844,7 +844,7 @@ void TestBigram()
 
         std::cout << "  search('good morning', T):\n";
         for (auto& r : results)
-            std::cout << "    doc=" << r.doc_id << "  score=" << r.score << "\n";
+            std::cout << "    doc=" << ReaderDocumentIDValue(r.doc_id) << "  score=" << r.score << "\n";
 
         AssertContains   (results, 0, "bigram: doc0 matches good morning");
         AssertNotContains(results, 1, "bigram: doc1 has no good");
@@ -861,7 +861,7 @@ void TestBigram()
 
         std::cout << "  search('morning vietnam', T):\n";
         for (auto& r : results)
-            std::cout << "    doc=" << r.doc_id << "  score=" << r.score << "\n";
+            std::cout << "    doc=" << ReaderDocumentIDValue(r.doc_id) << "  score=" << r.score << "\n";
 
         AssertContains   (results, 0, "bigram: doc0 matches morning vietnam");
         AssertNotContains(results, 1, "bigram: doc1 has no vietnam");

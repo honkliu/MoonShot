@@ -222,6 +222,7 @@ public:
 
     const DocDataEntry* GetDocDataEntry(uint64_t docId) const
     {
+        docId = ReaderDocumentIDValue(docId);
         if (!m_DocData || docId >= m_IndexFileHeader.IFH_NumDocuments)
             return nullptr;
 

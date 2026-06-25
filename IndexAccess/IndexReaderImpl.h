@@ -73,6 +73,17 @@ public:
         return total;
     }
 
+    uint8_t GetSourceMask() override
+    {
+        uint8_t sourceMask = 0;
+        const uint64_t doc = GetDocumentID();
+        for (auto& c : m_Children) {
+            if (!c->IsEnd() && c->GetDocumentID() == doc)
+                sourceMask |= c->GetSourceMask();
+        }
+        return sourceMask;
+    }
+
     void GoNext() override
     {
         if (IsEnd())
@@ -206,6 +217,19 @@ public:
         return total;
     }
 
+    uint8_t GetSourceMask() override
+    {
+        uint64_t doc = GetDocumentID();
+        uint8_t sourceMask = 0;
+
+        for (auto& c : m_Children) {
+            if (!c->IsEnd() && c->GetDocumentID() == doc)
+                sourceMask |= c->GetSourceMask();
+        }
+
+        return sourceMask;
+    }
+
     void GoNext() override
     {
         if (IsEnd())
@@ -265,6 +289,8 @@ public:
         return m_Base->GetScore(entry);
     }
 
+    uint8_t GetSourceMask() override { return m_Base->GetSourceMask(); }
+
     void GoNext() override
     {
         m_Base->GoNext();
@@ -323,6 +349,8 @@ public:
     {
         return IsEnd() ? 0.0f : m_Results[m_Pos].score;
     }
+
+    uint8_t GetSourceMask() override { return IsEnd() ? 0 : READER_SOURCE_VECTOR; }
 
     void GoNext() override
     {
