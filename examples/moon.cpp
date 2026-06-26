@@ -323,13 +323,20 @@ static std::vector<FileItem> CollectSampleMergeFiles(const std::string& path,
     return files;
 }
 
-// Returns the filename without extension — used as the Title stream.
+// Returns the filename without extension, with common filename separators
+// converted to spaces so rnr_alpaca_10k indexes title token "alpaca".
 static std::string Stem(const std::string& path)
 {
     auto slash = path.find_last_of("/\\");
     std::string name = (slash == std::string::npos) ? path : path.substr(slash + 1);
     auto dot = name.rfind('.');
-    return (dot == std::string::npos) ? name : name.substr(0, dot);
+    if (dot != std::string::npos)
+        name = name.substr(0, dot);
+    for (char& ch : name) {
+        if (ch == '_' || ch == '-')
+            ch = ' ';
+    }
+    return name;
 }
 
 // ─── index: build one batch delta ─────────────────────────────────────────────
@@ -449,7 +456,7 @@ static void CollectSearchResults(IndexContext& ctx,
                                  const SearchOptions& options,
                                  std::vector<SearchHit>& hits)
 {
-    if (ctx.DocumentCount() == 0)
+    if (ctx.DocumentCount() == 0 && !ctx.HasDelta())
         return;
 
     const std::string streams = SearchStreamSet(options);
@@ -465,8 +472,6 @@ static void Search(IndexContext& ctx, const std::string& query, const SearchOpti
 {
     std::vector<SearchHit> results;
     CollectSearchResults(ctx, query, options, results);
-    if (auto* delta = ctx.GetDeltaContext())
-        CollectSearchResults(*delta, query, options, results);
 
     std::sort(results.begin(), results.end(), [](const SearchHit& left, const SearchHit& right) {
         if (left.result.score != right.result.score)
@@ -508,12 +513,159 @@ static void WarmVectorGraph(IndexContext& ctx)
 {
     auto vectorStart = std::chrono::steady_clock::now();
     std::cout << "Building vector graph..." << std::flush;
+    ctx.Build();
     size_t vectorCount = ctx.VectorCount();
-    if (auto* delta = ctx.GetDeltaContext())
+    if (auto* delta = ctx.GetDeltaContext()) {
+        delta->Build();
         vectorCount += delta->VectorCount();
+    }
     const auto vectorMs = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - vectorStart).count();
     std::cout << " " << vectorCount << " vector(s) in " << vectorMs << " ms\n";
+}
+
+static std::vector<std::string> SplitCommandLine(const std::string& text)
+{
+    std::vector<std::string> out;
+    std::istringstream in(text);
+    std::string item;
+    while (in >> item)
+        out.push_back(std::move(item));
+    return out;
+}
+
+static void PrintInteractiveHelp()
+{
+    std::cout
+        << "Commands:\n"
+        << "  /h                         Show this help\n"
+        << "  /q                         Quit\n"
+        << "  /a <file>                  Add one document to memory\n"
+        << "  /a <dir> -e md,txt [-r]    Add documents from a directory\n"
+        << "  /s                         Save pending additions as delta and publish it\n"
+        << "  /m                         Merge delta into the main index and reload\n"
+        << "Queries:\n"
+        << "  anything else              Search current base + delta\n";
+}
+
+static uint64_t NextInteractiveDocId(IndexContext& ctx)
+{
+    uint64_t nextDocId = ctx.AllocateDocumentID();
+    if (auto* delta = ctx.GetDeltaContext())
+        nextDocId = std::max(nextDocId, delta->DocumentCount());
+    return nextDocId;
+}
+
+static bool AddInteractiveFiles(IndexContext& ctx,
+                                const std::vector<FileItem>& files,
+                                uint64_t& kept,
+                                uint64_t& skipped)
+{
+    uint64_t nextDocId = NextInteractiveDocId(ctx);
+    std::string firstContent;
+    for (const auto& file : files) {
+        if (AddFileDocument(ctx, file, nextDocId, kept, skipped, &firstContent))
+            ++nextDocId;
+    }
+    return kept > 0;
+}
+
+static bool HandleAddCommand(IndexContext& ctx, const std::vector<std::string>& args)
+{
+    if (args.size() < 2) {
+        std::cout << "usage: /a <file> | /a <dir> -e md,txt [-r]\n";
+        return true;
+    }
+
+    const std::string path = args[1];
+    std::vector<std::string> extensions = ParseExtensions("md,txt");
+    bool recursive = false;
+    for (size_t i = 2; i < args.size(); ++i) {
+        if (args[i] == "-e" && i + 1 < args.size()) {
+            extensions = ParseExtensions(args[++i]);
+        } else if (args[i] == "-r") {
+            recursive = true;
+        } else {
+            std::cout << "unknown /a option: " << args[i] << "\n";
+            return true;
+        }
+    }
+
+    std::vector<FileItem> files;
+    std::error_code ec;
+    const auto fsPath = FsPathFromUtf8(path);
+    if (std::filesystem::is_directory(fsPath, ec))
+        files = CollectDirectoryFiles(path, extensions, recursive);
+    else
+        files = CollectSingleFile(path);
+
+    if (files.empty()) {
+        std::cout << "no readable indexable files found: " << path << "\n";
+        return true;
+    }
+
+    uint64_t kept = 0;
+    uint64_t skipped = 0;
+    AddInteractiveFiles(ctx, files, kept, skipped);
+    std::cout << "added " << kept << " document(s) to memory";
+    if (skipped) std::cout << " (skipped " << skipped << ")";
+    std::cout << "; run /s to publish as delta\n";
+    return true;
+}
+
+static bool SaveInteractiveDelta(IndexContext& ctx, const std::string& idxPath)
+{
+    if (!IndexSerializer::IsValidIndex(idxPath.c_str())) {
+        if (!ctx.SaveIndex(idxPath.c_str())) {
+            std::cout << "failed to save index: " << idxPath << "\n";
+            return false;
+        }
+        ctx.LoadIndex(idxPath.c_str());
+        std::cout << "saved and loaded index: " << idxPath << "\n";
+        return true;
+    }
+
+    const std::string deltaPath = DeltaIndexPath(idxPath);
+    if (!ctx.SaveIndex(deltaPath.c_str())) {
+        std::cout << "failed to save delta: " << deltaPath << "\n";
+        return false;
+    }
+    std::cout << "saved and published delta: " << deltaPath << "\n";
+    return true;
+}
+
+static bool MergeInteractiveDelta(IndexContext& ctx, const std::string& idxPath)
+{
+    if (!ctx.HasDelta()) {
+        std::cout << "no delta loaded\n";
+        return true;
+    }
+    if (!ctx.Merge(idxPath.c_str())) {
+        std::cout << "merge failed: " << idxPath << "\n";
+        return false;
+    }
+    const std::string deltaPath = DeltaIndexPath(idxPath);
+    std::error_code ec;
+    std::filesystem::remove(FsPathFromUtf8(deltaPath), ec);
+    ctx.LoadIndex(idxPath.c_str());
+    std::cout << "merged delta into main index and reloaded: " << idxPath << "\n";
+    return true;
+}
+
+static bool HandleInteractiveCommand(IndexContext& ctx,
+                                     const std::string& idxPath,
+                                     const std::string& line,
+                                     bool& shouldQuit)
+{
+    const auto args = SplitCommandLine(line);
+    if (args.empty()) return true;
+    if (args[0] == "/q") { shouldQuit = true; return true; }
+    if (args[0] == "/h") { PrintInteractiveHelp(); return true; }
+    if (args[0] == "/a") return HandleAddCommand(ctx, args);
+    if (args[0] == "/s") return SaveInteractiveDelta(ctx, idxPath);
+    if (args[0] == "/m") return MergeInteractiveDelta(ctx, idxPath);
+    std::cout << "unknown command: " << args[0] << " (try /h)\n";
+    return true;
 }
 
 static int RunInteractiveSearch(const std::string& idxPath, const SearchOptions& options)
@@ -537,15 +689,21 @@ static int RunInteractiveSearch(const std::string& idxPath, const SearchOptions&
     if (options.vector)
         WarmVectorGraph(ctx);
 
-    std::cout << "Type a query, or 'quit' to exit.\n";
+    std::cout << "Type a query, or /h for commands.\n";
 
     std::string line;
     while (true) {
         std::cout << "> ";
         std::cout.flush();
         if (!std::getline(std::cin, line)) break;
-        if (line == "quit" || line == "exit" || line == "q") break;
+        line = Trim(std::move(line));
         if (line.empty()) continue;
+        if (!line.empty() && line[0] == '/') {
+            bool shouldQuit = false;
+            HandleInteractiveCommand(ctx, idxPath, line, shouldQuit);
+            if (shouldQuit) break;
+            continue;
+        }
         Search(ctx, line, options);
     }
 
