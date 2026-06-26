@@ -132,8 +132,10 @@ fn load_index_discovers_delta_context() {
     add_doc_via_context(&mut delta, 1, "delta", "delta body", "delta.txt");
     delta.SaveIndex(&delta_path).unwrap();
 
-    let loaded = IndexContext::with_path(Some(base_path_text));
+    let mut loaded = IndexContext::with_path(Some(base_path_text));
     assert!(loaded.HasDelta());
+    assert!(search_doc_ids(&mut loaded, "delta").contains(&1));
+    assert_eq!(loaded.GetDocPath(1), "delta.txt");
 }
 
 #[test]

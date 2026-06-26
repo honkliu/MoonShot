@@ -107,7 +107,14 @@ impl IndexContext {
     }
 
     pub fn AllocateDocumentID(&self) -> u64 {
-        self.m_Store.lock().unwrap().AllDocStats().keys().copied().max().map(|docId| docId + 1).unwrap_or(0)
+        let mut nextId = self.m_IndexFileHeader.IFH_NumDocuments;
+        if let Some(delta) = self.m_DeltaContext.as_ref() {
+            nextId = nextId.max(delta.DocumentCount());
+        }
+        for docId in self.m_Store.lock().unwrap().AllDocStats().keys().copied() {
+            nextId = nextId.max(docId + 1);
+        }
+        nextId
     }
 
     pub fn AddDocument(&mut self, doc: &Document, buildVector: bool) -> u64 {
@@ -153,7 +160,12 @@ impl IndexContext {
     pub fn GetStore(&self) -> Arc<Mutex<PostingStore>> { Arc::clone(&self.m_Store) }
     pub fn DocumentCount(&self) -> u64 { self.m_IndexFileHeader.IFH_NumDocuments }
     pub fn AvgDocLen(&self) -> f32 { self.m_IndexFileHeader.IFH_AvgDocLength }
-    pub fn GetDocPath(&self, doc_id: u64) -> String { self.m_Store.lock().unwrap().GetDocPath(ReaderDocumentIDValue(doc_id)).to_string() }
+    pub fn GetDocPath(&self, doc_id: u64) -> String {
+        let docId = ReaderDocumentIDValue(doc_id);
+        let path = self.m_Store.lock().unwrap().GetDocPath(docId).to_string();
+        if !path.is_empty() { return path; }
+        self.m_DeltaContext.as_ref().map(|delta| delta.GetDocPath(docId)).unwrap_or_default()
+    }
 
     pub fn HasDelta(&self) -> bool {
         self.m_DeltaContext.as_ref().map(|delta| delta.DocumentCount() > 0).unwrap_or(false)
@@ -197,10 +209,18 @@ impl IndexContext {
         -> Box<dyn IndexReader>
     {
         let tree = self.Compile(query, stream_set);
-        self.BuildIndexReader(tree.root)
+        self.GetReader(tree)
     }
 
     pub fn GetReader(&mut self, tree: EvalTree) -> Box<dyn IndexReader> {
+        let baseReader = self.BuildLocalReader(tree.clone());
+        if let Some(delta) = self.m_DeltaContext.as_mut() {
+            return Box::new(OrIndexReader::new(vec![baseReader, delta.BuildLocalReader(tree)]));
+        }
+        baseReader
+    }
+
+    fn BuildLocalReader(&mut self, tree: EvalTree) -> Box<dyn IndexReader> {
         if tree.HasTextQuery() && tree.HasVectorQuery() {
             let children = vec![
                 self.BuildIndexReader(tree.root),
@@ -215,6 +235,14 @@ impl IndexContext {
     }
 
     pub fn GetStreamReader(&mut self, stream_key: &str) -> Box<dyn IndexReader> {
+        let baseReader = self.BuildLocalStreamReader(stream_key);
+        if let Some(delta) = self.m_DeltaContext.as_mut() {
+            return Box::new(OrIndexReader::new(vec![baseReader, delta.BuildLocalStreamReader(stream_key)]));
+        }
+        baseReader
+    }
+
+    fn BuildLocalStreamReader(&mut self, stream_key: &str) -> Box<dyn IndexReader> {
         let docFreq = self.m_Store.lock().unwrap().DocFreq(stream_key);
         Box::new(AdvancedIndexReader::open(
             stream_key, Arc::clone(&self.m_BlockTable), docFreq))
@@ -252,11 +280,18 @@ impl IndexContext {
 
         IndexSerializer::Save(&self.m_WriteIndexFileHeader, &self.m_WriteBlockTable, &self.m_WriteDocData, path)?;
         if savingDeltaIndex {
-            let mut delta = IndexContext::with_path_and_load_delta(Some(path.to_string()), false);
-            if delta.m_Built && delta.DocumentCount() > 0 {
-                delta.m_LoadedFromDisk = true;
-                self.m_DeltaContext = Some(Box::new(delta));
-            }
+            let mut delta = IndexContext::with_path_and_load_delta(None, false);
+            delta.m_IndexPath = Some(path.to_string());
+            delta.m_BlockTable = Arc::new(std::mem::replace(&mut self.m_WriteBlockTable, IndexBlockTable::new(512)));
+            delta.m_VectorIndex = std::mem::replace(&mut self.m_WriteVectorIndex, HnswIndex::new(DOC_VECTOR_DIM, 32, 200, VectorMetric::Cosine));
+            delta.m_IndexFileHeader = self.m_WriteIndexFileHeader;
+            delta.m_DocData = std::mem::take(&mut self.m_WriteDocData);
+            delta.m_Built = true;
+            delta.m_LoadedFromDisk = true;
+            delta.m_VectorBuilt = false;
+
+            self.m_WriteIndexFileHeader = IndexFileHeader::default();
+            self.m_DeltaContext = Some(Box::new(delta));
         }
         Ok(())
     }

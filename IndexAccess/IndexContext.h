@@ -95,13 +95,14 @@ public:
 
     uint64_t AllocateDocumentID() const
     {
-        if (m_Store->AllDocStats().empty())
-            return 0;
+        uint64_t nextId = m_IndexFileHeader.IFH_NumDocuments;
+        if (m_DeltaContext)
+            nextId = std::max(nextId, m_DeltaContext->DocumentCount());
 
-        uint64_t maxId = 0;
         for (const auto& [docId, _] : m_Store->AllDocStats())
-            maxId = std::max(maxId, docId);
-        return maxId + 1;
+            nextId = std::max(nextId, docId + 1);
+
+        return nextId;
     }
 
     uint64_t AddDocument(const Document& doc, bool buildVector = true)
@@ -170,6 +171,24 @@ public:
             return empty;
         }
 
+        auto baseReader = BuildLocalReader(evalTree);
+        if (HasDelta()) {
+            std::vector<shared_ptr<IndexReader>> children;
+            children.push_back(baseReader);
+            children.push_back(m_DeltaContext->BuildLocalReader(evalTree));
+            return make_shared<OrIndexReader>(std::move(children));
+        }
+
+        return baseReader;
+    }
+
+    shared_ptr<IndexReader> BuildLocalReader(EvalTree* evalTree)
+    {
+        if (!evalTree || evalTree->IsEmpty()) {
+            auto empty = make_shared<AdvancedIndexReader>();
+            return empty;
+        }
+
         if (evalTree->HasTextQuery() && evalTree->HasVectorQuery()) {
             std::vector<shared_ptr<IndexReader>> children;
             children.push_back(BuildIndexReader(evalTree->root));
@@ -204,6 +223,18 @@ public:
     /* Open a reader for one specific stream key (e.g. "raceA", "carT"). */
     shared_ptr<IndexReader> GetStreamReader(const char* streamKey)
     {
+        auto baseReader = BuildLocalStreamReader(streamKey);
+        if (HasDelta()) {
+            std::vector<shared_ptr<IndexReader>> children;
+            children.push_back(baseReader);
+            children.push_back(m_DeltaContext->BuildLocalStreamReader(streamKey));
+            return make_shared<OrIndexReader>(std::move(children));
+        }
+        return baseReader;
+    }
+
+    shared_ptr<IndexReader> BuildLocalStreamReader(const char* streamKey)
+    {
         auto reader = make_shared<AdvancedIndexReader>();
         reader->Open(streamKey, &m_BlockTable, this);
         return reader;
@@ -223,10 +254,12 @@ public:
     {
         docId = ReaderDocumentIDValue(docId);
         if (!m_DocData || docId >= m_IndexFileHeader.IFH_NumDocuments)
-            return nullptr;
+            return m_DeltaContext ? m_DeltaContext->GetDocDataEntry(docId) : nullptr;
 
         const auto* entry = reinterpret_cast<const DocDataEntry*>(m_DocData + docId * DOC_REC_SIZE);
-        return entry->DDE_DocID == docId ? entry : nullptr;
+        if (entry->DDE_DocID == docId)
+            return entry;
+        return m_DeltaContext ? m_DeltaContext->GetDocDataEntry(docId) : nullptr;
     }
 
     const IndexFileHeader& GetIndexFileHeader() const { return m_IndexFileHeader; }
@@ -297,7 +330,7 @@ public:
         delta->m_DocData = m_WriteDocData;
         delta->m_Built = true;
         delta->m_LoadedFromDisk = true;
-        delta->m_VectorBuilt = true;
+        delta->m_VectorBuilt = false;
         delta->m_Executor = IndexSearchExecutor(delta.get());
 
         m_WriteDocData = nullptr;

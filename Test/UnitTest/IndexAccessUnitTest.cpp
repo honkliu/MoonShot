@@ -611,24 +611,25 @@ void TestDeltaRuntimeHandoff()
     {
         IndexContext engine("", INDEX_FILE);
         Document doc;
-        doc.doc_id = 0;
         doc.path = "delta.txt";
         doc.title = "delta banana";
         doc.body = "delta runtime document";
-        engine.AddDocument(doc);
+        const uint64_t deltaDocId = engine.AddDocument(doc);
+        assert(deltaDocId == 1);
 
         assert(engine.SaveIndex(DELTA_FILE));
         assert(engine.HasDelta());
 
         auto* delta = engine.GetDeltaContext();
         assert(delta != nullptr);
-        assert(delta->DocumentCount() == 1);
-        assert(delta->GetDocPath(0) == "delta.txt");
+        assert(delta->DocumentCount() == 2);
+        assert(delta->GetDocPath(deltaDocId) == "delta.txt");
 
-        std::unique_ptr<EvalTree> tree(delta->Compile("banana", "AUTB"));
-        std::unique_ptr<IndexSearchExecutor> exec(delta->GetExecutor());
-        auto results = exec->Execute(delta->GetReader(tree.get()), 5);
-        AssertContains(results, 0, "delta runtime handoff");
+        std::unique_ptr<EvalTree> tree(engine.Compile("banana", "AUTB"));
+        std::unique_ptr<IndexSearchExecutor> exec(engine.GetExecutor());
+        auto results = exec->Execute(engine.GetReader(tree.get()), 5);
+        AssertContains(results, deltaDocId, "default reader includes delta runtime");
+        assert(engine.GetDocPath(deltaDocId) == "delta.txt");
     }
 
     std::remove(INDEX_FILE);
