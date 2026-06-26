@@ -8,25 +8,31 @@
 #include <string>
 
 /*
- * Binary index file format (version 12).
+ * Binary index file format (version 14).
  *
  * Layout:
- *   [Header 88B]       magic, version, fixed section offsets and counts
+ *   [Header]           magic, version, fixed section offsets and counts
  *   [HeadTermEntry]    fixed 32B records, count = IFH_HeadTermEntryCount
  *   [LeafTermBlock]    fixed 4096B blocks, count = IFH_LeafTermBlockCount
  *                          LTB_Directory[0..94]: LeafTermEntry offsets from block base
  *                          LTB_Directory[95]: entry count
- *                          LTB_Data: packed LeafTermEntry records + LTE_Term bytes
+ *                          LTB_Data: packed 32B LeafTermEntry records + LTE_Term bytes
  *   [DocData]          N x 1024B records
  *   [Blocks]           raw IndexBlock structs
  *                        first block: packed varbyte docID/tf pairs
  *                        continuation block: 12B IndexBlockContinuationHeader + pairs
+ *   [TermMphfHeader]   one fixed MPHF descriptor
+ *   [MPHF Disp]        int32 displacement per MPHF bucket
+ *   [MPHF Entries]     4096B pages of fixed 32B TermMphfEntry records
  */
 
 struct BuildBlocksResult {
     std::vector<IndexBlock>          BBR_IndexBlocks;
     std::vector<HeadTermEntry>       BBR_HeadTermEntries;
     std::vector<LeafTermBlock>       BBR_LeafTermBlocks;
+    TermMphfHeader                   BBR_TermMphfHeader;
+    std::vector<int32_t>             BBR_TermMphfDisplacements;
+    std::vector<IndexBlock>          BBR_TermMphfEntryPages;
     uint64_t                         BBR_TotalTerms = 0;
 };
 
@@ -40,6 +46,9 @@ public:
                      const char* path);
     static bool IsValidIndex(const char* path);
     static BuildBlocksResult BuildBlocks(const PostingStore& store);
+    static void BuildTermMphfFromLeafBlocks(const LeafTermBlock* leafBlocks,
+                                            uint32_t leafBlockCount,
+                                            BuildBlocksResult& result);
 
 };
 

@@ -30,10 +30,34 @@ static constexpr size_t HEAD_TERM_KEY_MAX = 26;
 static constexpr size_t LEAF_TERM_DIRECTORY_COUNT = 96;
 static constexpr size_t LEAF_TERM_DATA_OFFSET = LEAF_TERM_DIRECTORY_COUNT * sizeof(uint16_t);
 static constexpr uint8_t  INDEX_FILE_MAGIC[8] = {'M','O','O','N','S','H','O','T'};
-static constexpr uint32_t INDEX_FORMAT_VERSION = 12;
+static constexpr uint32_t INDEX_FORMAT_VERSION = 14;
 
 static constexpr uint64_t INDEX_BLOCK_CACHE_BYTES = 100ull * 1024ull * 1024ull;
 static constexpr uint64_t LEAF_TERM_CACHE_BYTES = 100ull * 1024ull * 1024ull;
+
+inline uint64_t TermMphfHash(const char* term, size_t len, uint64_t seed)
+{
+    uint64_t hash = 1469598103934665603ull ^ seed;
+    for (size_t i = 0; i < len; ++i) {
+        hash ^= static_cast<uint8_t>(term[i]);
+        hash *= 1099511628211ull;
+    }
+    hash ^= hash >> 32;
+    hash *= 0xd6e8feb86659fd93ull;
+    hash ^= hash >> 32;
+    return hash;
+}
+
+inline uint64_t TermMphfSlotSeed(uint64_t seed, uint32_t displacement)
+{
+    uint64_t x = seed ^ (0x9e3779b97f4a7c15ull * (static_cast<uint64_t>(displacement) + 1));
+    x ^= x >> 30;
+    x *= 0xbf58476d1ce4e5b9ull;
+    x ^= x >> 27;
+    x *= 0x94d049bb133111ebull;
+    x ^= x >> 31;
+    return x;
+}
 
 /*
 * Physical index file structures.
@@ -56,6 +80,26 @@ struct IndexFileHeader {
     uint64_t IFH_DocDataOffset;
     uint64_t IFH_IndexBlockOffset;
     uint64_t IFH_IndexBlockCount;
+    uint64_t IFH_TermMphfHeaderOffset;
+    uint64_t IFH_TermMphfHeaderCount;
+    uint64_t IFH_TermMphfDisplacementOffset;
+    uint64_t IFH_TermMphfDisplacementCount;
+    uint64_t IFH_TermMphfEntryOffset;
+    uint64_t IFH_TermMphfEntryPageCount;
+};
+#pragma pack(pop)
+
+static constexpr uint64_t TERM_MPHF_MAGIC = 0x4850464d4d524554ull; // "TERMMFPH" little-endian tag
+
+#pragma pack(push,1)
+struct TermMphfHeader {
+    uint64_t TMH_Magic = TERM_MPHF_MAGIC;
+    uint64_t TMH_TermCount = 0;
+    uint32_t TMH_BucketCount = 0;
+    uint32_t TMH_SlotCount = 0;
+    uint64_t TMH_BucketSeed = 0;
+    uint64_t TMH_SlotSeed = 0;
+    uint64_t TMH_FingerprintSeed = 0;
 };
 #pragma pack(pop)
 
@@ -102,6 +146,7 @@ struct IndexBlockContinuationHeader {
 struct alignas(8) IndexBlock {
     uint8_t IB_Data[PAGE_SIZE];
 };
+static_assert(sizeof(IndexBlock) == PAGE_SIZE);
 
 #pragma pack(push,1)
 struct LeafTermEntry {
@@ -111,10 +156,23 @@ struct LeafTermEntry {
     uint32_t    LTE_IndexLength             = 0;
     uint32_t    LTE_ContinuationBlockCount  = 0;
     uint32_t    LTE_Flags                   = 0;
-    uint8_t     LTE_TermLength              = 0;
+
+    union {
+        uint64_t LTE_Fingerprint;
+        struct {
+            uint8_t LTE_Reserved[7];
+            uint8_t LTE_TermLength;
+        };
+    };
+
     char        LTE_Term[0];
 };
 #pragma pack(pop)
+
+using TermMphfEntry = LeafTermEntry;
+static_assert(sizeof(LeafTermEntry) == 32);
+static_assert(sizeof(TermMphfEntry) == 32);
+static_assert(PAGE_SIZE % sizeof(TermMphfEntry) == 0);
 
 struct alignas(16) HeadTermEntry {
     uint32_t HTE_LeafTermBlockID = 0;
@@ -244,12 +302,33 @@ class IndexBlockTable
             if (m_LeafTermPool.BCP_SlotTable)
                 PinnedMemFree(m_LeafTermPool.BCP_SlotTable);
             delete m_LeafTermPool.BCP_File;
+            ClearTermMphf();
         }
 
         void SetHeadTermEntries(std::unique_ptr<HeadTermEntry[]> head, uint32_t headCount)
         {
             m_HeadTermEntries = std::move(head);
             m_HeadTermEntryCount = headCount;
+        }
+
+        void SetTermMphf(const TermMphfHeader& header, std::unique_ptr<int32_t[]> displacements, uint32_t displacementCount, uint8_t* entryPages, uint32_t entryPageCount)
+        {
+            ClearTermMphf();
+            if (header.TMH_TermCount == 0 || header.TMH_BucketCount == 0 || header.TMH_SlotCount == 0 || !displacements || !entryPages || entryPageCount == 0)
+                return;
+            const uint64_t requiredBytes = header.TMH_SlotCount * sizeof(TermMphfEntry);
+            const uint64_t availableBytes = static_cast<uint64_t>(entryPageCount) * PAGE_SIZE;
+            if (header.TMH_Magic != TERM_MPHF_MAGIC
+                || header.TMH_SlotCount != header.TMH_TermCount
+                || displacementCount != header.TMH_BucketCount
+                || requiredBytes > availableBytes)
+                return;
+
+            m_TermMphfHeader = header;
+            m_TermMphfDisplacements = std::move(displacements);
+            m_TermMphfDisplacementCount = displacementCount;
+            m_TermMphfEntryPages = entryPages;
+            m_TermMphfEntryPageCount = entryPageCount;
         }
 
         void HandOverBlockTable(IndexBlockTable& source)
@@ -259,6 +338,7 @@ class IndexBlockTable
             SetBlockMemory(nullptr, nullptr);
             m_HeadTermEntries.reset();
             m_HeadTermEntryCount = 0;
+            ClearTermMphf();
 
             source.ExitBlockThread(source.m_IndexPool);
             source.ExitBlockThread(source.m_LeafTermPool);
@@ -269,6 +349,15 @@ class IndexBlockTable
             m_HeadTermEntries = std::move(source.m_HeadTermEntries);
             m_HeadTermEntryCount = source.m_HeadTermEntryCount;
             source.m_HeadTermEntryCount = 0;
+            m_TermMphfHeader = source.m_TermMphfHeader;
+            m_TermMphfDisplacements = std::move(source.m_TermMphfDisplacements);
+            m_TermMphfDisplacementCount = source.m_TermMphfDisplacementCount;
+            m_TermMphfEntryPages = source.m_TermMphfEntryPages;
+            m_TermMphfEntryPageCount = source.m_TermMphfEntryPageCount;
+            source.m_TermMphfHeader = {};
+            source.m_TermMphfDisplacementCount = 0;
+            source.m_TermMphfEntryPages = nullptr;
+            source.m_TermMphfEntryPageCount = 0;
 
             StartBlockThread(m_IndexPool);
             StartBlockThread(m_LeafTermPool);
@@ -293,55 +382,49 @@ class IndexBlockTable
             /* Step 1: BloomFilter */
             const size_t termLength = std::strlen(term);
             if (!m_BloomFilter.CanTermExist(term, termLength)) return false;
-            if (!m_HeadTermEntries || m_HeadTermEntryCount == 0) return false;
-            if (termLength > HEAD_TERM_KEY_MAX) return false;
+            if (HasTermMphf()) {
+                uint32_t mphfIndexBlockID = 0;
+                uint32_t mphfIndexOffset = 0;
+                uint32_t mphfIndexLength = 0;
+                uint32_t mphfDocFreq = 0;
+                uint32_t mphfContinuationBlockCount = 0;
+                if (!FindTermDataMphf(term, termLength,
+                                      &mphfIndexBlockID,
+                                      &mphfIndexOffset,
+                                      &mphfIndexLength,
+                                      &mphfDocFreq,
+                                      &mphfContinuationBlockCount))
+                    return false;
 
-            /* Step 2: Level-1 — find leaf block whose first term <= term */
-            const std::string_view termText(term);
-            const HeadTermEntry* begin = m_HeadTermEntries.get();
-            const HeadTermEntry* end = begin + m_HeadTermEntryCount;
-            auto it = std::upper_bound(begin, end, termText,
-                [](std::string_view t, const HeadTermEntry& e) { return t < std::string_view(e.HTE_FirstTerm, e.HTE_FirstTermLength); });
-            if (it == begin) return false;
-            --it;
+                uint32_t exactIndexBlockID = 0;
+                uint32_t exactIndexOffset = 0;
+                uint32_t exactIndexLength = 0;
+                uint32_t exactDocFreq = 0;
+                uint32_t exactContinuationBlockCount = 0;
+                if (!FindTermDataHeadLeaf(term, termLength,
+                                          &exactIndexBlockID,
+                                          &exactIndexOffset,
+                                          &exactIndexLength,
+                                          &exactDocFreq,
+                                          &exactContinuationBlockCount))
+                    return false;
 
-            uint32_t blockID = it->HTE_LeafTermBlockID;
-            uint32_t leafSlot = UINT32_MAX;
-            const LeafTermBlock* block = static_cast<const LeafTermBlock*>(GetBlock(BlockKind::LeafTerm, blockID, &leafSlot));
-            if (!block) return false;
-            const uint8_t* blockBase = reinterpret_cast<const uint8_t*>(block);
-            const uint32_t entryCount = block->LTB_Directory[LEAF_TERM_DIRECTORY_COUNT - 1];
+                if (mphfIndexBlockID != exactIndexBlockID
+                    || mphfIndexOffset != exactIndexOffset
+                    || mphfIndexLength != exactIndexLength
+                    || mphfDocFreq != exactDocFreq
+                    || mphfContinuationBlockCount != exactContinuationBlockCount)
+                    return false;
 
-            uint32_t left = 0;
-            uint32_t right = entryCount;
-            while (left < right) {
-                const uint32_t mid = left + (right - left) / 2;
-                const LeafTermEntry* entry = reinterpret_cast<const LeafTermEntry*>(blockBase + block->LTB_Directory[mid]);
-                const std::string_view entryTerm(entry->LTE_Term, entry->LTE_TermLength);
-                if (entryTerm < termText)
-                    left = mid + 1;
-                else
-                    right = mid;
+                *indexBlockIDOut = mphfIndexBlockID;
+                *indexOffsetOut = mphfIndexOffset;
+                *indexLengthOut = mphfIndexLength;
+                *docFreqOut = mphfDocFreq;
+                if (continuationBlockCountOut) *continuationBlockCountOut = mphfContinuationBlockCount;
+                return true;
             }
 
-            if (left == entryCount) {
-                ReleaseBlock(BlockKind::LeafTerm, leafSlot);
-                return false;
-            }
-            const LeafTermEntry* entry = reinterpret_cast<const LeafTermEntry*>(blockBase + block->LTB_Directory[left]);
-            const std::string_view entryTerm(entry->LTE_Term, entry->LTE_TermLength);
-            if (entryTerm != termText) {
-                ReleaseBlock(BlockKind::LeafTerm, leafSlot);
-                return false;
-            }
-
-            *docFreqOut = entry->LTE_DocFreq;
-            *indexBlockIDOut = entry->LTE_IndexBlockID;
-            *indexOffsetOut = entry->LTE_IndexOffset;
-            *indexLengthOut = entry->LTE_IndexLength;
-            if (continuationBlockCountOut) *continuationBlockCountOut = entry->LTE_ContinuationBlockCount;
-            ReleaseBlock(BlockKind::LeafTerm, leafSlot);
-            return true;
+            return FindTermDataHeadLeaf(term, termLength, indexBlockIDOut, indexOffsetOut, indexLengthOut, docFreqOut, continuationBlockCountOut);
         }
 
         void* GetBlock(BlockKind kind, uint32_t block_seq, uint32_t* slotOut, bool sequential = false)
@@ -443,6 +526,8 @@ class IndexBlockTable
             }
             StartBlockThread(m_IndexPool);
             StartBlockThread(m_LeafTermPool);
+            if (!indexBlocks && !leafTermBlocks)
+                ClearTermMphf();
         }
 
         uint8_t* Init(BlockKind kind,
@@ -505,11 +590,138 @@ class IndexBlockTable
         BlockCachePool                           m_LeafTermPool;
         BloomFilter                              m_BloomFilter;
 
+        TermMphfHeader                          m_TermMphfHeader;
+        std::unique_ptr<int32_t[]>              m_TermMphfDisplacements;
+        uint32_t                                m_TermMphfDisplacementCount = 0;
+        uint8_t*                                m_TermMphfEntryPages = nullptr;
+        uint32_t                                m_TermMphfEntryPageCount = 0;
+
         /* Level-1: fixed directory — (HTE_FirstTerm → HTE_LeafTermBlockID), sorted by HTE_FirstTerm */
         std::unique_ptr<HeadTermEntry[]>         m_HeadTermEntries;
         uint32_t                                 m_HeadTermEntryCount = 0;
 
     private:
+        bool FindTermDataMphf(const char* term,
+                              size_t termLength,
+                              uint32_t* indexBlockIDOut,
+                              uint32_t* indexOffsetOut,
+                              uint32_t* indexLengthOut,
+                              uint32_t* docFreqOut,
+                              uint32_t* continuationBlockCountOut) const
+        {
+            if (!m_TermMphfEntryPages || !m_TermMphfDisplacements || m_TermMphfHeader.TMH_TermCount == 0)
+                return false;
+            if (m_TermMphfHeader.TMH_Magic != TERM_MPHF_MAGIC
+                || m_TermMphfHeader.TMH_BucketCount == 0
+                || m_TermMphfHeader.TMH_SlotCount == 0
+                || m_TermMphfDisplacementCount != m_TermMphfHeader.TMH_BucketCount)
+                return false;
+
+            const uint64_t bucket = TermMphfHash(term, termLength, m_TermMphfHeader.TMH_BucketSeed) % m_TermMphfHeader.TMH_BucketCount;
+            const int64_t displacement = m_TermMphfDisplacements[static_cast<size_t>(bucket)];
+            if (displacement < 0) return false;
+
+            const uint64_t slot = TermMphfHash(term, termLength, TermMphfSlotSeed(m_TermMphfHeader.TMH_SlotSeed, static_cast<uint32_t>(displacement))) % m_TermMphfHeader.TMH_SlotCount;
+            const uint64_t entriesPerPage = PAGE_SIZE / sizeof(TermMphfEntry);
+            const uint64_t pageId = slot / entriesPerPage;
+            const uint64_t inPage = slot % entriesPerPage;
+            if (pageId >= m_TermMphfEntryPageCount)
+                return false;
+
+            const auto* pageBase = m_TermMphfEntryPages + pageId * PAGE_SIZE;
+            const auto* entry = reinterpret_cast<const TermMphfEntry*>(pageBase + inPage * sizeof(TermMphfEntry));
+            uint64_t fingerprint = TermMphfHash(term, termLength, m_TermMphfHeader.TMH_FingerprintSeed);
+            if (fingerprint == 0) fingerprint = 1;
+            if (entry->LTE_Fingerprint != fingerprint)
+                return false;
+
+            *docFreqOut = entry->LTE_DocFreq;
+            *indexBlockIDOut = entry->LTE_IndexBlockID;
+            *indexOffsetOut = entry->LTE_IndexOffset;
+            *indexLengthOut = entry->LTE_IndexLength;
+            if (continuationBlockCountOut) *continuationBlockCountOut = entry->LTE_ContinuationBlockCount;
+            return true;
+        }
+
+        bool FindTermDataHeadLeaf(const char* term,
+                                  size_t termLength,
+                                  uint32_t* indexBlockIDOut,
+                                  uint32_t* indexOffsetOut,
+                                  uint32_t* indexLengthOut,
+                                  uint32_t* docFreqOut,
+                                  uint32_t* continuationBlockCountOut) const
+        {
+            if (!m_HeadTermEntries || m_HeadTermEntryCount == 0) return false;
+            if (termLength > HEAD_TERM_KEY_MAX) return false;
+
+            const std::string_view termText(term, termLength);
+            const HeadTermEntry* begin = m_HeadTermEntries.get();
+            const HeadTermEntry* end = begin + m_HeadTermEntryCount;
+            auto it = std::upper_bound(begin, end, termText,
+                [](std::string_view t, const HeadTermEntry& e) { return t < std::string_view(e.HTE_FirstTerm, e.HTE_FirstTermLength); });
+            if (it == begin) return false;
+            --it;
+
+            uint32_t leafSlot = UINT32_MAX;
+            const LeafTermBlock* block = static_cast<const LeafTermBlock*>(const_cast<IndexBlockTable*>(this)->GetBlock(BlockKind::LeafTerm, it->HTE_LeafTermBlockID, &leafSlot));
+            if (!block) return false;
+            const uint8_t* blockBase = reinterpret_cast<const uint8_t*>(block);
+            const uint32_t entryCount = block->LTB_Directory[LEAF_TERM_DIRECTORY_COUNT - 1];
+
+            uint32_t left = 0;
+            uint32_t right = entryCount;
+            while (left < right) {
+                const uint32_t mid = left + (right - left) / 2;
+                const LeafTermEntry* entry = reinterpret_cast<const LeafTermEntry*>(blockBase + block->LTB_Directory[mid]);
+                const std::string_view entryTerm(entry->LTE_Term, entry->LTE_TermLength);
+                if (entryTerm < termText)
+                    left = mid + 1;
+                else
+                    right = mid;
+            }
+
+            if (left == entryCount) {
+                const_cast<IndexBlockTable*>(this)->ReleaseBlock(BlockKind::LeafTerm, leafSlot);
+                return false;
+            }
+            const LeafTermEntry* entry = reinterpret_cast<const LeafTermEntry*>(blockBase + block->LTB_Directory[left]);
+            const std::string_view entryTerm(entry->LTE_Term, entry->LTE_TermLength);
+            if (entryTerm != termText) {
+                const_cast<IndexBlockTable*>(this)->ReleaseBlock(BlockKind::LeafTerm, leafSlot);
+                return false;
+            }
+
+            *docFreqOut = entry->LTE_DocFreq;
+            *indexBlockIDOut = entry->LTE_IndexBlockID;
+            *indexOffsetOut = entry->LTE_IndexOffset;
+            *indexLengthOut = entry->LTE_IndexLength;
+            if (continuationBlockCountOut) *continuationBlockCountOut = entry->LTE_ContinuationBlockCount;
+            const_cast<IndexBlockTable*>(this)->ReleaseBlock(BlockKind::LeafTerm, leafSlot);
+            return true;
+        }
+
+        bool HasTermMphf() const
+        {
+            return m_TermMphfEntryPages
+                && m_TermMphfDisplacements
+                && m_TermMphfHeader.TMH_Magic == TERM_MPHF_MAGIC
+                && m_TermMphfHeader.TMH_TermCount > 0
+                && m_TermMphfHeader.TMH_BucketCount > 0
+                && m_TermMphfHeader.TMH_SlotCount > 0
+                && m_TermMphfDisplacementCount == m_TermMphfHeader.TMH_BucketCount;
+        }
+
+        void ClearTermMphf()
+        {
+            if (m_TermMphfEntryPages)
+                PinnedMemFree(m_TermMphfEntryPages);
+            m_TermMphfHeader = {};
+            m_TermMphfDisplacements.reset();
+            m_TermMphfDisplacementCount = 0;
+            m_TermMphfEntryPages = nullptr;
+            m_TermMphfEntryPageCount = 0;
+        }
+
         void HandOverPool(BlockCachePool& dest, BlockCachePool& source)
         {
             dest.BCP_Pages = source.BCP_Pages;

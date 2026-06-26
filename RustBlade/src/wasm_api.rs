@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use wasm_bindgen::prelude::*;
 
-// Rust/WASM inspection surface for the C++ v12 index format. There is no native
+// Rust/WASM inspection surface for the C++ v14 index format. There is no native
 // C++ peer file; the binary structures below mirror BlockTable.h/IndexSerializer.h.
 
 use crate::block_table::{
@@ -33,7 +33,7 @@ fn parse_index_summary_inner(data: &[u8], file_size: usize) -> Result<String, St
     let subindex_size = header.docdata_off.saturating_sub(header.head_term_off);
     let docdata_size = header.num_docs * DOC_REC_SIZE as u64;
     Ok(format!(
-        r#"{{"header":{{"size":{},"magic":"MOONSHOT","version":{},"num_docs":{},"num_terms":{},"head_term_off":{},"head_term_count":{},"leaf_term_off":{},"leaf_term_count":{},"docdata_off":{},"docdata_size":{},"index_block_off":{},"index_block_count":{},"subindex_off":{},"subindex_size":{},"pageskip_off":0,"pageskip_size":0,"blocks_off":{},"num_blocks":{},"ib_data_off":0,"file_size":{}}},"head_leaf_term_table":{{"head":[],"leaf_blocks":[]}},"docdata":[],"blocks":[],"summary_only":true}}"#,
+        r#"{{"header":{{"size":{},"magic":"MOONSHOT","version":{},"num_docs":{},"num_terms":{},"head_term_off":{},"head_term_count":{},"leaf_term_off":{},"leaf_term_count":{},"docdata_off":{},"docdata_size":{},"index_block_off":{},"index_block_count":{},"term_mphf_header_off":{},"term_mphf_header_count":{},"term_mphf_displacement_off":{},"term_mphf_displacement_count":{},"term_mphf_entry_off":{},"term_mphf_entry_page_count":{},"subindex_off":{},"subindex_size":{},"pageskip_off":0,"pageskip_size":0,"blocks_off":{},"num_blocks":{},"ib_data_off":0,"file_size":{}}},"head_leaf_term_table":{{"head":[],"leaf_blocks":[]}},"docdata":[],"blocks":[],"summary_only":true}}"#,
         INDEX_FILE_HEADER_SIZE,
         header.version,
         header.num_docs,
@@ -46,6 +46,12 @@ fn parse_index_summary_inner(data: &[u8], file_size: usize) -> Result<String, St
         docdata_size,
         header.index_block_off,
         header.index_block_count,
+        header.term_mphf_header_off,
+        header.term_mphf_header_count,
+        header.term_mphf_displacement_off,
+        header.term_mphf_displacement_count,
+        header.term_mphf_entry_off,
+        header.term_mphf_entry_page_count,
         header.head_term_off,
         subindex_size,
         header.index_block_off,
@@ -65,7 +71,7 @@ pub fn parse_index(data: &[u8]) -> String {
 fn parse_index_inner(data: &[u8]) -> Result<String, String> {
     let header = parse_header(data)?;
     let mut store = PostingStore::new();
-    let (head_entries, leaf_blocks, blocks, _) = IndexSerializer::decode(&mut store, data)
+    let (head_entries, leaf_blocks, blocks, _, _, _, _) = IndexSerializer::decode(&mut store, data)
         .map_err(|error| format!("{error:?}"))?;
 
     let mut block_entry_map: HashMap<u32, Vec<LeafTermEntry>> = HashMap::new();
@@ -77,7 +83,7 @@ fn parse_index_inner(data: &[u8]) -> Result<String, String> {
     let subindex_size = header.docdata_off.saturating_sub(header.head_term_off);
     let docdata_size = header.num_docs * DOC_REC_SIZE as u64;
     out.push_str(&format!(
-        r#""header":{{"size":{},"magic":"MOONSHOT","version":{},"num_docs":{},"num_terms":{},"head_term_off":{},"head_term_count":{},"leaf_term_off":{},"leaf_term_count":{},"docdata_off":{},"docdata_size":{},"index_block_off":{},"index_block_count":{},"subindex_off":{},"subindex_size":{},"pageskip_off":0,"pageskip_size":0,"blocks_off":{},"num_blocks":{},"ib_data_off":0,"file_size":{}}},"#,
+        r#""header":{{"size":{},"magic":"MOONSHOT","version":{},"num_docs":{},"num_terms":{},"head_term_off":{},"head_term_count":{},"leaf_term_off":{},"leaf_term_count":{},"docdata_off":{},"docdata_size":{},"index_block_off":{},"index_block_count":{},"term_mphf_header_off":{},"term_mphf_header_count":{},"term_mphf_displacement_off":{},"term_mphf_displacement_count":{},"term_mphf_entry_off":{},"term_mphf_entry_page_count":{},"subindex_off":{},"subindex_size":{},"pageskip_off":0,"pageskip_size":0,"blocks_off":{},"num_blocks":{},"ib_data_off":0,"file_size":{}}},"#,
         INDEX_FILE_HEADER_SIZE,
         header.version,
         header.num_docs,
@@ -90,6 +96,12 @@ fn parse_index_inner(data: &[u8]) -> Result<String, String> {
         docdata_size,
         header.index_block_off,
         header.index_block_count,
+        header.term_mphf_header_off,
+        header.term_mphf_header_count,
+        header.term_mphf_displacement_off,
+        header.term_mphf_displacement_count,
+        header.term_mphf_entry_off,
+        header.term_mphf_entry_page_count,
         header.head_term_off,
         subindex_size,
         header.index_block_off,
@@ -288,6 +300,12 @@ struct Header {
     docdata_off: u64,
     index_block_off: u64,
     index_block_count: u64,
+    term_mphf_header_off: u64,
+    term_mphf_header_count: u64,
+    term_mphf_displacement_off: u64,
+    term_mphf_displacement_count: u64,
+    term_mphf_entry_off: u64,
+    term_mphf_entry_page_count: u64,
 }
 
 fn parse_header(data: &[u8]) -> Result<Header, String> {
@@ -312,6 +330,12 @@ fn parse_header(data: &[u8]) -> Result<Header, String> {
         docdata_off: u64_at(data, 64),
         index_block_off: u64_at(data, 72),
         index_block_count: u64_at(data, 80),
+        term_mphf_header_off: u64_at(data, 88),
+        term_mphf_header_count: u64_at(data, 96),
+        term_mphf_displacement_off: u64_at(data, 104),
+        term_mphf_displacement_count: u64_at(data, 112),
+        term_mphf_entry_off: u64_at(data, 120),
+        term_mphf_entry_page_count: u64_at(data, 128),
     })
 }
 

@@ -14,7 +14,7 @@ use crate::compiler::IndexSearchCompiler;
 use crate::tokenizer::{SmartTokenizer, Tokenizer};
 use crate::serializer::{IndexSerializer, IndexFileHeader};
 use crate::error::{Result, RustBladeError};
-use crate::block_table::{DOC_PATH_MAX, DOC_REC_SIZE, DOC_VECTOR_DIM, INDEX_FILE_HEADER_SIZE, PAGE_SIZE, HEAD_TERM_KEY_MAX, INDEX_BLOCK_CONTINUATION_HEADER_SIZE, LEAF_TERM_DATA_OFFSET, LEAF_TERM_DIRECTORY_COUNT, HeadTermEntry, IndexBlock, IndexBlockContinuationHeader, LeafTermEntry, LeafTermBlock, PinnedBlock};
+use crate::block_table::{DOC_PATH_MAX, DOC_REC_SIZE, DOC_VECTOR_DIM, INDEX_FILE_HEADER_SIZE, PAGE_SIZE, HEAD_TERM_KEY_MAX, INDEX_BLOCK_CONTINUATION_HEADER_SIZE, LEAF_TERM_DATA_OFFSET, LEAF_TERM_DIRECTORY_COUNT, TERM_MPHF_HEADER_SIZE, HeadTermEntry, IndexBlock, IndexBlockContinuationHeader, LeafTermEntry, LeafTermBlock, PinnedBlock};
 use crate::vector_index::{HnswIndex, VectorMetric, VectorSearchResult};
 use crate::vector_index::build_hashed_embedding;
 
@@ -416,6 +416,22 @@ impl IndexContext {
             + (delta.m_IndexFileHeader.IFH_AvgDocLength as f64 * deltaDocLimit as f64);
         let avgDocLength = if mergedDocs == 0 { 1.0 } else { (totalDocLength / mergedDocs as f64) as f32 };
 
+        let mut mergedLeafBlocks = Vec::with_capacity(headEntryCount as usize);
+        if headEntryCount > 0 {
+            let leafBytes = fs::read(&leafTempPath)?;
+            if leafBytes.len() != headEntryCount as usize * PAGE_SIZE { return Err(RustBladeError::InvalidFormat); }
+            for index in 0..headEntryCount as usize {
+                let offset = index * PAGE_SIZE;
+                mergedLeafBlocks.push(LeafTermBlock::from_bytes(&leafBytes[offset..offset + PAGE_SIZE]).ok_or(RustBladeError::InvalidFormat)?);
+            }
+        }
+        let (mphfHeader, mphfDisplacements, mphfEntryPages) = IndexSerializer::BuildTermMphfFromLeafBlocks(&mergedLeafBlocks);
+        if totalTerms > 0 && (mphfDisplacements.is_empty() || mphfEntryPages.is_empty()) { return Err(RustBladeError::InvalidFormat); }
+        let mphfHeaderCount = if !mphfDisplacements.is_empty() && !mphfEntryPages.is_empty() { 1u64 } else { 0u64 };
+        let mphfHeaderOffset = indexOffset + indexBlockCount as usize * PAGE_SIZE;
+        let mphfDisplacementOffset = mphfHeaderOffset + mphfHeaderCount as usize * TERM_MPHF_HEADER_SIZE;
+        let mphfEntryOffset = mphfDisplacementOffset + mphfDisplacements.len() * std::mem::size_of::<i32>();
+
         let header = IndexFileHeader {
             IFH_AvgDocLength: avgDocLength,
             IFH_NumDocuments: mergedDocs as u64,
@@ -427,6 +443,12 @@ impl IndexContext {
             IFH_DocDataOffset: docDataOffset as u64,
             IFH_IndexBlockOffset: indexOffset as u64,
             IFH_IndexBlockCount: indexBlockCount as u64,
+            IFH_TermMphfHeaderOffset: mphfHeaderOffset as u64,
+            IFH_TermMphfHeaderCount: mphfHeaderCount,
+            IFH_TermMphfDisplacementOffset: mphfDisplacementOffset as u64,
+            IFH_TermMphfDisplacementCount: mphfDisplacements.len() as u64,
+            IFH_TermMphfEntryOffset: mphfEntryOffset as u64,
+            IFH_TermMphfEntryPageCount: mphfEntryPages.len() as u64,
         };
 
         let _ = fs::remove_file(&tempPath);
@@ -438,6 +460,15 @@ impl IndexContext {
             Self::AppendFile(&mut output, &leafTempPath)?;
             Self::AppendFile(&mut output, &docDataTempPath)?;
             Self::AppendFile(&mut output, &indexTempPath)?;
+            if header.IFH_TermMphfHeaderCount > 0 {
+                output.write_all(&mphfHeader.to_bytes())?;
+                for displacement in &mphfDisplacements {
+                    output.write_all(&displacement.to_le_bytes())?;
+                }
+                for page in &mphfEntryPages {
+                    output.write_all(&page.IB_Data)?;
+                }
+            }
             output.flush()?;
         }
 
@@ -450,6 +481,8 @@ impl IndexContext {
 
     fn BuildIndexData(store: &PostingStore, buildVectorIndex: bool) -> (IndexFileHeader, IndexBlockTable, HnswIndex, Vec<u8>) {
         let blocks = IndexSerializer::BuildBlocks(store);
+        assert!(blocks.BBR_TotalTerms == 0 || (!blocks.BBR_TermMphfDisplacements.is_empty() && !blocks.BBR_TermMphfEntryPages.is_empty()),
+            "Failed to build TermMPHF for non-empty index");
         let docData = Self::EncodeDocData(store);
         let documentCount = store.AllDocStats().keys().copied().max().map(|id| id + 1).unwrap_or(0);
 
@@ -457,6 +490,10 @@ impl IndexContext {
         let leafOffset = headOffset + blocks.BBR_HeadTermEntries.len() * 32;
         let docDataOffset = leafOffset + blocks.BBR_LeafTermBlocks.len() * PAGE_SIZE;
         let indexOffset = docDataOffset + docData.len();
+        let mphfHeaderCount = if !blocks.BBR_TermMphfDisplacements.is_empty() && !blocks.BBR_TermMphfEntryPages.is_empty() { 1u64 } else { 0u64 };
+        let mphfHeaderOffset = indexOffset + blocks.BBR_IndexBlocks.len() * PAGE_SIZE;
+        let mphfDisplacementOffset = mphfHeaderOffset + mphfHeaderCount as usize * TERM_MPHF_HEADER_SIZE;
+        let mphfEntryOffset = mphfDisplacementOffset + blocks.BBR_TermMphfDisplacements.len() * std::mem::size_of::<i32>();
 
         let header = IndexFileHeader {
             IFH_AvgDocLength: if documentCount == 0 { 1.0 } else { store.TotalTerms() as f32 / documentCount as f32 },
@@ -469,11 +506,23 @@ impl IndexContext {
             IFH_DocDataOffset: docDataOffset as u64,
             IFH_IndexBlockOffset: indexOffset as u64,
             IFH_IndexBlockCount: blocks.BBR_IndexBlocks.len() as u64,
+            IFH_TermMphfHeaderOffset: mphfHeaderOffset as u64,
+            IFH_TermMphfHeaderCount: mphfHeaderCount,
+            IFH_TermMphfDisplacementOffset: mphfDisplacementOffset as u64,
+            IFH_TermMphfDisplacementCount: blocks.BBR_TermMphfDisplacements.len() as u64,
+            IFH_TermMphfEntryOffset: mphfEntryOffset as u64,
+            IFH_TermMphfEntryPageCount: blocks.BBR_TermMphfEntryPages.len() as u64,
         };
 
         let mut blockTable = IndexBlockTable::new(blocks.BBR_IndexBlocks.len().max(512) + 64);
+        let mphfHeader = blocks.BBR_TermMphfHeader;
+        let mphfDisplacements = blocks.BBR_TermMphfDisplacements;
+        let mphfEntryPages = blocks.BBR_TermMphfEntryPages;
         blockTable.SetIndexBlocks(blocks.BBR_IndexBlocks);
         blockTable.SetHeadLeafTermTable(blocks.BBR_HeadTermEntries, blocks.BBR_LeafTermBlocks);
+        if header.IFH_TermMphfHeaderCount > 0 {
+            blockTable.SetTermMphf(mphfHeader, mphfDisplacements, mphfEntryPages);
+        }
 
         let mut vectorIndex = HnswIndex::new(DOC_VECTOR_DIM, 32, 200, VectorMetric::Cosine);
         vectorIndex.SetDocData(docData.clone());
@@ -522,6 +571,7 @@ impl IndexContext {
         self.m_IndexPath = Some(path.to_string());
         let mut store = PostingStore::new();
         let (header, head_term_entries, docdata) = IndexSerializer::load_file_tables(&mut store, path)?;
+        let (mphfHeader, mphfDisplacements, mphfEntryPages) = IndexSerializer::LoadTermMphf(path, &header)?;
         let mut table = IndexBlockTable::new(header.IFH_IndexBlockCount as usize);
         table.InitFileBacked(
             path,
@@ -533,6 +583,9 @@ impl IndexContext {
             header.IFH_LeafTermBlockCount.min(25_600) as u32,
         )?;
         table.SetHeadEntries(head_term_entries);
+        if header.IFH_TermMphfHeaderCount > 0 {
+            table.SetTermMphf(mphfHeader, mphfDisplacements, mphfEntryPages);
+        }
 
         let mut vector_index = HnswIndex::new(DOC_VECTOR_DIM, 32, 200, VectorMetric::Cosine);
         vector_index.SetDocData(docdata.clone());
@@ -552,10 +605,13 @@ impl IndexContext {
     /// Load from raw bytes (WASM path — no file system access needed).
     pub fn LoadFromBytes(&mut self, data: &[u8]) -> Result<()> {
         let mut store = PostingStore::new();
-        let (head_term_entries, leaf_term_blocks, blocks, docdata) = IndexSerializer::decode(&mut store, data)?;
+        let (head_term_entries, leaf_term_blocks, blocks, docdata, mphfHeader, mphfDisplacements, mphfEntryPages) = IndexSerializer::decode(&mut store, data)?;
         let mut table = IndexBlockTable::new(blocks.len().max(512) + 64);
         table.SetIndexBlocks(blocks);
         table.SetHeadLeafTermTable(head_term_entries, leaf_term_blocks);
+        if !mphfDisplacements.is_empty() && !mphfEntryPages.is_empty() {
+            table.SetTermMphf(mphfHeader, mphfDisplacements, mphfEntryPages);
+        }
 
         let mut vector_index = HnswIndex::new(DOC_VECTOR_DIM, 32, 200, VectorMetric::Cosine);
         vector_index.SetDocData(docdata.clone());
@@ -726,8 +782,9 @@ fn WriteLeafEntry(block: &mut LeafTermBlock, entryIndex: usize, offset: usize, e
     data[12..16].copy_from_slice(&entry.LTE_IndexLength.to_le_bytes());
     data[16..20].copy_from_slice(&entry.LTE_ContinuationBlockCount.to_le_bytes());
     data[20..24].copy_from_slice(&entry.LTE_Flags.to_le_bytes());
-    data[24] = entry.LTE_Term.len() as u8;
-    data[25..25 + entry.LTE_Term.len()].copy_from_slice(entry.LTE_Term.as_bytes());
+    data[24..31].fill(0);
+    data[31] = entry.LTE_Term.len() as u8;
+    data[32..32 + entry.LTE_Term.len()].copy_from_slice(entry.LTE_Term.as_bytes());
 }
 
 #[allow(non_snake_case)]
@@ -903,6 +960,7 @@ impl<'a> LeafTermBlockView<'a> {
             LTE_IndexLength: self.m_PostingIndexLength as u32,
             LTE_ContinuationBlockCount: self.m_PostingContinuationBlockCount,
             LTE_Flags: source.LTE_Flags,
+            LTE_Fingerprint: 0,
         };
 
         WriteLeafEntry(&mut self.m_LeafBlocks[self.m_LeafBlockID as usize], self.m_LeafEntryCount, self.m_LeafWriteOffset, &entry);

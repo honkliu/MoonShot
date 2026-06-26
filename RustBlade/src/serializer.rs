@@ -6,6 +6,9 @@ use crate::block_table::{
     IndexBlock,
     IndexBlockTable,
     IndexBlockContinuationHeader,
+    TermMphfHash,
+    TermMphfHeader,
+    TermMphfSlotSeed,
     LeafTermBlock,
     LeafTermEntry,
     DOC_PATH_MAX,
@@ -15,6 +18,9 @@ use crate::block_table::{
     INDEX_BLOCK_CONTINUATION_HEADER_SIZE,
     INDEX_FILE_HEADER_SIZE,
     INDEX_FORMAT_VERSION,
+    TERM_MPHF_ENTRY_SIZE,
+    TERM_MPHF_HEADER_SIZE,
+    TERM_MPHF_MAGIC,
     LEAF_TERM_DATA_OFFSET,
     LEAF_TERM_DIRECTORY_COUNT,
     PAGE_SIZE,
@@ -37,6 +43,12 @@ pub struct IndexFileHeader {
     pub IFH_DocDataOffset: u64,
     pub IFH_IndexBlockOffset: u64,
     pub IFH_IndexBlockCount: u64,
+    pub IFH_TermMphfHeaderOffset: u64,
+    pub IFH_TermMphfHeaderCount: u64,
+    pub IFH_TermMphfDisplacementOffset: u64,
+    pub IFH_TermMphfDisplacementCount: u64,
+    pub IFH_TermMphfEntryOffset: u64,
+    pub IFH_TermMphfEntryPageCount: u64,
 }
 
 impl IndexFileHeader {
@@ -55,6 +67,12 @@ impl IndexFileHeader {
             IFH_DocDataOffset: u64_at(data, 64),
             IFH_IndexBlockOffset: u64_at(data, 72),
             IFH_IndexBlockCount: u64_at(data, 80),
+            IFH_TermMphfHeaderOffset: u64_at(data, 88),
+            IFH_TermMphfHeaderCount: u64_at(data, 96),
+            IFH_TermMphfDisplacementOffset: u64_at(data, 104),
+            IFH_TermMphfDisplacementCount: u64_at(data, 112),
+            IFH_TermMphfEntryOffset: u64_at(data, 120),
+            IFH_TermMphfEntryPageCount: u64_at(data, 128),
         })
     }
 
@@ -72,6 +90,12 @@ impl IndexFileHeader {
         write_u64(&mut out, 64, self.IFH_DocDataOffset);
         write_u64(&mut out, 72, self.IFH_IndexBlockOffset);
         write_u64(&mut out, 80, self.IFH_IndexBlockCount);
+        write_u64(&mut out, 88, self.IFH_TermMphfHeaderOffset);
+        write_u64(&mut out, 96, self.IFH_TermMphfHeaderCount);
+        write_u64(&mut out, 104, self.IFH_TermMphfDisplacementOffset);
+        write_u64(&mut out, 112, self.IFH_TermMphfDisplacementCount);
+        write_u64(&mut out, 120, self.IFH_TermMphfEntryOffset);
+        write_u64(&mut out, 128, self.IFH_TermMphfEntryPageCount);
         out
     }
 }
@@ -81,10 +105,154 @@ pub struct BuildBlocksResult {
     pub BBR_IndexBlocks: Vec<IndexBlock>,
     pub BBR_HeadTermEntries: Vec<HeadTermEntry>,
     pub BBR_LeafTermBlocks: Vec<LeafTermBlock>,
+    pub BBR_TermMphfHeader: TermMphfHeader,
+    pub BBR_TermMphfDisplacements: Vec<i32>,
+    pub BBR_TermMphfEntryPages: Vec<IndexBlock>,
     pub BBR_TotalTerms: u64,
 }
 
 pub struct IndexSerializer;
+
+#[derive(Clone)]
+#[allow(non_snake_case)]
+struct TermMphfBuildTerm {
+    Term: String,
+    DocFreq: u32,
+    IndexBlockID: u32,
+    IndexOffset: u32,
+    IndexLength: u32,
+    ContinuationBlockCount: u32,
+    Flags: u32,
+}
+
+fn next_power_of_two(mut value: u32) -> u32 {
+    if value <= 1 { return 1; }
+    value -= 1;
+    value |= value >> 1;
+    value |= value >> 2;
+    value |= value >> 4;
+    value |= value >> 8;
+    value |= value >> 16;
+    value + 1
+}
+
+#[allow(non_snake_case)]
+fn MphfSlotFor(term: &str, slot_count: u32, slot_seed: u64, displacement: u32) -> u32 {
+    (TermMphfHash(term.as_bytes(), TermMphfSlotSeed(slot_seed, displacement)) % slot_count as u64) as u32
+}
+
+#[allow(non_snake_case)]
+fn TryBuildTermMphf(terms: &[TermMphfBuildTerm], bucket_seed: u64, slot_seed: u64, fingerprint_seed: u64)
+    -> Option<(TermMphfHeader, Vec<i32>, Vec<IndexBlock>)>
+{
+    let term_count = terms.len() as u32;
+    if term_count == 0 { return None; }
+    let bucket_count = next_power_of_two(std::cmp::max(1, term_count / 4));
+    let slot_count = term_count;
+    let max_displacement = std::cmp::min(1u32 << 20, std::cmp::max(4096u32, std::cmp::max(1u32, slot_count / 16)));
+
+    let mut ids: Vec<usize> = (0..terms.len()).collect();
+    ids.sort_by(|a, b| terms[*a].Term.cmp(&terms[*b].Term));
+    for index in 1..ids.len() {
+        if terms[ids[index - 1]].Term == terms[ids[index]].Term { return None; }
+    }
+
+    let mut buckets = vec![Vec::<usize>::new(); bucket_count as usize];
+    for (index, term) in terms.iter().enumerate() {
+        let bucket = (TermMphfHash(term.Term.as_bytes(), bucket_seed) % bucket_count as u64) as usize;
+        buckets[bucket].push(index);
+    }
+
+    let mut order: Vec<usize> = (0..bucket_count as usize).collect();
+    order.sort_by(|a, b| buckets[*b].len().cmp(&buckets[*a].len()));
+
+    let mut displacements = vec![-1i32; bucket_count as usize];
+    let mut used = vec![false; slot_count as usize];
+    let mut slots = vec![u32::MAX; term_count as usize];
+
+    for bucket in order {
+        let bucket_terms = &buckets[bucket];
+        if bucket_terms.is_empty() {
+            displacements[bucket] = 0;
+            continue;
+        }
+
+        let mut placed = false;
+        let mut candidate_slots = vec![0u32; bucket_terms.len()];
+        for displacement in 0..max_displacement {
+            let mut ok = true;
+            for (i, term_index) in bucket_terms.iter().enumerate() {
+                let slot = MphfSlotFor(&terms[*term_index].Term, slot_count, slot_seed, displacement);
+                candidate_slots[i] = slot;
+                if used[slot as usize] || candidate_slots[..i].iter().any(|candidate| *candidate == slot) {
+                    ok = false;
+                    break;
+                }
+            }
+            if !ok { continue; }
+
+            displacements[bucket] = displacement as i32;
+            for (i, term_index) in bucket_terms.iter().enumerate() {
+                used[candidate_slots[i] as usize] = true;
+                slots[*term_index] = candidate_slots[i];
+            }
+            placed = true;
+            break;
+        }
+
+        if !placed { return None; }
+    }
+
+    let page_count = (slot_count as usize + (PAGE_SIZE / TERM_MPHF_ENTRY_SIZE) - 1) / (PAGE_SIZE / TERM_MPHF_ENTRY_SIZE);
+    let mut entry_pages = vec![IndexBlock::default(); page_count];
+    for (index, source) in terms.iter().enumerate() {
+        let slot = slots[index];
+        if slot == u32::MAX { return None; }
+        let byte_offset = slot as usize * TERM_MPHF_ENTRY_SIZE;
+        let page = byte_offset / PAGE_SIZE;
+        let offset = byte_offset % PAGE_SIZE;
+        let data = &mut entry_pages[page].IB_Data[offset..offset + TERM_MPHF_ENTRY_SIZE];
+        data[0..4].copy_from_slice(&source.DocFreq.to_le_bytes());
+        data[4..8].copy_from_slice(&source.IndexBlockID.to_le_bytes());
+        data[8..12].copy_from_slice(&source.IndexOffset.to_le_bytes());
+        data[12..16].copy_from_slice(&source.IndexLength.to_le_bytes());
+        data[16..20].copy_from_slice(&source.ContinuationBlockCount.to_le_bytes());
+        data[20..24].copy_from_slice(&source.Flags.to_le_bytes());
+        let mut fingerprint = TermMphfHash(source.Term.as_bytes(), fingerprint_seed);
+        if fingerprint == 0 { fingerprint = 1; }
+        data[24..32].copy_from_slice(&fingerprint.to_le_bytes());
+    }
+
+    Some((TermMphfHeader {
+        TMH_Magic: TERM_MPHF_MAGIC,
+        TMH_TermCount: term_count as u64,
+        TMH_BucketCount: bucket_count,
+        TMH_SlotCount: slot_count,
+        TMH_BucketSeed: bucket_seed,
+        TMH_SlotSeed: slot_seed,
+        TMH_FingerprintSeed: fingerprint_seed,
+    }, displacements, entry_pages))
+}
+
+#[allow(non_snake_case)]
+fn BuildTermMphf(terms: &[TermMphfBuildTerm]) -> (TermMphfHeader, Vec<i32>, Vec<IndexBlock>) {
+    if terms.is_empty() { return (TermMphfHeader::default(), Vec::new(), Vec::new()); }
+    const BUCKET_SEED_BASE: u64 = 0x9ae16a3b2f90404f;
+    const SLOT_SEED_BASE: u64 = 0xc3a5c85c97cb3127;
+    const FINGERPRINT_SEED_BASE: u64 = 0xb492b66fbe98f273;
+    const SEED_STEP: u64 = 0x9e3779b97f4a7c15;
+
+    for attempt in 0..32u64 {
+        let bucket_seed = BUCKET_SEED_BASE.wrapping_add(SEED_STEP.wrapping_mul(attempt));
+        let slot_seed = SLOT_SEED_BASE ^ SEED_STEP.wrapping_mul(attempt + 1);
+        let fingerprint_seed = FINGERPRINT_SEED_BASE.wrapping_add(SEED_STEP.wrapping_mul(attempt + 3));
+        if let Some(result) = TryBuildTermMphf(terms, bucket_seed, slot_seed, fingerprint_seed) {
+            return result;
+        }
+    }
+
+    (TermMphfHeader::default(), Vec::new(), Vec::new())
+}
 
 impl IndexSerializer {
     #[allow(non_snake_case)]
@@ -122,6 +290,22 @@ impl IndexSerializer {
             file.write_all(&bytes)?;
         }
 
+        if header.IFH_TermMphfHeaderCount > 0 {
+            file.write_all(&blockTable.TermMphfHeader().to_bytes())?;
+        }
+
+        if header.IFH_TermMphfDisplacementCount > 0 {
+            for displacement in blockTable.TermMphfDisplacements() {
+                file.write_all(&displacement.to_le_bytes())?;
+            }
+        }
+
+        if header.IFH_TermMphfEntryPageCount > 0 {
+            for block in blockTable.TermMphfEntryPages() {
+                file.write_all(&block.IB_Data)?;
+            }
+        }
+
         file.flush()?;
         Ok(())
     }
@@ -148,6 +332,60 @@ impl IndexSerializer {
         Ok((header, head, docdata))
     }
 
+    #[allow(non_snake_case)]
+    pub fn LoadTermMphf(path: &str, header: &IndexFileHeader) -> Result<(TermMphfHeader, Vec<i32>, Vec<IndexBlock>)> {
+        if header.IFH_TermMphfHeaderCount == 0 {
+            return Ok((TermMphfHeader::default(), Vec::new(), Vec::new()));
+        }
+        if header.IFH_TermMphfHeaderCount != 1 || header.IFH_TermMphfDisplacementCount == 0 || header.IFH_TermMphfEntryPageCount == 0 {
+            return Err(RustBladeError::InvalidFormat);
+        }
+
+        let mut file = File::open(path)?;
+        file.seek(std::io::SeekFrom::Start(header.IFH_TermMphfHeaderOffset))?;
+        let mut header_bytes = [0u8; TERM_MPHF_HEADER_SIZE];
+        file.read_exact(&mut header_bytes)?;
+        let mphf_header = TermMphfHeader::from_bytes(&header_bytes).ok_or(RustBladeError::InvalidFormat)?;
+        if mphf_header.TMH_Magic != TERM_MPHF_MAGIC { return Err(RustBladeError::InvalidFormat); }
+
+        file.seek(std::io::SeekFrom::Start(header.IFH_TermMphfDisplacementOffset))?;
+        let mut displacements = Vec::with_capacity(header.IFH_TermMphfDisplacementCount as usize);
+        for _ in 0..header.IFH_TermMphfDisplacementCount {
+            let mut bytes = [0u8; 4];
+            file.read_exact(&mut bytes)?;
+            displacements.push(i32::from_le_bytes(bytes));
+        }
+
+        file.seek(std::io::SeekFrom::Start(header.IFH_TermMphfEntryOffset))?;
+        let mut pages = Vec::with_capacity(header.IFH_TermMphfEntryPageCount as usize);
+        for _ in 0..header.IFH_TermMphfEntryPageCount {
+            let mut block = IndexBlock::default();
+            file.read_exact(&mut block.IB_Data)?;
+            pages.push(block);
+        }
+
+        Ok((mphf_header, displacements, pages))
+    }
+
+    #[allow(non_snake_case)]
+    pub fn BuildTermMphfFromLeafBlocks(leaf_blocks: &[LeafTermBlock]) -> (TermMphfHeader, Vec<i32>, Vec<IndexBlock>) {
+        let mut terms = Vec::new();
+        for block in leaf_blocks {
+            for entry in block.entries() {
+                terms.push(TermMphfBuildTerm {
+                    Term: entry.LTE_Term,
+                    DocFreq: entry.LTE_DocFreq,
+                    IndexBlockID: entry.LTE_IndexBlockID,
+                    IndexOffset: entry.LTE_IndexOffset,
+                    IndexLength: entry.LTE_IndexLength,
+                    ContinuationBlockCount: entry.LTE_ContinuationBlockCount,
+                    Flags: entry.LTE_Flags,
+                });
+            }
+        }
+        BuildTermMphf(&terms)
+    }
+
     pub fn load_file_tables(store: &mut PostingStore, path: &str)
         -> Result<(IndexFileHeader, Vec<HeadTermEntry>, Vec<u8>)>
     {
@@ -155,7 +393,7 @@ impl IndexSerializer {
     }
 
     pub fn decode(store: &mut PostingStore, data: &[u8])
-        -> Result<(Vec<HeadTermEntry>, Vec<LeafTermBlock>, Vec<IndexBlock>, Vec<u8>)>
+        -> Result<(Vec<HeadTermEntry>, Vec<LeafTermBlock>, Vec<IndexBlock>, Vec<u8>, TermMphfHeader, Vec<i32>, Vec<IndexBlock>)>
     {
         let header = IndexFileHeader::parse(data)?;
 
@@ -166,6 +404,11 @@ impl IndexSerializer {
         let docdata_offset = header.IFH_DocDataOffset as usize;
         let index_offset = header.IFH_IndexBlockOffset as usize;
         let index_count = header.IFH_IndexBlockCount as usize;
+        let mphf_header_offset = header.IFH_TermMphfHeaderOffset as usize;
+        let mphf_displacement_offset = header.IFH_TermMphfDisplacementOffset as usize;
+        let mphf_displacement_count = header.IFH_TermMphfDisplacementCount as usize;
+        let mphf_entry_offset = header.IFH_TermMphfEntryOffset as usize;
+        let mphf_entry_page_count = header.IFH_TermMphfEntryPageCount as usize;
         let num_docs = header.IFH_NumDocuments as usize;
 
         let mut head = Vec::with_capacity(head_count);
@@ -200,7 +443,31 @@ impl IndexSerializer {
             index_blocks.push(block);
         }
 
-        Ok((head, leaf_blocks, index_blocks, docdata))
+        let (mphf_header, mphf_displacements, mphf_entry_pages) = if header.IFH_TermMphfHeaderCount == 0 {
+            (TermMphfHeader::default(), Vec::new(), Vec::new())
+        } else {
+            if header.IFH_TermMphfHeaderCount != 1 { return Err(RustBladeError::InvalidFormat); }
+            if mphf_header_offset + TERM_MPHF_HEADER_SIZE > data.len() { return Err(RustBladeError::InvalidFormat); }
+            let mphf_header = TermMphfHeader::from_bytes(&data[mphf_header_offset..mphf_header_offset + TERM_MPHF_HEADER_SIZE]).ok_or(RustBladeError::InvalidFormat)?;
+            if mphf_header.TMH_Magic != TERM_MPHF_MAGIC { return Err(RustBladeError::InvalidFormat); }
+            if mphf_displacement_offset + mphf_displacement_count * 4 > data.len() { return Err(RustBladeError::InvalidFormat); }
+            let mut mphf_displacements = Vec::with_capacity(mphf_displacement_count);
+            for index in 0..mphf_displacement_count {
+                let offset = mphf_displacement_offset + index * 4;
+                mphf_displacements.push(i32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()));
+            }
+            if mphf_entry_offset + mphf_entry_page_count * PAGE_SIZE > data.len() { return Err(RustBladeError::InvalidFormat); }
+            let mut mphf_entry_pages = Vec::with_capacity(mphf_entry_page_count);
+            for index in 0..mphf_entry_page_count {
+                let offset = mphf_entry_offset + index * PAGE_SIZE;
+                let mut block = IndexBlock::default();
+                block.IB_Data.copy_from_slice(&data[offset..offset + PAGE_SIZE]);
+                mphf_entry_pages.push(block);
+            }
+            (mphf_header, mphf_displacements, mphf_entry_pages)
+        };
+
+        Ok((head, leaf_blocks, index_blocks, docdata, mphf_header, mphf_displacements, mphf_entry_pages))
     }
 
     #[allow(non_snake_case)]
@@ -285,6 +552,7 @@ impl IndexSerializer {
 
         let mut head_entries = Vec::new();
         let mut total_terms = 0u64;
+        let mut mphf_terms = Vec::with_capacity(terms.len());
 
         for (term, posting_list) in terms {
             if term.len() > HEAD_TERM_KEY_MAX { continue; }
@@ -346,6 +614,7 @@ impl IndexSerializer {
                 LTE_IndexLength: data_here as u32,
                 LTE_ContinuationBlockCount: continuation_block_count,
                 LTE_Flags: 0,
+                LTE_Fingerprint: 0,
             };
             let entry_bytes = leaf_entry.byte_len();
             if leaf_entry_count > 0
@@ -359,15 +628,28 @@ impl IndexSerializer {
             leaf_write_offset += entry_bytes;
             leaf_entry_count += 1;
             total_terms += 1;
+            mphf_terms.push(TermMphfBuildTerm {
+                Term: term.clone(),
+                DocFreq: posting_list.doc_freq(),
+                IndexBlockID: index_block_id,
+                IndexOffset: data_offset as u32,
+                IndexLength: data_here as u32,
+                ContinuationBlockCount: continuation_block_count,
+                Flags: 0,
+            });
         }
 
         if wptr > 0 { flush_index_block(&mut IndexBlocks, &mut cur, &mut wptr, &mut seq); }
         flush_leaf_block(&mut leaf_blocks, &mut head_entries, &mut leaf_block, &mut leaf_write_offset, &mut leaf_entry_count, &mut first_leaf_term);
+        let (mphf_header, mphf_displacements, mphf_entry_pages) = BuildTermMphf(&mphf_terms);
 
         BuildBlocksResult {
             BBR_IndexBlocks: IndexBlocks,
             BBR_HeadTermEntries: head_entries,
             BBR_LeafTermBlocks: leaf_blocks,
+            BBR_TermMphfHeader: mphf_header,
+            BBR_TermMphfDisplacements: mphf_displacements,
+            BBR_TermMphfEntryPages: mphf_entry_pages,
             BBR_TotalTerms: total_terms,
         }
     }
@@ -384,8 +666,9 @@ fn WriteLeafEntry(block: &mut LeafTermBlock, entryIndex: usize, offset: usize, e
     data[12..16].copy_from_slice(&entry.LTE_IndexLength.to_le_bytes());
     data[16..20].copy_from_slice(&entry.LTE_ContinuationBlockCount.to_le_bytes());
     data[20..24].copy_from_slice(&entry.LTE_Flags.to_le_bytes());
-    data[24] = entry.LTE_Term.len() as u8;
-    data[25..25 + entry.LTE_Term.len()].copy_from_slice(entry.LTE_Term.as_bytes());
+    data[24..31].fill(0);
+    data[31] = entry.LTE_Term.len() as u8;
+    data[32..32 + entry.LTE_Term.len()].copy_from_slice(entry.LTE_Term.as_bytes());
 }
 
 #[allow(non_snake_case)]

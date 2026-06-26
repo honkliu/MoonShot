@@ -362,11 +362,13 @@ public:
         const std::string leafTempPath = prefix + ".leaf.tmp";
         const std::string indexTempPath = prefix + ".blocks.tmp";
         const std::string docDataTempPath = prefix + ".docdata.tmp";
+        const std::string mphfEntryTempPath = prefix + ".mphf.entries.tmp";
         std::remove(tempPath.c_str());
         std::remove(headTempPath.c_str());
         std::remove(leafTempPath.c_str());
         std::remove(indexTempPath.c_str());
         std::remove(docDataTempPath.c_str());
+        std::remove(mphfEntryTempPath.c_str());
 
         auto cleanupTempFiles = [&]() {
             std::remove(tempPath.c_str());
@@ -374,6 +376,7 @@ public:
             std::remove(leafTempPath.c_str());
             std::remove(indexTempPath.c_str());
             std::remove(docDataTempPath.c_str());
+            std::remove(mphfEntryTempPath.c_str());
         };
 
         IndexContext& delta = *m_DeltaContext;
@@ -568,7 +571,7 @@ public:
                       << ")\n";
         }
 
-        // Step 4: Assemble <output>.tmp in v12 physical order, patch the header,
+        // Step 4: Assemble <output>.tmp in v14 physical order, patch the header,
         // release old file handles, then rename <output>.tmp to the final path.
         {
             auto stepStart = std::chrono::steady_clock::now();
@@ -582,6 +585,25 @@ public:
             if (!AppendFile(output, docDataTempPath)) { cleanupTempFiles(); return false; }
             if (!AppendFile(output, indexTempPath)) { cleanupTempFiles(); return false; }
 
+            BuildBlocksResult mphfResult;
+            if (headEntryCount > UINT32_MAX) { cleanupTempFiles(); return false; }
+            std::vector<LeafTermBlock> mergedLeafBlocks(static_cast<size_t>(headEntryCount));
+            if (headEntryCount > 0) {
+                FileAccess leafInput(leafTempPath.c_str());
+                const uint64_t leafBytes = headEntryCount * sizeof(LeafTermBlock);
+                if (!leafInput.Init()
+                    || leafBytes > static_cast<uint64_t>(std::numeric_limits<int>::max())
+                    || leafInput.GetData(mergedLeafBlocks.data(), static_cast<int>(leafBytes)) != static_cast<int>(leafBytes)) {
+                    cleanupTempFiles();
+                    return false;
+                }
+                IndexSerializer::BuildTermMphfFromLeafBlocks(mergedLeafBlocks.data(), static_cast<uint32_t>(headEntryCount), mphfResult);
+                if (totalTerms > 0 && (mphfResult.BBR_TermMphfDisplacements.empty() || mphfResult.BBR_TermMphfEntryPages.empty())) {
+                    cleanupTempFiles();
+                    return false;
+                }
+            }
+
             std::memcpy(header.IFH_Magic, INDEX_FILE_MAGIC, sizeof(INDEX_FILE_MAGIC));
             header.IFH_Version = INDEX_FORMAT_VERSION;
             header.IFH_NumDocuments = mergedDocs;
@@ -594,12 +616,26 @@ public:
             header.IFH_DocDataOffset = header.IFH_LeafTermBlockOffset + header.IFH_LeafTermBlockCount * sizeof(LeafTermBlock);
             header.IFH_IndexBlockOffset = header.IFH_DocDataOffset + mergedDocs * DOC_REC_SIZE;
             header.IFH_IndexBlockCount = indexBlockCount;
+            header.IFH_TermMphfHeaderOffset = header.IFH_IndexBlockOffset + static_cast<uint64_t>(indexBlockCount) * sizeof(IndexBlock);
+            header.IFH_TermMphfHeaderCount = (!mphfResult.BBR_TermMphfDisplacements.empty() && !mphfResult.BBR_TermMphfEntryPages.empty()) ? 1 : 0;
+            header.IFH_TermMphfDisplacementOffset = header.IFH_TermMphfHeaderOffset + header.IFH_TermMphfHeaderCount * sizeof(TermMphfHeader);
+            header.IFH_TermMphfDisplacementCount = mphfResult.BBR_TermMphfDisplacements.size();
+            header.IFH_TermMphfEntryOffset = header.IFH_TermMphfDisplacementOffset + header.IFH_TermMphfDisplacementCount * sizeof(int32_t);
+            header.IFH_TermMphfEntryPageCount = mphfResult.BBR_TermMphfEntryPages.size();
+
+            if (header.IFH_TermMphfHeaderCount > 0
+                && (!output.PutData(&mphfResult.BBR_TermMphfHeader, sizeof(TermMphfHeader))
+                    || !output.PutData(mphfResult.BBR_TermMphfDisplacements.data(), header.IFH_TermMphfDisplacementCount * sizeof(int32_t))
+                    || !output.PutData(mphfResult.BBR_TermMphfEntryPages.data(), header.IFH_TermMphfEntryPageCount * sizeof(IndexBlock)))) {
+                cleanupTempFiles();
+                return false;
+            }
 
             if (!output.SetPosition(0) || !output.PutData(&header, sizeof(header))) {
                 cleanupTempFiles();
                 return false;
             }
-            const uint64_t outputBytes = header.IFH_IndexBlockOffset + static_cast<uint64_t>(indexBlockCount) * sizeof(IndexBlock);
+            const uint64_t outputBytes = header.IFH_TermMphfEntryOffset + header.IFH_TermMphfEntryPageCount * sizeof(IndexBlock);
             std::cout << "  merge step4 assembled final index in "
                       << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - stepStart).count()
                       << " ms bytes=" << outputBytes
@@ -613,6 +649,7 @@ public:
         std::remove(leafTempPath.c_str());
         std::remove(indexTempPath.c_str());
         std::remove(docDataTempPath.c_str());
+        std::remove(mphfEntryTempPath.c_str());
 
         ResetLoadedRuntimeState();
         std::remove(outputPath);
@@ -672,7 +709,9 @@ public:
 
         if (m_IndexFileHeader.IFH_HeadTermEntryCount > UINT32_MAX
             || m_IndexFileHeader.IFH_LeafTermBlockCount > UINT32_MAX
-            || m_IndexFileHeader.IFH_IndexBlockCount > UINT32_MAX)
+            || m_IndexFileHeader.IFH_IndexBlockCount > UINT32_MAX
+            || m_IndexFileHeader.IFH_TermMphfDisplacementCount > UINT32_MAX
+            || m_IndexFileHeader.IFH_TermMphfEntryPageCount > UINT32_MAX)
         {
             std::cerr << "Index section count exceeds runtime limit in: " << m_IndexPath << "\n";
             ResetLoadedRuntimeState();
@@ -683,6 +722,8 @@ public:
 
         const uint32_t indexBlockCount = static_cast<uint32_t>(m_IndexFileHeader.IFH_IndexBlockCount);
         const uint32_t leafTermBlockCount = static_cast<uint32_t>(m_IndexFileHeader.IFH_LeafTermBlockCount);
+        const uint32_t mphfDisplacementCount = static_cast<uint32_t>(m_IndexFileHeader.IFH_TermMphfDisplacementCount);
+        const uint32_t mphfEntryPageCount = static_cast<uint32_t>(m_IndexFileHeader.IFH_TermMphfEntryPageCount);
         const uint32_t indexBlockLoadCount = std::min(indexBlockCount, INDEX_BLOCK_CACHE_SLOT_COUNT);
         const uint32_t leafTermBlockLoadCount = std::min(leafTermBlockCount, LEAF_TERM_BLOCK_CACHE_SLOT_COUNT);
 
@@ -719,6 +760,68 @@ public:
         }
 
         m_BlockTable.SetHeadTermEntries(std::move(headTermEntries), static_cast<uint32_t>(m_IndexFileHeader.IFH_HeadTermEntryCount));
+
+        if (m_IndexFileHeader.IFH_TermMphfHeaderCount > 0) {
+            if (m_IndexFileHeader.IFH_TermMphfHeaderCount != 1
+                || mphfDisplacementCount == 0
+                || mphfEntryPageCount == 0)
+            {
+                std::cerr << "Invalid TermMPHF header/counts in: " << m_IndexPath << "\n";
+                ResetLoadedRuntimeState();
+                return;
+            }
+
+            TermMphfHeader mphfHeader{};
+            if (!indexFile.SetPosition(m_IndexFileHeader.IFH_TermMphfHeaderOffset)
+                || indexFile.GetData(&mphfHeader, static_cast<int>(sizeof(mphfHeader))) != static_cast<int>(sizeof(mphfHeader))
+                || mphfHeader.TMH_Magic != TERM_MPHF_MAGIC)
+            {
+                std::cerr << "Failed to read TermMPHF header for: " << m_IndexPath << "\n";
+                ResetLoadedRuntimeState();
+                return;
+            }
+
+            const uint64_t displacementBytes = static_cast<uint64_t>(mphfDisplacementCount) * sizeof(int32_t);
+            if (displacementBytes > static_cast<uint64_t>(std::numeric_limits<int>::max())) {
+                std::cerr << "Invalid TermMPHF displacement count in: " << m_IndexPath << "\n";
+                ResetLoadedRuntimeState();
+                return;
+            }
+
+            std::unique_ptr<int32_t[]> displacements(new int32_t[mphfDisplacementCount]);
+            if (!indexFile.SetPosition(m_IndexFileHeader.IFH_TermMphfDisplacementOffset)
+                || indexFile.GetData(displacements.get(), static_cast<int>(displacementBytes)) != static_cast<int>(displacementBytes))
+            {
+                std::cerr << "Failed to read TermMPHF displacements for: " << m_IndexPath << "\n";
+                ResetLoadedRuntimeState();
+                return;
+            }
+
+            const uint64_t entryPageBytes = static_cast<uint64_t>(mphfEntryPageCount) * sizeof(IndexBlock);
+            if (entryPageBytes > static_cast<uint64_t>(std::numeric_limits<int>::max())) {
+                std::cerr << "Invalid TermMPHF entry page count in: " << m_IndexPath << "\n";
+                ResetLoadedRuntimeState();
+                return;
+            }
+
+            auto* entryPages = static_cast<uint8_t*>(PinnedMemAlloc(entryPageBytes));
+            if (!entryPages) {
+                std::cerr << "Failed to allocate TermMPHF entry pages for: " << m_IndexPath << "\n";
+                ResetLoadedRuntimeState();
+                return;
+            }
+
+            if (!indexFile.SetPosition(m_IndexFileHeader.IFH_TermMphfEntryOffset)
+                || indexFile.GetData(entryPages, static_cast<int>(entryPageBytes)) != static_cast<int>(entryPageBytes))
+            {
+                PinnedMemFree(entryPages);
+                std::cerr << "Failed to read TermMPHF entry pages for: " << m_IndexPath << "\n";
+                ResetLoadedRuntimeState();
+                return;
+            }
+
+            m_BlockTable.SetTermMphf(mphfHeader, std::move(displacements), mphfDisplacementCount, entryPages, mphfEntryPageCount);
+        }
 
         ClearDocDataOnly();
 
@@ -940,7 +1043,16 @@ private:
         header.IFH_AvgDocLength = totalDocs ? static_cast<float>(totalLen) / static_cast<float>(totalDocs) : 1.0f;
 
         auto br = IndexSerializer::BuildBlocks(*m_Store);
-        if (br.BBR_IndexBlocks.size() > UINT32_MAX || br.BBR_LeafTermBlocks.size() > UINT32_MAX || br.BBR_HeadTermEntries.size() > UINT32_MAX) {
+        if (br.BBR_TotalTerms > 0 && (br.BBR_TermMphfDisplacements.empty() || br.BBR_TermMphfEntryPages.empty())) {
+            std::cerr << "Failed to build TermMPHF for non-empty index\n";
+            ResetRuntimeState(blockTable, vectorIndex, header, docData, built);
+            return false;
+        }
+        if (br.BBR_IndexBlocks.size() > UINT32_MAX
+            || br.BBR_LeafTermBlocks.size() > UINT32_MAX
+            || br.BBR_HeadTermEntries.size() > UINT32_MAX
+            || br.BBR_TermMphfDisplacements.size() > UINT32_MAX
+            || br.BBR_TermMphfEntryPages.size() > UINT32_MAX) {
             std::cerr << "Built index section count exceeds runtime limit\n";
             ResetRuntimeState(blockTable, vectorIndex, header, docData, built);
             return false;
@@ -949,6 +1061,8 @@ private:
         const uint32_t indexBlockCount = static_cast<uint32_t>(br.BBR_IndexBlocks.size());
         const uint32_t leafTermBlockCount = static_cast<uint32_t>(br.BBR_LeafTermBlocks.size());
         const uint32_t headCount = static_cast<uint32_t>(br.BBR_HeadTermEntries.size());
+        const uint32_t mphfDisplacementCount = static_cast<uint32_t>(br.BBR_TermMphfDisplacements.size());
+        const uint32_t mphfEntryPageCount = static_cast<uint32_t>(br.BBR_TermMphfEntryPages.size());
 
         header.IFH_NumTerms = br.BBR_TotalTerms;
         header.IFH_HeadTermEntryOffset = sizeof(IndexFileHeader);
@@ -958,6 +1072,12 @@ private:
         header.IFH_DocDataOffset = header.IFH_LeafTermBlockOffset + static_cast<uint64_t>(leafTermBlockCount) * sizeof(LeafTermBlock);
         header.IFH_IndexBlockOffset = header.IFH_DocDataOffset + header.IFH_NumDocuments * DOC_REC_SIZE;
         header.IFH_IndexBlockCount = indexBlockCount;
+        header.IFH_TermMphfHeaderOffset = header.IFH_IndexBlockOffset + static_cast<uint64_t>(indexBlockCount) * sizeof(IndexBlock);
+        header.IFH_TermMphfHeaderCount = mphfDisplacementCount > 0 && mphfEntryPageCount > 0 ? 1 : 0;
+        header.IFH_TermMphfDisplacementOffset = header.IFH_TermMphfHeaderOffset + header.IFH_TermMphfHeaderCount * sizeof(TermMphfHeader);
+        header.IFH_TermMphfDisplacementCount = mphfDisplacementCount;
+        header.IFH_TermMphfEntryOffset = header.IFH_TermMphfDisplacementOffset + static_cast<uint64_t>(mphfDisplacementCount) * sizeof(int32_t);
+        header.IFH_TermMphfEntryPageCount = mphfEntryPageCount;
 
         auto* indexBlocks = blockTable.Init(BlockKind::Index, nullptr, 0, indexBlockCount, indexBlockCount);
         auto* leafTermBlocks = blockTable.Init(BlockKind::LeafTerm, nullptr, 0, leafTermBlockCount, leafTermBlockCount);
@@ -978,6 +1098,18 @@ private:
         }
 
         blockTable.SetHeadTermEntries(std::move(headTermEntries), headCount);
+
+        if (header.IFH_TermMphfHeaderCount > 0) {
+            std::unique_ptr<int32_t[]> displacements(new int32_t[mphfDisplacementCount]);
+            std::memcpy(displacements.get(), br.BBR_TermMphfDisplacements.data(), static_cast<size_t>(mphfDisplacementCount) * sizeof(int32_t));
+            auto* entryPages = static_cast<uint8_t*>(PinnedMemAlloc(static_cast<uint64_t>(mphfEntryPageCount) * sizeof(IndexBlock)));
+            if (!entryPages) {
+                ResetRuntimeState(blockTable, vectorIndex, header, docData, built);
+                return false;
+            }
+            std::memcpy(entryPages, br.BBR_TermMphfEntryPages.data(), static_cast<size_t>(mphfEntryPageCount) * sizeof(IndexBlock));
+            blockTable.SetTermMphf(br.BBR_TermMphfHeader, std::move(displacements), mphfDisplacementCount, entryPages, mphfEntryPageCount);
+        }
 
         if (buildVectorIndex) {
             vectorIndex.SetDocData(docData);

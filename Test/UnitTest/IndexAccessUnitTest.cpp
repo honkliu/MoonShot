@@ -957,6 +957,50 @@ void TestHeadTermMaxKeyBoundary()
     std::cout << "  max head key found; too-long key skipped\n";
 }
 
+void TestTermMphfSameBaseCollision()
+{
+    PostingStore store;
+    std::vector<std::string> terms;
+    terms.reserve(256);
+    terms.push_back("t28");
+    terms.push_back("t66");
+    for (uint32_t i = 0; terms.size() < 256; ++i) {
+        std::string term = "x" + std::to_string(i);
+        terms.push_back(term);
+    }
+
+    uint64_t docId = 0;
+    for (const auto& term : terms)
+        store.AddPosting(term, docId++, 1);
+
+    auto built = IndexSerializer::BuildBlocks(store);
+    assert(built.BBR_TotalTerms == terms.size());
+    assert(built.BBR_TermMphfHeader.TMH_Magic == TERM_MPHF_MAGIC);
+    assert(built.BBR_TermMphfHeader.TMH_SlotCount == terms.size());
+    assert(!built.BBR_TermMphfDisplacements.empty());
+    assert(!built.BBR_TermMphfEntryPages.empty());
+
+    std::vector<uint8_t> used(terms.size(), 0);
+    for (const auto& term : terms) {
+        const auto& header = built.BBR_TermMphfHeader;
+        const uint64_t bucket = TermMphfHash(term.data(), term.size(), header.TMH_BucketSeed) % header.TMH_BucketCount;
+        const int32_t displacement = built.BBR_TermMphfDisplacements[static_cast<size_t>(bucket)];
+        assert(displacement >= 0);
+        const uint64_t slot = TermMphfHash(term.data(), term.size(), TermMphfSlotSeed(header.TMH_SlotSeed, static_cast<uint32_t>(displacement))) % header.TMH_SlotCount;
+        assert(slot < used.size());
+        assert(!used[static_cast<size_t>(slot)]);
+        used[static_cast<size_t>(slot)] = 1;
+
+        const uint64_t byteOffset = slot * sizeof(TermMphfEntry);
+        const auto* entry = reinterpret_cast<const TermMphfEntry*>(reinterpret_cast<const uint8_t*>(built.BBR_TermMphfEntryPages.data()) + byteOffset);
+        uint64_t fingerprint = TermMphfHash(term.data(), term.size(), header.TMH_FingerprintSeed);
+        if (fingerprint == 0) fingerprint = 1;
+        assert(entry->LTE_Fingerprint == fingerprint);
+    }
+
+    std::cout << "  MPHF same-base collision regression passed\n";
+}
+
 } // namespace IndexAccessTests
 
 std::map<std::string, std::function<void()>> testRegistry = {
@@ -977,4 +1021,5 @@ std::map<std::string, std::function<void()>> testRegistry = {
     {"TestBigram",           IndexAccessTests::TestBigram},
     {"TestContinuationPostings", IndexAccessTests::TestContinuationPostings},
     {"TestHeadTermMaxKeyBoundary", IndexAccessTests::TestHeadTermMaxKeyBoundary},
+    {"TestTermMphfSameBaseCollision", IndexAccessTests::TestTermMphfSameBaseCollision},
 };

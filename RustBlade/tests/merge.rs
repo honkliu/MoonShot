@@ -1,7 +1,8 @@
 use rustblade::executor::IndexSearchExecutor;
 use rustblade::index_writer::IndexWriter;
-use rustblade::block_table::INDEX_FILE_HEADER_SIZE;
-use rustblade::serializer::IndexFileHeader;
+use rustblade::block_table::{INDEX_FILE_HEADER_SIZE, PAGE_SIZE, TERM_MPHF_ENTRY_SIZE, TERM_MPHF_MAGIC, TermMphfHash, TermMphfSlotSeed};
+use rustblade::posting_store::PostingStore;
+use rustblade::serializer::{IndexFileHeader, IndexSerializer};
 use rustblade::tokenizer::Tokenizer;
 use rustblade::vector_index::build_hashed_embedding;
 use rustblade::{Document, IndexContext, SmartTokenizer};
@@ -58,6 +59,47 @@ fn read_header(path: &std::path::Path) -> IndexFileHeader {
     let mut bytes = [0u8; INDEX_FILE_HEADER_SIZE];
     file.read_exact(&mut bytes).unwrap();
     IndexFileHeader::parse(&bytes).unwrap()
+}
+
+#[test]
+fn term_mphf_handles_same_bucket_same_base_terms() {
+    let mut store = PostingStore::new();
+    let mut terms = vec!["t28".to_string(), "t66".to_string()];
+    let mut suffix = 0;
+    while terms.len() < 256 {
+        terms.push(format!("x{suffix}"));
+        suffix += 1;
+    }
+
+    for (doc_id, term) in terms.iter().enumerate() {
+        store.AddPosting(term, doc_id as u64, 1);
+    }
+
+    let built = IndexSerializer::BuildBlocks(&store);
+    assert_eq!(built.BBR_TotalTerms, terms.len() as u64);
+    assert_eq!(built.BBR_TermMphfHeader.TMH_Magic, TERM_MPHF_MAGIC);
+    assert_eq!(built.BBR_TermMphfHeader.TMH_SlotCount, terms.len() as u32);
+    assert!(!built.BBR_TermMphfDisplacements.is_empty());
+    assert!(!built.BBR_TermMphfEntryPages.is_empty());
+
+    let mut used = vec![false; terms.len()];
+    for term in &terms {
+        let header = built.BBR_TermMphfHeader;
+        let bucket = (TermMphfHash(term.as_bytes(), header.TMH_BucketSeed) % header.TMH_BucketCount as u64) as usize;
+        let displacement = built.BBR_TermMphfDisplacements[bucket];
+        assert!(displacement >= 0);
+        let slot = (TermMphfHash(term.as_bytes(), TermMphfSlotSeed(header.TMH_SlotSeed, displacement as u32)) % header.TMH_SlotCount as u64) as usize;
+        assert!(!used[slot]);
+        used[slot] = true;
+
+        let byte_offset = slot * TERM_MPHF_ENTRY_SIZE;
+        let page = byte_offset / PAGE_SIZE;
+        let offset = byte_offset % PAGE_SIZE;
+        let entry = &built.BBR_TermMphfEntryPages[page].IB_Data[offset..offset + TERM_MPHF_ENTRY_SIZE];
+        let mut fingerprint = TermMphfHash(term.as_bytes(), header.TMH_FingerprintSeed);
+        if fingerprint == 0 { fingerprint = 1; }
+        assert_eq!(u64::from_le_bytes(entry[24..32].try_into().unwrap()), fingerprint);
+    }
 }
 
 #[test]

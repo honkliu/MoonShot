@@ -14,9 +14,77 @@ pub const DOC_PATH_MAX: usize = 256;
 pub const HEAD_TERM_KEY_MAX: usize = 26;
 pub const LEAF_TERM_DIRECTORY_COUNT: usize = 96;
 pub const LEAF_TERM_DATA_OFFSET: usize = LEAF_TERM_DIRECTORY_COUNT * std::mem::size_of::<u16>();
-pub const INDEX_FILE_HEADER_SIZE: usize = 88;
-pub const INDEX_FORMAT_VERSION: u32 = 12;
+pub const INDEX_FILE_HEADER_SIZE: usize = 136;
+pub const INDEX_FORMAT_VERSION: u32 = 14;
 pub const INDEX_BLOCK_CONTINUATION_HEADER_SIZE: usize = 12;
+pub const TERM_MPHF_MAGIC: u64 = 0x4850464d4d524554u64;
+pub const TERM_MPHF_HEADER_SIZE: usize = 48;
+pub const TERM_MPHF_ENTRY_SIZE: usize = 32;
+pub const TERM_MPHF_ENTRIES_PER_PAGE: usize = PAGE_SIZE / TERM_MPHF_ENTRY_SIZE;
+
+#[allow(non_snake_case)]
+pub fn TermMphfHash(term: &[u8], seed: u64) -> u64 {
+    let mut hash = 1469598103934665603u64 ^ seed;
+    for byte in term {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(1099511628211u64);
+    }
+    hash ^= hash >> 32;
+    hash = hash.wrapping_mul(0xd6e8feb86659fd93u64);
+    hash ^= hash >> 32;
+    hash
+}
+
+#[allow(non_snake_case)]
+pub fn TermMphfSlotSeed(seed: u64, displacement: u32) -> u64 {
+    let mut x = seed ^ 0x9e3779b97f4a7c15u64.wrapping_mul(displacement as u64 + 1);
+    x ^= x >> 30;
+    x = x.wrapping_mul(0xbf58476d1ce4e5b9u64);
+    x ^= x >> 27;
+    x = x.wrapping_mul(0x94d049bb133111ebu64);
+    x ^= x >> 31;
+    x
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+#[allow(non_snake_case)]
+pub struct TermMphfHeader {
+    pub TMH_Magic: u64,
+    pub TMH_TermCount: u64,
+    pub TMH_BucketCount: u32,
+    pub TMH_SlotCount: u32,
+    pub TMH_BucketSeed: u64,
+    pub TMH_SlotSeed: u64,
+    pub TMH_FingerprintSeed: u64,
+}
+
+#[allow(non_snake_case)]
+impl TermMphfHeader {
+    pub fn to_bytes(&self) -> [u8; TERM_MPHF_HEADER_SIZE] {
+        let mut out = [0u8; TERM_MPHF_HEADER_SIZE];
+        out[0..8].copy_from_slice(&self.TMH_Magic.to_le_bytes());
+        out[8..16].copy_from_slice(&self.TMH_TermCount.to_le_bytes());
+        out[16..20].copy_from_slice(&self.TMH_BucketCount.to_le_bytes());
+        out[20..24].copy_from_slice(&self.TMH_SlotCount.to_le_bytes());
+        out[24..32].copy_from_slice(&self.TMH_BucketSeed.to_le_bytes());
+        out[32..40].copy_from_slice(&self.TMH_SlotSeed.to_le_bytes());
+        out[40..48].copy_from_slice(&self.TMH_FingerprintSeed.to_le_bytes());
+        out
+    }
+
+    pub fn from_bytes(data: &[u8]) -> Option<Self> {
+        if data.len() < TERM_MPHF_HEADER_SIZE { return None; }
+        Some(Self {
+            TMH_Magic: u64::from_le_bytes(data[0..8].try_into().ok()?),
+            TMH_TermCount: u64::from_le_bytes(data[8..16].try_into().ok()?),
+            TMH_BucketCount: u32::from_le_bytes(data[16..20].try_into().ok()?),
+            TMH_SlotCount: u32::from_le_bytes(data[20..24].try_into().ok()?),
+            TMH_BucketSeed: u64::from_le_bytes(data[24..32].try_into().ok()?),
+            TMH_SlotSeed: u64::from_le_bytes(data[32..40].try_into().ok()?),
+            TMH_FingerprintSeed: u64::from_le_bytes(data[40..48].try_into().ok()?),
+        })
+    }
+}
 
 #[derive(Clone, Copy)]
 #[allow(non_snake_case)]
@@ -122,10 +190,11 @@ pub struct LeafTermEntry {
     pub LTE_IndexLength: u32,
     pub LTE_ContinuationBlockCount: u32,
     pub LTE_Flags: u32,
+    pub LTE_Fingerprint: u64,
 }
 
 impl LeafTermEntry {
-    pub fn byte_len(&self) -> usize { 25 + self.LTE_Term.len() }
+    pub fn byte_len(&self) -> usize { TERM_MPHF_ENTRY_SIZE + self.LTE_Term.len() }
 }
 
 #[allow(non_snake_case)]
@@ -139,12 +208,12 @@ impl LeafTermBlock {
         let block_offset = self.LTB_Directory[index] as usize;
         if block_offset < LEAF_TERM_DATA_OFFSET { return None; }
         let offset = block_offset - LEAF_TERM_DATA_OFFSET;
-        if offset + 25 > self.LTB_Data.len() { return None; }
+        if offset + TERM_MPHF_ENTRY_SIZE > self.LTB_Data.len() { return None; }
 
         let data = &self.LTB_Data[offset..];
-        let term_len = data[24] as usize;
-        if offset + 25 + term_len > self.LTB_Data.len() { return None; }
-        let lteTerm = std::str::from_utf8(&data[25..25 + term_len]).ok()?.to_string();
+        let term_len = data[31] as usize;
+        if offset + TERM_MPHF_ENTRY_SIZE + term_len > self.LTB_Data.len() { return None; }
+        let lteTerm = std::str::from_utf8(&data[32..32 + term_len]).ok()?.to_string();
 
         Some(LeafTermEntry {
             LTE_DocFreq: u32::from_le_bytes(data[0..4].try_into().ok()?),
@@ -153,6 +222,7 @@ impl LeafTermBlock {
             LTE_IndexLength: u32::from_le_bytes(data[12..16].try_into().ok()?),
             LTE_ContinuationBlockCount: u32::from_le_bytes(data[16..20].try_into().ok()?),
             LTE_Flags: u32::from_le_bytes(data[20..24].try_into().ok()?),
+            LTE_Fingerprint: u64::from_le_bytes(data[24..32].try_into().ok()?),
             LTE_Term: lteTerm,
         })
     }
@@ -341,6 +411,9 @@ pub struct IndexBlockTable {
     index_pool: RefCell<BlockCachePool<IndexBlock>>,
     leaf_term_pool: RefCell<BlockCachePool<LeafTermBlock>>,
     head_term_entries: Vec<HeadTermEntry>,
+    term_mphf_header: TermMphfHeader,
+    term_mphf_displacements: Vec<i32>,
+    term_mphf_entry_pages: Vec<IndexBlock>,
     bloom: BloomFilter,
 }
 
@@ -351,6 +424,9 @@ impl IndexBlockTable {
             index_pool: RefCell::new(BlockCachePool::new()),
             leaf_term_pool: RefCell::new(BlockCachePool::new()),
             head_term_entries: Vec::new(),
+            term_mphf_header: TermMphfHeader::default(),
+            term_mphf_displacements: Vec::new(),
+            term_mphf_entry_pages: Vec::new(),
             bloom: BloomFilter,
         }
     }
@@ -408,8 +484,40 @@ impl IndexBlockTable {
         self.index_pool = std::mem::replace(&mut source.index_pool, RefCell::new(BlockCachePool::new()));
         self.leaf_term_pool = std::mem::replace(&mut source.leaf_term_pool, RefCell::new(BlockCachePool::new()));
         self.head_term_entries = std::mem::take(&mut source.head_term_entries);
+        self.term_mphf_header = source.term_mphf_header;
+        self.term_mphf_displacements = std::mem::take(&mut source.term_mphf_displacements);
+        self.term_mphf_entry_pages = std::mem::take(&mut source.term_mphf_entry_pages);
+        source.term_mphf_header = TermMphfHeader::default();
         self.bloom = BloomFilter;
     }
+
+    pub fn SetTermMphf(&mut self, header: TermMphfHeader, displacements: Vec<i32>, entry_pages: Vec<IndexBlock>) {
+        if header.TMH_TermCount == 0 || header.TMH_BucketCount == 0 || header.TMH_SlotCount == 0 || displacements.is_empty() || entry_pages.is_empty() {
+            self.term_mphf_header = TermMphfHeader::default();
+            self.term_mphf_displacements.clear();
+            self.term_mphf_entry_pages.clear();
+            return;
+        }
+        let required_bytes = header.TMH_SlotCount as usize * TERM_MPHF_ENTRY_SIZE;
+        let available_bytes = entry_pages.len() * PAGE_SIZE;
+        if header.TMH_Magic != TERM_MPHF_MAGIC
+            || header.TMH_SlotCount as u64 != header.TMH_TermCount
+            || displacements.len() != header.TMH_BucketCount as usize
+            || required_bytes > available_bytes
+        {
+            self.term_mphf_header = TermMphfHeader::default();
+            self.term_mphf_displacements.clear();
+            self.term_mphf_entry_pages.clear();
+            return;
+        }
+        self.term_mphf_header = header;
+        self.term_mphf_displacements = displacements;
+        self.term_mphf_entry_pages = entry_pages;
+    }
+
+    pub fn TermMphfHeader(&self) -> &TermMphfHeader { &self.term_mphf_header }
+    pub fn TermMphfDisplacements(&self) -> &[i32] { &self.term_mphf_displacements }
+    pub fn TermMphfEntryPages(&self) -> &[IndexBlock] { &self.term_mphf_entry_pages }
 
     pub fn HeadTermEntries(&self) -> &[HeadTermEntry] {
         &self.head_term_entries
@@ -435,6 +543,23 @@ impl IndexBlockTable {
 
     pub fn FindTermData(&self, term: &str) -> Option<(IndexLocation, PinnedBlock<IndexBlock>)> {
         if !self.bloom.can_term_exist(term) { return None; }
+        if self.HasTermMphf() {
+            let (mphf_location, mphf_block) = self.FindTermDataMphf(term)?;
+            let (exact_location, _exact_block) = self.FindTermDataHeadLeaf(term)?;
+            if mphf_location.index_block_id != exact_location.index_block_id
+                || mphf_location.index_offset != exact_location.index_offset
+                || mphf_location.index_length != exact_location.index_length
+                || mphf_location.doc_freq != exact_location.doc_freq
+                || mphf_location.continuation_block_count != exact_location.continuation_block_count
+            {
+                return None;
+            }
+            return Some((mphf_location, mphf_block));
+        }
+        self.FindTermDataHeadLeaf(term)
+    }
+
+    fn FindTermDataHeadLeaf(&self, term: &str) -> Option<(IndexLocation, PinnedBlock<IndexBlock>)> {
         if self.head_term_entries.is_empty() { return None; }
 
         let pos = self.head_term_entries.partition_point(|entry| entry.first_term() <= term);
@@ -463,6 +588,43 @@ impl IndexBlockTable {
             index_length: entry.LTE_IndexLength as usize,
             doc_freq: entry.LTE_DocFreq,
             continuation_block_count: entry.LTE_ContinuationBlockCount,
+        }, index_block))
+    }
+
+    fn HasTermMphf(&self) -> bool {
+        self.term_mphf_header.TMH_Magic == TERM_MPHF_MAGIC
+            && self.term_mphf_header.TMH_TermCount > 0
+            && self.term_mphf_header.TMH_BucketCount > 0
+            && self.term_mphf_header.TMH_SlotCount > 0
+            && self.term_mphf_header.TMH_SlotCount as u64 == self.term_mphf_header.TMH_TermCount
+            && self.term_mphf_displacements.len() == self.term_mphf_header.TMH_BucketCount as usize
+            && self.term_mphf_entry_pages.len() * PAGE_SIZE >= self.term_mphf_header.TMH_SlotCount as usize * TERM_MPHF_ENTRY_SIZE
+    }
+
+    fn FindTermDataMphf(&self, term: &str) -> Option<(IndexLocation, PinnedBlock<IndexBlock>)> {
+        let bytes = term.as_bytes();
+        let bucket = (TermMphfHash(bytes, self.term_mphf_header.TMH_BucketSeed) % self.term_mphf_header.TMH_BucketCount as u64) as usize;
+        let displacement = *self.term_mphf_displacements.get(bucket)?;
+        if displacement < 0 { return None; }
+        let slot = TermMphfHash(bytes, TermMphfSlotSeed(self.term_mphf_header.TMH_SlotSeed, displacement as u32)) % self.term_mphf_header.TMH_SlotCount as u64;
+        let byte_offset = slot as usize * TERM_MPHF_ENTRY_SIZE;
+        let page = byte_offset / PAGE_SIZE;
+        let offset = byte_offset % PAGE_SIZE;
+        let block = self.term_mphf_entry_pages.get(page)?;
+        if offset + TERM_MPHF_ENTRY_SIZE > PAGE_SIZE { return None; }
+        let data = &block.IB_Data[offset..offset + TERM_MPHF_ENTRY_SIZE];
+        let mut fingerprint = TermMphfHash(bytes, self.term_mphf_header.TMH_FingerprintSeed);
+        if fingerprint == 0 { fingerprint = 1; }
+        if u64::from_le_bytes(data[24..32].try_into().ok()?) != fingerprint { return None; }
+
+        let index_block_id = u32::from_le_bytes(data[4..8].try_into().ok()?);
+        let index_block = self.index_pool.borrow_mut().get_or_read(index_block_id)?.1;
+        Some((IndexLocation {
+            doc_freq: u32::from_le_bytes(data[0..4].try_into().ok()?),
+            index_block_id,
+            index_offset: u32::from_le_bytes(data[8..12].try_into().ok()?) as usize,
+            index_length: u32::from_le_bytes(data[12..16].try_into().ok()?) as usize,
+            continuation_block_count: u32::from_le_bytes(data[16..20].try_into().ok()?),
         }, index_block))
     }
 
