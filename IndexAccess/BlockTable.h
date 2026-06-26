@@ -382,47 +382,9 @@ class IndexBlockTable
             /* Step 1: BloomFilter */
             const size_t termLength = std::strlen(term);
             if (!m_BloomFilter.CanTermExist(term, termLength)) return false;
-            if (HasTermMphf()) {
-                uint32_t mphfIndexBlockID = 0;
-                uint32_t mphfIndexOffset = 0;
-                uint32_t mphfIndexLength = 0;
-                uint32_t mphfDocFreq = 0;
-                uint32_t mphfContinuationBlockCount = 0;
-                if (!FindTermDataMphf(term, termLength,
-                                      &mphfIndexBlockID,
-                                      &mphfIndexOffset,
-                                      &mphfIndexLength,
-                                      &mphfDocFreq,
-                                      &mphfContinuationBlockCount))
-                    return false;
-
-                uint32_t exactIndexBlockID = 0;
-                uint32_t exactIndexOffset = 0;
-                uint32_t exactIndexLength = 0;
-                uint32_t exactDocFreq = 0;
-                uint32_t exactContinuationBlockCount = 0;
-                if (!FindTermDataHeadLeaf(term, termLength,
-                                          &exactIndexBlockID,
-                                          &exactIndexOffset,
-                                          &exactIndexLength,
-                                          &exactDocFreq,
-                                          &exactContinuationBlockCount))
-                    return false;
-
-                if (mphfIndexBlockID != exactIndexBlockID
-                    || mphfIndexOffset != exactIndexOffset
-                    || mphfIndexLength != exactIndexLength
-                    || mphfDocFreq != exactDocFreq
-                    || mphfContinuationBlockCount != exactContinuationBlockCount)
-                    return false;
-
-                *indexBlockIDOut = mphfIndexBlockID;
-                *indexOffsetOut = mphfIndexOffset;
-                *indexLengthOut = mphfIndexLength;
-                *docFreqOut = mphfDocFreq;
-                if (continuationBlockCountOut) *continuationBlockCountOut = mphfContinuationBlockCount;
+            if (HasTermMphf()
+                && FindTermDataMphf(term, termLength, indexBlockIDOut, indexOffsetOut, indexLengthOut, docFreqOut, continuationBlockCountOut))
                 return true;
-            }
 
             return FindTermDataHeadLeaf(term, termLength, indexBlockIDOut, indexOffsetOut, indexLengthOut, docFreqOut, continuationBlockCountOut);
         }

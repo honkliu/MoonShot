@@ -544,17 +544,9 @@ impl IndexBlockTable {
     pub fn FindTermData(&self, term: &str) -> Option<(IndexLocation, PinnedBlock<IndexBlock>)> {
         if !self.bloom.can_term_exist(term) { return None; }
         if self.HasTermMphf() {
-            let (mphf_location, mphf_block) = self.FindTermDataMphf(term)?;
-            let (exact_location, _exact_block) = self.FindTermDataHeadLeaf(term)?;
-            if mphf_location.index_block_id != exact_location.index_block_id
-                || mphf_location.index_offset != exact_location.index_offset
-                || mphf_location.index_length != exact_location.index_length
-                || mphf_location.doc_freq != exact_location.doc_freq
-                || mphf_location.continuation_block_count != exact_location.continuation_block_count
-            {
-                return None;
+            if let Some(result) = self.FindTermDataMphf(term) {
+                return Some(result);
             }
-            return Some((mphf_location, mphf_block));
         }
         self.FindTermDataHeadLeaf(term)
     }
