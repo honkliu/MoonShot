@@ -22,8 +22,11 @@
 #include <cstdint>
 #include <algorithm>
 #include <cctype>
+#include <unordered_map>
+#include <unordered_set>
 #include <cstdlib>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <map>
 #include <set>
@@ -716,7 +719,7 @@ struct IndexOptions {
     std::string filePath;
     std::string dirPath;
     std::vector<std::string> extensions = ParseExtensions("md,txt");
-    uint64_t batchSize = 200;
+    uint64_t batchSize = 10000;
     bool recursive = false;
 };
 
@@ -724,6 +727,20 @@ struct SampleMergeOptions {
     std::string dirPath;
     std::string outPath;
     std::vector<std::string> extensions = ParseExtensions("cpp,h,rs");
+};
+
+struct BeirBuildOptions {
+    std::string dataPath;
+    uint64_t limit = 0;
+};
+
+struct BeirEvalOptions {
+    std::string dataPath;
+    std::string qrels = "test";
+    std::string streams = "TB";
+    std::string mode = "bow";
+    std::vector<int> at = {10, 100, 1000};
+    uint64_t limit = 0;
 };
 
 static bool ParseBatchSize(const std::string& text, uint64_t& batchSize)
@@ -734,6 +751,34 @@ static bool ParseBatchSize(const std::string& text, uint64_t& batchSize)
     if (!end || *end != '\0' || value == 0) return false;
     batchSize = static_cast<uint64_t>(value);
     return true;
+}
+
+static bool ParseUInt64(const std::string& text, uint64_t& value)
+{
+    if (text.empty()) return false;
+    char* end = nullptr;
+    unsigned long long parsed = std::strtoull(text.c_str(), &end, 10);
+    if (!end || *end != '\0') return false;
+    value = static_cast<uint64_t>(parsed);
+    return true;
+}
+
+static bool ParseAtList(const std::string& text, std::vector<int>& values)
+{
+    values.clear();
+    std::stringstream ss(text);
+    std::string item;
+    while (std::getline(ss, item, ',')) {
+        item = Trim(std::move(item));
+        if (item.empty()) continue;
+        char* end = nullptr;
+        long parsed = std::strtol(item.c_str(), &end, 10);
+        if (!end || *end != '\0' || parsed <= 0) return false;
+        values.push_back(static_cast<int>(parsed));
+    }
+    std::sort(values.begin(), values.end());
+    values.erase(std::unique(values.begin(), values.end()), values.end());
+    return !values.empty();
 }
 
 static bool ParseSearchOptions(const std::vector<std::string>& args,
@@ -785,8 +830,9 @@ static bool ParseIndexOptions(const std::vector<std::string>& args,
             options.extensions = ParseExtensions(args[++i]);
             if (options.extensions.empty()) { error = "-ext must include at least one extension"; return false; }
         } else if (arg == "-b") {
-            if (i + 1 >= args.size()) { error = "Usage: moon -b 200"; return false; }
+            if (i + 1 >= args.size()) { error = "Usage: moon -b 10000"; return false; }
             if (!ParseBatchSize(args[++i], options.batchSize)) { error = "-b must be a positive integer"; return false; }
+            if (options.batchSize < 10000) { error = "-b must be at least 10000 for indexing performance"; return false; }
         } else if (arg == "-r") {
             options.recursive = true;
         } else {
@@ -801,7 +847,7 @@ static bool ParseIndexOptions(const std::vector<std::string>& args,
     }
     if (!options.filePath.empty() || !options.dirPath.empty())
         return true;
-    error = "Usage: moon -file <filename> | moon -dir <directory> [-ext md,txt] [-r] [-b 200]";
+    error = "Usage: moon -file <filename> | moon -dir <directory> [-ext md,txt] [-r] [-b 10000]";
     return false;
 }
 
@@ -834,6 +880,73 @@ static bool ParseSampleMergeOptions(const std::vector<std::string>& args,
     return true;
 }
 
+static bool ParseBeirBuildOptions(const std::vector<std::string>& args,
+                                  BeirBuildOptions& options,
+                                  std::string& error)
+{
+    for (size_t i = 1; i < args.size(); ++i) {
+        const std::string& arg = args[i];
+        if (arg == "-data") {
+            if (i + 1 >= args.size()) { error = "Usage: moon [-idx <index>] -beir-build -data <beir-dir> [-limit N]"; return false; }
+            options.dataPath = args[++i];
+        } else if (arg == "-limit") {
+            if (i + 1 >= args.size()) { error = "Usage: moon -beir-build -limit N"; return false; }
+            if (!ParseUInt64(args[++i], options.limit)) { error = "-limit must be a non-negative integer"; return false; }
+        } else {
+            error = "Unknown BEIR build option: " + arg;
+            return false;
+        }
+    }
+
+    if (options.dataPath.empty()) {
+        error = "Usage: moon [-idx <index>] -beir-build -data <beir-dir> [-limit N]";
+        return false;
+    }
+    return true;
+}
+
+static bool ParseBeirEvalOptions(const std::vector<std::string>& args,
+                                 BeirEvalOptions& options,
+                                 std::string& error)
+{
+    for (size_t i = 1; i < args.size(); ++i) {
+        const std::string& arg = args[i];
+        if (arg == "-data") {
+            if (i + 1 >= args.size()) { error = "Usage: moon [-idx <index>] -beir-eval -data <beir-dir> [-qrels test] [-k 10,100,1000]"; return false; }
+            options.dataPath = args[++i];
+        } else if (arg == "-qrels") {
+            if (i + 1 >= args.size()) { error = "Usage: moon -beir-eval -qrels <split-or-path>"; return false; }
+            options.qrels = args[++i];
+        } else if (arg == "-k") {
+            if (i + 1 >= args.size()) { error = "Usage: moon -beir-eval -k 10,100,1000"; return false; }
+            if (!ParseAtList(args[++i], options.at)) { error = "-k must be a comma-separated list of positive integers"; return false; }
+        } else if (arg == "-streams") {
+            if (i + 1 >= args.size()) { error = "Usage: moon -beir-eval -streams TB"; return false; }
+            options.streams = args[++i];
+        } else if (arg == "-mode") {
+            if (i + 1 >= args.size()) { error = "Usage: moon -beir-eval -mode bow|weakand|compile"; return false; }
+            options.mode = args[++i];
+            if (options.mode != "bow" && options.mode != "weakand" && options.mode != "compile") { error = "-mode must be bow, weakand, or compile"; return false; }
+        } else if (arg == "-limit") {
+            if (i + 1 >= args.size()) { error = "Usage: moon -beir-eval -limit N"; return false; }
+            if (!ParseUInt64(args[++i], options.limit)) { error = "-limit must be a non-negative integer"; return false; }
+        } else {
+            error = "Unknown BEIR eval option: " + arg;
+            return false;
+        }
+    }
+
+    if (options.dataPath.empty()) {
+        error = "Usage: moon [-idx <index>] -beir-eval -data <beir-dir> [-qrels test] [-k 10,100,1000]";
+        return false;
+    }
+    if (options.streams.empty()) {
+        error = "-streams must not be empty";
+        return false;
+    }
+    return true;
+}
+
 static std::string JoinExtensions(const std::vector<std::string>& extensions)
 {
     std::string text;
@@ -854,10 +967,10 @@ static void PrintHelp(const std::string& idxPath)
         << "Build or update an index:\n"
         << "  moon [-idx <index>] -file <file>\n"
         << "      Index one file.\n\n"
-        << "  moon [-idx <index>] -dir <dir> -ext md,txt [-r] [-b 200]\n"
+        << "  moon [-idx <index>] -dir <dir> -ext md,txt [-r] [-b 10000]\n"
         << "      Index files under <dir>. Use -r for recursive traversal.\n"
         << "      -ext is a comma-separated extension list without or with dots.\n"
-        << "      -b controls how many new files are saved per delta batch.\n\n"
+        << "      -b controls how many new files are saved per delta batch; minimum 10000.\n\n"
         << "Search an index:\n"
         << "  moon [-idx <index>] -i\n"
         << "      Open an interactive inverted-index search prompt.\n\n"
@@ -871,12 +984,20 @@ static void PrintHelp(const std::string& idxPath)
         << "      Recursively indexes matching files, builds a base index and delta\n"
         << "      index, merges them, reloads the merged output, and runs a sanity\n"
         << "      query. This is the simplest end-to-end MoonShot merge sample.\n\n"
+        << "BEIR recall evaluation:\n"
+        << "  moon [-idx <index>] -beir-build -data <beir-dir> [-limit N]\n"
+        << "      Build an index from BEIR corpus.jsonl. Stored doc paths are BEIR ids.\n\n"
+        << "  moon [-idx <index>] -beir-eval -data <beir-dir> [-qrels test] [-k 10,100,1000] [-streams TB] [-mode bow|weakand|compile] [-limit N]\n"
+        << "      Evaluate Recall@k from BEIR queries.jsonl and qrels/<split>.tsv.\n"
+        << "      Default mode is bow. weakand requires multiple unigram/bigram evidence hits.\n\n"
         << "Examples:\n"
         << "  moon -idx .\\notes.idx -dir .\\docs -ext md,txt -r\n"
         << "  moon -idx .\\notes.idx -i\n"
         << "  moon -idx .\\notes.idx -v\n"
         << "  moon -idx .\\notes.idx -i -v\n"
-        << "  moon -sample-merge -dir . -out .\\build\\moonshot-source-merge.idx -ext cpp,h,rs\n";
+        << "  moon -sample-merge -dir . -out .\\build\\moonshot-source-merge.idx -ext cpp,h,rs\n"
+        << "  moon -idx .\\build\\beir-scifact.idx -beir-build -data .\\data\\scifact\n"
+        << "  moon -idx .\\build\\beir-scifact.idx -beir-eval -data .\\data\\scifact -qrels test -k 10,100,1000\n";
 }
 
 static bool ApplyGlobalOptions(std::vector<std::string>& args,
@@ -932,6 +1053,418 @@ static uint64_t CountStoredDocuments(IndexContext& ctx, uint64_t firstDocId = 0)
             ++count;
     }
     return count;
+}
+
+static std::string BeirFilePath(const std::string& dataPath, const std::string& relativePath)
+{
+    auto path = FsPathFromUtf8(dataPath);
+    path /= FsPathFromUtf8(relativePath);
+    return PathToUtf8(path);
+}
+
+static int HexDigit(char ch)
+{
+    if (ch >= '0' && ch <= '9') return ch - '0';
+    if (ch >= 'a' && ch <= 'f') return 10 + ch - 'a';
+    if (ch >= 'A' && ch <= 'F') return 10 + ch - 'A';
+    return -1;
+}
+
+static void AppendUtf8(uint32_t codepoint, std::string& out)
+{
+    if (codepoint <= 0x7F) {
+        out.push_back(static_cast<char>(codepoint));
+    } else if (codepoint <= 0x7FF) {
+        out.push_back(static_cast<char>(0xC0 | (codepoint >> 6)));
+        out.push_back(static_cast<char>(0x80 | (codepoint & 0x3F)));
+    } else if (codepoint <= 0xFFFF) {
+        out.push_back(static_cast<char>(0xE0 | (codepoint >> 12)));
+        out.push_back(static_cast<char>(0x80 | ((codepoint >> 6) & 0x3F)));
+        out.push_back(static_cast<char>(0x80 | (codepoint & 0x3F)));
+    } else {
+        out.push_back(static_cast<char>(0xF0 | (codepoint >> 18)));
+        out.push_back(static_cast<char>(0x80 | ((codepoint >> 12) & 0x3F)));
+        out.push_back(static_cast<char>(0x80 | ((codepoint >> 6) & 0x3F)));
+        out.push_back(static_cast<char>(0x80 | (codepoint & 0x3F)));
+    }
+}
+
+static bool ExtractJsonString(const std::string& line, const std::string& key, std::string& value)
+{
+    const std::string needle = "\"" + key + "\"";
+    const size_t keyPos = line.find(needle);
+    if (keyPos == std::string::npos) return false;
+    const size_t colon = line.find(':', keyPos + needle.size());
+    if (colon == std::string::npos) return false;
+    size_t pos = colon + 1;
+    while (pos < line.size() && std::isspace(static_cast<unsigned char>(line[pos]))) ++pos;
+    if (pos >= line.size() || line[pos] != '"') return false;
+    ++pos;
+
+    value.clear();
+    while (pos < line.size()) {
+        char ch = line[pos++];
+        if (ch == '"') return true;
+        if (ch != '\\') {
+            value.push_back(ch);
+            continue;
+        }
+        if (pos >= line.size()) return false;
+        const char esc = line[pos++];
+        switch (esc) {
+        case '"': value.push_back('"'); break;
+        case '\\': value.push_back('\\'); break;
+        case '/': value.push_back('/'); break;
+        case 'b': value.push_back('\b'); break;
+        case 'f': value.push_back('\f'); break;
+        case 'n': value.push_back('\n'); break;
+        case 'r': value.push_back('\r'); break;
+        case 't': value.push_back('\t'); break;
+        case 'u': {
+            if (pos + 4 > line.size()) return false;
+            uint32_t codepoint = 0;
+            for (int i = 0; i < 4; ++i) {
+                const int digit = HexDigit(line[pos + i]);
+                if (digit < 0) return false;
+                codepoint = (codepoint << 4) | static_cast<uint32_t>(digit);
+            }
+            pos += 4;
+            AppendUtf8(codepoint, value);
+            break;
+        }
+        default:
+            value.push_back(esc);
+            break;
+        }
+    }
+    return false;
+}
+
+using BeirQrels = std::unordered_map<std::string, std::unordered_set<std::string>>;
+
+static bool LoadBeirQrels(const std::string& path, BeirQrels& qrels)
+{
+    std::ifstream in(FsPathFromUtf8(path));
+    if (!in) return false;
+    std::string line;
+    bool firstLine = true;
+    while (std::getline(in, line)) {
+        if (line.empty()) continue;
+        if (firstLine) {
+            firstLine = false;
+            if (line.find("query-id") != std::string::npos || line.find("corpus-id") != std::string::npos)
+                continue;
+        }
+        std::vector<std::string> columns;
+        std::stringstream ss(line);
+        std::string column;
+        while (std::getline(ss, column, '\t'))
+            columns.push_back(std::move(column));
+        if (columns.size() < 3) continue;
+        char* end = nullptr;
+        const double score = std::strtod(columns[2].c_str(), &end);
+        if (!end || end == columns[2].c_str() || score <= 0.0) continue;
+        qrels[columns[0]].insert(columns[1]);
+    }
+    return true;
+}
+
+static bool IsBeirStopword(const std::string& token)
+{
+    static const std::unordered_set<std::string> stopwords = {
+        "a", "an", "and", "are", "as", "at", "be", "been", "by", "for", "from", "has", "have", "in",
+        "into", "is", "it", "its", "of", "on", "or", "that", "the", "their", "there", "these", "this",
+        "to", "was", "were", "with", "without", "can", "could", "may", "might", "must", "should", "than",
+        "then", "which", "while", "during", "between", "within", "using", "used", "use"
+    };
+    return stopwords.count(token) != 0;
+}
+
+static std::vector<std::string> ParseBeirStreams(const std::string& streamSet)
+{
+    std::vector<std::string> streams;
+    for (char ch : streamSet) {
+        switch (ch) {
+        case 'A': streams.emplace_back("A"); break;
+        case 'U': streams.emplace_back("U"); break;
+        case 'T': streams.emplace_back("T"); break;
+        case 'B': streams.emplace_back("B"); break;
+        case 'M': streams.emplace_back("M"); break;
+        default: break;
+        }
+    }
+    if (streams.empty())
+        streams.emplace_back("T");
+    return streams;
+}
+
+static std::shared_ptr<IndexReader> BuildBeirBowReader(IndexContext& ctx,
+                                                       SmartTokenizer& tokenizer,
+                                                       const std::string& query,
+                                                       const std::string& streamSet)
+{
+    const auto streams = ParseBeirStreams(streamSet);
+    const auto tokens = tokenizer.Tokenize(query.c_str());
+    std::set<std::string> streamKeys;
+    for (const auto& token : tokens) {
+        if (token.size() <= 1 || IsBeirStopword(token))
+            continue;
+        for (const auto& stream : streams)
+            streamKeys.insert(token + stream);
+    }
+
+    if (streamKeys.empty()) {
+        for (const auto& token : tokens) {
+            if (token.empty()) continue;
+            for (const auto& stream : streams)
+                streamKeys.insert(token + stream);
+        }
+    }
+    if (streamKeys.empty())
+        return nullptr;
+
+    auto orNode = std::make_shared<OrNode>();
+    for (const auto& key : streamKeys)
+        orNode->children.push_back(std::make_shared<TermNode>(key, 1));
+
+    EvalTree tree;
+    tree.root = std::move(orNode);
+    return ctx.GetReader(&tree);
+}
+
+static uint32_t BeirMinShouldMatch(size_t termCount)
+{
+    if (termCount <= 2) return 1;
+    if (termCount <= 5) return 2;
+    return 3;
+}
+
+static std::shared_ptr<IndexReader> BuildBeirWeakAndReader(IndexContext& ctx,
+                                                           SmartTokenizer& tokenizer,
+                                                           const std::string& query,
+                                                           const std::string& streamSet)
+{
+    const auto streams = ParseBeirStreams(streamSet);
+    const auto tokens = tokenizer.Tokenize(query.c_str());
+    std::vector<std::string> terms;
+    std::set<std::string> seenTerms;
+    for (const auto& token : tokens) {
+        if (token.size() <= 1 || IsBeirStopword(token))
+            continue;
+        if (seenTerms.insert(token).second)
+            terms.push_back(token);
+    }
+
+    if (terms.empty()) {
+        for (const auto& token : tokens) {
+            if (token.empty()) continue;
+            if (seenTerms.insert(token).second)
+                terms.push_back(token);
+        }
+    }
+    if (terms.empty())
+        return nullptr;
+
+    std::vector<std::shared_ptr<IndexReader>> children;
+    std::set<std::string> streamKeys;
+    for (const auto& term : terms) {
+        for (const auto& stream : streams)
+            streamKeys.insert(term + stream);
+    }
+    for (size_t i = 0; i + 1 < terms.size(); ++i) {
+        const std::string bigram = terms[i] + BIGRAM_SEP + terms[i + 1];
+        for (const auto& stream : streams)
+            streamKeys.insert(bigram + stream);
+    }
+
+    for (const auto& key : streamKeys) {
+        auto reader = ctx.GetStreamReader(key.c_str());
+        if (reader && !reader->IsEnd())
+            children.push_back(std::move(reader));
+    }
+    if (children.empty())
+        return nullptr;
+
+    const uint32_t minShouldMatch = std::min<uint32_t>(
+        BeirMinShouldMatch(terms.size()),
+        static_cast<uint32_t>(children.size()));
+    return std::make_shared<WeakAndIndexReader>(std::move(children), minShouldMatch);
+}
+
+static std::string ResolveBeirQrelsPath(const BeirEvalOptions& options)
+{
+    if (std::filesystem::is_regular_file(FsPathFromUtf8(options.qrels)))
+        return options.qrels;
+    return BeirFilePath(options.dataPath, "qrels/" + options.qrels + ".tsv");
+}
+
+static int RunBeirBuild(const std::string& idxPath, const BeirBuildOptions& options)
+{
+    const std::string corpusPath = BeirFilePath(options.dataPath, "corpus.jsonl");
+    std::ifstream corpus(FsPathFromUtf8(corpusPath));
+    if (!corpus) {
+        std::cerr << "BEIR corpus not found: " << corpusPath << "\n";
+        return 1;
+    }
+
+    std::error_code ec;
+    std::filesystem::remove(FsPathFromUtf8(idxPath), ec);
+    ec.clear();
+    std::filesystem::remove(FsPathFromUtf8(DeltaIndexPath(idxPath)), ec);
+
+    IndexContext ctx("", "", false);
+    std::string line;
+    uint64_t docId = 0;
+    uint64_t skipped = 0;
+    auto start = std::chrono::steady_clock::now();
+    while (std::getline(corpus, line)) {
+        if (options.limit > 0 && docId >= options.limit) break;
+        std::string id;
+        std::string title;
+        std::string text;
+        if (!ExtractJsonString(line, "_id", id) || !ExtractJsonString(line, "text", text)) {
+            ++skipped;
+            continue;
+        }
+        ExtractJsonString(line, "title", title);
+        Document doc;
+        doc.doc_id = docId;
+        doc.path = id;
+        doc.title = title;
+        doc.body = text;
+        doc.importance = 0.1f;
+        ctx.AddDocument(doc, false);
+        ++docId;
+        if (docId % 1000 == 0)
+            std::cout << "  BEIR indexed " << docId << " docs\n";
+    }
+
+    if (docId == 0) {
+        std::cerr << "BEIR corpus had no readable docs: " << corpusPath << "\n";
+        return 1;
+    }
+
+    std::cout << "  writing BEIR index: " << idxPath << "\n";
+    if (!ctx.SaveIndex(idxPath.c_str())) {
+        std::cerr << "Failed to save BEIR index: " << idxPath << "\n";
+        return 1;
+    }
+    const auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - start).count();
+    std::cout << "BEIR build complete docs=" << docId;
+    if (skipped) std::cout << " skipped=" << skipped;
+    std::cout << " elapsed_ms=" << elapsedMs << "\n";
+    return 0;
+}
+
+static int RunBeirEval(const std::string& idxPath, const BeirEvalOptions& options)
+{
+    if (!IndexSerializer::IsValidIndex(idxPath.c_str())) {
+        std::cerr << "BEIR index not found or invalid: " << idxPath << "\n";
+        return 1;
+    }
+
+    const std::string queryPath = BeirFilePath(options.dataPath, "queries.jsonl");
+    const std::string qrelsPath = ResolveBeirQrelsPath(options);
+    BeirQrels qrels;
+    if (!LoadBeirQrels(qrelsPath, qrels) || qrels.empty()) {
+        std::cerr << "BEIR qrels not found or empty: " << qrelsPath << "\n";
+        return 1;
+    }
+
+    std::ifstream queries(FsPathFromUtf8(queryPath));
+    if (!queries) {
+        std::cerr << "BEIR queries not found: " << queryPath << "\n";
+        return 1;
+    }
+
+    IndexContext ctx("", idxPath.c_str(), false);
+    std::unique_ptr<IndexSearchExecutor> executor(ctx.GetExecutor());
+    SmartTokenizer beirTokenizer;
+    const int maxK = *std::max_element(options.at.begin(), options.at.end());
+    std::vector<double> macroRecall(options.at.size(), 0.0);
+    std::vector<uint64_t> microHits(options.at.size(), 0);
+    uint64_t microRelevant = 0;
+    uint64_t evaluated = 0;
+    uint64_t missingQrels = 0;
+
+    std::string line;
+    auto start = std::chrono::steady_clock::now();
+    while (std::getline(queries, line)) {
+        std::string qid;
+        std::string query;
+        if (!ExtractJsonString(line, "_id", qid) || !ExtractJsonString(line, "text", query))
+            continue;
+        auto qrelIt = qrels.find(qid);
+        if (qrelIt == qrels.end() || qrelIt->second.empty()) {
+            ++missingQrels;
+            continue;
+        }
+        if (options.limit > 0 && evaluated >= options.limit) break;
+
+        std::shared_ptr<IndexReader> reader;
+        if (options.mode == "bow") {
+            reader = BuildBeirBowReader(ctx, beirTokenizer, query, options.streams);
+        } else if (options.mode == "weakand") {
+            reader = BuildBeirWeakAndReader(ctx, beirTokenizer, query, options.streams);
+        } else {
+            reader = ctx.GetReader(query.c_str(), options.streams.c_str());
+        }
+        auto results = executor->Execute(reader, maxK);
+        std::vector<uint64_t> cumulativeHits(options.at.size(), 0);
+        uint64_t hitCount = 0;
+        size_t nextAt = 0;
+        for (size_t rank = 0; rank < results.size(); ++rank) {
+            const std::string docIdText = ctx.GetDocPath(results[rank].doc_id);
+            if (qrelIt->second.count(docIdText))
+                ++hitCount;
+            while (nextAt < options.at.size() && rank + 1 == static_cast<size_t>(options.at[nextAt])) {
+                cumulativeHits[nextAt] = hitCount;
+                ++nextAt;
+            }
+        }
+        while (nextAt < options.at.size()) {
+            cumulativeHits[nextAt] = hitCount;
+            ++nextAt;
+        }
+
+        const uint64_t relevantCount = static_cast<uint64_t>(qrelIt->second.size());
+        microRelevant += relevantCount;
+        for (size_t i = 0; i < options.at.size(); ++i) {
+            macroRecall[i] += static_cast<double>(cumulativeHits[i]) / static_cast<double>(relevantCount);
+            microHits[i] += cumulativeHits[i];
+        }
+        ++evaluated;
+        if (evaluated % 100 == 0)
+            std::cout << "  BEIR evaluated " << evaluated << " queries\n";
+    }
+
+    if (evaluated == 0 || microRelevant == 0) {
+        std::cerr << "No BEIR queries with qrels were evaluated\n";
+        return 1;
+    }
+
+    const auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - start).count();
+    std::cout << "BEIR eval index=" << idxPath
+              << " data=" << options.dataPath
+              << " qrels=" << qrelsPath
+              << " streams=" << options.streams
+              << " mode=" << options.mode
+              << " queries=" << evaluated
+              << " missing_qrels=" << missingQrels
+              << " elapsed_ms=" << elapsedMs << "\n";
+    std::cout << std::fixed << std::setprecision(4);
+    for (size_t i = 0; i < options.at.size(); ++i) {
+        const double macro = macroRecall[i] / static_cast<double>(evaluated);
+        const double micro = static_cast<double>(microHits[i]) / static_cast<double>(microRelevant);
+        std::cout << "Recall@" << options.at[i]
+                  << " macro=" << macro
+                  << " micro=" << micro
+                  << " hits=" << microHits[i]
+                  << "/" << microRelevant << "\n";
+    }
+    return 0;
 }
 
 static int RunSampleMerge(const SampleMergeOptions& options)
@@ -1238,6 +1771,23 @@ int main(int argc, char* argv[])
             return 1;
         }
         return RunSampleMerge(options);
+
+    // ── BEIR recall evaluation ──────────────────────────────────────────────
+    } else if (cmd == "-beir-build") {
+        BeirBuildOptions options;
+        if (!ParseBeirBuildOptions(args, options, error)) {
+            std::cerr << error << "\n";
+            return 1;
+        }
+        return RunBeirBuild(idxPath, options);
+
+    } else if (cmd == "-beir-eval") {
+        BeirEvalOptions options;
+        if (!ParseBeirEvalOptions(args, options, error)) {
+            std::cerr << error << "\n";
+            return 1;
+        }
+        return RunBeirEval(idxPath, options);
 
     // ── interactive search ────────────────────────────────────────────────────
     } else if (cmd == "-i" || cmd == "-v") {

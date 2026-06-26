@@ -597,8 +597,12 @@ impl IndexBlockTable {
         let bytes = term.as_bytes();
         let bucket = (TermMphfHash(bytes, self.term_mphf_header.TMH_BucketSeed) % self.term_mphf_header.TMH_BucketCount as u64) as usize;
         let displacement = *self.term_mphf_displacements.get(bucket)?;
-        if displacement < 0 { return None; }
-        let slot = TermMphfHash(bytes, TermMphfSlotSeed(self.term_mphf_header.TMH_SlotSeed, displacement as u32)) % self.term_mphf_header.TMH_SlotCount as u64;
+        let slot = if displacement < 0 {
+            (-(displacement as i64) - 1) as u64
+        } else {
+            TermMphfHash(bytes, TermMphfSlotSeed(self.term_mphf_header.TMH_SlotSeed, displacement as u32)) % self.term_mphf_header.TMH_SlotCount as u64
+        };
+        if slot >= self.term_mphf_header.TMH_SlotCount as u64 { return None; }
         let byte_offset = slot as usize * TERM_MPHF_ENTRY_SIZE;
         let page = byte_offset / PAGE_SIZE;
         let offset = byte_offset % PAGE_SIZE;

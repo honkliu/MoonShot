@@ -173,7 +173,6 @@ void TestAndSearch()
 void TestOrSearch()
 {
     BuildSharedIndex();
-
     auto compiler = new IndexSearchCompiler();
     auto tree     = compiler->Compile("morning OR apocalypse", "AUT");
     auto reader   = g_ctx->GetReader(tree);
@@ -186,6 +185,41 @@ void TestOrSearch()
     AssertContains(results, 1, "OR apocalypse");
 
     delete compiler; delete tree;
+}
+
+void TestWeakAndSearch()
+{
+    IndexContext engine;
+    SmartTokenizer tok;
+    auto writer = engine.GetWriter();
+
+    writer->Write(tok.Tokenize("alpha beta gamma"), 0, "Title");
+    writer->SetDocImportance(0, 0.1f);
+    writer->SetDocVector(0, BuildHashedEmbedding(tok.Tokenize("alpha beta gamma")));
+
+    writer->Write(tok.Tokenize("alpha beta"), 1, "Title");
+    writer->SetDocImportance(1, 0.1f);
+    writer->SetDocVector(1, BuildHashedEmbedding(tok.Tokenize("alpha beta")));
+
+    writer->Write(tok.Tokenize("alpha"), 2, "Title");
+    writer->SetDocImportance(2, 0.1f);
+    writer->SetDocVector(2, BuildHashedEmbedding(tok.Tokenize("alpha")));
+
+    engine.Build();
+
+    std::vector<std::shared_ptr<IndexReader>> children;
+    children.push_back(engine.GetStreamReader("alphaT"));
+    children.push_back(engine.GetStreamReader("betaT"));
+    children.push_back(engine.GetStreamReader("gammaT"));
+
+    auto reader = std::make_shared<WeakAndIndexReader>(std::move(children), 2);
+    std::unique_ptr<IndexSearchExecutor> exec(engine.GetExecutor());
+    auto results = exec->Execute(reader, 10);
+
+    AssertContains(results, 0, "weak-and doc with 3 terms");
+    AssertContains(results, 1, "weak-and doc with 2 terms");
+    AssertNotContains(results, 2, "weak-and excludes doc with 1 term");
+    std::cout << "  weak-and min=2 returned docs with at least two matching terms\n";
 }
 
 /*
@@ -824,16 +858,22 @@ void TestBigram()
     auto BK = [](const char* a, const char* b, char st) {
         return std::string(a) + BIGRAM_SEP + b + st;
     };
+    const auto goodMorning = tok.Tokenize("good morning vietnam");
+    const auto badMorning = tok.Tokenize("bad morning london");
+    const auto goodNight = tok.Tokenize("good night vietnam");
+    assert(goodMorning.size() == 3);
+    assert(badMorning.size() == 3);
+    assert(goodNight.size() == 3);
 
-    assert(store->GetPostingList(BK("good","morning",'T'))    != nullptr);
-    assert(store->GetPostingList(BK("morning","vietnam",'T')) != nullptr);
-    assert(store->GetPostingList(BK("bad","morning",'T'))     != nullptr);
-    assert(store->GetPostingList(BK("good","night",'T'))      != nullptr);
+    assert(store->GetPostingList(BK(goodMorning[0].c_str(), goodMorning[1].c_str(), 'T')) != nullptr);
+    assert(store->GetPostingList(BK(goodMorning[1].c_str(), goodMorning[2].c_str(), 'T')) != nullptr);
+    assert(store->GetPostingList(BK(badMorning[0].c_str(), badMorning[1].c_str(), 'T')) != nullptr);
+    assert(store->GetPostingList(BK(goodNight[0].c_str(), goodNight[1].c_str(), 'T')) != nullptr);
 
-    std::cout << "  good·morningT    doc_freq="
-              << store->GetPostingList(BK("good","morning",'T'))->doc_freq() << "\n";
-    std::cout << "  morning·vietnamT doc_freq="
-              << store->GetPostingList(BK("morning","vietnam",'T'))->doc_freq() << "\n";
+    std::cout << "  " << goodMorning[0] << "·" << goodMorning[1] << "T    doc_freq="
+              << store->GetPostingList(BK(goodMorning[0].c_str(), goodMorning[1].c_str(), 'T'))->doc_freq() << "\n";
+    std::cout << "  " << goodMorning[1] << "·" << goodMorning[2] << "T doc_freq="
+              << store->GetPostingList(BK(goodMorning[1].c_str(), goodMorning[2].c_str(), 'T'))->doc_freq() << "\n";
 
     IndexSearchCompiler compiler;
     auto exec = engine.GetExecutor();
@@ -891,7 +931,7 @@ void TestBigram()
 
         assert(orNode->children[0]->GetType() == NodeType::Term);
         auto* bigramNode = static_cast<TermNode*>(orNode->children[0].get());
-        assert(bigramNode->stream_key == std::string("good") + BIGRAM_SEP + "morningT");
+        assert(bigramNode->stream_key == goodMorning[0] + BIGRAM_SEP + goodMorning[1] + "T");
         std::cout << "  bigram arm key: " << bigramNode->stream_key << "\n";
 
         assert(orNode->children[1]->GetType() == NodeType::And);
@@ -985,8 +1025,9 @@ void TestTermMphfSameBaseCollision()
         const auto& header = built.BBR_TermMphfHeader;
         const uint64_t bucket = TermMphfHash(term.data(), term.size(), header.TMH_BucketSeed) % header.TMH_BucketCount;
         const int32_t displacement = built.BBR_TermMphfDisplacements[static_cast<size_t>(bucket)];
-        assert(displacement >= 0);
-        const uint64_t slot = TermMphfHash(term.data(), term.size(), TermMphfSlotSeed(header.TMH_SlotSeed, static_cast<uint32_t>(displacement))) % header.TMH_SlotCount;
+        const uint64_t slot = displacement < 0
+            ? static_cast<uint64_t>(-static_cast<int64_t>(displacement) - 1)
+            : TermMphfHash(term.data(), term.size(), TermMphfSlotSeed(header.TMH_SlotSeed, static_cast<uint32_t>(displacement))) % header.TMH_SlotCount;
         assert(slot < used.size());
         assert(!used[static_cast<size_t>(slot)]);
         used[static_cast<size_t>(slot)] = 1;
@@ -1001,6 +1042,29 @@ void TestTermMphfSameBaseCollision()
     std::cout << "  MPHF same-base collision regression passed\n";
 }
 
+void TestTokenizerSnowballStemming()
+{
+    SmartTokenizer tokenizer;
+    const auto tokens = tokenizer.Tokenize("suggested suggests suggesting");
+    assert(tokens.size() == 3);
+    assert(tokens[0] == "suggest");
+    assert(tokens[1] == "suggest");
+    assert(tokens[2] == "suggest");
+
+    IndexContext engine;
+    Document doc;
+    doc.doc_id = 0;
+    doc.title = "suggested treatment";
+    doc.body = "The paper suggested a possible mechanism.";
+    engine.AddDocument(doc);
+    engine.Build();
+
+    auto reader = engine.GetStreamReader("suggestT");
+    assert(!reader->IsEnd());
+    assert(reader->GetDocumentID() == 0);
+    std::cout << "  Snowball stems suggested/suggests/suggesting to suggest\n";
+}
+
 } // namespace IndexAccessTests
 
 std::map<std::string, std::function<void()>> testRegistry = {
@@ -1008,6 +1072,7 @@ std::map<std::string, std::function<void()>> testRegistry = {
     {"TestSingleTermSearch", IndexAccessTests::TestSingleTermSearch},
     {"TestAndSearch",        IndexAccessTests::TestAndSearch},
     {"TestOrSearch",         IndexAccessTests::TestOrSearch},
+    {"TestWeakAndSearch",    IndexAccessTests::TestWeakAndSearch},
     {"TestNotSearch",        IndexAccessTests::TestNotSearch},
     {"TestFieldConstraint",  IndexAccessTests::TestFieldConstraint},
     {"TestEvalTree",         IndexAccessTests::TestEvalTree},
@@ -1022,4 +1087,5 @@ std::map<std::string, std::function<void()>> testRegistry = {
     {"TestContinuationPostings", IndexAccessTests::TestContinuationPostings},
     {"TestHeadTermMaxKeyBoundary", IndexAccessTests::TestHeadTermMaxKeyBoundary},
     {"TestTermMphfSameBaseCollision", IndexAccessTests::TestTermMphfSameBaseCollision},
+    {"TestTokenizerSnowballStemming", IndexAccessTests::TestTokenizerSnowballStemming},
 };

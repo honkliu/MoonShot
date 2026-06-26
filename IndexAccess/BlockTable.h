@@ -581,9 +581,10 @@ class IndexBlockTable
 
             const uint64_t bucket = TermMphfHash(term, termLength, m_TermMphfHeader.TMH_BucketSeed) % m_TermMphfHeader.TMH_BucketCount;
             const int64_t displacement = m_TermMphfDisplacements[static_cast<size_t>(bucket)];
-            if (displacement < 0) return false;
-
-            const uint64_t slot = TermMphfHash(term, termLength, TermMphfSlotSeed(m_TermMphfHeader.TMH_SlotSeed, static_cast<uint32_t>(displacement))) % m_TermMphfHeader.TMH_SlotCount;
+            const uint64_t slot = displacement < 0
+                ? static_cast<uint64_t>(-displacement - 1)
+                : TermMphfHash(term, termLength, TermMphfSlotSeed(m_TermMphfHeader.TMH_SlotSeed, static_cast<uint32_t>(displacement))) % m_TermMphfHeader.TMH_SlotCount;
+            if (slot >= m_TermMphfHeader.TMH_SlotCount) return false;
             const uint64_t entriesPerPage = PAGE_SIZE / sizeof(TermMphfEntry);
             const uint64_t pageId = slot / entriesPerPage;
             const uint64_t inPage = slot % entriesPerPage;

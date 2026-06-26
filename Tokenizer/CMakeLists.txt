@@ -1,6 +1,9 @@
 cmake_minimum_required(VERSION 3.10)
 
 find_package(ICU REQUIRED COMPONENTS uc i18n)
+find_path(LIBSTEMMER_INCLUDE_DIR libstemmer.h REQUIRED)
+find_library(LIBSTEMMER_LIBRARY_RELEASE NAMES stemmer PATHS "${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/lib" NO_DEFAULT_PATH REQUIRED)
+find_library(LIBSTEMMER_LIBRARY_DEBUG NAMES stemmer PATHS "${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/debug/lib" NO_DEFAULT_PATH REQUIRED)
 
 aux_source_directory(. SOURCEFILES)
 
@@ -9,6 +12,12 @@ add_library(Tokenizer ${SOURCEFILES})
 target_include_directories(Tokenizer PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
     $<BUILD_INTERFACE:${ICU_INCLUDE_DIRS}>
+    $<BUILD_INTERFACE:${LIBSTEMMER_INCLUDE_DIR}>
 )
 
-target_link_libraries(Tokenizer PUBLIC ICU::uc ICU::i18n)
+target_link_libraries(Tokenizer PUBLIC
+    ${ICU_UC_LIBRARY_RELEASE}
+    ${ICU_I18N_LIBRARY_RELEASE}
+    optimized ${LIBSTEMMER_LIBRARY_RELEASE}
+    debug ${LIBSTEMMER_LIBRARY_DEBUG}
+)

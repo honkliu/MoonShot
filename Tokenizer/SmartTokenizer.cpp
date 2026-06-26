@@ -1,5 +1,6 @@
 #include "Tokenizer.h"
 
+#include <libstemmer.h>
 #include <stdexcept>
 #include <unicode/normalizer2.h>
 #include <unicode/unistr.h>
@@ -7,6 +8,12 @@
 
 using namespace std;
 using namespace icu;
+
+struct StemmerDeleter {
+    void operator()(sb_stemmer* stemmer) const { sb_stemmer_delete(stemmer); }
+};
+
+using StemmerPtr = unique_ptr<sb_stemmer, StemmerDeleter>;
 
 static bool IsIndexableToken(const string& utf8)
 {
@@ -37,6 +44,35 @@ static bool IsIndexableToken(const string& utf8)
     }
 
     return true;
+}
+
+static bool IsAsciiLowerAlpha(const string& token)
+{
+    if (token.empty()) return false;
+    for (unsigned char ch : token) {
+        if (ch < 'a' || ch > 'z')
+            return false;
+    }
+    return true;
+}
+
+static string StemEnglishToken(const string& token)
+{
+    if (!IsAsciiLowerAlpha(token))
+        return token;
+
+    thread_local StemmerPtr stemmer(sb_stemmer_new("english", "UTF_8"));
+    if (!stemmer)
+        return token;
+
+    const auto* result = sb_stemmer_stem(
+        stemmer.get(),
+        reinterpret_cast<const sb_symbol*>(token.data()),
+        static_cast<int>(token.size()));
+    if (!result)
+        return token;
+
+    return string(reinterpret_cast<const char*>(result), static_cast<size_t>(sb_stemmer_length(stemmer.get())));
 }
 
 SmartTokenizer::SmartTokenizer(const Locale& locale)
@@ -84,6 +120,7 @@ vector<string> SmartTokenizer::Tokenize(const char* text)
 
             string utf8;
             word.toUTF8String(utf8);
+            utf8 = StemEnglishToken(utf8);
 
             if (IsIndexableToken(utf8))
                 tokens.push_back(move(utf8));

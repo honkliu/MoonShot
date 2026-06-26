@@ -258,6 +258,123 @@ private:
 };
 
 /*
+* WeakAndIndexReader — DAAT soft intersection.
+* Returns a document when at least m_MinShouldMatch children match it.
+*/
+class WeakAndIndexReader : public IndexReader {
+public:
+    WeakAndIndexReader(std::vector<std::shared_ptr<IndexReader>> children,
+                       uint32_t minShouldMatch)
+        : m_Children(std::move(children))
+        , m_MinShouldMatch(std::max<uint32_t>(1, minShouldMatch))
+    {
+        AlignToMatch();
+    }
+
+    void SetDebug(const char* label, int depth = 0) override
+    {
+        IndexReader::SetDebug(label, depth);
+        std::println("{}[WEAK-AND min={}]", std::string(depth * 2, ' '), m_MinShouldMatch);
+        for (auto& c : m_Children) c->SetDebug(label, depth + 1);
+    }
+
+    bool IsEnd() override { return m_CurrentDoc == NO_MORE_DOCS; }
+
+    uint64_t GetDocumentID() override { return m_CurrentDoc; }
+
+    uint32_t GetTermFreq() override
+    {
+        uint32_t total = 0;
+        for (auto& c : m_Children) {
+            if (!c->IsEnd() && c->GetDocumentID() == m_CurrentDoc)
+                total += c->GetTermFreq();
+        }
+        return total;
+    }
+
+    float GetScore(const DocDataEntry* entry) override
+    {
+        float total = 0.0f;
+        for (auto& c : m_Children) {
+            if (!c->IsEnd() && c->GetDocumentID() == m_CurrentDoc)
+                total += c->GetScore(entry);
+        }
+        return total;
+    }
+
+    uint8_t GetSourceMask() override
+    {
+        uint8_t sourceMask = 0;
+        for (auto& c : m_Children) {
+            if (!c->IsEnd() && c->GetDocumentID() == m_CurrentDoc)
+                sourceMask |= c->GetSourceMask();
+        }
+        return sourceMask;
+    }
+
+    void GoNext() override
+    {
+        if (IsEnd()) return;
+        for (auto& c : m_Children) {
+            if (!c->IsEnd() && c->GetDocumentID() == m_CurrentDoc)
+                c->GoNext();
+        }
+        AlignToMatch();
+    }
+
+    void GoUntil(uint64_t target, uint64_t limit = NO_MORE_DOCS) override
+    {
+        for (auto& c : m_Children) {
+            if (!c->IsEnd() && c->GetDocumentID() < target)
+                c->GoUntil(target, limit);
+        }
+        AlignToMatch();
+    }
+
+    void Close() override { for (auto& c : m_Children) c->Close(); }
+
+private:
+    std::vector<std::shared_ptr<IndexReader>> m_Children;
+    uint32_t m_MinShouldMatch = 1;
+    uint64_t m_CurrentDoc = NO_MORE_DOCS;
+
+    void AlignToMatch()
+    {
+        while (true) {
+            uint64_t doc = NO_MORE_DOCS;
+            for (auto& c : m_Children) {
+                if (!c->IsEnd())
+                    doc = std::min(doc, c->GetDocumentID());
+            }
+
+            if (doc == NO_MORE_DOCS) {
+                m_CurrentDoc = NO_MORE_DOCS;
+                return;
+            }
+
+            uint32_t matches = 0;
+            for (auto& c : m_Children) {
+                if (!c->IsEnd() && c->GetDocumentID() == doc)
+                    ++matches;
+            }
+
+            if (matches >= m_MinShouldMatch) {
+                m_CurrentDoc = doc;
+                if (m_debug)
+                    std::println("{}WEAK-AND match doc {} children={}",
+                                 std::string(m_debugDepth * 2, ' '), doc, matches);
+                return;
+            }
+
+            for (auto& c : m_Children) {
+                if (!c->IsEnd() && c->GetDocumentID() == doc)
+                    c->GoNext();
+            }
+        }
+    }
+};
+
+/*
 * NotIndexReader — base reader filtered by an exclusion reader.
 */
 class NotIndexReader : public IndexReader {

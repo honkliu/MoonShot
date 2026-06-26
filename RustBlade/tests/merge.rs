@@ -87,8 +87,11 @@ fn term_mphf_handles_same_bucket_same_base_terms() {
         let header = built.BBR_TermMphfHeader;
         let bucket = (TermMphfHash(term.as_bytes(), header.TMH_BucketSeed) % header.TMH_BucketCount as u64) as usize;
         let displacement = built.BBR_TermMphfDisplacements[bucket];
-        assert!(displacement >= 0);
-        let slot = (TermMphfHash(term.as_bytes(), TermMphfSlotSeed(header.TMH_SlotSeed, displacement as u32)) % header.TMH_SlotCount as u64) as usize;
+        let slot = if displacement < 0 {
+            (-(displacement as i64) - 1) as usize
+        } else {
+            (TermMphfHash(term.as_bytes(), TermMphfSlotSeed(header.TMH_SlotSeed, displacement as u32)) % header.TMH_SlotCount as u64) as usize
+        };
         assert!(!used[slot]);
         used[slot] = true;
 

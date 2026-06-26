@@ -99,9 +99,9 @@ static bool try_build_term_mphf(const std::vector<TermMphfBuildTerm>& terms,
                                 uint64_t fingerprintSeed)
 {
     const uint32_t termCount = static_cast<uint32_t>(terms.size());
-    const uint32_t bucketCount = next_power_of_two(std::max<uint32_t>(1, termCount / 4));
+    const uint32_t bucketCount = next_power_of_two(std::max<uint32_t>(1, termCount / 2));
     const uint32_t slotCount = termCount;
-    const uint32_t maxDisplacement = std::min<uint32_t>(1u << 20, std::max<uint32_t>(4096u, std::max<uint32_t>(1u, slotCount / 16)));
+    const uint32_t maxDisplacement = std::min<uint32_t>(1u << 20, std::max<uint32_t>(65536u, std::max<uint32_t>(1u, slotCount / 8)));
 
     std::vector<uint32_t> ids(termCount);
     for (uint32_t i = 0; i < termCount; ++i) ids[i] = i;
@@ -136,6 +136,8 @@ static bool try_build_term_mphf(const std::vector<TermMphfBuildTerm>& terms,
             displacements[bucket] = 0;
             continue;
         }
+        if (bucketTerms.size() == 1)
+            continue;
 
         bool placed = false;
         std::vector<uint32_t> candidateSlots(bucketTerms.size());
@@ -170,6 +172,28 @@ static bool try_build_term_mphf(const std::vector<TermMphfBuildTerm>& terms,
         if (!placed) {
             return false;
         }
+    }
+
+    std::vector<uint32_t> freeSlots;
+    freeSlots.reserve(slotCount);
+    for (uint32_t slot = 0; slot < slotCount; ++slot) {
+        if (!used[slot])
+            freeSlots.push_back(slot);
+    }
+    size_t nextFreeSlot = 0;
+    for (uint32_t bucket = 0; bucket < bucketCount; ++bucket) {
+        const auto& bucketTerms = buckets[bucket];
+        if (bucketTerms.size() != 1)
+            continue;
+        if (nextFreeSlot >= freeSlots.size())
+            return false;
+        const uint32_t slot = freeSlots[nextFreeSlot++];
+        const int64_t directDisplacement = -static_cast<int64_t>(slot) - 1;
+        if (directDisplacement < std::numeric_limits<int32_t>::min())
+            return false;
+        displacements[bucket] = static_cast<int32_t>(directDisplacement);
+        used[slot] = 1;
+        slots[bucketTerms[0]] = slot;
     }
 
     const uint32_t entriesPerPage = PAGE_SIZE / sizeof(TermMphfEntry);

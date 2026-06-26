@@ -147,9 +147,9 @@ fn TryBuildTermMphf(terms: &[TermMphfBuildTerm], bucket_seed: u64, slot_seed: u6
 {
     let term_count = terms.len() as u32;
     if term_count == 0 { return None; }
-    let bucket_count = next_power_of_two(std::cmp::max(1, term_count / 4));
+    let bucket_count = next_power_of_two(std::cmp::max(1, term_count / 2));
     let slot_count = term_count;
-    let max_displacement = std::cmp::min(1u32 << 20, std::cmp::max(4096u32, std::cmp::max(1u32, slot_count / 16)));
+    let max_displacement = std::cmp::min(1u32 << 20, std::cmp::max(65536u32, std::cmp::max(1u32, slot_count / 8)));
 
     let mut ids: Vec<usize> = (0..terms.len()).collect();
     ids.sort_by(|a, b| terms[*a].Term.cmp(&terms[*b].Term));
@@ -174,6 +174,9 @@ fn TryBuildTermMphf(terms: &[TermMphfBuildTerm], bucket_seed: u64, slot_seed: u6
         let bucket_terms = &buckets[bucket];
         if bucket_terms.is_empty() {
             displacements[bucket] = 0;
+            continue;
+        }
+        if bucket_terms.len() == 1 {
             continue;
         }
 
@@ -201,6 +204,25 @@ fn TryBuildTermMphf(terms: &[TermMphfBuildTerm], bucket_seed: u64, slot_seed: u6
         }
 
         if !placed { return None; }
+    }
+
+    let mut free_slots = Vec::with_capacity(slot_count as usize);
+    for slot in 0..slot_count {
+        if !used[slot as usize] {
+            free_slots.push(slot);
+        }
+    }
+    let mut next_free_slot = 0usize;
+    for (bucket, bucket_terms) in buckets.iter().enumerate() {
+        if bucket_terms.len() != 1 { continue; }
+        if next_free_slot >= free_slots.len() { return None; }
+        let slot = free_slots[next_free_slot];
+        next_free_slot += 1;
+        let direct_displacement = -(slot as i64) - 1;
+        if direct_displacement < i32::MIN as i64 { return None; }
+        displacements[bucket] = direct_displacement as i32;
+        used[slot as usize] = true;
+        slots[bucket_terms[0]] = slot;
     }
 
     let page_count = (slot_count as usize + (PAGE_SIZE / TERM_MPHF_ENTRY_SIZE) - 1) / (PAGE_SIZE / TERM_MPHF_ENTRY_SIZE);
