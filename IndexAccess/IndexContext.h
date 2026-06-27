@@ -841,10 +841,8 @@ public:
                 return;
             }
 
-            if (docdata_bytes > static_cast<uint64_t>(std::numeric_limits<int>::max())
-                || !indexFile.SetPosition(m_IndexFileHeader.IFH_DocDataOffset)
-                || indexFile.GetData(m_DocData, static_cast<int>(docdata_bytes)) != static_cast<int>(docdata_bytes))
-            {
+            if (!indexFile.SetPosition(m_IndexFileHeader.IFH_DocDataOffset)
+                || !ReadFileData(indexFile, m_DocData, docdata_bytes)) {
                 std::cerr << "Failed to read DocData for: " << m_IndexPath << "\n";
                 ResetLoadedRuntimeState();
                 return;
@@ -1517,7 +1515,6 @@ private:
     {
         FileAccess input(path.c_str());
         if (!input.Init()) return false;
-
         uint8_t buffer[PAGE_SIZE * 16];
         while (true) {
             const int bytes = input.GetData(buffer, static_cast<int>(sizeof(buffer)));
@@ -1525,6 +1522,20 @@ private:
             if (bytes == 0) return true;
             if (!output.PutData(buffer, static_cast<uint64_t>(bytes))) return false;
         }
+    }
+
+    static bool ReadFileData(FileAccess& input, void* buffer, uint64_t bytes)
+    {
+        auto* cursor = static_cast<uint8_t*>(buffer);
+        constexpr uint64_t READ_CHUNK_BYTES = 64ull * 1024ull * 1024ull;
+        while (bytes > 0) {
+            const int chunk = static_cast<int>(std::min<uint64_t>(bytes, READ_CHUNK_BYTES));
+            if (input.GetData(cursor, chunk) != chunk)
+                return false;
+            cursor += chunk;
+            bytes -= static_cast<uint64_t>(chunk);
+        }
+        return true;
     }
 
     /*
