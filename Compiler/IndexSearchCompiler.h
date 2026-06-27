@@ -10,6 +10,8 @@
 #include <vector>
 #include <algorithm>
 #include <cctype>
+#include <set>
+#include <unordered_set>
 
 /*
 * Compiles a query string into an EvalTree.
@@ -33,13 +35,14 @@ public:
 
     EvalTree* Compile(const char* queryString,
                       const char* streamSet = "AUT",
-                      IEmbeddingModel* embeddingModel = nullptr)
+                      IEmbeddingModel* embeddingModel = nullptr,
+                      QueryCompileMode mode = QueryCompileMode::Default)
     {
         if (!queryString || !*queryString)
             return new EvalTree{};
 
         auto streams = ParseStreamSet(streamSet);
-        auto root    = streams.empty() ? nullptr : ParseExpression(queryString, streams);
+        auto root    = streams.empty() ? nullptr : ParseExpression(queryString, streams, mode);
 
         auto tree  = new EvalTree();
         tree->root = root;
@@ -119,6 +122,51 @@ private:
         return token == "not" || token == "NOT" || token == "Not" || token == "nOT" || token == "-";
     }
 
+    static bool IsWeakAndStopword(const std::string& token)
+    {
+        static const std::unordered_set<std::string> stopwords = {
+            "a", "an", "and", "are", "as", "at", "be", "been", "by", "for", "from", "has", "have", "in",
+            "into", "is", "it", "its", "of", "on", "or", "that", "the", "their", "there", "these", "this",
+            "to", "was", "were", "with", "without", "can", "could", "may", "might", "must", "should", "than",
+            "then", "which", "while", "during", "between", "within", "using", "used", "use"
+        };
+        return stopwords.count(token) != 0;
+    }
+
+    static std::string QueryTermKey(const QueryTerm& term)
+    {
+        std::string key = term.term;
+        key.push_back('\x1e');
+        for (const auto& stream : term.streams) {
+            key += stream;
+            key.push_back(',');
+        }
+        return key;
+    }
+
+    static std::vector<QueryTerm> FilterWeakAndTerms(const std::vector<QueryTerm>& tokens)
+    {
+        std::vector<QueryTerm> filtered;
+        std::set<std::string> seen;
+        for (const auto& token : tokens) {
+            if (token.term.size() <= 1 || IsWeakAndStopword(token.term))
+                continue;
+            if (seen.insert(QueryTermKey(token)).second)
+                filtered.push_back(token);
+        }
+
+        if (!filtered.empty())
+            return filtered;
+
+        for (const auto& token : tokens) {
+            if (token.term.empty())
+                continue;
+            if (seen.insert(QueryTermKey(token)).second)
+                filtered.push_back(token);
+        }
+        return filtered;
+    }
+
     std::vector<std::string> SplitRawItems(const std::string& query)
     {
         std::vector<std::string> items;
@@ -194,6 +242,13 @@ private:
         return MakeTermGroup(term.term, term.streams, word_span);
     }
 
+    static uint32_t MinShouldMatch(size_t termCount)
+    {
+        if (termCount <= 2) return 1;
+        if (termCount <= 5) return 2;
+        return 3;
+    }
+
     /* AND of bigram groups for each adjacent token pair. */
     std::shared_ptr<EvalNode> BuildBigramQuery(
             const std::vector<QueryTerm>& terms)
@@ -221,9 +276,56 @@ private:
         return andNode;
     }
 
-        std::shared_ptr<EvalNode> BuildImplicitExpression(
-                const std::vector<QueryTerm>& tokens)
+    void AppendBigramGroups(const std::vector<QueryTerm>& terms,
+                            std::vector<std::shared_ptr<EvalNode>>& groups)
     {
+        if (terms.size() < 2)
+            return;
+
+        for (size_t i = 0; i + 1 < terms.size(); ++i) {
+            if (terms[i].streams != terms[i + 1].streams)
+                continue;
+
+            groups.push_back(MakeTermGroup(
+                terms[i].term + BIGRAM_SEP + terms[i + 1].term,
+                terms[i].streams,
+                /*word_span=*/2));
+        }
+    }
+
+    std::shared_ptr<EvalNode> BuildWeakAndExpression(
+            const std::vector<QueryTerm>& tokens)
+    {
+        auto terms = FilterWeakAndTerms(tokens);
+        if (terms.empty())
+            return nullptr;
+        if (terms.size() == 1)
+            return MakeTermGroup(terms[0]);
+
+        std::vector<std::shared_ptr<EvalNode>> groups;
+        groups.reserve(terms.size() * 2);
+        for (const auto& token : terms)
+            groups.push_back(MakeTermGroup(token));
+        AppendBigramGroups(terms, groups);
+
+        if (groups.size() == 1)
+            return groups[0];
+
+        auto weakAndNode = std::make_shared<WeakAndNode>();
+        weakAndNode->children = std::move(groups);
+        weakAndNode->min_should_match = std::min<uint32_t>(
+            MinShouldMatch(terms.size()),
+            static_cast<uint32_t>(weakAndNode->children.size()));
+        return weakAndNode;
+    }
+
+        std::shared_ptr<EvalNode> BuildImplicitExpression(
+                const std::vector<QueryTerm>& tokens,
+                QueryCompileMode mode = QueryCompileMode::Default)
+    {
+        if (mode == QueryCompileMode::WeakAnd)
+            return BuildWeakAndExpression(tokens);
+
             std::shared_ptr<EvalNode> unigramBase;
         if (tokens.empty()) {
             return nullptr;
@@ -248,22 +350,24 @@ private:
 
         std::shared_ptr<EvalNode> BuildMinusExpression(
                 const std::vector<QueryTerm>& positive,
-                const std::vector<QueryTerm>& negative)
+                const std::vector<QueryTerm>& negative,
+                QueryCompileMode mode = QueryCompileMode::Default)
         {
                 if (negative.empty())
-                    return BuildImplicitExpression(positive);
+                    return BuildImplicitExpression(positive, mode);
                 if (positive.empty())
                     return nullptr;
 
             auto notNode = std::make_shared<NotNode>();
-                notNode->base = BuildImplicitExpression(positive);
-                notNode->exclude = BuildImplicitExpression(negative);
+                notNode->base = BuildImplicitExpression(positive, mode);
+                notNode->exclude = BuildImplicitExpression(negative, mode);
             return notNode;
         }
 
     std::shared_ptr<EvalNode> ParseExpression(
             const std::string&              query,
-            const std::vector<std::string>& streams)
+            const std::vector<std::string>& streams,
+            QueryCompileMode                mode = QueryCompileMode::Default)
     {
         std::vector<std::shared_ptr<EvalNode>> disjuncts;
         std::vector<QueryTerm> positive;
@@ -274,7 +378,7 @@ private:
         for (const auto& raw : SplitRawItems(query)) {
             if (IsOrToken(raw)) {
                 if (!positive.empty() || !negative.empty()) {
-                    if (auto node = BuildMinusExpression(positive, negative))
+                    if (auto node = BuildMinusExpression(positive, negative, mode))
                         disjuncts.push_back(node);
                     positive.clear();
                     negative.clear();
@@ -292,10 +396,10 @@ private:
         if (!sawAnyTerm) return nullptr;
 
         if (disjuncts.empty())
-            return BuildMinusExpression(positive, negative);
+            return BuildMinusExpression(positive, negative, mode);
 
         if (!positive.empty() || !negative.empty()) {
-            if (auto node = BuildMinusExpression(positive, negative))
+            if (auto node = BuildMinusExpression(positive, negative, mode))
                 disjuncts.push_back(node);
         }
 

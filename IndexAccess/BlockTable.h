@@ -331,6 +331,11 @@ class IndexBlockTable
             m_TermMphfEntryPageCount = entryPageCount;
         }
 
+        void SetTermMphfEnabled(bool enabled)
+        {
+            m_TermMphfEnabled = enabled;
+        }
+
         void HandOverBlockTable(IndexBlockTable& source)
         {
             if (this == &source) return;
@@ -557,6 +562,7 @@ class IndexBlockTable
         uint32_t                                m_TermMphfDisplacementCount = 0;
         uint8_t*                                m_TermMphfEntryPages = nullptr;
         uint32_t                                m_TermMphfEntryPageCount = 0;
+        bool                                    m_TermMphfEnabled = true;
 
         /* Level-1: fixed directory — (HTE_FirstTerm → HTE_LeafTermBlockID), sorted by HTE_FirstTerm */
         std::unique_ptr<HeadTermEntry[]>         m_HeadTermEntries;
@@ -667,6 +673,7 @@ class IndexBlockTable
         {
             return m_TermMphfEntryPages
                 && m_TermMphfDisplacements
+                && m_TermMphfEnabled
                 && m_TermMphfHeader.TMH_Magic == TERM_MPHF_MAGIC
                 && m_TermMphfHeader.TMH_TermCount > 0
                 && m_TermMphfHeader.TMH_BucketCount > 0

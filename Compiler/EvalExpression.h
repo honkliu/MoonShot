@@ -5,8 +5,10 @@
 #include <vector>
 #include <memory>
 #include <cstddef>
+#include <cstdint>
 
-enum class NodeType { Term, And, Or, Not };
+enum class NodeType { Term, And, Or, Not, WeakAnd };
+enum class QueryCompileMode { Default, WeakAnd };
 
 /*
 * Bigram separator — mirrors REF's CreateBigramString().
@@ -46,6 +48,12 @@ struct AndNode : EvalNode {
 struct OrNode : EvalNode {
     std::vector<std::shared_ptr<EvalNode>> children;
     NodeType GetType() const override { return NodeType::Or; }
+};
+
+struct WeakAndNode : EvalNode {
+    std::vector<std::shared_ptr<EvalNode>> children;
+    uint32_t min_should_match = 1;
+    NodeType GetType() const override { return NodeType::WeakAnd; }
 };
 
 struct NotNode : EvalNode {

@@ -738,9 +738,12 @@ struct BeirEvalOptions {
     std::string dataPath;
     std::string qrels = "test";
     std::string streams = "TB";
-    std::string mode = "bow";
+    std::string mode = "weakand";
     std::vector<int> at = {10, 100, 1000};
     uint64_t limit = 0;
+    bool noMphf = false;
+    uint64_t leafCacheMb = 0;
+    bool leafCacheMatchMphf = false;
 };
 
 static bool ParseBatchSize(const std::string& text, uint64_t& batchSize)
@@ -927,6 +930,13 @@ static bool ParseBeirEvalOptions(const std::vector<std::string>& args,
             if (i + 1 >= args.size()) { error = "Usage: moon -beir-eval -mode bow|weakand|compile"; return false; }
             options.mode = args[++i];
             if (options.mode != "bow" && options.mode != "weakand" && options.mode != "compile") { error = "-mode must be bow, weakand, or compile"; return false; }
+        } else if (arg == "-no-mphf") {
+            options.noMphf = true;
+        } else if (arg == "-leaf-cache-mb") {
+            if (i + 1 >= args.size()) { error = "Usage: moon -beir-eval -leaf-cache-mb N"; return false; }
+            if (!ParseUInt64(args[++i], options.leafCacheMb) || options.leafCacheMb == 0) { error = "-leaf-cache-mb must be a positive integer"; return false; }
+        } else if (arg == "-leaf-cache-match-mphf") {
+            options.leafCacheMatchMphf = true;
         } else if (arg == "-limit") {
             if (i + 1 >= args.size()) { error = "Usage: moon -beir-eval -limit N"; return false; }
             if (!ParseUInt64(args[++i], options.limit)) { error = "-limit must be a non-negative integer"; return false; }
@@ -987,9 +997,9 @@ static void PrintHelp(const std::string& idxPath)
         << "BEIR recall evaluation:\n"
         << "  moon [-idx <index>] -beir-build -data <beir-dir> [-limit N]\n"
         << "      Build an index from BEIR corpus.jsonl. Stored doc paths are BEIR ids.\n\n"
-        << "  moon [-idx <index>] -beir-eval -data <beir-dir> [-qrels test] [-k 10,100,1000] [-streams TB] [-mode bow|weakand|compile] [-limit N]\n"
+        << "  moon [-idx <index>] -beir-eval -data <beir-dir> [-qrels test] [-k 10,100,1000] [-streams TB] [-mode bow|weakand|compile] [-no-mphf] [-leaf-cache-mb N] [-leaf-cache-match-mphf] [-limit N]\n"
         << "      Evaluate Recall@k from BEIR queries.jsonl and qrels/<split>.tsv.\n"
-        << "      Default mode is bow. weakand requires multiple unigram/bigram evidence hits.\n\n"
+        << "      Default mode is weakand. bow is kept as a recall-ceiling baseline.\n\n"
         << "Examples:\n"
         << "  moon -idx .\\notes.idx -dir .\\docs -ext md,txt -r\n"
         << "  moon -idx .\\notes.idx -i\n"
@@ -1232,70 +1242,39 @@ static std::shared_ptr<IndexReader> BuildBeirBowReader(IndexContext& ctx,
     return ctx.GetReader(&tree);
 }
 
-static uint32_t BeirMinShouldMatch(size_t termCount)
-{
-    if (termCount <= 2) return 1;
-    if (termCount <= 5) return 2;
-    return 3;
-}
-
-static std::shared_ptr<IndexReader> BuildBeirWeakAndReader(IndexContext& ctx,
-                                                           SmartTokenizer& tokenizer,
-                                                           const std::string& query,
-                                                           const std::string& streamSet)
-{
-    const auto streams = ParseBeirStreams(streamSet);
-    const auto tokens = tokenizer.Tokenize(query.c_str());
-    std::vector<std::string> terms;
-    std::set<std::string> seenTerms;
-    for (const auto& token : tokens) {
-        if (token.size() <= 1 || IsBeirStopword(token))
-            continue;
-        if (seenTerms.insert(token).second)
-            terms.push_back(token);
-    }
-
-    if (terms.empty()) {
-        for (const auto& token : tokens) {
-            if (token.empty()) continue;
-            if (seenTerms.insert(token).second)
-                terms.push_back(token);
-        }
-    }
-    if (terms.empty())
-        return nullptr;
-
-    std::vector<std::shared_ptr<IndexReader>> children;
-    std::set<std::string> streamKeys;
-    for (const auto& term : terms) {
-        for (const auto& stream : streams)
-            streamKeys.insert(term + stream);
-    }
-    for (size_t i = 0; i + 1 < terms.size(); ++i) {
-        const std::string bigram = terms[i] + BIGRAM_SEP + terms[i + 1];
-        for (const auto& stream : streams)
-            streamKeys.insert(bigram + stream);
-    }
-
-    for (const auto& key : streamKeys) {
-        auto reader = ctx.GetStreamReader(key.c_str());
-        if (reader && !reader->IsEnd())
-            children.push_back(std::move(reader));
-    }
-    if (children.empty())
-        return nullptr;
-
-    const uint32_t minShouldMatch = std::min<uint32_t>(
-        BeirMinShouldMatch(terms.size()),
-        static_cast<uint32_t>(children.size()));
-    return std::make_shared<WeakAndIndexReader>(std::move(children), minShouldMatch);
-}
-
 static std::string ResolveBeirQrelsPath(const BeirEvalOptions& options)
 {
     if (std::filesystem::is_regular_file(FsPathFromUtf8(options.qrels)))
         return options.qrels;
     return BeirFilePath(options.dataPath, "qrels/" + options.qrels + ".tsv");
+}
+
+static bool ReadIndexHeaderOnly(const std::string& idxPath, IndexFileHeader& header)
+{
+    std::ifstream input(FsPathFromUtf8(idxPath), std::ios::binary);
+    if (!input) return false;
+    input.read(reinterpret_cast<char*>(&header), sizeof(header));
+    return input.good()
+        && std::memcmp(header.IFH_Magic, INDEX_FILE_MAGIC, sizeof(INDEX_FILE_MAGIC)) == 0
+        && header.IFH_Version == INDEX_FORMAT_VERSION;
+}
+
+static uint64_t BeirEvalLeafCacheBytes(const std::string& idxPath, const BeirEvalOptions& options)
+{
+    if (options.leafCacheMb > 0)
+        return options.leafCacheMb * 1024ull * 1024ull;
+
+    if (!options.leafCacheMatchMphf)
+        return 0;
+
+    IndexFileHeader header{};
+    if (!ReadIndexHeaderOnly(idxPath, header))
+        return 0;
+
+    const uint64_t mphfBytes = header.IFH_TermMphfHeaderCount * sizeof(TermMphfHeader)
+        + header.IFH_TermMphfDisplacementCount * sizeof(int32_t)
+        + header.IFH_TermMphfEntryPageCount * sizeof(IndexBlock);
+    return LEAF_TERM_CACHE_BYTES + mphfBytes;
 }
 
 static int RunBeirBuild(const std::string& idxPath, const BeirBuildOptions& options)
@@ -1378,7 +1357,12 @@ static int RunBeirEval(const std::string& idxPath, const BeirEvalOptions& option
         return 1;
     }
 
-    IndexContext ctx("", idxPath.c_str(), false);
+    const uint64_t leafCacheBytes = BeirEvalLeafCacheBytes(idxPath, options);
+    IndexContext ctx("", "", false);
+    if (leafCacheBytes > 0)
+        ctx.SetLeafTermCacheBytes(leafCacheBytes);
+    ctx.LoadIndex(idxPath.c_str());
+    ctx.SetTermMphfEnabled(!options.noMphf);
     std::unique_ptr<IndexSearchExecutor> executor(ctx.GetExecutor());
     SmartTokenizer beirTokenizer;
     const int maxK = *std::max_element(options.at.begin(), options.at.end());
@@ -1406,7 +1390,7 @@ static int RunBeirEval(const std::string& idxPath, const BeirEvalOptions& option
         if (options.mode == "bow") {
             reader = BuildBeirBowReader(ctx, beirTokenizer, query, options.streams);
         } else if (options.mode == "weakand") {
-            reader = BuildBeirWeakAndReader(ctx, beirTokenizer, query, options.streams);
+            reader = ctx.GetReader(query.c_str(), options.streams.c_str(), QueryCompileMode::WeakAnd);
         } else {
             reader = ctx.GetReader(query.c_str(), options.streams.c_str());
         }
@@ -1451,6 +1435,8 @@ static int RunBeirEval(const std::string& idxPath, const BeirEvalOptions& option
               << " qrels=" << qrelsPath
               << " streams=" << options.streams
               << " mode=" << options.mode
+              << " mphf=" << (options.noMphf ? "off" : "on")
+              << " leaf_cache_mb=" << (leafCacheBytes ? (leafCacheBytes / (1024ull * 1024ull)) : (LEAF_TERM_CACHE_BYTES / (1024ull * 1024ull)))
               << " queries=" << evaluated
               << " missing_qrels=" << missingQrels
               << " elapsed_ms=" << elapsedMs << "\n";

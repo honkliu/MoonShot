@@ -207,16 +207,18 @@ public:
     IndexSearchExecutor* GetExecutor()  { return new IndexSearchExecutor(this); }
 
     EvalTree* Compile(const char* queryString,
-                      const char* streamSet = "AUT")
+                      const char* streamSet = "AUT",
+                      QueryCompileMode mode = QueryCompileMode::Default)
     {
-        return m_Compiler.Compile(queryString, streamSet, m_VectorIndex.GetModel());
+        return m_Compiler.Compile(queryString, streamSet, m_VectorIndex.GetModel(), mode);
     }
 
     /* Compile query string and return an ISR tree ready for traversal. */
     shared_ptr<IndexReader> GetReader(const char* queryString,
-                                      const char* streamSet = "AUT")
+                                      const char* streamSet = "AUT",
+                                      QueryCompileMode mode = QueryCompileMode::Default)
     {
-        auto tree = std::unique_ptr<EvalTree>(Compile(queryString, streamSet));
+        auto tree = std::unique_ptr<EvalTree>(Compile(queryString, streamSet, mode));
         return GetReader(tree.get());
     }
 
@@ -264,6 +266,20 @@ public:
 
     const IndexFileHeader& GetIndexFileHeader() const { return m_IndexFileHeader; }
     uint64_t DocumentCount() const { return m_IndexFileHeader.IFH_NumDocuments; }
+
+    void SetTermMphfEnabled(bool enabled)
+    {
+        m_BlockTable.SetTermMphfEnabled(enabled);
+        if (m_DeltaContext)
+            m_DeltaContext->SetTermMphfEnabled(enabled);
+    }
+
+    void SetLeafTermCacheBytes(uint64_t bytes)
+    {
+        m_LeafTermCacheBytes = bytes > 0 ? bytes : LEAF_TERM_CACHE_BYTES;
+        if (m_DeltaContext)
+            m_DeltaContext->SetLeafTermCacheBytes(bytes);
+    }
 
     std::vector<float> CompileToVector(const char* queryString)
     {
@@ -725,7 +741,7 @@ public:
         const uint32_t mphfDisplacementCount = static_cast<uint32_t>(m_IndexFileHeader.IFH_TermMphfDisplacementCount);
         const uint32_t mphfEntryPageCount = static_cast<uint32_t>(m_IndexFileHeader.IFH_TermMphfEntryPageCount);
         const uint32_t indexBlockLoadCount = std::min(indexBlockCount, INDEX_BLOCK_CACHE_SLOT_COUNT);
-        const uint32_t leafTermBlockLoadCount = std::min(leafTermBlockCount, LEAF_TERM_BLOCK_CACHE_SLOT_COUNT);
+        const uint32_t leafTermBlockLoadCount = std::min(leafTermBlockCount, LeafTermBlockCacheSlotCount());
 
         auto* indexBlocks = m_BlockTable.Init(BlockKind::Index, m_IndexPath.c_str(),
                   m_IndexFileHeader.IFH_IndexBlockOffset, indexBlockCount, indexBlockLoadCount);
@@ -887,11 +903,18 @@ private:
     IndexFileHeader              m_WriteIndexFileHeader{};
     uint8_t*                     m_WriteDocData = nullptr;
     bool                         m_WriteBuilt = false;
+    uint64_t                     m_LeafTermCacheBytes = LEAF_TERM_CACHE_BYTES;
 
     static constexpr uint32_t INDEX_BLOCK_CACHE_SLOT_COUNT =
         static_cast<uint32_t>(INDEX_BLOCK_CACHE_BYTES / sizeof(IndexBlock));
     static constexpr uint32_t LEAF_TERM_BLOCK_CACHE_SLOT_COUNT =
         static_cast<uint32_t>(LEAF_TERM_CACHE_BYTES / sizeof(LeafTermBlock));
+
+    uint32_t LeafTermBlockCacheSlotCount() const
+    {
+        const uint64_t slots = m_LeafTermCacheBytes / sizeof(LeafTermBlock);
+        return static_cast<uint32_t>(std::min<uint64_t>(slots, UINT32_MAX));
+    }
 
     void ClearDocDataOnly(uint8_t*& docData, FreshDiskAnnVectorIndex& vectorIndex)
     {
@@ -1603,6 +1626,24 @@ private:
                 return children[0];
 
             return make_shared<OrIndexReader>(std::move(children));
+        }
+
+        case NodeType::WeakAnd: {
+            auto* weakAndNode = static_cast<WeakAndNode*>(node.get());
+            std::vector<shared_ptr<IndexReader>> children;
+
+            for (auto& child : weakAndNode->children)
+                children.push_back(BuildIndexReader(child));
+
+            if (children.empty()) {
+                auto empty = make_shared<AdvancedIndexReader>();
+                return empty;
+            }
+
+            if (children.size() == 1)
+                return children[0];
+
+            return make_shared<WeakAndIndexReader>(std::move(children), weakAndNode->min_should_match);
         }
 
         case NodeType::Not: {
