@@ -739,6 +739,7 @@ struct BeirEvalOptions {
     std::string qrels = "test";
     std::string streams = "TB";
     std::string mode = "weakand";
+    std::string weakAndShape = "flat";
     std::vector<int> at = {10, 100, 1000};
     uint64_t limit = 0;
     bool noMphf = false;
@@ -927,9 +928,13 @@ static bool ParseBeirEvalOptions(const std::vector<std::string>& args,
             if (i + 1 >= args.size()) { error = "Usage: moon -beir-eval -streams TB"; return false; }
             options.streams = args[++i];
         } else if (arg == "-mode") {
-            if (i + 1 >= args.size()) { error = "Usage: moon -beir-eval -mode bow|weakand|compile"; return false; }
+            if (i + 1 >= args.size()) { error = "Usage: moon -beir-eval -mode bow|weakand|weakand2phase|compile"; return false; }
             options.mode = args[++i];
-            if (options.mode != "bow" && options.mode != "weakand" && options.mode != "compile") { error = "-mode must be bow, weakand, or compile"; return false; }
+            if (options.mode != "bow" && options.mode != "weakand" && options.mode != "weakand2phase" && options.mode != "compile") { error = "-mode must be bow, weakand, weakand2phase, or compile"; return false; }
+        } else if (arg == "-weakand-shape") {
+            if (i + 1 >= args.size()) { error = "Usage: moon -beir-eval -weakand-shape flat|or|or-prune"; return false; }
+            options.weakAndShape = args[++i];
+            if (options.weakAndShape != "flat" && options.weakAndShape != "or" && options.weakAndShape != "or-prune") { error = "-weakand-shape must be flat, or, or-prune"; return false; }
         } else if (arg == "-no-mphf") {
             options.noMphf = true;
         } else if (arg == "-leaf-cache-mb") {
@@ -997,7 +1002,7 @@ static void PrintHelp(const std::string& idxPath)
         << "BEIR recall evaluation:\n"
         << "  moon [-idx <index>] -beir-build -data <beir-dir> [-limit N]\n"
         << "      Build an index from BEIR corpus.jsonl. Stored doc paths are BEIR ids.\n\n"
-        << "  moon [-idx <index>] -beir-eval -data <beir-dir> [-qrels test] [-k 10,100,1000] [-streams TB] [-mode bow|weakand|compile] [-no-mphf] [-leaf-cache-mb N] [-leaf-cache-match-mphf] [-limit N]\n"
+        << "  moon [-idx <index>] -beir-eval -data <beir-dir> [-qrels test] [-k 10,100,1000] [-streams TB] [-mode bow|weakand|weakand2phase|compile] [-weakand-shape flat|or|or-prune] [-no-mphf] [-leaf-cache-mb N] [-leaf-cache-match-mphf] [-limit N]\n"
         << "      Evaluate Recall@k from BEIR queries.jsonl and qrels/<split>.tsv.\n"
         << "      Default mode is weakand. bow is kept as a recall-ceiling baseline.\n\n"
         << "Examples:\n"
@@ -1363,6 +1368,12 @@ static int RunBeirEval(const std::string& idxPath, const BeirEvalOptions& option
         ctx.SetLeafTermCacheBytes(leafCacheBytes);
     ctx.LoadIndex(idxPath.c_str());
     ctx.SetTermMphfEnabled(!options.noMphf);
+    WeakAndBuildMode weakAndBuildMode = WeakAndBuildMode::FlatPruned;
+    if (options.weakAndShape == "or")
+        weakAndBuildMode = WeakAndBuildMode::OrChildren;
+    else if (options.weakAndShape == "or-prune")
+        weakAndBuildMode = WeakAndBuildMode::OrChildrenPruned;
+    ctx.SetWeakAndBuildMode(weakAndBuildMode);
     std::unique_ptr<IndexSearchExecutor> executor(ctx.GetExecutor());
     SmartTokenizer beirTokenizer;
     const int maxK = *std::max_element(options.at.begin(), options.at.end());
@@ -1391,6 +1402,66 @@ static int RunBeirEval(const std::string& idxPath, const BeirEvalOptions& option
             reader = BuildBeirBowReader(ctx, beirTokenizer, query, options.streams);
         } else if (options.mode == "weakand") {
             reader = ctx.GetReader(query.c_str(), options.streams.c_str(), QueryCompileMode::WeakAnd);
+        } else if (options.mode == "weakand2phase") {
+            auto titleReader = ctx.GetReader(query.c_str(), "T", QueryCompileMode::WeakAnd);
+            auto bodyReader = ctx.GetReader(query.c_str(), "B", QueryCompileMode::WeakAnd);
+            auto titleResults = executor->Execute(titleReader, maxK);
+            auto bodyResults = executor->Execute(bodyReader, maxK);
+            std::unordered_map<uint64_t, SearchResult> merged;
+            for (const auto& result : titleResults) {
+                merged[ReaderDocumentIDValue(result.doc_id)] = result;
+            }
+            for (const auto& result : bodyResults) {
+                const uint64_t docId = ReaderDocumentIDValue(result.doc_id);
+                auto it = merged.find(docId);
+                if (it == merged.end()) {
+                    merged.emplace(docId, result);
+                    continue;
+                }
+                auto& slot = it->second;
+                if (slot.score < result.score)
+                    slot.score = result.score;
+                slot.doc_id = MakeReaderDocumentID(docId, ReaderDocumentIDSourceMask(slot.doc_id) | ReaderDocumentIDSourceMask(result.doc_id));
+            }
+            auto results = std::vector<SearchResult>{};
+            results.reserve(merged.size());
+            for (auto& [_, result] : merged)
+                results.push_back(std::move(result));
+            std::sort(results.begin(), results.end(), [](const SearchResult& a, const SearchResult& b) {
+                if (a.score != b.score)
+                    return a.score > b.score;
+                return ReaderDocumentIDValue(a.doc_id) < ReaderDocumentIDValue(b.doc_id);
+            });
+            if (results.size() > static_cast<size_t>(maxK))
+                results.resize(static_cast<size_t>(maxK));
+
+            std::vector<uint64_t> cumulativeHits(options.at.size(), 0);
+            uint64_t hitCount = 0;
+            size_t nextAt = 0;
+            for (size_t rank = 0; rank < results.size(); ++rank) {
+                const std::string docIdText = ctx.GetDocPath(results[rank].doc_id);
+                if (qrelIt->second.count(docIdText))
+                    ++hitCount;
+                while (nextAt < options.at.size() && rank + 1 == static_cast<size_t>(options.at[nextAt])) {
+                    cumulativeHits[nextAt] = hitCount;
+                    ++nextAt;
+                }
+            }
+            while (nextAt < options.at.size()) {
+                cumulativeHits[nextAt] = hitCount;
+                ++nextAt;
+            }
+
+            const uint64_t relevantCount = static_cast<uint64_t>(qrelIt->second.size());
+            microRelevant += relevantCount;
+            for (size_t i = 0; i < options.at.size(); ++i) {
+                macroRecall[i] += static_cast<double>(cumulativeHits[i]) / static_cast<double>(relevantCount);
+                microHits[i] += cumulativeHits[i];
+            }
+            ++evaluated;
+            if (evaluated % 100 == 0)
+                std::cout << "  BEIR evaluated " << evaluated << " queries\n";
+            continue;
         } else {
             reader = ctx.GetReader(query.c_str(), options.streams.c_str());
         }
@@ -1435,6 +1506,7 @@ static int RunBeirEval(const std::string& idxPath, const BeirEvalOptions& option
               << " qrels=" << qrelsPath
               << " streams=" << options.streams
               << " mode=" << options.mode
+              << " weakand_shape=" << options.weakAndShape
               << " mphf=" << (options.noMphf ? "off" : "on")
               << " leaf_cache_mb=" << (leafCacheBytes ? (leafCacheBytes / (1024ull * 1024ull)) : (LEAF_TERM_CACHE_BYTES / (1024ull * 1024ull)))
               << " queries=" << evaluated

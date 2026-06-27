@@ -24,6 +24,9 @@ void AdvancedIndexReader::Open(const char*      streamKey,
     m_BlockTable      = blockTable;
     m_Context         = context;
     m_DocFreq         = 0;
+    m_Idf             = 0.0f;
+    m_Bm25LengthBias  = 0.0f;
+    m_Bm25LengthScale = 0.0f;
     m_BlockSeqNumber  = 0;
     m_BlockSlotNumber = UINT32_MAX;
     m_RemainingContinuationBlocks = 0;
@@ -35,6 +38,20 @@ void AdvancedIndexReader::Open(const char*      streamKey,
                                             &indexLength,      &m_DocFreq,
                                             &m_RemainingContinuationBlocks);
     if (found) {
+        static constexpr float K1 = 1.2f;
+        static constexpr float B = 0.75f;
+
+        const IndexFileHeader& header = m_Context->GetIndexFileHeader();
+        assert(header.IFH_NumDocuments > 0);
+        assert(header.IFH_AvgDocLength > 0.0f);
+
+        const float totalDocs = static_cast<float>(header.IFH_NumDocuments);
+        const float df = static_cast<float>(std::max(1u, m_DocFreq));
+        m_Idf = std::max(0.0f,
+            std::log((totalDocs - df + 0.5f) / (df + 0.5f) + 1.0f));
+        m_Bm25LengthBias = K1 * (1.0f - B);
+        m_Bm25LengthScale = K1 * B / header.IFH_AvgDocLength;
+
         IndexBlock* block = reinterpret_cast<IndexBlock*>(
             m_BlockTable->GetBlock(BlockKind::Index, m_BlockSeqNumber, &m_BlockSlotNumber));
         assert(block);
@@ -107,31 +124,17 @@ uint32_t AdvancedIndexReader::GetTermFreq() {
 }
 float AdvancedIndexReader::GetScore(const DocDataEntry* entry) {
     assert(entry);
-    assert(m_Context);
     const uint32_t docLength = entry->DDE_DocLength;
     assert(docLength > 0);
 
     const float tf = static_cast<float>(GetTermFreq());
-    const float df = static_cast<float>(std::max(1u, m_DocFreq));
-
-    const IndexFileHeader& header = m_Context->GetIndexFileHeader();
-    const uint64_t documentCount = header.IFH_NumDocuments;
-    const float averageDocLength = header.IFH_AvgDocLength;
-    assert(documentCount > 0);
-    assert(averageDocLength > 0.0f);
-    const float totalDocs = static_cast<float>(documentCount);
-
     const float dl = static_cast<float>(std::max(1u, docLength));
-    
-    static constexpr float K1 = 1.2f;
-    static constexpr float B = 0.75f;
 
-    const float idf = std::max(0.0f,
-        std::log((totalDocs - df + 0.5f) / (df + 0.5f) + 1.0f));
-    const float tfNorm = tf * (K1 + 1.0f) /
-        (tf + K1 * (1.0f - B + B * dl / averageDocLength));
+    static constexpr float K1PlusOne = 2.2f;
+    const float tfNorm = tf * K1PlusOne /
+        (tf + m_Bm25LengthBias + m_Bm25LengthScale * dl);
 
-    return idf * tfNorm;
+    return m_Idf * tfNorm;
 }
 void AdvancedIndexReader::Close() {
     if (m_BlockTable && m_BlockSlotNumber != UINT32_MAX)

@@ -16,6 +16,12 @@ std::vector<SearchResult> IndexSearchExecutor::Execute(std::shared_ptr<IndexRead
         return {};
 
     std::vector<SearchResult> results;
+    const bool boundedTopK = topK > 0;
+    const size_t heapLimit = boundedTopK ? static_cast<size_t>(topK) : 0;
+
+    auto worseScoreFirst = [](const SearchResult& a, const SearchResult& b) {
+        return a.score > b.score;
+    };
 
     while (!reader->IsEnd()) {
         uint64_t docId     = reader->GetDocumentID();
@@ -25,7 +31,17 @@ std::vector<SearchResult> IndexSearchExecutor::Execute(std::shared_ptr<IndexRead
         float    score     = reader->GetScore(entry)
                    + entry->DDE_StaticRank;
 
-        results.push_back({MakeReaderDocumentID(docId, reader->GetSourceMask()), score, ""});
+        SearchResult result{MakeReaderDocumentID(docId, reader->GetSourceMask()), score, ""};
+        if (!boundedTopK) {
+            results.push_back(std::move(result));
+        } else if (results.size() < heapLimit) {
+            results.push_back(std::move(result));
+            std::push_heap(results.begin(), results.end(), worseScoreFirst);
+        } else if (score > results.front().score) {
+            std::pop_heap(results.begin(), results.end(), worseScoreFirst);
+            results.back() = std::move(result);
+            std::push_heap(results.begin(), results.end(), worseScoreFirst);
+        }
         reader->GoNext();
     }
 

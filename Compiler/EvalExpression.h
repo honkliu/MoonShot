@@ -9,6 +9,7 @@
 
 enum class NodeType { Term, And, Or, Not, WeakAnd };
 enum class QueryCompileMode { Default, WeakAnd };
+enum class WeakAndBuildMode { FlatPruned, OrChildren, OrChildrenPruned };
 
 /*
 * Bigram separator — mirrors REF's CreateBigramString().

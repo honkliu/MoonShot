@@ -161,7 +161,10 @@ class OrIndexReader : public IndexReader {
 public:
     explicit OrIndexReader(std::vector<std::shared_ptr<IndexReader>> children)
         : m_Children(std::move(children))
-    {}
+    {
+        InitializeChildDocs();
+        RefreshCurrentDoc();
+    }
 
     void SetDebug(const char* label, int depth = 0) override
     {
@@ -172,60 +175,40 @@ public:
 
     bool IsEnd() override
     {
-        for (auto& c : m_Children) {
-            if (!c->IsEnd())
-                return false;
-        }
-        return true;
+        return m_CurrentDoc == NO_MORE_DOCS;
     }
 
     uint64_t GetDocumentID() override
     {
-        uint64_t minDoc = NO_MORE_DOCS;
-
-        for (auto& c : m_Children) {
-            if (!c->IsEnd())
-                minDoc = std::min(minDoc, c->GetDocumentID());
-        }
-
-        return minDoc;
+        return m_CurrentDoc;
     }
 
     uint32_t GetTermFreq() override
     {
-        uint64_t doc   = GetDocumentID();
         uint32_t total = 0;
 
-        for (auto& c : m_Children) {
-            if (!c->IsEnd() && c->GetDocumentID() == doc)
-                total += c->GetTermFreq();
-        }
+        for (const size_t childIndex : m_MatchingChildren)
+            total += m_Children[childIndex]->GetTermFreq();
 
         return total;
     }
 
     float GetScore(const DocDataEntry* entry) override
     {
-        uint64_t doc   = GetDocumentID();
         float    total = 0.0f;
 
-        for (auto& c : m_Children) {
-            if (!c->IsEnd() && c->GetDocumentID() == doc)
-                total += c->GetScore(entry);
-        }
+        for (const size_t childIndex : m_MatchingChildren)
+            total += m_Children[childIndex]->GetScore(entry);
 
         return total;
     }
 
     uint8_t GetSourceMask() override
     {
-        uint64_t doc = GetDocumentID();
         uint8_t sourceMask = 0;
 
-        for (auto& c : m_Children) {
-            if (!c->IsEnd() && c->GetDocumentID() == doc)
-                sourceMask |= c->GetSourceMask();
-        }
+        for (const size_t childIndex : m_MatchingChildren)
+            sourceMask |= m_Children[childIndex]->GetSourceMask();
 
         return sourceMask;
     }
@@ -235,26 +218,60 @@ public:
         if (IsEnd())
             return;
 
-        uint64_t doc = GetDocumentID();
-
-        for (auto& c : m_Children) {
-            if (!c->IsEnd() && c->GetDocumentID() == doc)
-                c->GoNext();
+        for (const size_t childIndex : m_MatchingChildren) {
+            m_Children[childIndex]->GoNext();
+            UpdateChildDoc(childIndex);
         }
+        RefreshCurrentDoc();
     }
 
     void GoUntil(uint64_t target, uint64_t limit = NO_MORE_DOCS) override
     {
-        for (auto& c : m_Children) {
-            if (!c->IsEnd() && c->GetDocumentID() < target)
-                c->GoUntil(target, limit);
+        for (size_t i = 0; i < m_Children.size(); ++i) {
+            if (m_ChildDocs[i] < target) {
+                m_Children[i]->GoUntil(target, limit);
+                UpdateChildDoc(i);
+            }
         }
+        RefreshCurrentDoc();
     }
 
     void Close() override { for (auto& c : m_Children) c->Close(); }
 
 private:
     std::vector<std::shared_ptr<IndexReader>> m_Children;
+    std::vector<uint64_t> m_ChildDocs;
+    std::vector<size_t> m_MatchingChildren;
+    uint64_t m_CurrentDoc = NO_MORE_DOCS;
+
+    void InitializeChildDocs()
+    {
+        m_ChildDocs.resize(m_Children.size());
+        for (size_t i = 0; i < m_Children.size(); ++i)
+            UpdateChildDoc(i);
+    }
+
+    void UpdateChildDoc(size_t childIndex)
+    {
+        auto& child = m_Children[childIndex];
+        m_ChildDocs[childIndex] = (!child || child->IsEnd()) ? NO_MORE_DOCS : child->GetDocumentID();
+    }
+
+    void RefreshCurrentDoc()
+    {
+        m_CurrentDoc = NO_MORE_DOCS;
+        for (const uint64_t childDoc : m_ChildDocs)
+            m_CurrentDoc = std::min(m_CurrentDoc, childDoc);
+
+        m_MatchingChildren.clear();
+        if (m_CurrentDoc == NO_MORE_DOCS)
+            return;
+
+        for (size_t i = 0; i < m_ChildDocs.size(); ++i) {
+            if (m_ChildDocs[i] == m_CurrentDoc)
+                m_MatchingChildren.push_back(i);
+        }
+    }
 };
 
 /*
@@ -268,6 +285,7 @@ public:
         : m_Children(std::move(children))
         , m_MinShouldMatch(std::max<uint32_t>(1, minShouldMatch))
     {
+        InitializeChildDocs();
         AlignToMatch();
     }
 
@@ -285,48 +303,44 @@ public:
     uint32_t GetTermFreq() override
     {
         uint32_t total = 0;
-        for (auto& c : m_Children) {
-            if (!c->IsEnd() && c->GetDocumentID() == m_CurrentDoc)
-                total += c->GetTermFreq();
-        }
+        for (const size_t childIndex : m_MatchingChildren)
+            total += m_Children[childIndex]->GetTermFreq();
         return total;
     }
 
     float GetScore(const DocDataEntry* entry) override
     {
         float total = 0.0f;
-        for (auto& c : m_Children) {
-            if (!c->IsEnd() && c->GetDocumentID() == m_CurrentDoc)
-                total += c->GetScore(entry);
-        }
+        for (const size_t childIndex : m_MatchingChildren)
+            total += m_Children[childIndex]->GetScore(entry);
         return total;
     }
 
     uint8_t GetSourceMask() override
     {
         uint8_t sourceMask = 0;
-        for (auto& c : m_Children) {
-            if (!c->IsEnd() && c->GetDocumentID() == m_CurrentDoc)
-                sourceMask |= c->GetSourceMask();
-        }
+        for (const size_t childIndex : m_MatchingChildren)
+            sourceMask |= m_Children[childIndex]->GetSourceMask();
         return sourceMask;
     }
 
     void GoNext() override
     {
         if (IsEnd()) return;
-        for (auto& c : m_Children) {
-            if (!c->IsEnd() && c->GetDocumentID() == m_CurrentDoc)
-                c->GoNext();
+        for (const size_t childIndex : m_MatchingChildren) {
+            m_Children[childIndex]->GoNext();
+            UpdateChildDoc(childIndex);
         }
         AlignToMatch();
     }
 
     void GoUntil(uint64_t target, uint64_t limit = NO_MORE_DOCS) override
     {
-        for (auto& c : m_Children) {
-            if (!c->IsEnd() && c->GetDocumentID() < target)
-                c->GoUntil(target, limit);
+        for (size_t i = 0; i < m_Children.size(); ++i) {
+            if (m_ChildDocs[i] < target) {
+                m_Children[i]->GoUntil(target, limit);
+                UpdateChildDoc(i);
+            }
         }
         AlignToMatch();
     }
@@ -335,40 +349,54 @@ public:
 
 private:
     std::vector<std::shared_ptr<IndexReader>> m_Children;
+    std::vector<uint64_t> m_ChildDocs;
+    std::vector<size_t> m_MatchingChildren;
     uint32_t m_MinShouldMatch = 1;
     uint64_t m_CurrentDoc = NO_MORE_DOCS;
+
+    void InitializeChildDocs()
+    {
+        m_ChildDocs.resize(m_Children.size());
+        for (size_t i = 0; i < m_Children.size(); ++i)
+            UpdateChildDoc(i);
+    }
+
+    void UpdateChildDoc(size_t childIndex)
+    {
+        auto& child = m_Children[childIndex];
+        m_ChildDocs[childIndex] = (!child || child->IsEnd()) ? NO_MORE_DOCS : child->GetDocumentID();
+    }
 
     void AlignToMatch()
     {
         while (true) {
             uint64_t doc = NO_MORE_DOCS;
-            for (auto& c : m_Children) {
-                if (!c->IsEnd())
-                    doc = std::min(doc, c->GetDocumentID());
-            }
+            for (const uint64_t childDoc : m_ChildDocs)
+                doc = std::min(doc, childDoc);
 
             if (doc == NO_MORE_DOCS) {
                 m_CurrentDoc = NO_MORE_DOCS;
+                m_MatchingChildren.clear();
                 return;
             }
 
-            uint32_t matches = 0;
-            for (auto& c : m_Children) {
-                if (!c->IsEnd() && c->GetDocumentID() == doc)
-                    ++matches;
+            m_MatchingChildren.clear();
+            for (size_t i = 0; i < m_ChildDocs.size(); ++i) {
+                if (m_ChildDocs[i] == doc)
+                    m_MatchingChildren.push_back(i);
             }
 
-            if (matches >= m_MinShouldMatch) {
+            if (m_MatchingChildren.size() >= m_MinShouldMatch) {
                 m_CurrentDoc = doc;
                 if (m_debug)
                     std::println("{}WEAK-AND match doc {} children={}",
-                                 std::string(m_debugDepth * 2, ' '), doc, matches);
+                                 std::string(m_debugDepth * 2, ' '), doc, m_MatchingChildren.size());
                 return;
             }
 
-            for (auto& c : m_Children) {
-                if (!c->IsEnd() && c->GetDocumentID() == doc)
-                    c->GoNext();
+            for (const size_t childIndex : m_MatchingChildren) {
+                m_Children[childIndex]->GoNext();
+                UpdateChildDoc(childIndex);
             }
         }
     }

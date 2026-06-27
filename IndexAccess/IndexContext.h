@@ -274,6 +274,13 @@ public:
             m_DeltaContext->SetTermMphfEnabled(enabled);
     }
 
+    void SetWeakAndBuildMode(WeakAndBuildMode mode)
+    {
+        m_WeakAndBuildMode = mode;
+        if (m_DeltaContext)
+            m_DeltaContext->SetWeakAndBuildMode(mode);
+    }
+
     void SetLeafTermCacheBytes(uint64_t bytes)
     {
         m_LeafTermCacheBytes = bytes > 0 ? bytes : LEAF_TERM_CACHE_BYTES;
@@ -904,6 +911,7 @@ private:
     uint8_t*                     m_WriteDocData = nullptr;
     bool                         m_WriteBuilt = false;
     uint64_t                     m_LeafTermCacheBytes = LEAF_TERM_CACHE_BYTES;
+    WeakAndBuildMode             m_WeakAndBuildMode = WeakAndBuildMode::FlatPruned;
 
     static constexpr uint32_t INDEX_BLOCK_CACHE_SLOT_COUNT =
         static_cast<uint32_t>(INDEX_BLOCK_CACHE_BYTES / sizeof(IndexBlock));
@@ -1632,18 +1640,47 @@ private:
             auto* weakAndNode = static_cast<WeakAndNode*>(node.get());
             std::vector<shared_ptr<IndexReader>> children;
 
-            for (auto& child : weakAndNode->children)
-                children.push_back(BuildIndexReader(child));
+            if (m_WeakAndBuildMode == WeakAndBuildMode::FlatPruned) {
+                auto appendChild = [&](auto&& self, const shared_ptr<EvalNode>& child) -> void {
+                    if (!child)
+                        return;
+                    if (child->GetType() == NodeType::Or) {
+                        auto* orNode = static_cast<OrNode*>(child.get());
+                        for (auto& grandchild : orNode->children)
+                            self(self, grandchild);
+                        return;
+                    }
+
+                    auto reader = BuildIndexReader(child);
+                    if (reader && !reader->IsEnd())
+                        children.push_back(std::move(reader));
+                };
+
+                for (auto& child : weakAndNode->children)
+                    appendChild(appendChild, child);
+            } else {
+                const bool pruneEmpty = m_WeakAndBuildMode == WeakAndBuildMode::OrChildrenPruned;
+                for (auto& child : weakAndNode->children) {
+                    auto reader = BuildIndexReader(child);
+                    if (pruneEmpty && (!reader || reader->IsEnd()))
+                        continue;
+                    children.push_back(std::move(reader));
+                }
+            }
 
             if (children.empty()) {
                 auto empty = make_shared<AdvancedIndexReader>();
                 return empty;
             }
 
+            const uint32_t minShouldMatch = std::min<uint32_t>(
+                weakAndNode->min_should_match,
+                static_cast<uint32_t>(children.size()));
+
             if (children.size() == 1)
                 return children[0];
 
-            return make_shared<WeakAndIndexReader>(std::move(children), weakAndNode->min_should_match);
+            return make_shared<WeakAndIndexReader>(std::move(children), minShouldMatch);
         }
 
         case NodeType::Not: {
