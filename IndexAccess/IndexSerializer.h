@@ -8,7 +8,7 @@
 #include <string>
 
 /*
- * Binary index file format (version 14).
+ * Binary index file format (version 16).
  *
  * Layout:
  *   [Header]           magic, version, fixed section offsets and counts
@@ -19,7 +19,7 @@
  *                          LTB_Data: packed 32B LeafTermEntry records + LTE_Term bytes
  *   [DocData]          N x 1024B records
  *   [Blocks]           raw IndexBlock structs
- *                        first block: packed varbyte docID/tf pairs
+ *                        first block: packed docID-varbyte + log-scaled uint8 tf pairs
  *                        continuation block: 12B IndexBlockContinuationHeader + pairs
  *   [TermMphfHeader]   one fixed MPHF descriptor
  *   [MPHF Disp]        int32 displacement per MPHF bucket

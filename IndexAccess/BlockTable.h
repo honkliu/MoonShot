@@ -30,7 +30,7 @@ static constexpr size_t HEAD_TERM_KEY_MAX = 26;
 static constexpr size_t LEAF_TERM_DIRECTORY_COUNT = 96;
 static constexpr size_t LEAF_TERM_DATA_OFFSET = LEAF_TERM_DIRECTORY_COUNT * sizeof(uint16_t);
 static constexpr uint8_t  INDEX_FILE_MAGIC[8] = {'M','O','O','N','S','H','O','T'};
-static constexpr uint32_t INDEX_FORMAT_VERSION = 14;
+static constexpr uint32_t INDEX_FORMAT_VERSION = 16;
 
 static constexpr uint64_t INDEX_BLOCK_CACHE_BYTES = 100ull * 1024ull * 1024ull;
 static constexpr uint64_t LEAF_TERM_CACHE_BYTES = 100ull * 1024ull * 1024ull;

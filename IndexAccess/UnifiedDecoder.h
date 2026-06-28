@@ -31,7 +31,7 @@ public:
         : m_current_ptr(nullptr)
         , m_block_end(nullptr)
         , m_current_doc(0)
-        , m_current_tf(0)
+        , m_current_tf8(0)
         , m_has_current(false)
     {}
 
@@ -41,7 +41,7 @@ public:
     void OpenRaw(const uint8_t* data, size_t len)
     {
         m_current_doc = 0;
-        m_current_tf  = 0;
+        m_current_tf8 = 0;
         m_current_ptr = data;
         m_block_end   = data ? data + len : data;
         m_has_current = false;
@@ -58,38 +58,12 @@ public:
 
     /*
     * Decode and advance to the next (doc_id, tf) pair.
-    * After this call, GetDocumentID() / GetTermFrequency() return
+    * After this call, GetDocumentID() / GetTermFrequencyByte() return
     * the newly decoded values if IsEnd() is false.
     */
     void GoNext()
     {
-        if (!m_current_ptr || m_current_ptr >= m_block_end) {
-            m_has_current = false;
-            return;
-        }
-
-        uint64_t docID = 0;
-        uint8_t  shift = 0;
-        while (true) {
-            uint8_t byte = *m_current_ptr++;
-            docID |= static_cast<uint64_t>(byte & 0x7F) << shift;
-            if (!(byte & 0x80))
-                break;
-            shift += 7;
-        }
-        m_current_doc = docID;
-
-        m_current_tf = 0;
-        shift        = 0;
-        while (true) {
-            uint8_t byte = *m_current_ptr++;
-            m_current_tf |= static_cast<uint32_t>(byte & 0x7F) << shift;
-            if (!(byte & 0x80))
-                break;
-            shift += 7;
-        }
-
-        m_has_current = true;
+        DecodeNext();
     }
 
     /*
@@ -97,28 +71,55 @@ public:
     */
     void GoUntil(uint64_t target)
     {
-        while (m_has_current && m_current_doc < target)
-            GoNext();
+        if (m_has_current && m_current_doc >= target)
+            return;
 
-        /*
-        * If not yet on any entry, advance once to read the first one,
-        * then continue seeking.
-        */
-        if (!m_has_current && m_current_ptr && m_current_ptr < m_block_end) {
-            GoNext();
-            while (m_has_current && m_current_doc < target)
-                GoNext();
-        }
+        do {
+            DecodeNext();
+        } while (m_has_current && m_current_doc < target);
     }
 
     uint64_t GetDocumentID()    const { return m_current_doc; }
-    uint32_t GetTermFrequency() const { return m_current_tf;  }
+    uint8_t GetTermFrequencyByte() const { return m_current_tf8; }
 
 private:
+    void DecodeNext()
+    {
+        if (!m_current_ptr || m_current_ptr >= m_block_end) {
+            m_has_current = false;
+            return;
+        }
+
+        m_current_doc = DecodeVarUInt64();
+        if (m_current_ptr >= m_block_end) {
+            m_has_current = false;
+            return;
+        }
+        m_current_tf8 = *m_current_ptr++;
+
+        m_has_current = true;
+    }
+
+    uint64_t DecodeVarUInt64()
+    {
+        uint8_t byte = *m_current_ptr++;
+        if (!(byte & 0x80))
+            return byte;
+
+        uint64_t value = static_cast<uint64_t>(byte & 0x7F);
+        uint8_t shift = 7;
+        do {
+            byte = *m_current_ptr++;
+            value |= static_cast<uint64_t>(byte & 0x7F) << shift;
+            shift += 7;
+        } while (byte & 0x80);
+        return value;
+    }
+
     const uint8_t* m_current_ptr;
     const uint8_t* m_block_end;
     uint64_t       m_current_doc;
-    uint32_t       m_current_tf;
+    uint8_t        m_current_tf8;
     bool           m_has_current;
 };
 

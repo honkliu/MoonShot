@@ -23,17 +23,18 @@
 
 /* ── helpers ─────────────────────────────────────────────────────────────── */
 
-static bool read_vbc_pair_end(const uint8_t* data, size_t size, size_t& offset)
+static bool read_posting_pair_end(const uint8_t* data, size_t size, size_t& offset)
 {
-    auto read_one = [&]() -> bool {
-        while (offset < size) {
-            const uint8_t byte = data[offset++];
-            if ((byte & 0x80u) == 0)
-                return true;
+    while (offset < size) {
+        const uint8_t byte = data[offset++];
+        if ((byte & 0x80u) == 0) {
+            if (offset >= size)
+                return false;
+            ++offset;
+            return true;
         }
-        return false;
-    };
-    return read_one() && read_one();
+    }
+    return false;
 }
 
 static size_t posting_prefix_bytes(const uint8_t* data, size_t size, size_t capacity)
@@ -43,7 +44,7 @@ static size_t posting_prefix_bytes(const uint8_t* data, size_t size, size_t capa
     const size_t limit = std::min(size, capacity);
     while (cursor < limit) {
         const size_t before = cursor;
-        if (!read_vbc_pair_end(data, size, cursor) || cursor > limit) {
+        if (!read_posting_pair_end(data, size, cursor) || cursor > limit) {
             cursor = before;
             break;
         }
@@ -445,7 +446,7 @@ BuildBlocksResult IndexSerializer::BuildBlocks(const PostingStore& store)
                         if ((byte & 0x80u) == 0) break;
                         shift += 7;
                     }
-                    while (src[cont_cursor++] & 0x80u) {}
+                    ++cont_cursor;
                 }
 
                 auto* header = reinterpret_cast<IndexBlockContinuationHeader*>(cur.IB_Data + wptr);

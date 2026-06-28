@@ -126,8 +126,8 @@ static std::vector<IndexEntry> decode_IndexEntries(const uint8_t* data, size_t s
     while (pos < size && entries.size() < 12) {
         uint64_t docId = vb_read(data, size, pos);
         if (pos >= size) break;
-        uint64_t tf = vb_read(data, size, pos);
-        entries.push_back({docId, static_cast<uint32_t>(tf)});
+        const uint32_t tf = data[pos++];
+        entries.push_back({docId, tf});
     }
     return entries;
 }

@@ -18,6 +18,8 @@ std::vector<SearchResult> IndexSearchExecutor::Execute(std::shared_ptr<IndexRead
     std::vector<SearchResult> results;
     const bool boundedTopK = topK > 0;
     const size_t heapLimit = boundedTopK ? static_cast<size_t>(topK) : 0;
+    if (boundedTopK)
+        results.reserve(heapLimit);
 
     auto worseScoreFirst = [](const SearchResult& a, const SearchResult& b) {
         return a.score > b.score;

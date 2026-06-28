@@ -68,53 +68,54 @@ badB:  (1, 24),  (3, 123),  (9, 32),  (17, 7),  …
 DocIDs are sorted ascending.  Because DocIDs encode importance, traversal
 from the front automatically yields the highest-quality documents.
 
-### 2.2 Wire Encoding — VarByte Absolute Pairs
+### 2.2 Wire Encoding — VarByte DocID + Fixed TF
 
 Storing raw 8-byte DocIDs is wasteful.  We store:
 
 - **DocID**: the absolute document ID.
 - **TF**: raw unsigned integer.
 
-Both values are encoded with **Variable-Byte (VBC)** encoding:
+DocIDs are encoded with **Variable-Byte (VBC)** encoding, and TF is stored as an 8-bit saturated integer:
 
 ```
-Each integer is stored in 1–9 bytes.
+DocID is stored in 1–9 bytes.
 Low 7 bits of each byte carry payload.
 High bit = 1 means "more bytes follow"; 0 means "last byte".
+TF is stored in exactly 1 byte as `min(255, tf)`.
 ```
 
 Example for the entry `(DocID=1, TF=24)`:
 
 ```
 DocID      = 1:    encoded as  0x01          (1 byte)
-TF         = 24:   encoded as  0x18          (1 byte)
+TF         = 24:   encoded as  0x95          (1 byte, log-scaled)
 ```
 
 Example for the next entry `(DocID=3, TF=123)`:
 
 ```
 DocID       = 3:     encoded as  0x03
-TF          = 123:   encoded as  0x7B
+TF          = 123:   encoded as  0xDE
 ```
 
 Full posting `badB: (1,24),(3,123),(9,32)` encodes to:
 
 ```
-01 18 03 7B 09 20
-│  │  │  │  │  └─ TF=32
+01 95 03 DE 09 A1
+│  │  │  │  │  └─ TF=32 encoded
 │  │  │  │  └──── DocID=9
-│  │  │  └─────── TF=123
+│  │  │  └─────── TF=123 encoded
 │  │  └────────── DocID=3
-│  └───────────── TF=24
+│  └───────────── TF=24 encoded
 └──────────────── DocID=1
 ```
 
-Average compression: 2–4 bytes per (DocID, TF) pair vs 12 bytes raw (≈3–6×).
+Average compression depends on DocID size: TF is always 1 byte, so common small-docID pairs are 2–4 bytes vs 12 bytes raw.
 
 ### 2.3 Position Data (future)
 
 For phrase queries, we need the within-document position of each term
-occurrence.  Position lists are stored **after** TF in the same VBC stream:
+occurrence.  Position lists are stored **after** the fixed TF in a VBC stream:
 
 ```
 (DocID=1, TF=3, positions=[4, 17, 42])

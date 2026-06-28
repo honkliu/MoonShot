@@ -24,7 +24,7 @@ struct IndexEntry {
 * Sorted array of entries for one (term+stream) key, e.g. "foxT".
 *
 * entries  — decoded form; used by the writer to accumulate postings.
-* GetBytes() returns VarByte-encoded absolute (docID, termFrequency) pairs.
+* GetBytes() returns absolute docID VarByte + log-scaled uint8 termFrequency pairs.
 */
 struct PostingList {
     std::vector<IndexEntry> entries;
@@ -46,6 +46,11 @@ private:
         out.push_back(static_cast<uint8_t>(v));
     }
 
+    static uint8_t tf8_encode(uint32_t tf)
+    {
+        return static_cast<uint8_t>(std::min<uint32_t>(255, tf));
+    }
+
     std::vector<uint8_t> Encode() const
     {
         std::vector<uint8_t> bytes;
@@ -53,7 +58,7 @@ private:
 
         for (const auto& e : entries) {
             vb_write(e.IE_DocID, bytes);
-            vb_write(e.IE_TermFrequency, bytes);
+            bytes.push_back(tf8_encode(e.IE_TermFrequency));
         }
         return bytes;
     }
