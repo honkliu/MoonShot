@@ -753,7 +753,7 @@ function renderPostingSample(sample, key, unknownOwner = false) {
   const start = page * POSTING_ROWS_PER_PAGE;
   const rows = sample.postings.slice(start, start + POSTING_ROWS_PER_PAGE);
 
-  let html = unknownOwner ? '<div style="color:#888;padding:4px 0;font-size:11px">Decoded absolute docid-varbyte + log-scaled uint8 tf pairs for this bounded slice.</div>' : '';
+  let html = unknownOwner ? '<div style="color:#888;padding:4px 0;font-size:11px">Decoded absolute docid-varbyte + scale16 uint8 tf pairs for this bounded slice.</div>' : '';
   html += `<div class="pager">`
     + `<button type="button" class="icon-btn" title="Previous postings" onclick="event.stopPropagation();setPostingPage('${htmlAttr(key)}',${page - 1})" ${page <= 0 ? 'disabled' : ''}>‹</button>`
     + `<button type="button" class="icon-btn" title="Next postings" onclick="event.stopPropagation();setPostingPage('${htmlAttr(key)}',${page + 1})" ${page >= pageCount - 1 ? 'disabled' : ''}>›</button>`

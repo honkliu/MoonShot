@@ -75,38 +75,39 @@ Storing raw 8-byte DocIDs is wasteful.  We store:
 - **DocID**: the absolute document ID.
 - **TF**: raw unsigned integer.
 
-DocIDs are encoded with **Variable-Byte (VBC)** encoding, and TF is stored as an 8-bit saturated integer:
+DocIDs are encoded with **Variable-Byte (VBC)** encoding, and TF is stored as a scale16 8-bit integer:
 
 ```
 DocID is stored in 1–9 bytes.
 Low 7 bits of each byte carry payload.
 High bit = 1 means "more bytes follow"; 0 means "last byte".
-TF is stored in exactly 1 byte as `min(255, tf)`.
+TF is stored in exactly 1 byte as `min(255, round(16 * log2(1 + tf)))`.
+At query time, this encoded byte is used directly as the BM25 term-frequency signal.
 ```
 
 Example for the entry `(DocID=1, TF=24)`:
 
 ```
 DocID      = 1:    encoded as  0x01          (1 byte)
-TF         = 24:   encoded as  0x95          (1 byte, log-scaled)
+TF         = 24:   encoded as  0x4A          (1 byte, scale16)
 ```
 
 Example for the next entry `(DocID=3, TF=123)`:
 
 ```
 DocID       = 3:     encoded as  0x03
-TF          = 123:   encoded as  0xDE
+TF          = 123:   encoded as  0x6F
 ```
 
 Full posting `badB: (1,24),(3,123),(9,32)` encodes to:
 
 ```
-01 95 03 DE 09 A1
-│  │  │  │  │  └─ TF=32 encoded
+01 4A 03 6F 09 51
+│  │  │  │  │  └─ TF=32 scale16
 │  │  │  │  └──── DocID=9
-│  │  │  └─────── TF=123 encoded
+│  │  │  └─────── TF=123 scale16
 │  │  └────────── DocID=3
-│  └───────────── TF=24 encoded
+│  └───────────── TF=24 scale16
 └──────────────── DocID=1
 ```
 

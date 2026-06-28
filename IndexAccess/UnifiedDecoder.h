@@ -58,7 +58,7 @@ public:
 
     /*
     * Decode and advance to the next (doc_id, tf) pair.
-    * After this call, GetDocumentID() / GetTermFrequencyByte() return
+    * After this call, GetDocumentID() / GetTermFreq() return
     * the newly decoded values if IsEnd() is false.
     */
     void GoNext()
@@ -80,7 +80,7 @@ public:
     }
 
     uint64_t GetDocumentID()    const { return m_current_doc; }
-    uint8_t GetTermFrequencyByte() const { return m_current_tf8; }
+    uint8_t GetTermFreq() const { return m_current_tf8; }
 
 private:
     void DecodeNext()

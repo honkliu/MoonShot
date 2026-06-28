@@ -120,15 +120,14 @@ uint64_t AdvancedIndexReader::GetDocumentID() {
     return m_Decoder.GetDocumentID();
 }
 uint32_t AdvancedIndexReader::GetTermFreq() {
-    if (IsEnd()) return 0u;
-    return m_Decoder.GetTermFrequencyByte();
+    return m_Decoder.GetTermFreq();
 }
 float AdvancedIndexReader::GetScore(const DocDataEntry* entry) {
     assert(entry);
     const uint32_t docLength = entry->DDE_DocLength;
     assert(docLength > 0);
 
-    const float tf = static_cast<float>(m_Decoder.GetTermFrequencyByte());
+    const float tf = static_cast<float>(m_Decoder.GetTermFreq());
     const float dl = static_cast<float>(std::max(1u, docLength));
 
     static constexpr float K1PlusOne = 2.2f;

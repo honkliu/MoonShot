@@ -24,7 +24,7 @@ struct IndexEntry {
 * Sorted array of entries for one (term+stream) key, e.g. "foxT".
 *
 * entries  — decoded form; used by the writer to accumulate postings.
-* GetBytes() returns absolute docID VarByte + log-scaled uint8 termFrequency pairs.
+* GetBytes() returns absolute docID VarByte + scale16 uint8 termFrequency pairs.
 */
 struct PostingList {
     std::vector<IndexEntry> entries;
@@ -48,7 +48,9 @@ private:
 
     static uint8_t tf8_encode(uint32_t tf)
     {
-        return static_cast<uint8_t>(std::min<uint32_t>(255, tf));
+        static constexpr double TF_SCALE = 16.0;
+        const double encoded = std::round(TF_SCALE * std::log2(1.0 + static_cast<double>(tf)));
+        return static_cast<uint8_t>(std::min<double>(255.0, std::max<double>(0.0, encoded)));
     }
 
     std::vector<uint8_t> Encode() const
