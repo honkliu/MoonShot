@@ -23,6 +23,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <cmath>
 #include <filesystem>
 #include <iostream>
 #include <limits>
@@ -266,6 +267,27 @@ public:
 
     const IndexFileHeader& GetIndexFileHeader() const { return m_IndexFileHeader; }
     uint64_t DocumentCount() const { return m_IndexFileHeader.IFH_NumDocuments; }
+
+    uint32_t GetStreamDocFreq(const char* streamKey)
+    {
+        uint32_t indexBlockID = 0;
+        uint32_t indexOffset = 0;
+        uint32_t indexLength = 0;
+        uint32_t docFreq = 0;
+        uint32_t continuationBlocks = 0;
+        uint64_t totalDocFreq = 0;
+        if (m_BlockTable.FindTermData(streamKey,
+                                      &indexBlockID,
+                                      &indexOffset,
+                                      &indexLength,
+                                      &docFreq,
+                                      &continuationBlocks)) {
+            totalDocFreq += docFreq;
+        }
+        if (m_DeltaContext)
+            totalDocFreq += m_DeltaContext->GetStreamDocFreq(streamKey);
+        return static_cast<uint32_t>(std::min<uint64_t>(totalDocFreq, UINT32_MAX));
+    }
 
     void SetTermMphfEnabled(bool enabled)
     {
@@ -1053,6 +1075,21 @@ private:
             entry->DDE_DocID = docId;
             entry->DDE_StaticRank = stats.importance;
             entry->DDE_DocLength = stats.doc_len;
+            const float docLength = static_cast<float>(std::max<uint32_t>(1, stats.doc_len));
+            const float diversity = std::min(1.0f, static_cast<float>(stats.unique_terms) / docLength);
+            const float logLength = std::log2(docLength);
+            const float lengthQuality = std::max(0.0f, 1.0f - std::abs(logLength - 6.0f) / 4.0f);
+            entry->DDE_QualityScore = 0.6f * lengthQuality + 0.4f * diversity;
+            entry->DDE_AuthorityScore = stats.title_len > 0
+                ? std::min(1.0f, std::log2(1.0f + static_cast<float>(stats.title_len)) / 5.0f)
+                : 0.0f;
+            const float repetitionPenalty = std::max(0.0f, 0.35f - diversity) / 0.35f;
+            const float overlongPenalty = std::max(0.0f, (logLength - 10.0f) / 4.0f);
+            entry->DDE_SpamScore = std::min(1.0f, repetitionPenalty + overlongPenalty);
+            entry->DDE_FeatureScore[0] = static_cast<float>(stats.title_len);
+            entry->DDE_FeatureScore[1] = static_cast<float>(stats.body_len);
+            entry->DDE_FeatureScore[2] = diversity;
+            entry->DDE_FeatureScore[3] = lengthQuality;
             if (m_Store->HasDocVector(docId)) {
                 entry->DDE_VectorFlags = 1;
                 entry->DDE_VectorDim = static_cast<uint16_t>(DOC_VECTOR_DIM);
@@ -1569,6 +1606,49 @@ private:
         return true;
     }
 
+    uint32_t EstimateDocFreq(const shared_ptr<EvalNode>& node)
+    {
+        if (!node) return 0;
+        if (node->GetType() == NodeType::Term) {
+            auto* termNode = static_cast<TermNode*>(node.get());
+            uint32_t indexBlockID = 0;
+            uint32_t indexOffset = 0;
+            uint32_t indexLength = 0;
+            uint32_t docFreq = 0;
+            uint32_t continuationBlocks = 0;
+            if (m_BlockTable.FindTermData(termNode->stream_key.c_str(),
+                                          &indexBlockID,
+                                          &indexOffset,
+                                          &indexLength,
+                                          &docFreq,
+                                          &continuationBlocks)) {
+                return docFreq;
+            }
+            return 0;
+        }
+
+        if (node->GetType() == NodeType::Or) {
+            auto* orNode = static_cast<OrNode*>(node.get());
+            uint64_t total = 0;
+            for (const auto& child : orNode->children)
+                total += EstimateDocFreq(child);
+            return static_cast<uint32_t>(std::min<uint64_t>(total, UINT32_MAX));
+        }
+
+        return 0;
+    }
+
+    bool IsHighDfWeakAndGate(const shared_ptr<EvalNode>& node)
+    {
+        const uint64_t docCount = DocumentCount();
+        if (docCount == 0) return false;
+        const uint32_t docFreq = EstimateDocFreq(node);
+        if (docFreq == 0) return false;
+
+        const uint64_t threshold = std::max<uint64_t>(100000, docCount / 5); // 20% corpus
+        return docFreq > threshold;
+    }
+
     /*
     * Recursively convert EvalNode → ISR tree.
     * Mirrors ISRCreatorDocShard::CreateIsr():
@@ -1641,15 +1721,18 @@ private:
             std::vector<shared_ptr<IndexReader>> children;
 
             if (m_WeakAndBuildMode == WeakAndBuildMode::FlatPruned) {
-                auto appendChild = [&](auto&& self, const shared_ptr<EvalNode>& child) -> void {
+                auto appendChild = [&](auto&& self, const shared_ptr<EvalNode>& child, bool allowHighDf) -> void {
                     if (!child)
                         return;
                     if (child->GetType() == NodeType::Or) {
                         auto* orNode = static_cast<OrNode*>(child.get());
                         for (auto& grandchild : orNode->children)
-                            self(self, grandchild);
+                            self(self, grandchild, allowHighDf);
                         return;
                     }
+
+                    if (!allowHighDf && IsHighDfWeakAndGate(child))
+                        return;
 
                     auto reader = BuildIndexReader(child);
                     if (reader && !reader->IsEnd())
@@ -1657,7 +1740,12 @@ private:
                 };
 
                 for (auto& child : weakAndNode->children)
-                    appendChild(appendChild, child);
+                    appendChild(appendChild, child, false);
+
+                if (children.empty()) {
+                    for (auto& child : weakAndNode->children)
+                        appendChild(appendChild, child, true);
+                }
             } else {
                 const bool pruneEmpty = m_WeakAndBuildMode == WeakAndBuildMode::OrChildrenPruned;
                 for (auto& child : weakAndNode->children) {
@@ -1673,9 +1761,16 @@ private:
                 return empty;
             }
 
-            const uint32_t minShouldMatch = std::min<uint32_t>(
-                weakAndNode->min_should_match,
-                static_cast<uint32_t>(children.size()));
+            uint32_t minShouldMatch = 1;
+            if (m_WeakAndBuildMode == WeakAndBuildMode::FlatPruned) {
+                if (children.size() <= 2) minShouldMatch = 1;
+                else if (children.size() <= 5) minShouldMatch = 2;
+                else minShouldMatch = 3;
+            } else {
+                minShouldMatch = std::min<uint32_t>(
+                    weakAndNode->min_should_match,
+                    static_cast<uint32_t>(children.size()));
+            }
 
             if (children.size() == 1)
                 return children[0];
@@ -1689,6 +1784,19 @@ private:
             auto  excl    = BuildIndexReader(notNode->exclude);
 
             return make_shared<NotIndexReader>(base, excl);
+        }
+
+        case NodeType::Boost: {
+            auto* boostNode = static_cast<BoostNode*>(node.get());
+            auto base = BuildIndexReader(boostNode->base);
+            if (!base || base->IsEnd())
+                return base;
+
+            auto boost = BuildIndexReader(boostNode->boost);
+            if (!boost || boost->IsEnd())
+                return base;
+
+            return make_shared<BoostIndexReader>(base, boost, boostNode->boost_weight);
         }
 
         default: {

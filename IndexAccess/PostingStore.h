@@ -71,6 +71,12 @@ private:
 */
 struct DocStats {
     uint32_t    doc_len    = 0;
+    uint32_t    unique_terms = 0;
+    uint32_t    title_len = 0;
+    uint32_t    body_len = 0;
+    uint32_t    url_len = 0;
+    uint32_t    anchor_len = 0;
+    uint32_t    meta_len = 0;
     float       importance = 0.0f;
     std::string path;              // file path stored in DocData
 };
@@ -111,6 +117,20 @@ public:
     {
         m_DocStats[doc_id].doc_len += count;
         m_TotalTerms += count;
+    }
+
+    void AddStreamStats(uint64_t doc_id, char stream, uint32_t tokenCount, uint32_t uniqueCount)
+    {
+        auto& stats = m_DocStats[doc_id];
+        stats.unique_terms += uniqueCount;
+        switch (stream) {
+        case 'T': stats.title_len += tokenCount; break;
+        case 'B': stats.body_len += tokenCount; break;
+        case 'U': stats.url_len += tokenCount; break;
+        case 'A': stats.anchor_len += tokenCount; break;
+        case 'M': stats.meta_len += tokenCount; break;
+        default: break;
+        }
     }
 
     void SetDocImportance(uint64_t doc_id, float score)

@@ -39,6 +39,7 @@ public:
             if (!word.empty())
                 ++termTf[word];
         }
+        const uint32_t uniqueUnigramCount = static_cast<uint32_t>(termTf.size());
 
         /*
         * Index bigrams: adjacent pairs joined by BIGRAM_SEP (\x1F).
@@ -59,6 +60,10 @@ public:
 
         m_Store->AddDocTokens(documentId,
                              static_cast<uint32_t>(words.size()));
+        m_Store->AddStreamStats(documentId,
+                    abbrev.empty() ? 'B' : abbrev[0],
+                    static_cast<uint32_t>(words.size()),
+                    uniqueUnigramCount);
     }
 
     void SetDocImportance(uint64_t doc_id, float score) override

@@ -1247,6 +1247,47 @@ static std::shared_ptr<IndexReader> BuildBeirBowReader(IndexContext& ctx,
     return ctx.GetReader(&tree);
 }
 
+static std::shared_ptr<IndexReader> BuildBeirRareBigramReader(IndexContext& ctx,
+                                                              SmartTokenizer& tokenizer,
+                                                              const std::string& query,
+                                                              const std::string& streamSet)
+{
+    const auto streams = ParseBeirStreams(streamSet);
+    const auto tokens = tokenizer.Tokenize(query.c_str());
+    if (tokens.size() < 2)
+        return nullptr;
+
+    const uint32_t docFreqMax = static_cast<uint32_t>(
+        std::min<uint64_t>(5000, std::max<uint64_t>(64, ctx.DocumentCount() / 1000)));
+    std::set<std::string> streamKeys;
+    for (size_t i = 0; i + 1 < tokens.size(); ++i) {
+        if (tokens[i].size() <= 1 || tokens[i + 1].size() <= 1)
+            continue;
+
+        const std::string bigram = tokens[i] + BIGRAM_SEP + tokens[i + 1];
+        for (const auto& stream : streams) {
+            const std::string streamKey = bigram + stream;
+            const uint32_t docFreq = ctx.GetStreamDocFreq(streamKey.c_str());
+            if (docFreq > 0 && docFreq <= docFreqMax)
+                streamKeys.insert(streamKey);
+        }
+    }
+
+    if (streamKeys.empty())
+        return nullptr;
+
+    if (streamKeys.size() == 1)
+        return ctx.GetStreamReader(streamKeys.begin()->c_str());
+
+    auto orNode = std::make_shared<OrNode>();
+    for (const auto& key : streamKeys)
+        orNode->children.push_back(std::make_shared<TermNode>(key, 2));
+
+    EvalTree tree;
+    tree.root = std::move(orNode);
+    return ctx.GetReader(&tree);
+}
+
 static std::string ResolveBeirQrelsPath(const BeirEvalOptions& options)
 {
     if (std::filesystem::is_regular_file(FsPathFromUtf8(options.qrels)))
@@ -1403,15 +1444,17 @@ static int RunBeirEval(const std::string& idxPath, const BeirEvalOptions& option
         } else if (options.mode == "weakand") {
             reader = ctx.GetReader(query.c_str(), options.streams.c_str(), QueryCompileMode::WeakAnd);
         } else if (options.mode == "weakand2phase") {
-            auto titleReader = ctx.GetReader(query.c_str(), "T", QueryCompileMode::WeakAnd);
-            auto bodyReader = ctx.GetReader(query.c_str(), "B", QueryCompileMode::WeakAnd);
-            auto titleResults = executor->Execute(titleReader, maxK);
-            auto bodyResults = executor->Execute(bodyReader, maxK);
+            auto bigramReader = BuildBeirRareBigramReader(ctx, beirTokenizer, query, options.streams);
+            auto weakAndReader = ctx.GetReader(query.c_str(), options.streams.c_str(), QueryCompileMode::WeakAnd);
+            auto bigramResults = executor->ExecuteBounded(bigramReader, maxK, static_cast<uint64_t>(std::max(256, maxK)));
+            auto weakAndResults = executor->Execute(weakAndReader, maxK);
+            for (auto& result : bigramResults)
+                result.score *= 0.35f;
             std::unordered_map<uint64_t, SearchResult> merged;
-            for (const auto& result : titleResults) {
+            for (const auto& result : bigramResults) {
                 merged[ReaderDocumentIDValue(result.doc_id)] = result;
             }
-            for (const auto& result : bodyResults) {
+            for (const auto& result : weakAndResults) {
                 const uint64_t docId = ReaderDocumentIDValue(result.doc_id);
                 auto it = merged.find(docId);
                 if (it == merged.end()) {

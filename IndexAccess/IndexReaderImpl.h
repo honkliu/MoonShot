@@ -402,6 +402,85 @@ private:
     }
 };
 
+class BoostIndexReader : public IndexReader {
+public:
+    BoostIndexReader(std::shared_ptr<IndexReader> base,
+                     std::shared_ptr<IndexReader> boost,
+                     float boostWeight)
+        : m_Base(std::move(base))
+        , m_Boost(std::move(boost))
+        , m_BoostWeight(boostWeight)
+    {
+    }
+
+    void SetDebug(const char* label, int depth = 0) override
+    {
+        IndexReader::SetDebug(label, depth);
+        std::println("{}[BOOST weight={}]", std::string(depth * 2, ' '), m_BoostWeight);
+        if (m_Base) m_Base->SetDebug(label, depth + 1);
+        if (m_Boost) m_Boost->SetDebug(label, depth + 1);
+    }
+
+    bool IsEnd() override { return !m_Base || m_Base->IsEnd(); }
+
+    uint64_t GetDocumentID() override { return IsEnd() ? NO_MORE_DOCS : m_Base->GetDocumentID(); }
+
+    uint32_t GetTermFreq() override { return IsEnd() ? 0 : m_Base->GetTermFreq(); }
+
+    float GetScore(const DocDataEntry* entry) override
+    {
+        if (IsEnd()) return 0.0f;
+
+        float total = m_Base->GetScore(entry);
+        if (BoostMatchesBase())
+            total += m_BoostWeight;
+        return total;
+    }
+
+    uint8_t GetSourceMask() override
+    {
+        if (IsEnd()) return 0;
+
+        uint8_t sourceMask = m_Base->GetSourceMask();
+        if (BoostMatchesBase())
+            sourceMask |= m_Boost->GetSourceMask();
+        return sourceMask;
+    }
+
+    void GoNext() override
+    {
+        if (!IsEnd()) m_Base->GoNext();
+    }
+
+    void GoUntil(uint64_t target, uint64_t limit = NO_MORE_DOCS) override
+    {
+        if (m_Base) m_Base->GoUntil(target, limit);
+    }
+
+    void Close() override
+    {
+        if (m_Base) m_Base->Close();
+        if (m_Boost) m_Boost->Close();
+    }
+
+private:
+    std::shared_ptr<IndexReader> m_Base;
+    std::shared_ptr<IndexReader> m_Boost;
+    float m_BoostWeight = 1.0f;
+
+    bool BoostMatchesBase()
+    {
+        if (!m_Boost || m_Boost->IsEnd() || IsEnd())
+            return false;
+
+        const uint64_t doc = m_Base->GetDocumentID();
+        if (m_Boost->GetDocumentID() < doc)
+            m_Boost->GoUntil(doc);
+
+        return !m_Boost->IsEnd() && m_Boost->GetDocumentID() == doc;
+    }
+};
+
 /*
 * NotIndexReader — base reader filtered by an exclusion reader.
 */

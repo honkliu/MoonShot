@@ -23,6 +23,10 @@ public:
     std::vector<SearchResult> Execute(std::shared_ptr<IndexReader> reader,
                                       int topK = 10);
 
+        std::vector<SearchResult> ExecuteBounded(std::shared_ptr<IndexReader> reader,
+                                                                                         int topK,
+                                                                                         uint64_t maxVisitedDocs);
+
     std::vector<SearchResult> Execute(IndexReader* reader, int topK = 10);
 
     std::vector<SearchResult> ExecutePhased(

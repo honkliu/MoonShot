@@ -7,7 +7,7 @@
 #include <cstddef>
 #include <cstdint>
 
-enum class NodeType { Term, And, Or, Not, WeakAnd };
+enum class NodeType { Term, And, Or, Not, WeakAnd, Boost };
 enum class QueryCompileMode { Default, WeakAnd };
 enum class WeakAndBuildMode { FlatPruned, OrChildren, OrChildrenPruned };
 
@@ -61,6 +61,13 @@ struct NotNode : EvalNode {
     std::shared_ptr<EvalNode> base;
     std::shared_ptr<EvalNode> exclude;
     NodeType GetType() const override { return NodeType::Not; }
+};
+
+struct BoostNode : EvalNode {
+    std::shared_ptr<EvalNode> base;
+    std::shared_ptr<EvalNode> boost;
+    float boost_weight = 1.0f;
+    NodeType GetType() const override { return NodeType::Boost; }
 };
 
 class EvalTree {

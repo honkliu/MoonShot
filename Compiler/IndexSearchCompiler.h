@@ -11,7 +11,6 @@
 #include <algorithm>
 #include <cctype>
 #include <set>
-#include <unordered_set>
 
 /*
 * Compiles a query string into an EvalTree.
@@ -122,17 +121,6 @@ private:
         return token == "not" || token == "NOT" || token == "Not" || token == "nOT" || token == "-";
     }
 
-    static bool IsWeakAndStopword(const std::string& token)
-    {
-        static const std::unordered_set<std::string> stopwords = {
-            "a", "an", "and", "are", "as", "at", "be", "been", "by", "for", "from", "has", "have", "in",
-            "into", "is", "it", "its", "of", "on", "or", "that", "the", "their", "there", "these", "this",
-            "to", "was", "were", "with", "without", "can", "could", "may", "might", "must", "should", "than",
-            "then", "which", "while", "during", "between", "within", "using", "used", "use"
-        };
-        return stopwords.count(token) != 0;
-    }
-
     static std::string QueryTermKey(const QueryTerm& term)
     {
         std::string key = term.term;
@@ -149,7 +137,7 @@ private:
         std::vector<QueryTerm> filtered;
         std::set<std::string> seen;
         for (const auto& token : tokens) {
-            if (token.term.size() <= 1 || IsWeakAndStopword(token.term))
+            if (token.term.size() <= 1)
                 continue;
             if (seen.insert(QueryTermKey(token)).second)
                 filtered.push_back(token);
@@ -276,6 +264,22 @@ private:
         return andNode;
     }
 
+    std::shared_ptr<EvalNode> BuildAnyBigramQuery(
+            const std::vector<QueryTerm>& terms)
+    {
+        if (terms.size() < 2)
+            return nullptr;
+
+        std::vector<std::shared_ptr<EvalNode>> groups;
+        AppendBigramGroups(terms, groups);
+        if (groups.empty()) return nullptr;
+        if (groups.size() == 1) return groups[0];
+
+        auto orNode = std::make_shared<OrNode>();
+        orNode->children = std::move(groups);
+        return orNode;
+    }
+
     void AppendBigramGroups(const std::vector<QueryTerm>& terms,
                             std::vector<std::shared_ptr<EvalNode>>& groups)
     {
@@ -306,17 +310,28 @@ private:
         groups.reserve(terms.size() * 2);
         for (const auto& token : terms)
             groups.push_back(MakeTermGroup(token));
-        AppendBigramGroups(terms, groups);
 
-        if (groups.size() == 1)
-            return groups[0];
+        std::shared_ptr<EvalNode> base;
+        if (groups.size() == 1) {
+            base = groups[0];
+        } else {
+            auto weakAndNode = std::make_shared<WeakAndNode>();
+            weakAndNode->children = std::move(groups);
+            weakAndNode->min_should_match = std::min<uint32_t>(
+                MinShouldMatch(terms.size()),
+                static_cast<uint32_t>(weakAndNode->children.size()));
+            base = weakAndNode;
+        }
 
-        auto weakAndNode = std::make_shared<WeakAndNode>();
-        weakAndNode->children = std::move(groups);
-        weakAndNode->min_should_match = std::min<uint32_t>(
-            MinShouldMatch(terms.size()),
-            static_cast<uint32_t>(weakAndNode->children.size()));
-        return weakAndNode;
+        auto bigramBoost = BuildAnyBigramQuery(terms);
+        if (!bigramBoost)
+            return base;
+
+        auto boostNode = std::make_shared<BoostNode>();
+        boostNode->base = base;
+        boostNode->boost = bigramBoost;
+        boostNode->boost_weight = 1.0f;
+        return boostNode;
     }
 
         std::shared_ptr<EvalNode> BuildImplicitExpression(
