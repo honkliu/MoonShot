@@ -265,6 +265,8 @@ public:
         return m_DeltaContext ? m_DeltaContext->GetDocDataEntry(docId) : nullptr;
     }
 
+    const uint8_t* RawDocData() const { return m_DocData; }
+
     const IndexFileHeader& GetIndexFileHeader() const { return m_IndexFileHeader; }
     uint64_t DocumentCount() const { return m_IndexFileHeader.IFH_NumDocuments; }
 
@@ -320,6 +322,7 @@ public:
                                                  VectorMetric metric = VectorMetric::Cosine,
                                                  size_t efSearch = 200)
     {
+        BuildVectorRuntime();
         return m_VectorIndex.Search(query, topK, metric, efSearch);
     }
 
@@ -993,6 +996,10 @@ private:
     void BuildVectorRuntime()
     {
         if (m_VectorBuilt) return;
+        const bool showProgress = m_IndexFileHeader.IFH_NumDocuments >= 100000;
+        const auto start = std::chrono::steady_clock::now();
+        if (showProgress)
+            std::cout << "\n  vector runtime: scanning " << m_IndexFileHeader.IFH_NumDocuments << " DocData records\n";
         m_VectorIndex.Clear();
         m_VectorIndex.SetDocData(m_DocData);
         if (m_DocData) {
@@ -1000,9 +1007,16 @@ private:
                 const auto* entry = reinterpret_cast<const DocDataEntry*>(m_DocData + docId * DOC_REC_SIZE);
                 if (entry->DDE_DocID == docId && entry->DDE_VectorFlags != 0)
                     m_VectorIndex.Add(docId);
+                if (showProgress && docId > 0 && docId % 100000 == 0)
+                    std::cout << "  vector runtime: added through doc " << docId << "\n";
             }
         }
         m_VectorBuilt = true;
+        if (showProgress) {
+            const auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - start).count();
+            std::cout << "  vector runtime: built " << m_VectorIndex.Size() << " vectors in " << elapsedMs << " ms\n";
+        }
     }
 
     static std::string DeltaIndexPath(const std::string& path)
@@ -1809,6 +1823,7 @@ private:
     shared_ptr<IndexReader> BuildVectorIndexReader(const std::vector<float>& queryVector,
                                                    size_t efSearch = 200)
     {
+        BuildVectorRuntime();
         if (queryVector.empty() || m_VectorIndex.Empty()) {
             auto empty = make_shared<AdvancedIndexReader>();
             return empty;

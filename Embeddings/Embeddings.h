@@ -111,10 +111,6 @@ public:
 private:
     bool AddNode(uint64_t docId)
     {
-        if (std::find(m_DocIds.begin(), m_DocIds.end(), docId) != m_DocIds.end()) {
-            return true;
-        }
-
         Node node;
         node.level = RandomLevel(docId);
         node.neighbors.resize(node.level + 1);

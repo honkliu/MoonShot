@@ -17,9 +17,17 @@
  *   Windows : %USERPROFILE%\moon.idx
  */
 
+#ifdef _WIN32
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN
+#  endif
+#endif
+
 #include "moonshot.h"
 
+#include <array>
 #include <cstdint>
+#include <cstring>
 #include <algorithm>
 #include <cctype>
 #include <unordered_map>
@@ -37,10 +45,17 @@
 #include <chrono>
 
 #ifdef _WIN32
+#  include <winsock2.h>
+#  include <ws2tcpip.h>
 #  include <windows.h>
+#  include <shellapi.h>
 #  include <conio.h>
 #else
+#  include <arpa/inet.h>
+#  include <netdb.h>
 #  include <pwd.h>
+#  include <sys/socket.h>
+#  include <sys/types.h>
 #  include <unistd.h>
 #  include <limits.h>
 #  include <termios.h>
@@ -425,6 +440,15 @@ struct SearchHit {
 struct SearchOptions {
     bool inverted = false;
     bool vector = false;
+    bool bge = false;
+    bool bgeSidecar = false;
+    size_t topK = 1000;
+    size_t vectorEf = 1000;
+    std::string bgeHost = "127.0.0.1";
+    uint16_t bgePort = 8765;
+    std::string bgePython;
+    std::string bgeScript;
+    std::string bgeModel = "BAAI/bge-small-en-v1.5";
 };
 
 static uint64_t CountStoredDocuments(IndexContext& ctx, uint64_t firstDocId);
@@ -433,14 +457,223 @@ static std::string SearchStreamSet(const SearchOptions& options)
 {
     std::string streams;
     if (options.inverted) streams += "AUTB";
-    if (options.vector) streams += "V";
+    if (options.vector && !options.bge) streams += "V";
     return streams;
 }
 
 static const char* SearchModeName(const SearchOptions& options)
 {
+    if (options.bge && options.inverted && options.vector) return "inverted+BGE";
+    if (options.bge && options.vector) return "BGE vector";
     if (options.inverted && options.vector) return "inverted+vector";
     return options.inverted ? "inverted" : "vector";
+}
+
+static std::string QuoteShellArg(std::string text)
+{
+    if (text.find_first_of(" \t\"&()[]{}^=;!,`'") == std::string::npos)
+        return text;
+
+    std::string quoted = "\"";
+    for (char ch : text) {
+        if (ch == '"') quoted += "\\\"";
+        else quoted.push_back(ch);
+    }
+    quoted.push_back('"');
+    return quoted;
+}
+
+static std::string DefaultBgePython()
+{
+#ifdef _WIN32
+    const std::string local = ".\\.venv-bge\\Scripts\\python.exe";
+#else
+    const std::string local = "./.venv-bge/bin/python";
+#endif
+    return std::filesystem::is_regular_file(FsPathFromUtf8(local)) ? local : "python";
+}
+
+static std::string DefaultBgeScript()
+{
+    const std::string local = ".\\Tools\\embed_query.py";
+    return std::filesystem::is_regular_file(FsPathFromUtf8(local)) ? local : "Tools/embed_query.py";
+}
+
+static bool ReadSingleI8Vector(const std::string& path, std::vector<float>& vector)
+{
+    static constexpr char Magic[8] = {'M','S','V','E','C','I','8','1'};
+    std::ifstream input(FsPathFromUtf8(path), std::ios::binary);
+    if (!input) return false;
+    char magic[8]{};
+    uint32_t dim = 0;
+    uint32_t idBytes = 0;
+    input.read(magic, sizeof(magic));
+    input.read(reinterpret_cast<char*>(&dim), sizeof(dim));
+    input.read(reinterpret_cast<char*>(&idBytes), sizeof(idBytes));
+    if (!input || std::memcmp(magic, Magic, sizeof(Magic)) != 0 || dim != DOC_VECTOR_DIM || idBytes == 0)
+        return false;
+
+    std::vector<char> idBuffer(idBytes);
+    std::array<int8_t, DOC_VECTOR_DIM> payload{};
+    input.read(idBuffer.data(), static_cast<std::streamsize>(idBuffer.size()));
+    input.read(reinterpret_cast<char*>(payload.data()), static_cast<std::streamsize>(payload.size()));
+    if (!input) return false;
+
+    vector.assign(DOC_VECTOR_DIM, 0.0f);
+    for (size_t i = 0; i < DOC_VECTOR_DIM; ++i)
+        vector[i] = static_cast<float>(payload[i]) / 128.0f;
+    return true;
+}
+
+static bool SocketSendAll(intptr_t socketHandle, const char* data, size_t size)
+{
+    while (size > 0) {
+#ifdef _WIN32
+        const int sent = send(static_cast<SOCKET>(socketHandle), data, static_cast<int>(size), 0);
+#else
+        const ssize_t sent = send(static_cast<int>(socketHandle), data, size, 0);
+#endif
+        if (sent <= 0)
+            return false;
+        data += sent;
+        size -= static_cast<size_t>(sent);
+    }
+    return true;
+}
+
+static bool SocketRecvAll(intptr_t socketHandle, char* data, size_t size)
+{
+    while (size > 0) {
+#ifdef _WIN32
+        const int got = recv(static_cast<SOCKET>(socketHandle), data, static_cast<int>(size), 0);
+#else
+        const ssize_t got = recv(static_cast<int>(socketHandle), data, size, 0);
+#endif
+        if (got <= 0)
+            return false;
+        data += got;
+        size -= static_cast<size_t>(got);
+    }
+    return true;
+}
+
+static void CloseSocketHandle(intptr_t socketHandle)
+{
+#ifdef _WIN32
+    closesocket(static_cast<SOCKET>(socketHandle));
+#else
+    close(static_cast<int>(socketHandle));
+#endif
+}
+
+static bool EmbedQueryWithBgeService(const std::string& query,
+                                     const SearchOptions& options,
+                                     std::vector<float>& vector)
+{
+    if (query.empty() || query.size() > 65536)
+        return false;
+
+#ifdef _WIN32
+    static bool wsaStarted = false;
+    if (!wsaStarted) {
+        WSADATA wsa{};
+        if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0)
+            return false;
+        wsaStarted = true;
+    }
+#endif
+
+    addrinfo hints{};
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    addrinfo* resolved = nullptr;
+    const std::string port = std::to_string(options.bgePort);
+    if (getaddrinfo(options.bgeHost.c_str(), port.c_str(), &hints, &resolved) != 0 || !resolved)
+        return false;
+
+    intptr_t socketHandle = -1;
+    for (addrinfo* cur = resolved; cur; cur = cur->ai_next) {
+#ifdef _WIN32
+        SOCKET s = socket(cur->ai_family, cur->ai_socktype, cur->ai_protocol);
+        if (s == INVALID_SOCKET)
+            continue;
+        if (connect(s, cur->ai_addr, static_cast<int>(cur->ai_addrlen)) == 0) {
+            socketHandle = static_cast<intptr_t>(s);
+            break;
+        }
+        closesocket(s);
+#else
+        int s = socket(cur->ai_family, cur->ai_socktype, cur->ai_protocol);
+        if (s < 0)
+            continue;
+        if (connect(s, cur->ai_addr, cur->ai_addrlen) == 0) {
+            socketHandle = static_cast<intptr_t>(s);
+            break;
+        }
+        close(s);
+#endif
+    }
+    freeaddrinfo(resolved);
+    if (socketHandle == -1)
+        return false;
+
+    const uint32_t length = static_cast<uint32_t>(query.size());
+    bool ok = SocketSendAll(socketHandle, reinterpret_cast<const char*>(&length), sizeof(length))
+        && SocketSendAll(socketHandle, query.data(), query.size());
+    uint32_t dim = 0;
+    std::array<int8_t, DOC_VECTOR_DIM> payload{};
+    ok = ok
+        && SocketRecvAll(socketHandle, reinterpret_cast<char*>(&dim), sizeof(dim))
+        && dim == DOC_VECTOR_DIM
+        && SocketRecvAll(socketHandle, reinterpret_cast<char*>(payload.data()), payload.size());
+    CloseSocketHandle(socketHandle);
+    if (!ok)
+        return false;
+
+    vector.assign(DOC_VECTOR_DIM, 0.0f);
+    for (size_t i = 0; i < DOC_VECTOR_DIM; ++i)
+        vector[i] = static_cast<float>(payload[i]) / 128.0f;
+    return true;
+}
+
+static bool EmbedQueryWithBge(const std::string& query,
+                              const SearchOptions& options,
+                              std::vector<float>& vector)
+{
+    if (!options.bgeSidecar) {
+        if (EmbedQueryWithBgeService(query, options, vector))
+            return true;
+        std::cerr << "BGE embedding service unavailable at " << options.bgeHost << ":" << options.bgePort
+                  << " (start Tools/bge_embedding_service.py or pass -bge-sidecar)\n";
+        return false;
+    }
+
+    const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
+    const auto tempDir = std::filesystem::temp_directory_path();
+    const auto textPath = tempDir / ("moonshot_bge_query_" + std::to_string(stamp) + ".txt");
+    const auto vectorPath = tempDir / ("moonshot_bge_query_" + std::to_string(stamp) + ".i8bin");
+    {
+        std::ofstream out(textPath, std::ios::binary);
+        if (!out) return false;
+        out << query;
+    }
+
+    const std::string python = options.bgePython.empty() ? DefaultBgePython() : options.bgePython;
+    const std::string script = options.bgeScript.empty() ? DefaultBgeScript() : options.bgeScript;
+    const std::string command = QuoteShellArg(python)
+        + " " + QuoteShellArg(script)
+        + " --text-file " + QuoteShellArg(PathToUtf8(textPath))
+        + " --output " + QuoteShellArg(PathToUtf8(vectorPath))
+        + " --model " + QuoteShellArg(options.bgeModel);
+    const int exitCode = std::system(command.c_str());
+    const bool ok = exitCode == 0 && ReadSingleI8Vector(PathToUtf8(vectorPath), vector);
+    std::error_code ec;
+    std::filesystem::remove(textPath, ec);
+    ec.clear();
+    std::filesystem::remove(vectorPath, ec);
+    if (!ok)
+        std::cerr << "BGE query embedding failed; command was: " << command << "\n";
+    return ok;
 }
 
 static std::string SourceMaskText(uint8_t sourceMask)
@@ -462,13 +695,28 @@ static void CollectSearchResults(IndexContext& ctx,
     if (ctx.DocumentCount() == 0 && !ctx.HasDelta())
         return;
 
-    const std::string streams = SearchStreamSet(options);
-    if (streams.empty())
-        return;
-
     std::unique_ptr<IndexSearchExecutor> executor(ctx.GetExecutor());
-    for (const auto& result : executor->Execute(ctx.GetReader(query.c_str(), streams.c_str()), 0))
-        hits.push_back({&ctx, result});
+    const std::string streams = SearchStreamSet(options);
+    if (!streams.empty()) {
+        for (const auto& result : executor->Execute(ctx.GetReader(query.c_str(), streams.c_str()), 0))
+            hits.push_back({&ctx, result});
+    }
+
+    if (options.vector && options.bge) {
+        std::vector<float> queryVector;
+        if (!EmbedQueryWithBge(query, options, queryVector))
+            return;
+        const auto vectorResults = ctx.VectorSearch(queryVector,
+                                                    options.topK,
+                                                    VectorMetric::Cosine,
+                                                    options.vectorEf);
+        for (const auto& result : vectorResults) {
+            SearchResult hit;
+            hit.doc_id = MakeReaderDocumentID(result.doc_id, READER_SOURCE_VECTOR);
+            hit.score = result.score;
+            hits.push_back({&ctx, std::move(hit)});
+        }
+    }
 }
 
 static void Search(IndexContext& ctx, const std::string& query, const SearchOptions& options)
@@ -731,17 +979,29 @@ struct SampleMergeOptions {
 
 struct BeirBuildOptions {
     std::string dataPath;
+    std::string docVectorsPath;
+    uint64_t limit = 0;
+    bool buildVectors = false;
+};
+
+struct BeirPatchVectorOptions {
+    std::string sourceIndexPath;
+    std::string docVectorsPath;
     uint64_t limit = 0;
 };
 
 struct BeirEvalOptions {
     std::string dataPath;
     std::string qrels = "test";
+    std::string runOut;
+    std::string queryVectorsPath;
     std::string streams = "TB";
     std::string mode = "weakand";
     std::string weakAndShape = "flat";
     std::vector<int> at = {10, 100, 1000};
     uint64_t limit = 0;
+    uint64_t vectorEf = 1000;
+    uint64_t vectorTail = 128;
     bool noMphf = false;
     uint64_t leafCacheMb = 0;
     bool leafCacheMatchMphf = false;
@@ -789,11 +1049,44 @@ static bool ParseSearchOptions(const std::vector<std::string>& args,
                                SearchOptions& options,
                                std::string& error)
 {
-    for (const auto& arg : args) {
+    for (size_t i = 0; i < args.size(); ++i) {
+        const auto& arg = args[i];
         if (arg == "-i") {
             options.inverted = true;
         } else if (arg == "-v") {
             options.vector = true;
+        } else if (arg == "-bge") {
+            options.bge = true;
+            options.vector = true;
+        } else if (arg == "-bge-sidecar") {
+            options.bgeSidecar = true;
+        } else if (arg == "-bge-python") {
+            if (i + 1 >= args.size()) { error = "Usage: moon -v -bge -bge-python <python>"; return false; }
+            options.bgePython = args[++i];
+        } else if (arg == "-bge-script") {
+            if (i + 1 >= args.size()) { error = "Usage: moon -v -bge -bge-script <embed_query.py>"; return false; }
+            options.bgeScript = args[++i];
+        } else if (arg == "-bge-model") {
+            if (i + 1 >= args.size()) { error = "Usage: moon -v -bge -bge-model <model>"; return false; }
+            options.bgeModel = args[++i];
+        } else if (arg == "-bge-host") {
+            if (i + 1 >= args.size()) { error = "Usage: moon -v -bge -bge-host <host>"; return false; }
+            options.bgeHost = args[++i];
+        } else if (arg == "-bge-port") {
+            if (i + 1 >= args.size()) { error = "Usage: moon -v -bge -bge-port <port>"; return false; }
+            uint64_t value = 0;
+            if (!ParseUInt64(args[++i], value) || value == 0 || value > 65535) { error = "-bge-port must be 1..65535"; return false; }
+            options.bgePort = static_cast<uint16_t>(value);
+        } else if (arg == "-k") {
+            if (i + 1 >= args.size()) { error = "Usage: moon -v -bge -k N"; return false; }
+            uint64_t value = 0;
+            if (!ParseUInt64(args[++i], value) || value == 0) { error = "-k must be positive"; return false; }
+            options.topK = static_cast<size_t>(value);
+        } else if (arg == "-ef") {
+            if (i + 1 >= args.size()) { error = "Usage: moon -v -bge -ef N"; return false; }
+            uint64_t value = 0;
+            if (!ParseUInt64(args[++i], value) || value == 0) { error = "-ef must be positive"; return false; }
+            options.vectorEf = static_cast<size_t>(value);
         } else {
             error = "Unknown search option: " + arg;
             return false;
@@ -801,7 +1094,7 @@ static bool ParseSearchOptions(const std::vector<std::string>& args,
     }
 
     if (!options.inverted && !options.vector) {
-        error = "Usage: moon [-idx <index>] -i [-v] | moon [-idx <index>] -v";
+        error = "Usage: moon [-idx <index>] -i [-v] | moon [-idx <index>] -v [-bge]";
         return false;
     }
 
@@ -893,6 +1186,11 @@ static bool ParseBeirBuildOptions(const std::vector<std::string>& args,
         if (arg == "-data") {
             if (i + 1 >= args.size()) { error = "Usage: moon [-idx <index>] -beir-build -data <beir-dir> [-limit N]"; return false; }
             options.dataPath = args[++i];
+        } else if (arg == "-doc-vectors") {
+            if (i + 1 >= args.size()) { error = "Usage: moon -beir-build -doc-vectors <docid-tab-vector.tsv>"; return false; }
+            options.docVectorsPath = args[++i];
+        } else if (arg == "-build-vectors") {
+            options.buildVectors = true;
         } else if (arg == "-limit") {
             if (i + 1 >= args.size()) { error = "Usage: moon -beir-build -limit N"; return false; }
             if (!ParseUInt64(args[++i], options.limit)) { error = "-limit must be a non-negative integer"; return false; }
@@ -904,6 +1202,33 @@ static bool ParseBeirBuildOptions(const std::vector<std::string>& args,
 
     if (options.dataPath.empty()) {
         error = "Usage: moon [-idx <index>] -beir-build -data <beir-dir> [-limit N]";
+        return false;
+    }
+    return true;
+}
+
+static bool ParseBeirPatchVectorOptions(const std::vector<std::string>& args,
+                                        BeirPatchVectorOptions& options,
+                                        std::string& error)
+{
+    for (size_t i = 1; i < args.size(); ++i) {
+        const std::string& arg = args[i];
+        if (arg == "-src-index") {
+            if (i + 1 >= args.size()) { error = "Usage: moon -beir-patch-vectors -src-index <index> -doc-vectors <vectors>"; return false; }
+            options.sourceIndexPath = args[++i];
+        } else if (arg == "-doc-vectors") {
+            if (i + 1 >= args.size()) { error = "Usage: moon -beir-patch-vectors -doc-vectors <vectors>"; return false; }
+            options.docVectorsPath = args[++i];
+        } else if (arg == "-limit") {
+            if (i + 1 >= args.size()) { error = "Usage: moon -beir-patch-vectors -limit N"; return false; }
+            if (!ParseUInt64(args[++i], options.limit)) { error = "-limit must be a non-negative integer"; return false; }
+        } else {
+            error = "Unknown BEIR patch option: " + arg;
+            return false;
+        }
+    }
+    if (options.sourceIndexPath.empty() || options.docVectorsPath.empty()) {
+        error = "Usage: moon [-idx <output-index>] -beir-patch-vectors -src-index <index> -doc-vectors <vectors>";
         return false;
     }
     return true;
@@ -921,6 +1246,12 @@ static bool ParseBeirEvalOptions(const std::vector<std::string>& args,
         } else if (arg == "-qrels") {
             if (i + 1 >= args.size()) { error = "Usage: moon -beir-eval -qrels <split-or-path>"; return false; }
             options.qrels = args[++i];
+        } else if (arg == "-run-out") {
+            if (i + 1 >= args.size()) { error = "Usage: moon -beir-eval -run-out <trec-run-path>"; return false; }
+            options.runOut = args[++i];
+        } else if (arg == "-query-vectors") {
+            if (i + 1 >= args.size()) { error = "Usage: moon -beir-eval -query-vectors <qid-tab-vector.tsv>"; return false; }
+            options.queryVectorsPath = args[++i];
         } else if (arg == "-k") {
             if (i + 1 >= args.size()) { error = "Usage: moon -beir-eval -k 10,100,1000"; return false; }
             if (!ParseAtList(args[++i], options.at)) { error = "-k must be a comma-separated list of positive integers"; return false; }
@@ -930,7 +1261,7 @@ static bool ParseBeirEvalOptions(const std::vector<std::string>& args,
         } else if (arg == "-mode") {
             if (i + 1 >= args.size()) { error = "Usage: moon -beir-eval -mode bow|weakand|weakand2phase|compile"; return false; }
             options.mode = args[++i];
-            if (options.mode != "bow" && options.mode != "weakand" && options.mode != "weakand2phase" && options.mode != "compile") { error = "-mode must be bow, weakand, weakand2phase, or compile"; return false; }
+            if (options.mode != "bow" && options.mode != "weakand" && options.mode != "weakand2phase" && options.mode != "vector" && options.mode != "hybrid" && options.mode != "compile") { error = "-mode must be bow, weakand, weakand2phase, vector, hybrid, or compile"; return false; }
         } else if (arg == "-weakand-shape") {
             if (i + 1 >= args.size()) { error = "Usage: moon -beir-eval -weakand-shape flat|or|or-prune"; return false; }
             options.weakAndShape = args[++i];
@@ -945,6 +1276,12 @@ static bool ParseBeirEvalOptions(const std::vector<std::string>& args,
         } else if (arg == "-limit") {
             if (i + 1 >= args.size()) { error = "Usage: moon -beir-eval -limit N"; return false; }
             if (!ParseUInt64(args[++i], options.limit)) { error = "-limit must be a non-negative integer"; return false; }
+        } else if (arg == "-vector-ef") {
+            if (i + 1 >= args.size()) { error = "Usage: moon -beir-eval -vector-ef N"; return false; }
+            if (!ParseUInt64(args[++i], options.vectorEf) || options.vectorEf == 0) { error = "-vector-ef must be a positive integer"; return false; }
+        } else if (arg == "-vector-tail") {
+            if (i + 1 >= args.size()) { error = "Usage: moon -beir-eval -vector-tail N"; return false; }
+            if (!ParseUInt64(args[++i], options.vectorTail)) { error = "-vector-tail must be a non-negative integer"; return false; }
         } else {
             error = "Unknown BEIR eval option: " + arg;
             return false;
@@ -991,6 +1328,9 @@ static void PrintHelp(const std::string& idxPath)
         << "      Open an interactive inverted-index search prompt.\n\n"
         << "  moon [-idx <index>] -v\n"
         << "      Open an interactive vector search prompt.\n\n"
+        << "  moon [-idx <index>] -v -bge [-k 1000] [-ef 1000]\n"
+        << "      Open BGE vector search using local BGE service at 127.0.0.1:8765.\n"
+        << "      Use -bge-sidecar only for debugging one Python process per query.\n\n"
         << "  moon [-idx <index>] -i -v\n"
         << "      Open an interactive hybrid search prompt. Prefixes use AUTBV mask:\n"
         << "      letters mark matched sources, '-' marks sources not matched.\n\n"
@@ -1002,7 +1342,9 @@ static void PrintHelp(const std::string& idxPath)
         << "BEIR recall evaluation:\n"
         << "  moon [-idx <index>] -beir-build -data <beir-dir> [-limit N]\n"
         << "      Build an index from BEIR corpus.jsonl. Stored doc paths are BEIR ids.\n\n"
-        << "  moon [-idx <index>] -beir-eval -data <beir-dir> [-qrels test] [-k 10,100,1000] [-streams TB] [-mode bow|weakand|weakand2phase|compile] [-weakand-shape flat|or|or-prune] [-no-mphf] [-leaf-cache-mb N] [-leaf-cache-match-mphf] [-limit N]\n"
+        << "  moon -idx <output-index> -beir-patch-vectors -src-index <index> -doc-vectors <vectors.i8bin>\n"
+        << "      Copy an existing BEIR index and patch only DocData vector fields.\n\n"
+        << "  moon [-idx <index>] -beir-eval -data <beir-dir> [-qrels test] [-run-out out.trec] [-k 10,100,1000] [-streams TB] [-mode bow|weakand|weakand2phase|compile] [-weakand-shape flat|or|or-prune] [-no-mphf] [-leaf-cache-mb N] [-leaf-cache-match-mphf] [-limit N]\n"
         << "      Evaluate Recall@k from BEIR queries.jsonl and qrels/<split>.tsv.\n"
         << "      Default mode is weakand. bow is kept as a recall-ceiling baseline.\n\n"
         << "Examples:\n"
@@ -1156,6 +1498,18 @@ static bool ExtractJsonString(const std::string& line, const std::string& key, s
 }
 
 using BeirQrels = std::unordered_map<std::string, std::unordered_set<std::string>>;
+using ExternalVector = std::array<float, DOC_VECTOR_DIM>;
+using ExternalVectorMap = std::unordered_map<std::string, ExternalVector>;
+
+struct ExternalVectorStream {
+    std::ifstream input;
+    bool binary = false;
+    uint32_t dim = static_cast<uint32_t>(DOC_VECTOR_DIM);
+    uint32_t idBytes = 0;
+};
+
+static bool OpenExternalVectorStream(const std::string& path, ExternalVectorStream& stream);
+static bool ReadExternalVectorRecord(ExternalVectorStream& stream, std::string& id, ExternalVector& vector);
 
 static bool LoadBeirQrels(const std::string& path, BeirQrels& qrels)
 {
@@ -1182,6 +1536,141 @@ static bool LoadBeirQrels(const std::string& path, BeirQrels& qrels)
         qrels[columns[0]].insert(columns[1]);
     }
     return true;
+}
+
+static bool ParseExternalVector(const std::string& text, ExternalVector& vector)
+{
+    vector.fill(0.0f);
+    size_t dim = 0;
+    size_t start = 0;
+    while (start <= text.size() && dim < DOC_VECTOR_DIM) {
+        const size_t comma = text.find(',', start);
+        const std::string_view piece(text.data() + start,
+            (comma == std::string::npos ? text.size() : comma) - start);
+        if (!piece.empty()) {
+            char* end = nullptr;
+            std::string value(piece);
+            const float parsed = std::strtof(value.c_str(), &end);
+            if (!end || end == value.c_str())
+                return false;
+            vector[dim++] = parsed;
+        }
+        if (comma == std::string::npos)
+            break;
+        start = comma + 1;
+    }
+
+    float norm = 0.0f;
+    for (float value : vector)
+        norm += value * value;
+    if (norm <= 0.0f)
+        return false;
+    norm = std::sqrt(norm);
+    for (float& value : vector)
+        value /= norm;
+    return true;
+}
+
+static bool LoadExternalVectors(const std::string& path, ExternalVectorMap& vectors)
+{
+    if (path.empty())
+        return true;
+
+    ExternalVectorStream stream;
+    if (OpenExternalVectorStream(path, stream) && stream.binary) {
+        std::string id;
+        ExternalVector vector{};
+        while (ReadExternalVectorRecord(stream, id, vector))
+            vectors.emplace(id, vector);
+        return true;
+    }
+
+    std::ifstream input(FsPathFromUtf8(path));
+    if (!input)
+        return false;
+
+    std::string line;
+    while (std::getline(input, line)) {
+        if (line.empty())
+            continue;
+        const size_t tab = line.find('\t');
+        if (tab == std::string::npos || tab == 0 || tab + 1 >= line.size())
+            continue;
+        ExternalVector vector{};
+        if (ParseExternalVector(line.substr(tab + 1), vector))
+            vectors.emplace(line.substr(0, tab), vector);
+    }
+    return true;
+}
+
+static bool OpenExternalVectorStream(const std::string& path, ExternalVectorStream& stream)
+{
+    static constexpr char Magic[8] = {'M','S','V','E','C','I','8','1'};
+    stream = {};
+    stream.input.open(FsPathFromUtf8(path), std::ios::binary);
+    if (!stream.input)
+        return false;
+
+    char magic[8]{};
+    stream.input.read(magic, sizeof(magic));
+    if (stream.input.gcount() == sizeof(magic) && std::memcmp(magic, Magic, sizeof(Magic)) == 0) {
+        stream.binary = true;
+        stream.input.read(reinterpret_cast<char*>(&stream.dim), sizeof(stream.dim));
+        stream.input.read(reinterpret_cast<char*>(&stream.idBytes), sizeof(stream.idBytes));
+        return stream.input.good()
+            && stream.dim == DOC_VECTOR_DIM
+            && stream.idBytes > 0
+            && stream.idBytes <= 1024;
+    }
+
+    stream.input.close();
+    stream.input.open(FsPathFromUtf8(path));
+    return static_cast<bool>(stream.input);
+}
+
+static bool ReadExternalVectorRecord(std::istream& input, std::string& id, ExternalVector& vector)
+{
+    std::string line;
+    while (std::getline(input, line)) {
+        if (line.empty())
+            continue;
+        const size_t tab = line.find('\t');
+        if (tab == std::string::npos || tab == 0 || tab + 1 >= line.size())
+            continue;
+        ExternalVector parsed{};
+        if (!ParseExternalVector(line.substr(tab + 1), parsed))
+            continue;
+        id = line.substr(0, tab);
+        vector = parsed;
+        return true;
+    }
+    return false;
+}
+
+static bool ReadExternalVectorRecord(ExternalVectorStream& stream, std::string& id, ExternalVector& vector)
+{
+    if (!stream.binary)
+        return ReadExternalVectorRecord(stream.input, id, vector);
+
+    std::vector<char> idBuffer(stream.idBytes);
+    std::array<int8_t, DOC_VECTOR_DIM> payload{};
+    stream.input.read(idBuffer.data(), static_cast<std::streamsize>(idBuffer.size()));
+    if (!stream.input)
+        return false;
+    stream.input.read(reinterpret_cast<char*>(payload.data()), static_cast<std::streamsize>(payload.size()));
+    if (!stream.input)
+        return false;
+
+    const auto nul = std::find(idBuffer.begin(), idBuffer.end(), '\0');
+    id.assign(idBuffer.begin(), nul);
+    for (size_t i = 0; i < DOC_VECTOR_DIM; ++i)
+        vector[i] = static_cast<float>(payload[i]) / 128.0f;
+    return !id.empty();
+}
+
+static std::vector<float> ToVector(const ExternalVector& vector)
+{
+    return std::vector<float>(vector.begin(), vector.end());
 }
 
 static bool IsBeirStopword(const std::string& token)
@@ -1261,7 +1750,9 @@ static std::shared_ptr<IndexReader> BuildBeirRareBigramReader(IndexContext& ctx,
         std::min<uint64_t>(5000, std::max<uint64_t>(64, ctx.DocumentCount() / 1000)));
     std::set<std::string> streamKeys;
     for (size_t i = 0; i + 1 < tokens.size(); ++i) {
-        if (tokens[i].size() <= 1 || tokens[i + 1].size() <= 1)
+        if (tokens[i].empty() || tokens[i + 1].empty())
+            continue;
+        if (tokens[i].size() <= 1 && tokens[i + 1].size() <= 1)
             continue;
 
         const std::string bigram = tokens[i] + BIGRAM_SEP + tokens[i + 1];
@@ -1286,6 +1777,165 @@ static std::shared_ptr<IndexReader> BuildBeirRareBigramReader(IndexContext& ctx,
     EvalTree tree;
     tree.root = std::move(orNode);
     return ctx.GetReader(&tree);
+}
+
+static void WriteBeirRun(std::ofstream* output,
+                         IndexContext& ctx,
+                         const std::string& qid,
+                         const std::vector<SearchResult>& results,
+                         const std::string& tag)
+{
+    if (!output || !*output)
+        return;
+
+    for (size_t rank = 0; rank < results.size(); ++rank) {
+        const std::string docId = ctx.GetDocPath(results[rank].doc_id);
+        if (docId.empty())
+            continue;
+        *output << qid << " Q0 " << docId << ' ' << (rank + 1) << ' '
+                << std::setprecision(9) << results[rank].score << ' ' << tag << '\n';
+    }
+}
+
+static std::vector<SearchResult> MergeSearchResults(const std::vector<SearchResult>& primary,
+                                                    const std::vector<SearchResult>& secondary,
+                                                    float secondaryOnlyWeight,
+                                                    int maxK)
+{
+    std::unordered_map<uint64_t, SearchResult> merged;
+    for (const auto& result : secondary) {
+        auto seeded = result;
+        seeded.score *= secondaryOnlyWeight;
+        merged[ReaderDocumentIDValue(result.doc_id)] = seeded;
+    }
+    for (const auto& result : primary) {
+        const uint64_t docId = ReaderDocumentIDValue(result.doc_id);
+        auto it = merged.find(docId);
+        if (it == merged.end()) {
+            merged.emplace(docId, result);
+            continue;
+        }
+        auto& slot = it->second;
+        if (slot.score < result.score)
+            slot.score = result.score;
+        slot.doc_id = MakeReaderDocumentID(docId,
+            ReaderDocumentIDSourceMask(slot.doc_id) | ReaderDocumentIDSourceMask(result.doc_id));
+    }
+
+    std::vector<SearchResult> results;
+    results.reserve(merged.size());
+    for (auto& [_, result] : merged)
+        results.push_back(std::move(result));
+    std::sort(results.begin(), results.end(), [](const SearchResult& a, const SearchResult& b) {
+        if (a.score != b.score)
+            return a.score > b.score;
+        return ReaderDocumentIDValue(a.doc_id) < ReaderDocumentIDValue(b.doc_id);
+    });
+    if (maxK > 0 && results.size() > static_cast<size_t>(maxK))
+        results.resize(static_cast<size_t>(maxK));
+    return results;
+}
+
+static void ReserveTailResults(std::vector<SearchResult>& results,
+                               const std::vector<SearchResult>& primary,
+                               const std::vector<SearchResult>& tailCandidates,
+                               float tailWeight,
+                               size_t reserveTail,
+                               int maxK)
+{
+    if (tailCandidates.empty() || reserveTail == 0 || maxK < 100 || results.size() != static_cast<size_t>(maxK))
+        return;
+
+    std::unordered_set<uint64_t> primaryDocs;
+    for (const auto& result : primary)
+        primaryDocs.insert(ReaderDocumentIDValue(result.doc_id));
+
+    std::vector<SearchResult> tailOnly;
+    tailOnly.reserve(tailCandidates.size());
+    for (auto result : tailCandidates) {
+        const uint64_t docId = ReaderDocumentIDValue(result.doc_id);
+        if (primaryDocs.count(docId))
+            continue;
+        result.score *= tailWeight;
+        tailOnly.push_back(std::move(result));
+    }
+    std::sort(tailOnly.begin(), tailOnly.end(), [](const SearchResult& a, const SearchResult& b) {
+        if (a.score != b.score)
+            return a.score > b.score;
+        return ReaderDocumentIDValue(a.doc_id) < ReaderDocumentIDValue(b.doc_id);
+    });
+
+    std::unordered_set<uint64_t> resultDocs;
+    for (const auto& result : results)
+        resultDocs.insert(ReaderDocumentIDValue(result.doc_id));
+
+    size_t replaced = 0;
+    for (const auto& result : tailOnly) {
+        if (replaced >= reserveTail)
+            break;
+        const uint64_t docId = ReaderDocumentIDValue(result.doc_id);
+        if (resultDocs.count(docId))
+            continue;
+        results[results.size() - 1 - replaced] = result;
+        resultDocs.insert(docId);
+        ++replaced;
+    }
+}
+
+static std::vector<SearchResult> ExecuteVectorScan(IndexContext& ctx,
+                                                   const std::vector<float>& queryVector,
+                                                   int topK)
+{
+    std::vector<SearchResult> results;
+    if (queryVector.size() != DOC_VECTOR_DIM || topK <= 0 || !ctx.RawDocData())
+        return results;
+
+    const size_t heapLimit = static_cast<size_t>(topK);
+    results.reserve(heapLimit);
+    auto worseScoreFirst = [](const SearchResult& a, const SearchResult& b) {
+        return a.score > b.score;
+    };
+
+    float queryNorm = 0.0f;
+    for (float value : queryVector)
+        queryNorm += value * value;
+    if (queryNorm <= 0.0f)
+        return results;
+    queryNorm = std::sqrt(queryNorm);
+
+    const uint8_t* rawDocData = ctx.RawDocData();
+    for (uint64_t docId = 0; docId < ctx.DocumentCount(); ++docId) {
+        const auto* entry = reinterpret_cast<const DocDataEntry*>(rawDocData + docId * DOC_REC_SIZE);
+        if (entry->DDE_DocID != docId || entry->DDE_VectorFlags == 0)
+            continue;
+
+        float dot = 0.0f;
+        float docNorm = 0.0f;
+        for (size_t i = 0; i < DOC_VECTOR_DIM; ++i) {
+            const float docValue = static_cast<float>(entry->DDE_VectorData[i]) / 128.0f;
+            dot += queryVector[i] * docValue;
+            docNorm += docValue * docValue;
+        }
+        if (docNorm <= 0.0f)
+            continue;
+        const float score = dot / (queryNorm * std::sqrt(docNorm));
+        SearchResult result{MakeReaderDocumentID(docId, READER_SOURCE_VECTOR), score, ""};
+        if (results.size() < heapLimit) {
+            results.push_back(result);
+            std::push_heap(results.begin(), results.end(), worseScoreFirst);
+        } else if (score > results.front().score) {
+            std::pop_heap(results.begin(), results.end(), worseScoreFirst);
+            results.back() = result;
+            std::push_heap(results.begin(), results.end(), worseScoreFirst);
+        }
+    }
+
+    std::sort(results.begin(), results.end(), [](const SearchResult& a, const SearchResult& b) {
+        if (a.score != b.score)
+            return a.score > b.score;
+        return ReaderDocumentIDValue(a.doc_id) < ReaderDocumentIDValue(b.doc_id);
+    });
+    return results;
 }
 
 static std::string ResolveBeirQrelsPath(const BeirEvalOptions& options)
@@ -1332,6 +1982,15 @@ static int RunBeirBuild(const std::string& idxPath, const BeirBuildOptions& opti
         return 1;
     }
 
+    ExternalVectorStream docVectorInput;
+    if (!options.docVectorsPath.empty()) {
+        if (!OpenExternalVectorStream(options.docVectorsPath, docVectorInput)) {
+            std::cerr << "Could not load document vectors: " << options.docVectorsPath << "\n";
+            return 1;
+        }
+        std::cout << "  streaming external document vectors: " << options.docVectorsPath << "\n";
+    }
+
     std::error_code ec;
     std::filesystem::remove(FsPathFromUtf8(idxPath), ec);
     ec.clear();
@@ -1341,6 +2000,7 @@ static int RunBeirBuild(const std::string& idxPath, const BeirBuildOptions& opti
     std::string line;
     uint64_t docId = 0;
     uint64_t skipped = 0;
+    uint64_t vectorDocs = 0;
     auto start = std::chrono::steady_clock::now();
     while (std::getline(corpus, line)) {
         if (options.limit > 0 && docId >= options.limit) break;
@@ -1358,7 +2018,23 @@ static int RunBeirBuild(const std::string& idxPath, const BeirBuildOptions& opti
         doc.title = title;
         doc.body = text;
         doc.importance = 0.1f;
-        ctx.AddDocument(doc, false);
+        const bool useBuiltInVector = options.buildVectors && !docVectorInput.input.is_open();
+        ctx.AddDocument(doc, useBuiltInVector);
+        if (docVectorInput.input.is_open()) {
+            std::string vectorId;
+            ExternalVector vector{};
+            if (!ReadExternalVectorRecord(docVectorInput, vectorId, vector)) {
+                std::cerr << "Document vector file ended before corpus doc " << id << "\n";
+                return 1;
+            }
+            if (vectorId != id) {
+                std::cerr << "Document vector id mismatch: expected " << id << " got " << vectorId << "\n";
+                return 1;
+            }
+            auto writer = ctx.GetWriter();
+            writer->SetDocVector(docId, ToVector(vector));
+            ++vectorDocs;
+        }
         ++docId;
         if (docId % 1000 == 0)
             std::cout << "  BEIR indexed " << docId << " docs\n";
@@ -1377,8 +2053,92 @@ static int RunBeirBuild(const std::string& idxPath, const BeirBuildOptions& opti
     const auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - start).count();
     std::cout << "BEIR build complete docs=" << docId;
+    if (docVectorInput.input.is_open() || options.buildVectors) std::cout << " vector_docs=" << vectorDocs;
     if (skipped) std::cout << " skipped=" << skipped;
     std::cout << " elapsed_ms=" << elapsedMs << "\n";
+    return 0;
+}
+
+static int RunBeirPatchVectors(const std::string& idxPath, const BeirPatchVectorOptions& options)
+{
+    IndexFileHeader header{};
+    if (!ReadIndexHeaderOnly(options.sourceIndexPath, header)) {
+        std::cerr << "Source index not found or invalid: " << options.sourceIndexPath << "\n";
+        return 1;
+    }
+
+    if (idxPath == options.sourceIndexPath) {
+        std::cerr << "Output index must differ from source index for vector patching\n";
+        return 1;
+    }
+
+    std::error_code ec;
+    std::filesystem::copy_file(FsPathFromUtf8(options.sourceIndexPath),
+                               FsPathFromUtf8(idxPath),
+                               std::filesystem::copy_options::overwrite_existing,
+                               ec);
+    if (ec) {
+        std::cerr << "Failed to copy source index: " << ec.message() << "\n";
+        return 1;
+    }
+
+    ExternalVectorStream vectors;
+    if (!OpenExternalVectorStream(options.docVectorsPath, vectors)) {
+        std::cerr << "Could not open vector file: " << options.docVectorsPath << "\n";
+        return 1;
+    }
+
+    std::fstream output(FsPathFromUtf8(idxPath), std::ios::binary | std::ios::in | std::ios::out);
+    if (!output) {
+        std::cerr << "Could not open output index for patching: " << idxPath << "\n";
+        return 1;
+    }
+
+    uint64_t patched = 0;
+    for (uint64_t docId = 0; docId < header.IFH_NumDocuments; ++docId) {
+        if (options.limit > 0 && patched >= options.limit)
+            break;
+
+        std::string vectorId;
+        ExternalVector vector{};
+        if (!ReadExternalVectorRecord(vectors, vectorId, vector)) {
+            std::cerr << "Vector file ended before docId " << docId << "\n";
+            return 1;
+        }
+
+        const uint64_t entryOffset = header.IFH_DocDataOffset + docId * DOC_REC_SIZE;
+        const uint64_t flagsOffset = entryOffset + offsetof(DocDataEntry, DDE_VectorFlags);
+        const uint64_t dimOffset = entryOffset + offsetof(DocDataEntry, DDE_VectorDim);
+        const uint64_t formatOffset = entryOffset + offsetof(DocDataEntry, DDE_VectorFormat);
+        const uint64_t dataOffset = entryOffset + offsetof(DocDataEntry, DDE_VectorData);
+
+        const uint32_t flags = 1;
+        const uint16_t dim = static_cast<uint16_t>(DOC_VECTOR_DIM);
+        const uint16_t format = 1;
+        output.seekp(flagsOffset);
+        output.write(reinterpret_cast<const char*>(&flags), sizeof(flags));
+        output.seekp(dimOffset);
+        output.write(reinterpret_cast<const char*>(&dim), sizeof(dim));
+        output.seekp(formatOffset);
+        output.write(reinterpret_cast<const char*>(&format), sizeof(format));
+
+        std::array<int8_t, DOC_VECTOR_DIM> quantized{};
+        for (size_t i = 0; i < DOC_VECTOR_DIM; ++i) {
+            const float clipped = std::max(-128.0f, std::min(127.0f, vector[i] * 128.0f));
+            quantized[i] = static_cast<int8_t>(std::round(clipped));
+        }
+        output.seekp(dataOffset);
+        output.write(reinterpret_cast<const char*>(quantized.data()), quantized.size());
+        if (!output) {
+            std::cerr << "Failed while patching docId " << docId << "\n";
+            return 1;
+        }
+        ++patched;
+        if (patched % 100000 == 0)
+            std::cout << "  patched " << patched << " vectors\n";
+    }
+
+    std::cout << "BEIR vector patch complete docs=" << patched << " output=" << idxPath << "\n";
     return 0;
 }
 
@@ -1401,6 +2161,24 @@ static int RunBeirEval(const std::string& idxPath, const BeirEvalOptions& option
     if (!queries) {
         std::cerr << "BEIR queries not found: " << queryPath << "\n";
         return 1;
+    }
+
+    std::ofstream runOutput;
+    if (!options.runOut.empty()) {
+        runOutput.open(FsPathFromUtf8(options.runOut));
+        if (!runOutput) {
+            std::cerr << "Could not open BEIR run output: " << options.runOut << "\n";
+            return 1;
+        }
+    }
+
+    ExternalVectorMap queryVectors;
+    if (!options.queryVectorsPath.empty()) {
+        if (!LoadExternalVectors(options.queryVectorsPath, queryVectors)) {
+            std::cerr << "Could not load query vectors: " << options.queryVectorsPath << "\n";
+            return 1;
+        }
+        std::cout << "  loaded external query vectors: " << queryVectors.size() << "\n";
     }
 
     const uint64_t leafCacheBytes = BeirEvalLeafCacheBytes(idxPath, options);
@@ -1446,37 +2224,87 @@ static int RunBeirEval(const std::string& idxPath, const BeirEvalOptions& option
         } else if (options.mode == "weakand2phase") {
             auto bigramReader = BuildBeirRareBigramReader(ctx, beirTokenizer, query, options.streams);
             auto weakAndReader = ctx.GetReader(query.c_str(), options.streams.c_str(), QueryCompileMode::WeakAnd);
-            auto bigramResults = executor->ExecuteBounded(bigramReader, maxK, static_cast<uint64_t>(std::max(256, maxK)));
+            auto bigramResults = executor->ExecuteBounded(bigramReader, maxK, static_cast<uint64_t>(std::max(5000, maxK)));
             auto weakAndResults = executor->Execute(weakAndReader, maxK);
-            for (auto& result : bigramResults)
-                result.score *= 0.35f;
-            std::unordered_map<uint64_t, SearchResult> merged;
-            for (const auto& result : bigramResults) {
-                merged[ReaderDocumentIDValue(result.doc_id)] = result;
-            }
-            for (const auto& result : weakAndResults) {
-                const uint64_t docId = ReaderDocumentIDValue(result.doc_id);
-                auto it = merged.find(docId);
-                if (it == merged.end()) {
-                    merged.emplace(docId, result);
-                    continue;
+            static constexpr float BigramOnlyWeight = 0.35f;
+            auto results = MergeSearchResults(weakAndResults, bigramResults, BigramOnlyWeight, maxK);
+            ReserveTailResults(results,
+                               weakAndResults,
+                               bigramResults,
+                               BigramOnlyWeight,
+                               std::min<size_t>(16, static_cast<size_t>(maxK) / 40),
+                               maxK);
+
+            WriteBeirRun(options.runOut.empty() ? nullptr : &runOutput, ctx, qid, results, "moon-" + options.mode);
+
+            std::vector<uint64_t> cumulativeHits(options.at.size(), 0);
+            uint64_t hitCount = 0;
+            size_t nextAt = 0;
+            for (size_t rank = 0; rank < results.size(); ++rank) {
+                const std::string docIdText = ctx.GetDocPath(results[rank].doc_id);
+                if (qrelIt->second.count(docIdText))
+                    ++hitCount;
+                while (nextAt < options.at.size() && rank + 1 == static_cast<size_t>(options.at[nextAt])) {
+                    cumulativeHits[nextAt] = hitCount;
+                    ++nextAt;
                 }
-                auto& slot = it->second;
-                if (slot.score < result.score)
-                    slot.score = result.score;
-                slot.doc_id = MakeReaderDocumentID(docId, ReaderDocumentIDSourceMask(slot.doc_id) | ReaderDocumentIDSourceMask(result.doc_id));
             }
-            auto results = std::vector<SearchResult>{};
-            results.reserve(merged.size());
-            for (auto& [_, result] : merged)
-                results.push_back(std::move(result));
-            std::sort(results.begin(), results.end(), [](const SearchResult& a, const SearchResult& b) {
-                if (a.score != b.score)
-                    return a.score > b.score;
-                return ReaderDocumentIDValue(a.doc_id) < ReaderDocumentIDValue(b.doc_id);
-            });
+            while (nextAt < options.at.size()) {
+                cumulativeHits[nextAt] = hitCount;
+                ++nextAt;
+            }
+
+            const uint64_t relevantCount = static_cast<uint64_t>(qrelIt->second.size());
+            microRelevant += relevantCount;
+            for (size_t i = 0; i < options.at.size(); ++i) {
+                macroRecall[i] += static_cast<double>(cumulativeHits[i]) / static_cast<double>(relevantCount);
+                microHits[i] += cumulativeHits[i];
+            }
+            ++evaluated;
+            if (evaluated % 100 == 0)
+                std::cout << "  BEIR evaluated " << evaluated << " queries\n";
+            continue;
+        } else if (options.mode == "vector" || options.mode == "hybrid") {
+            std::vector<float> queryVector;
+            auto vectorIt = queryVectors.find(qid);
+            if (vectorIt != queryVectors.end()) {
+                queryVector = ToVector(vectorIt->second);
+            } else if (queryVectors.empty()) {
+                queryVector = ctx.CompileToVector(query.c_str());
+            }
+
+            std::vector<SearchResult> vectorResults;
+            if (!queryVector.empty())
+                vectorResults = ExecuteVectorScan(ctx, queryVector, maxK);
+
+            std::vector<SearchResult> results;
+            if (options.mode == "vector") {
+                results = std::move(vectorResults);
+            } else {
+                auto bigramReader = BuildBeirRareBigramReader(ctx, beirTokenizer, query, options.streams);
+                auto weakAndReader = ctx.GetReader(query.c_str(), options.streams.c_str(), QueryCompileMode::WeakAnd);
+                auto bigramResults = executor->ExecuteBounded(bigramReader, maxK, static_cast<uint64_t>(std::max(5000, maxK)));
+                auto weakAndResults = executor->Execute(weakAndReader, maxK);
+                static constexpr float BigramOnlyWeight = 0.35f;
+                results = MergeSearchResults(weakAndResults, bigramResults, BigramOnlyWeight, maxK);
+                ReserveTailResults(results,
+                                   weakAndResults,
+                                   bigramResults,
+                                   BigramOnlyWeight,
+                                   std::min<size_t>(16, static_cast<size_t>(maxK) / 40),
+                                   maxK);
+                results = MergeSearchResults(results, vectorResults, 0.40f, maxK);
+                ReserveTailResults(results,
+                                   weakAndResults,
+                                   vectorResults,
+                                   0.40f,
+                                   static_cast<size_t>(std::min<uint64_t>(options.vectorTail, static_cast<uint64_t>(maxK))),
+                                   maxK);
+            }
+
             if (results.size() > static_cast<size_t>(maxK))
                 results.resize(static_cast<size_t>(maxK));
+            WriteBeirRun(options.runOut.empty() ? nullptr : &runOutput, ctx, qid, results, "moon-" + options.mode);
 
             std::vector<uint64_t> cumulativeHits(options.at.size(), 0);
             uint64_t hitCount = 0;
@@ -1509,6 +2337,7 @@ static int RunBeirEval(const std::string& idxPath, const BeirEvalOptions& option
             reader = ctx.GetReader(query.c_str(), options.streams.c_str());
         }
         auto results = executor->Execute(reader, maxK);
+        WriteBeirRun(options.runOut.empty() ? nullptr : &runOutput, ctx, qid, results, "moon-" + options.mode);
         std::vector<uint64_t> cumulativeHits(options.at.size(), 0);
         uint64_t hitCount = 0;
         size_t nextAt = 0;
@@ -1881,6 +2710,14 @@ int main(int argc, char* argv[])
             return 1;
         }
         return RunBeirBuild(idxPath, options);
+
+    } else if (cmd == "-beir-patch-vectors") {
+        BeirPatchVectorOptions options;
+        if (!ParseBeirPatchVectorOptions(args, options, error)) {
+            std::cerr << error << "\n";
+            return 1;
+        }
+        return RunBeirPatchVectors(idxPath, options);
 
     } else if (cmd == "-beir-eval") {
         BeirEvalOptions options;
