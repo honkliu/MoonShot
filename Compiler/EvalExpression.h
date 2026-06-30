@@ -8,7 +8,7 @@
 #include <cstdint>
 
 enum class NodeType { Term, And, Or, Not, WeakAnd, Boost };
-enum class QueryCompileMode { Default, WeakAnd };
+enum class QueryCompileMode { Default, WeakAndBigram };
 enum class WeakAndBuildMode { FlatPruned, OrChildren, OrChildrenPruned };
 
 /*

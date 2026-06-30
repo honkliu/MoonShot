@@ -697,25 +697,28 @@ static void CollectSearchResults(IndexContext& ctx,
 
     std::unique_ptr<IndexSearchExecutor> executor(ctx.GetExecutor());
     const std::string streams = SearchStreamSet(options);
-    if (!streams.empty()) {
-        for (const auto& result : executor->Execute(ctx.GetReader(query.c_str(), streams.c_str()), 0))
-            hits.push_back({&ctx, result});
-    }
-
     if (options.vector && options.bge) {
         std::vector<float> queryVector;
         if (!EmbedQueryWithBge(query, options, queryVector))
             return;
-        const auto vectorResults = ctx.VectorSearch(queryVector,
-                                                    options.topK,
-                                                    VectorMetric::Cosine,
-                                                    options.vectorEf);
-        for (const auto& result : vectorResults) {
-            SearchResult hit;
-            hit.doc_id = MakeReaderDocumentID(result.doc_id, READER_SOURCE_VECTOR);
-            hit.score = result.score;
-            hits.push_back({&ctx, std::move(hit)});
+
+        std::unique_ptr<EvalTree> tree;
+        if (!streams.empty()) {
+            tree.reset(ctx.Compile(query.c_str(), streams.c_str(), QueryCompileMode::WeakAndBigram));
+        } else {
+            tree = std::make_unique<EvalTree>();
         }
+        tree->vector_query = std::move(queryVector);
+        tree->vector_ef_search = options.vectorEf;
+
+        for (const auto& result : executor->Execute(ctx.GetReader(tree.get()), static_cast<int>(options.topK)))
+            hits.push_back({&ctx, result});
+        return;
+    }
+
+    if (!streams.empty()) {
+        for (const auto& result : executor->Execute(ctx.GetReader(query.c_str(), streams.c_str()), 0))
+            hits.push_back({&ctx, result});
     }
 }
 
@@ -996,12 +999,11 @@ struct BeirEvalOptions {
     std::string runOut;
     std::string queryVectorsPath;
     std::string streams = "TB";
-    std::string mode = "weakand";
+    std::string mode = "weakandbigram";
     std::string weakAndShape = "flat";
     std::vector<int> at = {10, 100, 1000};
     uint64_t limit = 0;
     uint64_t vectorEf = 1000;
-    uint64_t vectorTail = 128;
     bool noMphf = false;
     uint64_t leafCacheMb = 0;
     bool leafCacheMatchMphf = false;
@@ -1259,9 +1261,9 @@ static bool ParseBeirEvalOptions(const std::vector<std::string>& args,
             if (i + 1 >= args.size()) { error = "Usage: moon -beir-eval -streams TB"; return false; }
             options.streams = args[++i];
         } else if (arg == "-mode") {
-            if (i + 1 >= args.size()) { error = "Usage: moon -beir-eval -mode bow|weakand|weakand2phase|compile"; return false; }
+            if (i + 1 >= args.size()) { error = "Usage: moon -beir-eval -mode bow|weakandbigram|compile"; return false; }
             options.mode = args[++i];
-            if (options.mode != "bow" && options.mode != "weakand" && options.mode != "weakand2phase" && options.mode != "vector" && options.mode != "hybrid" && options.mode != "compile") { error = "-mode must be bow, weakand, weakand2phase, vector, hybrid, or compile"; return false; }
+            if (options.mode != "bow" && options.mode != "weakandbigram" && options.mode != "vector" && options.mode != "hybrid" && options.mode != "compile") { error = "-mode must be bow, weakandbigram, vector, hybrid, or compile"; return false; }
         } else if (arg == "-weakand-shape") {
             if (i + 1 >= args.size()) { error = "Usage: moon -beir-eval -weakand-shape flat|or|or-prune"; return false; }
             options.weakAndShape = args[++i];
@@ -1279,9 +1281,6 @@ static bool ParseBeirEvalOptions(const std::vector<std::string>& args,
         } else if (arg == "-vector-ef") {
             if (i + 1 >= args.size()) { error = "Usage: moon -beir-eval -vector-ef N"; return false; }
             if (!ParseUInt64(args[++i], options.vectorEf) || options.vectorEf == 0) { error = "-vector-ef must be a positive integer"; return false; }
-        } else if (arg == "-vector-tail") {
-            if (i + 1 >= args.size()) { error = "Usage: moon -beir-eval -vector-tail N"; return false; }
-            if (!ParseUInt64(args[++i], options.vectorTail)) { error = "-vector-tail must be a non-negative integer"; return false; }
         } else {
             error = "Unknown BEIR eval option: " + arg;
             return false;
@@ -1344,9 +1343,9 @@ static void PrintHelp(const std::string& idxPath)
         << "      Build an index from BEIR corpus.jsonl. Stored doc paths are BEIR ids.\n\n"
         << "  moon -idx <output-index> -beir-patch-vectors -src-index <index> -doc-vectors <vectors.i8bin>\n"
         << "      Copy an existing BEIR index and patch only DocData vector fields.\n\n"
-        << "  moon [-idx <index>] -beir-eval -data <beir-dir> [-qrels test] [-run-out out.trec] [-k 10,100,1000] [-streams TB] [-mode bow|weakand|weakand2phase|compile] [-weakand-shape flat|or|or-prune] [-no-mphf] [-leaf-cache-mb N] [-leaf-cache-match-mphf] [-limit N]\n"
+        << "  moon [-idx <index>] -beir-eval -data <beir-dir> [-qrels test] [-run-out out.trec] [-k 10,100,1000] [-streams TB] [-mode bow|weakandbigram|compile] [-weakand-shape flat|or|or-prune] [-no-mphf] [-leaf-cache-mb N] [-leaf-cache-match-mphf] [-limit N]\n"
         << "      Evaluate Recall@k from BEIR queries.jsonl and qrels/<split>.tsv.\n"
-        << "      Default mode is weakand. bow is kept as a recall-ceiling baseline.\n\n"
+        << "      Default mode is weakandbigram. bow is kept as a recall-ceiling baseline.\n\n"
         << "Examples:\n"
         << "  moon -idx .\\notes.idx -dir .\\docs -ext md,txt -r\n"
         << "  moon -idx .\\notes.idx -i\n"
@@ -1736,49 +1735,6 @@ static std::shared_ptr<IndexReader> BuildBeirBowReader(IndexContext& ctx,
     return ctx.GetReader(&tree);
 }
 
-static std::shared_ptr<IndexReader> BuildBeirRareBigramReader(IndexContext& ctx,
-                                                              SmartTokenizer& tokenizer,
-                                                              const std::string& query,
-                                                              const std::string& streamSet)
-{
-    const auto streams = ParseBeirStreams(streamSet);
-    const auto tokens = tokenizer.Tokenize(query.c_str());
-    if (tokens.size() < 2)
-        return nullptr;
-
-    const uint32_t docFreqMax = static_cast<uint32_t>(
-        std::min<uint64_t>(5000, std::max<uint64_t>(64, ctx.DocumentCount() / 1000)));
-    std::set<std::string> streamKeys;
-    for (size_t i = 0; i + 1 < tokens.size(); ++i) {
-        if (tokens[i].empty() || tokens[i + 1].empty())
-            continue;
-        if (tokens[i].size() <= 1 && tokens[i + 1].size() <= 1)
-            continue;
-
-        const std::string bigram = tokens[i] + BIGRAM_SEP + tokens[i + 1];
-        for (const auto& stream : streams) {
-            const std::string streamKey = bigram + stream;
-            const uint32_t docFreq = ctx.GetStreamDocFreq(streamKey.c_str());
-            if (docFreq > 0 && docFreq <= docFreqMax)
-                streamKeys.insert(streamKey);
-        }
-    }
-
-    if (streamKeys.empty())
-        return nullptr;
-
-    if (streamKeys.size() == 1)
-        return ctx.GetStreamReader(streamKeys.begin()->c_str());
-
-    auto orNode = std::make_shared<OrNode>();
-    for (const auto& key : streamKeys)
-        orNode->children.push_back(std::make_shared<TermNode>(key, 2));
-
-    EvalTree tree;
-    tree.root = std::move(orNode);
-    return ctx.GetReader(&tree);
-}
-
 static void WriteBeirRun(std::ofstream* output,
                          IndexContext& ctx,
                          const std::string& qid,
@@ -1795,147 +1751,6 @@ static void WriteBeirRun(std::ofstream* output,
         *output << qid << " Q0 " << docId << ' ' << (rank + 1) << ' '
                 << std::setprecision(9) << results[rank].score << ' ' << tag << '\n';
     }
-}
-
-static std::vector<SearchResult> MergeSearchResults(const std::vector<SearchResult>& primary,
-                                                    const std::vector<SearchResult>& secondary,
-                                                    float secondaryOnlyWeight,
-                                                    int maxK)
-{
-    std::unordered_map<uint64_t, SearchResult> merged;
-    for (const auto& result : secondary) {
-        auto seeded = result;
-        seeded.score *= secondaryOnlyWeight;
-        merged[ReaderDocumentIDValue(result.doc_id)] = seeded;
-    }
-    for (const auto& result : primary) {
-        const uint64_t docId = ReaderDocumentIDValue(result.doc_id);
-        auto it = merged.find(docId);
-        if (it == merged.end()) {
-            merged.emplace(docId, result);
-            continue;
-        }
-        auto& slot = it->second;
-        if (slot.score < result.score)
-            slot.score = result.score;
-        slot.doc_id = MakeReaderDocumentID(docId,
-            ReaderDocumentIDSourceMask(slot.doc_id) | ReaderDocumentIDSourceMask(result.doc_id));
-    }
-
-    std::vector<SearchResult> results;
-    results.reserve(merged.size());
-    for (auto& [_, result] : merged)
-        results.push_back(std::move(result));
-    std::sort(results.begin(), results.end(), [](const SearchResult& a, const SearchResult& b) {
-        if (a.score != b.score)
-            return a.score > b.score;
-        return ReaderDocumentIDValue(a.doc_id) < ReaderDocumentIDValue(b.doc_id);
-    });
-    if (maxK > 0 && results.size() > static_cast<size_t>(maxK))
-        results.resize(static_cast<size_t>(maxK));
-    return results;
-}
-
-static void ReserveTailResults(std::vector<SearchResult>& results,
-                               const std::vector<SearchResult>& primary,
-                               const std::vector<SearchResult>& tailCandidates,
-                               float tailWeight,
-                               size_t reserveTail,
-                               int maxK)
-{
-    if (tailCandidates.empty() || reserveTail == 0 || maxK < 100 || results.size() != static_cast<size_t>(maxK))
-        return;
-
-    std::unordered_set<uint64_t> primaryDocs;
-    for (const auto& result : primary)
-        primaryDocs.insert(ReaderDocumentIDValue(result.doc_id));
-
-    std::vector<SearchResult> tailOnly;
-    tailOnly.reserve(tailCandidates.size());
-    for (auto result : tailCandidates) {
-        const uint64_t docId = ReaderDocumentIDValue(result.doc_id);
-        if (primaryDocs.count(docId))
-            continue;
-        result.score *= tailWeight;
-        tailOnly.push_back(std::move(result));
-    }
-    std::sort(tailOnly.begin(), tailOnly.end(), [](const SearchResult& a, const SearchResult& b) {
-        if (a.score != b.score)
-            return a.score > b.score;
-        return ReaderDocumentIDValue(a.doc_id) < ReaderDocumentIDValue(b.doc_id);
-    });
-
-    std::unordered_set<uint64_t> resultDocs;
-    for (const auto& result : results)
-        resultDocs.insert(ReaderDocumentIDValue(result.doc_id));
-
-    size_t replaced = 0;
-    for (const auto& result : tailOnly) {
-        if (replaced >= reserveTail)
-            break;
-        const uint64_t docId = ReaderDocumentIDValue(result.doc_id);
-        if (resultDocs.count(docId))
-            continue;
-        results[results.size() - 1 - replaced] = result;
-        resultDocs.insert(docId);
-        ++replaced;
-    }
-}
-
-static std::vector<SearchResult> ExecuteVectorScan(IndexContext& ctx,
-                                                   const std::vector<float>& queryVector,
-                                                   int topK)
-{
-    std::vector<SearchResult> results;
-    if (queryVector.size() != DOC_VECTOR_DIM || topK <= 0 || !ctx.RawDocData())
-        return results;
-
-    const size_t heapLimit = static_cast<size_t>(topK);
-    results.reserve(heapLimit);
-    auto worseScoreFirst = [](const SearchResult& a, const SearchResult& b) {
-        return a.score > b.score;
-    };
-
-    float queryNorm = 0.0f;
-    for (float value : queryVector)
-        queryNorm += value * value;
-    if (queryNorm <= 0.0f)
-        return results;
-    queryNorm = std::sqrt(queryNorm);
-
-    const uint8_t* rawDocData = ctx.RawDocData();
-    for (uint64_t docId = 0; docId < ctx.DocumentCount(); ++docId) {
-        const auto* entry = reinterpret_cast<const DocDataEntry*>(rawDocData + docId * DOC_REC_SIZE);
-        if (entry->DDE_DocID != docId || entry->DDE_VectorFlags == 0)
-            continue;
-
-        float dot = 0.0f;
-        float docNorm = 0.0f;
-        for (size_t i = 0; i < DOC_VECTOR_DIM; ++i) {
-            const float docValue = static_cast<float>(entry->DDE_VectorData[i]) / 128.0f;
-            dot += queryVector[i] * docValue;
-            docNorm += docValue * docValue;
-        }
-        if (docNorm <= 0.0f)
-            continue;
-        const float score = dot / (queryNorm * std::sqrt(docNorm));
-        SearchResult result{MakeReaderDocumentID(docId, READER_SOURCE_VECTOR), score, ""};
-        if (results.size() < heapLimit) {
-            results.push_back(result);
-            std::push_heap(results.begin(), results.end(), worseScoreFirst);
-        } else if (score > results.front().score) {
-            std::pop_heap(results.begin(), results.end(), worseScoreFirst);
-            results.back() = result;
-            std::push_heap(results.begin(), results.end(), worseScoreFirst);
-        }
-    }
-
-    std::sort(results.begin(), results.end(), [](const SearchResult& a, const SearchResult& b) {
-        if (a.score != b.score)
-            return a.score > b.score;
-        return ReaderDocumentIDValue(a.doc_id) < ReaderDocumentIDValue(b.doc_id);
-    });
-    return results;
 }
 
 static std::string ResolveBeirQrelsPath(const BeirEvalOptions& options)
@@ -2219,21 +2034,9 @@ static int RunBeirEval(const std::string& idxPath, const BeirEvalOptions& option
         std::shared_ptr<IndexReader> reader;
         if (options.mode == "bow") {
             reader = BuildBeirBowReader(ctx, beirTokenizer, query, options.streams);
-        } else if (options.mode == "weakand") {
-            reader = ctx.GetReader(query.c_str(), options.streams.c_str(), QueryCompileMode::WeakAnd);
-        } else if (options.mode == "weakand2phase") {
-            auto bigramReader = BuildBeirRareBigramReader(ctx, beirTokenizer, query, options.streams);
-            auto weakAndReader = ctx.GetReader(query.c_str(), options.streams.c_str(), QueryCompileMode::WeakAnd);
-            auto bigramResults = executor->ExecuteBounded(bigramReader, maxK, static_cast<uint64_t>(std::max(5000, maxK)));
-            auto weakAndResults = executor->Execute(weakAndReader, maxK);
-            static constexpr float BigramOnlyWeight = 0.35f;
-            auto results = MergeSearchResults(weakAndResults, bigramResults, BigramOnlyWeight, maxK);
-            ReserveTailResults(results,
-                               weakAndResults,
-                               bigramResults,
-                               BigramOnlyWeight,
-                               std::min<size_t>(16, static_cast<size_t>(maxK) / 40),
-                               maxK);
+        } else if (options.mode == "weakandbigram") {
+            reader = ctx.GetReader(query.c_str(), options.streams.c_str(), QueryCompileMode::WeakAndBigram);
+            auto results = executor->Execute(reader, maxK);
 
             WriteBeirRun(options.runOut.empty() ? nullptr : &runOutput, ctx, qid, results, "moon-" + options.mode);
 
@@ -2273,34 +2076,17 @@ static int RunBeirEval(const std::string& idxPath, const BeirEvalOptions& option
                 queryVector = ctx.CompileToVector(query.c_str());
             }
 
-            std::vector<SearchResult> vectorResults;
-            if (!queryVector.empty())
-                vectorResults = ExecuteVectorScan(ctx, queryVector, maxK);
-
-            std::vector<SearchResult> results;
-            if (options.mode == "vector") {
-                results = std::move(vectorResults);
+            std::unique_ptr<EvalTree> tree;
+            if (options.mode == "hybrid") {
+                tree.reset(ctx.Compile(query.c_str(), options.streams.c_str(), QueryCompileMode::WeakAndBigram));
             } else {
-                auto bigramReader = BuildBeirRareBigramReader(ctx, beirTokenizer, query, options.streams);
-                auto weakAndReader = ctx.GetReader(query.c_str(), options.streams.c_str(), QueryCompileMode::WeakAnd);
-                auto bigramResults = executor->ExecuteBounded(bigramReader, maxK, static_cast<uint64_t>(std::max(5000, maxK)));
-                auto weakAndResults = executor->Execute(weakAndReader, maxK);
-                static constexpr float BigramOnlyWeight = 0.35f;
-                results = MergeSearchResults(weakAndResults, bigramResults, BigramOnlyWeight, maxK);
-                ReserveTailResults(results,
-                                   weakAndResults,
-                                   bigramResults,
-                                   BigramOnlyWeight,
-                                   std::min<size_t>(16, static_cast<size_t>(maxK) / 40),
-                                   maxK);
-                results = MergeSearchResults(results, vectorResults, 0.40f, maxK);
-                ReserveTailResults(results,
-                                   weakAndResults,
-                                   vectorResults,
-                                   0.40f,
-                                   static_cast<size_t>(std::min<uint64_t>(options.vectorTail, static_cast<uint64_t>(maxK))),
-                                   maxK);
+                tree = std::make_unique<EvalTree>();
             }
+            if (!queryVector.empty())
+                tree->vector_query = std::move(queryVector);
+            tree->vector_ef_search = static_cast<size_t>(options.vectorEf);
+
+            auto results = executor->Execute(ctx.GetReader(tree.get()), maxK);
 
             if (results.size() > static_cast<size_t>(maxK))
                 results.resize(static_cast<size_t>(maxK));

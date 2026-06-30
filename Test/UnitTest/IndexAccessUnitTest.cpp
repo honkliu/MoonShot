@@ -937,6 +937,46 @@ void TestBigram()
         assert(orNode->children[1]->GetType() == NodeType::And);
         std::cout << "  unigram arm: AndNode verified\n";
     }
+
+    /*
+    * WeakAndBigram compiles to:
+    *   Or(WeakAnd(unigrams), WeakAnd(adjacent bigrams))
+    * A doc with only one adjacent bigram should not enter recall for a
+    * four-token query because the bigram branch requires two of three bigrams.
+    */
+    {
+        IndexContext localEngine;
+        auto localWriter = localEngine.GetWriter();
+        localWriter->Write(tok.Tokenize("alpha beta standalone"), 0, "Title");
+        localWriter->Write(tok.Tokenize("alpha beta gamma standalone"), 1, "Title");
+        localWriter->Write(tok.Tokenize("gamma delta standalone"), 2, "Title");
+        localWriter->Write(tok.Tokenize("delta epsilon standalone"), 3, "Title");
+        localWriter->Write(tok.Tokenize("epsilon zeta standalone"), 4, "Title");
+        localEngine.Build();
+
+        auto tree = std::unique_ptr<EvalTree>(compiler.Compile(
+            "alpha beta gamma delta epsilon zeta", "T", nullptr, QueryCompileMode::WeakAndBigram));
+        assert(tree && !tree->IsEmpty());
+        assert(tree->root->GetType() == NodeType::Or);
+
+        auto* orNode = static_cast<OrNode*>(tree->root.get());
+        assert(orNode->children.size() == 2);
+        assert(orNode->children[0]->GetType() == NodeType::WeakAnd);
+        assert(orNode->children[1]->GetType() == NodeType::WeakAnd);
+        auto* bigramWeakAnd = static_cast<WeakAndNode*>(orNode->children[1].get());
+        assert(bigramWeakAnd->children.size() == 5);
+        assert(bigramWeakAnd->min_should_match == 2);
+
+        std::unique_ptr<IndexSearchExecutor> localExec(localEngine.GetExecutor());
+        auto results = localExec->Execute(
+            localEngine.GetReader("alpha beta gamma delta epsilon zeta", "T", QueryCompileMode::WeakAndBigram), 10);
+        AssertNotContains(results, 0, "weakand bigram: one adjacent bigram is not enough");
+        AssertContains(results, 1, "weakand bigram: two adjacent bigrams match");
+        AssertNotContains(results, 2, "weakand bigram: trailing one adjacent bigram is not enough");
+        AssertNotContains(results, 3, "weakand bigram: middle one adjacent bigram is not enough");
+        AssertNotContains(results, 4, "weakand bigram: final one adjacent bigram is not enough");
+        std::cout << "  WeakAndBigram tree: Or(WeakAnd(unigrams), WeakAnd(bigrams)) verified\n";
+    }
 }
 
 } // namespace IndexAccessTests
