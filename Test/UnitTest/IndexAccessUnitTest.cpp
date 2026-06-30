@@ -932,8 +932,8 @@ void TestBigram()
 
     /*
     * WeakAndBigram compiles to one reader tree:
-    *   Boost(OR(WeakAnd(unigrams), OR(adjacent bigrams)), OR(adjacent bigrams))
-    * This restores the normal Compile -> GetReader -> Execute architecture.
+    *   OR(WeakAnd(unigrams), OR(adjacent bigrams))
+    * This keeps the normal Compile -> GetReader -> Execute architecture.
     */
     {
         IndexContext localEngine;
@@ -947,22 +947,17 @@ void TestBigram()
 
         auto tree = std::unique_ptr<EvalTree>(compiler.Compile(
             "alpha beta gamma delta epsilon zeta", "T", nullptr, QueryCompileMode::WeakAndBigram));
-        if (!tree || tree->IsEmpty() || tree->root->GetType() != NodeType::Boost)
-            throw std::runtime_error("WeakAndBigram must compile to a BoostNode");
+        if (!tree || tree->IsEmpty() || tree->root->GetType() != NodeType::Or)
+            throw std::runtime_error("WeakAndBigram must compile to OR(WeakAnd, OR(bigrams))");
 
-        auto* boostNode = static_cast<BoostNode*>(tree->root.get());
-        if (!boostNode->base || boostNode->base->GetType() != NodeType::Or)
-            throw std::runtime_error("WeakAndBigram base must be OR(WeakAnd, OR(bigrams))");
-        auto* candidateOr = static_cast<OrNode*>(boostNode->base.get());
+        auto* candidateOr = static_cast<OrNode*>(tree->root.get());
         if (candidateOr->children.size() != 2
             || candidateOr->children[0]->GetType() != NodeType::WeakAnd
             || candidateOr->children[1]->GetType() != NodeType::Or)
             throw std::runtime_error("WeakAndBigram candidate set must be OR(WeakAnd, OR(bigrams))");
-        if (!boostNode->boost || boostNode->boost->GetType() != NodeType::Or)
-            throw std::runtime_error("WeakAndBigram boost must be OR(adjacent bigrams)");
-        auto* bigramOr = static_cast<OrNode*>(boostNode->boost.get());
+        auto* bigramOr = static_cast<OrNode*>(candidateOr->children[1].get());
         if (bigramOr->children.size() != 5)
-            throw std::runtime_error("WeakAndBigram boost should contain five adjacent bigrams");
+            throw std::runtime_error("WeakAndBigram bigram branch should contain five adjacent bigrams");
 
         std::unique_ptr<IndexSearchExecutor> localExec(localEngine.GetExecutor());
         auto results = localExec->Execute(localEngine.GetReader(tree.get()), 10);
@@ -971,7 +966,7 @@ void TestBigram()
         AssertContains(results, 2, "weakand bigram: trailing one adjacent bigram enters recall");
         AssertContains(results, 3, "weakand bigram: middle one adjacent bigram enters recall");
         AssertContains(results, 4, "weakand bigram: final one adjacent bigram enters recall");
-        std::cout << "  WeakAndBigram tree: Boost(OR(WeakAnd, OR(bigrams)), OR(bigrams)) verified\n";
+        std::cout << "  WeakAndBigram tree: OR(WeakAnd, OR(bigrams)) verified\n";
     }
 }
 

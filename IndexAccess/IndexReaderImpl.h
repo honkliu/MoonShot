@@ -411,6 +411,8 @@ public:
         , m_Boost(std::move(boost))
         , m_BoostWeight(boostWeight)
     {
+        m_CurrentDoc = (!m_Base || m_Base->IsEnd()) ? NO_MORE_DOCS : m_Base->GetDocumentID();
+        m_BoostDoc = (!m_Boost || m_Boost->IsEnd()) ? NO_MORE_DOCS : m_Boost->GetDocumentID();
     }
 
     void SetDebug(const char* label, int depth = 0) override
@@ -421,9 +423,9 @@ public:
         if (m_Boost) m_Boost->SetDebug(label, depth + 1);
     }
 
-    bool IsEnd() override { return !m_Base || m_Base->IsEnd(); }
+    bool IsEnd() override { return m_CurrentDoc == NO_MORE_DOCS; }
 
-    uint64_t GetDocumentID() override { return IsEnd() ? NO_MORE_DOCS : m_Base->GetDocumentID(); }
+    uint64_t GetDocumentID() override { return m_CurrentDoc; }
 
     uint32_t GetTermFreq() override { return IsEnd() ? 0 : m_Base->GetTermFreq(); }
 
@@ -449,35 +451,46 @@ public:
 
     void GoNext() override
     {
-        if (!IsEnd()) m_Base->GoNext();
+        if (!IsEnd()) {
+            m_Base->GoNext();
+            m_CurrentDoc = (!m_Base || m_Base->IsEnd()) ? NO_MORE_DOCS : m_Base->GetDocumentID();
+        }
     }
 
     void GoUntil(uint64_t target, uint64_t limit = NO_MORE_DOCS) override
     {
-        if (m_Base) m_Base->GoUntil(target, limit);
+        if (m_Base) {
+            m_Base->GoUntil(target, limit);
+            m_CurrentDoc = (!m_Base || m_Base->IsEnd()) ? NO_MORE_DOCS : m_Base->GetDocumentID();
+        }
     }
 
     void Close() override
     {
         if (m_Base) m_Base->Close();
         if (m_Boost) m_Boost->Close();
+        m_CurrentDoc = NO_MORE_DOCS;
+        m_BoostDoc = NO_MORE_DOCS;
     }
 
 private:
     std::shared_ptr<IndexReader> m_Base;
     std::shared_ptr<IndexReader> m_Boost;
     float m_BoostWeight = 1.0f;
+    uint64_t m_CurrentDoc = NO_MORE_DOCS;
+    uint64_t m_BoostDoc = NO_MORE_DOCS;
 
     bool BoostMatchesBase()
     {
-        if (!m_Boost || m_Boost->IsEnd() || IsEnd())
+        if (!m_Boost || m_BoostDoc == NO_MORE_DOCS || IsEnd())
             return false;
 
-        const uint64_t doc = m_Base->GetDocumentID();
-        if (m_Boost->GetDocumentID() < doc)
-            m_Boost->GoUntil(doc);
+        if (m_BoostDoc < m_CurrentDoc) {
+            m_Boost->GoUntil(m_CurrentDoc);
+            m_BoostDoc = (!m_Boost || m_Boost->IsEnd()) ? NO_MORE_DOCS : m_Boost->GetDocumentID();
+        }
 
-        return !m_Boost->IsEnd() && m_Boost->GetDocumentID() == doc;
+        return m_BoostDoc == m_CurrentDoc;
     }
 };
 

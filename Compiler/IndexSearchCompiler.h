@@ -328,13 +328,8 @@ private:
 
         auto candidateOr = std::make_shared<OrNode>();
         candidateOr->children.push_back(std::move(base));
-        candidateOr->children.push_back(bigram);
-
-        auto boostNode = std::make_shared<BoostNode>();
-        boostNode->base = std::move(candidateOr);
-        boostNode->boost = std::move(bigram);
-        boostNode->boost_weight = 1.0f;
-        return boostNode;
+        candidateOr->children.push_back(std::move(bigram));
+        return candidateOr;
     }
 
     std::shared_ptr<EvalNode> BuildImplicitExpression(
