@@ -48,7 +48,8 @@ class AdvancedIndexReader : public IndexReader
         */
         void Open(const char*      streamKey,
               IndexBlockTable* blockTable,
-              const IndexContext* context);
+              const IndexContext* context,
+              uint32_t wordSpan = 1);
 
         void SetDebug(const char* label, int depth = 0) override
         {
@@ -88,6 +89,8 @@ class AdvancedIndexReader : public IndexReader
         uint32_t                    m_BlockSlotNumber = UINT32_MAX;
         uint32_t                    m_DocFreq         = 0;
         uint8_t                     m_SourceMask      = 0;
+        uint32_t                    m_WordSpan        = 1;
+        float                       m_SpanWeight      = 1.0f;
         float                       m_Idf             = 0.0f;
         float                       m_Bm25LengthBias  = 0.0f;
         float                       m_Bm25LengthScale = 0.0f;

@@ -7,7 +7,8 @@
 
 void AdvancedIndexReader::Open(const char*      streamKey,
                                 IndexBlockTable* blockTable,
-                                const IndexContext* context)
+                                const IndexContext* context,
+                                uint32_t wordSpan)
 {
     assert(streamKey);
     assert(blockTable);
@@ -24,6 +25,8 @@ void AdvancedIndexReader::Open(const char*      streamKey,
     m_BlockTable      = blockTable;
     m_Context         = context;
     m_DocFreq         = 0;
+    m_WordSpan        = std::max(1u, wordSpan);
+    m_SpanWeight      = m_WordSpan >= 2 ? 2.0f : 1.0f;
     m_Idf             = 0.0f;
     m_Bm25LengthBias  = 0.0f;
     m_Bm25LengthScale = 0.0f;
@@ -131,10 +134,8 @@ float AdvancedIndexReader::GetScore(const DocDataEntry* entry) {
     const float dl = static_cast<float>(std::max(1u, docLength));
 
     static constexpr float K1PlusOne = 2.2f;
-    const float tfNorm = tf * K1PlusOne /
+    return m_SpanWeight * m_Idf * tf * K1PlusOne /
         (tf + m_Bm25LengthBias + m_Bm25LengthScale * dl);
-
-    return m_Idf * tfNorm;
 }
 void AdvancedIndexReader::Close() {
     if (m_BlockTable && m_BlockSlotNumber != UINT32_MAX)

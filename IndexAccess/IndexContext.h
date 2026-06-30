@@ -1690,7 +1690,8 @@ private:
 
             reader->Open(termNode->stream_key.c_str(),
                          &m_BlockTable,
-                         this);
+                         this,
+                         termNode->word_span);
             return reader;
         }
 
