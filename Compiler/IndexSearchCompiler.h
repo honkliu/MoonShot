@@ -264,12 +264,13 @@ private:
         return andNode;
     }
 
-    void AppendBigramGroups(const std::vector<QueryTerm>& terms,
-                            std::vector<std::shared_ptr<EvalNode>>& groups)
+    std::shared_ptr<EvalNode> BuildAnyBigramQuery(
+            const std::vector<QueryTerm>& terms)
     {
         if (terms.size() < 2)
-            return;
+            return nullptr;
 
+        std::vector<std::shared_ptr<EvalNode>> groups;
         for (size_t i = 0; i + 1 < terms.size(); ++i) {
             if (terms[i].streams != terms[i + 1].streams)
                 continue;
@@ -279,25 +280,13 @@ private:
                 terms[i].streams,
                 /*word_span=*/2));
         }
-    }
 
-    std::shared_ptr<EvalNode> BuildBigramWeakAndQuery(
-            const std::vector<QueryTerm>& terms)
-    {
-        if (terms.size() < 2)
-            return nullptr;
+            if (groups.empty()) return nullptr;
+            if (groups.size() == 1) return groups[0];
 
-        std::vector<std::shared_ptr<EvalNode>> groups;
-        AppendBigramGroups(terms, groups);
-        if (groups.empty()) return nullptr;
-        if (groups.size() == 1) return groups[0];
-
-        auto weakAndNode = std::make_shared<WeakAndNode>();
-        weakAndNode->children = std::move(groups);
-        weakAndNode->min_should_match = std::min<uint32_t>(
-            MinShouldMatch(weakAndNode->children.size()),
-            static_cast<uint32_t>(weakAndNode->children.size()));
-        return weakAndNode;
+            auto orNode = std::make_shared<OrNode>();
+            orNode->children = std::move(groups);
+            return orNode;
     }
 
     std::shared_ptr<EvalNode> BuildWeakAndBaseExpression(
@@ -333,60 +322,65 @@ private:
     {
         auto terms = FilterWeakAndTerms(tokens);
         auto base = BuildWeakAndBaseExpression(terms);
-        auto bigramWeakAnd = BuildBigramWeakAndQuery(terms);
-        if (!base) return bigramWeakAnd;
-        if (!bigramWeakAnd) return base;
+        auto bigram = BuildAnyBigramQuery(terms);
+        if (!base) return bigram;
+        if (!bigram) return base;
 
-        auto orNode = std::make_shared<OrNode>();
-        orNode->children.push_back(std::move(base));
-        orNode->children.push_back(std::move(bigramWeakAnd));
-        return orNode;
+        auto candidateOr = std::make_shared<OrNode>();
+        candidateOr->children.push_back(std::move(base));
+        candidateOr->children.push_back(bigram);
+
+        auto boostNode = std::make_shared<BoostNode>();
+        boostNode->base = std::move(candidateOr);
+        boostNode->boost = std::move(bigram);
+        boostNode->boost_weight = 1.0f;
+        return boostNode;
     }
 
-        std::shared_ptr<EvalNode> BuildImplicitExpression(
-                const std::vector<QueryTerm>& tokens,
-                QueryCompileMode mode = QueryCompileMode::Default)
+    std::shared_ptr<EvalNode> BuildImplicitExpression(
+            const std::vector<QueryTerm>& tokens,
+            QueryCompileMode mode = QueryCompileMode::Default)
     {
         if (mode == QueryCompileMode::WeakAndBigram)
             return BuildWeakAndBigramExpression(tokens);
 
-            std::shared_ptr<EvalNode> unigramBase;
-        if (tokens.empty()) {
+        if (tokens.empty())
             return nullptr;
-        }
+
+        std::shared_ptr<EvalNode> unigramBase;
         if (tokens.size() == 1) {
-                    unigramBase = MakeTermGroup(tokens[0]);
-            } else {
-                auto andNode = std::make_shared<AndNode>();
-                for (auto& t : tokens)
-                        andNode->children.push_back(MakeTermGroup(t));
-                unigramBase = andNode;
+            unigramBase = MakeTermGroup(tokens[0]);
+        } else {
+            auto andNode = std::make_shared<AndNode>();
+            for (auto& t : tokens)
+                andNode->children.push_back(MakeTermGroup(t));
+            unigramBase = andNode;
         }
 
-                auto bigram = BuildBigramQuery(tokens);
-            if (!bigram) return unigramBase;
+        auto bigram = BuildBigramQuery(tokens);
+        if (!bigram) return unigramBase;
 
-            auto orNode = std::make_shared<OrNode>();
-            orNode->children.push_back(bigram);
-            orNode->children.push_back(unigramBase);
-            return orNode;
+        auto orNode = std::make_shared<OrNode>();
+        orNode->children.push_back(bigram);
+        orNode->children.push_back(unigramBase);
+        return orNode;
     }
 
-        std::shared_ptr<EvalNode> BuildMinusExpression(
-                const std::vector<QueryTerm>& positive,
-                const std::vector<QueryTerm>& negative,
-                QueryCompileMode mode = QueryCompileMode::Default)
-        {
-                if (negative.empty())
-                    return BuildImplicitExpression(positive, mode);
-                if (positive.empty())
-                    return nullptr;
+    std::shared_ptr<EvalNode> BuildMinusExpression(
+            const std::vector<QueryTerm>& positive,
+            const std::vector<QueryTerm>& negative,
+            QueryCompileMode mode = QueryCompileMode::Default)
+    {
+        if (negative.empty())
+            return BuildImplicitExpression(positive, mode);
+        if (positive.empty())
+            return nullptr;
 
-            auto notNode = std::make_shared<NotNode>();
-                notNode->base = BuildImplicitExpression(positive, mode);
-                notNode->exclude = BuildImplicitExpression(negative, mode);
-            return notNode;
-        }
+        auto notNode = std::make_shared<NotNode>();
+        notNode->base = BuildImplicitExpression(positive, mode);
+        notNode->exclude = BuildImplicitExpression(negative, mode);
+        return notNode;
+    }
 
     std::shared_ptr<EvalNode> ParseExpression(
             const std::string&              query,

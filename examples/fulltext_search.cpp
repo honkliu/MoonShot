@@ -133,21 +133,17 @@ int main()
     PRINT(run(engine, compiler, "python data science"));
 
     /* ------------------------------------------------------------------ *
-     * 3.  Multi-phase search.                                              *
-     *     Phase 1 (AUT) targets Title, URL, Anchor.                       *
-     *     ExecutePhased falls back to Phase 2 (AUTB) when < min results.  *
+     * 3.  Field expansion.                                                *
+     *     AUT targets Title, URL, Anchor. AUTB also includes Body.        *
      * ------------------------------------------------------------------ */
-    std::println("\n=== Multi-phase search ===");
+    std::println("\n=== Field expansion ===");
     {
-        auto tree1 = std::unique_ptr<EvalTree>(compiler.Compile("inverted", "AUT"));
         auto tree2 = std::unique_ptr<EvalTree>(compiler.Compile("inverted", "AUTB"));
         auto exec  = std::unique_ptr<IndexSearchExecutor>(engine.GetExecutor());
 
-        auto phased = exec->ExecutePhased(engine.GetReader(tree1.get()),
-                                          engine.GetReader(tree2.get()),
-                                          5, /*min_before_fallback=*/ 1);
-        std::println("  ExecutePhased(\"inverted\", min=1):");
-        PRINT(phased);
+        auto expanded = exec->Execute(engine.GetReader(tree2.get()), 5);
+        std::println("  Execute(\"inverted\", AUTB):");
+        PRINT(expanded);
     }
 
     /* ------------------------------------------------------------------ *

@@ -123,47 +123,6 @@ std::vector<SearchResult> IndexSearchExecutor::Execute(IndexReader* reader, int 
     return Execute(std::shared_ptr<IndexReader>(reader, [](IndexReader*){}), topK);
 }
 
-std::vector<SearchResult> IndexSearchExecutor::ExecutePhased(
-        std::shared_ptr<IndexReader> phase1Reader,
-        std::shared_ptr<IndexReader> phase2Reader,
-        int topK,
-        int minResultsForPhase1)
-{
-    auto results = CollectResults(phase1Reader);
-
-    if ((int)results.size() < minResultsForPhase1 && phase2Reader) {
-        auto phase2Results = CollectResults(phase2Reader);
-        MergeResults(results, phase2Results);
-    }
-
-    SortAndTruncate(results, topK);
-    return results;
-}
-
-std::vector<SearchResult> IndexSearchExecutor::CollectResults(
-    std::shared_ptr<IndexReader>& reader)
-{
-    std::vector<SearchResult> results;
-
-    if (!reader)
-        return results;
-
-    while (!reader->IsEnd()) {
-        uint64_t docId     = reader->GetDocumentID();
-        assert(m_Context);
-        const DocDataEntry* entry = m_Context->GetDocDataEntry(docId);
-        assert(entry);
-        float    score     = reader->GetScore(entry)
-                   + entry->DDE_StaticRank
-                   + DocDataPrior(*entry);
-
-        results.push_back({MakeReaderDocumentID(docId, reader->GetSourceMask()), score, ""});
-        reader->GoNext();
-    }
-
-    return results;
-}
-
 void IndexSearchExecutor::SortAndTruncate(std::vector<SearchResult>& results, int topK)
 {
     std::sort(results.begin(), results.end(),
@@ -173,26 +132,4 @@ void IndexSearchExecutor::SortAndTruncate(std::vector<SearchResult>& results, in
 
     if (topK > 0 && (int)results.size() > topK)
         results.resize(static_cast<size_t>(topK));
-}
-
-void IndexSearchExecutor::MergeResults(std::vector<SearchResult>&       base,
-                                       const std::vector<SearchResult>& additional)
-{
-    for (auto& result : additional) {
-        bool isDuplicate = false;
-
-        for (auto& existing : base) {
-            if (ReaderDocumentIDValue(existing.doc_id) == ReaderDocumentIDValue(result.doc_id)) {
-                existing.score = std::max(existing.score, result.score);
-                existing.doc_id = MakeReaderDocumentID(
-                    ReaderDocumentIDValue(existing.doc_id),
-                    ReaderDocumentIDSourceMask(existing.doc_id) | ReaderDocumentIDSourceMask(result.doc_id));
-                isDuplicate    = true;
-                break;
-            }
-        }
-
-        if (!isDuplicate)
-            base.push_back(result);
-    }
 }

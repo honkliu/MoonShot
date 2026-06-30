@@ -350,7 +350,7 @@ void TestEvalTree()
 }
 
 /*
-* Multi-phase: Phase 1 (AUT) finds nothing; ExecutePhased escalates to AUTB.
+* Field expansion: AUT misses body-only text; AUTB finds it.
 */
 void TestMultiPhase()
 {
@@ -373,16 +373,8 @@ void TestMultiPhase()
     std::cout << "  Phase 2 (AUTB) 'roulette': " << phase2.size() << " results\n";
     AssertContains(phase2, 4, "roulette body phase2");
 
-    auto tree_p1 = compiler->Compile("roulette", "AUT");
-    auto tree_p2 = compiler->Compile("roulette", "AUTB");
-    auto rdr_p1  = g_ctx->GetReader(tree_p1);
-    auto rdr_p2  = g_ctx->GetReader(tree_p2);
-    auto phased  = executor->ExecutePhased(rdr_p1, rdr_p2, 10, 1);
-    PrintResults(phased, "ExecutePhased 'roulette'");
-    AssertContains(phased, 4, "roulette phased");
-
     delete compiler;
-    delete tree1; delete tree2; delete tree_p1; delete tree_p2;
+    delete tree1; delete tree2;
 }
 
 /*
@@ -939,10 +931,9 @@ void TestBigram()
     }
 
     /*
-    * WeakAndBigram compiles to:
-    *   Or(WeakAnd(unigrams), WeakAnd(adjacent bigrams))
-    * A doc with only one adjacent bigram should not enter recall for a
-    * four-token query because the bigram branch requires two of three bigrams.
+    * WeakAndBigram compiles to one reader tree:
+    *   Boost(OR(WeakAnd(unigrams), OR(adjacent bigrams)), OR(adjacent bigrams))
+    * This restores the normal Compile -> GetReader -> Execute architecture.
     */
     {
         IndexContext localEngine;
@@ -956,26 +947,31 @@ void TestBigram()
 
         auto tree = std::unique_ptr<EvalTree>(compiler.Compile(
             "alpha beta gamma delta epsilon zeta", "T", nullptr, QueryCompileMode::WeakAndBigram));
-        assert(tree && !tree->IsEmpty());
-        assert(tree->root->GetType() == NodeType::Or);
+        if (!tree || tree->IsEmpty() || tree->root->GetType() != NodeType::Boost)
+            throw std::runtime_error("WeakAndBigram must compile to a BoostNode");
 
-        auto* orNode = static_cast<OrNode*>(tree->root.get());
-        assert(orNode->children.size() == 2);
-        assert(orNode->children[0]->GetType() == NodeType::WeakAnd);
-        assert(orNode->children[1]->GetType() == NodeType::WeakAnd);
-        auto* bigramWeakAnd = static_cast<WeakAndNode*>(orNode->children[1].get());
-        assert(bigramWeakAnd->children.size() == 5);
-        assert(bigramWeakAnd->min_should_match == 2);
+        auto* boostNode = static_cast<BoostNode*>(tree->root.get());
+        if (!boostNode->base || boostNode->base->GetType() != NodeType::Or)
+            throw std::runtime_error("WeakAndBigram base must be OR(WeakAnd, OR(bigrams))");
+        auto* candidateOr = static_cast<OrNode*>(boostNode->base.get());
+        if (candidateOr->children.size() != 2
+            || candidateOr->children[0]->GetType() != NodeType::WeakAnd
+            || candidateOr->children[1]->GetType() != NodeType::Or)
+            throw std::runtime_error("WeakAndBigram candidate set must be OR(WeakAnd, OR(bigrams))");
+        if (!boostNode->boost || boostNode->boost->GetType() != NodeType::Or)
+            throw std::runtime_error("WeakAndBigram boost must be OR(adjacent bigrams)");
+        auto* bigramOr = static_cast<OrNode*>(boostNode->boost.get());
+        if (bigramOr->children.size() != 5)
+            throw std::runtime_error("WeakAndBigram boost should contain five adjacent bigrams");
 
         std::unique_ptr<IndexSearchExecutor> localExec(localEngine.GetExecutor());
-        auto results = localExec->Execute(
-            localEngine.GetReader("alpha beta gamma delta epsilon zeta", "T", QueryCompileMode::WeakAndBigram), 10);
-        AssertNotContains(results, 0, "weakand bigram: one adjacent bigram is not enough");
+        auto results = localExec->Execute(localEngine.GetReader(tree.get()), 10);
+        AssertContains(results, 0, "weakand bigram: one adjacent bigram enters recall");
         AssertContains(results, 1, "weakand bigram: two adjacent bigrams match");
-        AssertNotContains(results, 2, "weakand bigram: trailing one adjacent bigram is not enough");
-        AssertNotContains(results, 3, "weakand bigram: middle one adjacent bigram is not enough");
-        AssertNotContains(results, 4, "weakand bigram: final one adjacent bigram is not enough");
-        std::cout << "  WeakAndBigram tree: Or(WeakAnd(unigrams), WeakAnd(bigrams)) verified\n";
+        AssertContains(results, 2, "weakand bigram: trailing one adjacent bigram enters recall");
+        AssertContains(results, 3, "weakand bigram: middle one adjacent bigram enters recall");
+        AssertContains(results, 4, "weakand bigram: final one adjacent bigram enters recall");
+        std::cout << "  WeakAndBigram tree: Boost(OR(WeakAnd, OR(bigrams)), OR(bigrams)) verified\n";
     }
 }
 

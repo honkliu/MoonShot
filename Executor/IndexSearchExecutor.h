@@ -23,31 +23,16 @@ public:
     std::vector<SearchResult> Execute(std::shared_ptr<IndexReader> reader,
                                       int topK = 10);
 
-        std::vector<SearchResult> ExecuteBounded(std::shared_ptr<IndexReader> reader,
-                                                                                         int topK,
-                                                                                         uint64_t maxVisitedDocs);
+    std::vector<SearchResult> ExecuteBounded(std::shared_ptr<IndexReader> reader,
+                                             int topK,
+                                             uint64_t maxVisitedDocs);
 
     std::vector<SearchResult> Execute(IndexReader* reader, int topK = 10);
-
-    std::vector<SearchResult> ExecutePhased(
-            std::shared_ptr<IndexReader> phase1Reader,
-            std::shared_ptr<IndexReader> phase2Reader,
-            int topK                = 10,
-            int minResultsForPhase1 = 3);
-
-    void Execute() {}
-    void Execute(EvalTree* /*evalTree*/) {}
 
 private:
     const IndexContext*          m_Context = nullptr;
 
-    std::vector<SearchResult> CollectResults(
-            std::shared_ptr<IndexReader>& reader);
-
     static void SortAndTruncate(std::vector<SearchResult>& results, int topK);
-
-    static void MergeResults(std::vector<SearchResult>&       base,
-                             const std::vector<SearchResult>& additional);
 };
 
 #endif

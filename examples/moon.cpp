@@ -2035,8 +2035,8 @@ static int RunBeirEval(const std::string& idxPath, const BeirEvalOptions& option
         if (options.mode == "bow") {
             reader = BuildBeirBowReader(ctx, beirTokenizer, query, options.streams);
         } else if (options.mode == "weakandbigram") {
-            reader = ctx.GetReader(query.c_str(), options.streams.c_str(), QueryCompileMode::WeakAndBigram);
-            auto results = executor->Execute(reader, maxK);
+            auto tree = std::unique_ptr<EvalTree>(ctx.Compile(query.c_str(), options.streams.c_str(), QueryCompileMode::WeakAndBigram));
+            auto results = executor->Execute(ctx.GetReader(tree.get()), maxK);
 
             WriteBeirRun(options.runOut.empty() ? nullptr : &runOutput, ctx, qid, results, "moon-" + options.mode);
 
