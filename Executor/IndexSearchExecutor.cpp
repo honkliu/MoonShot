@@ -11,15 +11,14 @@ namespace {
 float DocDataScore(const DocDataEntry& entry)
 {
     // Fitted formula from the 2026-06-30 full-feature GPU sweep:
-    // score = 1.8*weak + 0.1*dump_bigram + 1.0*static + 0.0*prior
-    //       + 1.0*quality + 0.5*authority - 2.0*spam + 2.0*both + 0.0*bigram_only.
+    // score = 2.0*weak + 0.175*dump_bigram + 0.25*static + 0.0*prior
+    //       + 6.0*quality + 0.5*authority - 0.25*spam + 0.0*both + 0.0*bigram_only.
     // Scheme A folds stream-side terms into leaf span weights:
-    // unigram span weight = 1.8; bigram span weight = 0.1 * dump_bigram_span_weight(2.0) = 0.2.
-    // The both-hit term is omitted so Execute() stays single-root and single-score.
-    return entry.DDE_StaticRank
-        + entry.DDE_QualityScore
+    // unigram span weight = 2.0; bigram span weight = 0.175 * dump_bigram_span_weight(2.0) = 0.35.
+    return 0.25f * entry.DDE_StaticRank
+        + 6.0f * entry.DDE_QualityScore
         + 0.5f * entry.DDE_AuthorityScore
-        - 2.0f * entry.DDE_SpamScore;
+        - 0.25f * entry.DDE_SpamScore;
 }
 
 }

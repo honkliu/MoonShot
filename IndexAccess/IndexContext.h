@@ -955,8 +955,9 @@ private:
     bool                         m_WriteBuilt = false;
     uint64_t                     m_LeafTermCacheBytes = LEAF_TERM_CACHE_BYTES;
     WeakAndBuildMode             m_WeakAndBuildMode = WeakAndBuildMode::FlatPruned;
-    float                        m_UnigramSpanWeight = 1.0f;
-    float                        m_BigramSpanWeight = 2.0f;
+    // Scheme A tuned defaults: stream score = 2.0*unigram + 0.35*raw_bigram.
+    float                        m_UnigramSpanWeight = 2.0f;
+    float                        m_BigramSpanWeight = 0.35f;
 
     static constexpr uint32_t INDEX_BLOCK_CACHE_SLOT_COUNT =
         static_cast<uint32_t>(INDEX_BLOCK_CACHE_BYTES / sizeof(IndexBlock));

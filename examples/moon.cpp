@@ -1005,7 +1005,7 @@ struct BeirEvalOptions {
     std::vector<int> at = {10, 100, 1000};
     uint64_t limit = 0;
     uint64_t vectorEf = 1000;
-    float bigramWeight = 2.0f;
+    float bigramWeight = 0.35f;
     bool noMphf = false;
     uint64_t leafCacheMb = 0;
     bool leafCacheMatchMphf = false;
@@ -2193,12 +2193,7 @@ static int RunBeirEval(const std::string& idxPath, const BeirEvalOptions& option
         ctx.SetLeafTermCacheBytes(leafCacheBytes);
     ctx.LoadIndex(idxPath.c_str());
     ctx.SetTermMphfEnabled(!options.noMphf);
-    if (options.mode == "weakandbigram" && options.dumpFeaturesPath.empty()) {
-        ctx.SetUnigramSpanWeight(1.8f);
-        ctx.SetBigramSpanWeight(0.2f);
-    } else {
-        ctx.SetBigramSpanWeight(options.bigramWeight);
-    }
+    ctx.SetBigramSpanWeight(options.bigramWeight);
     WeakAndBuildMode weakAndBuildMode = WeakAndBuildMode::FlatPruned;
     if (options.weakAndShape == "or")
         weakAndBuildMode = WeakAndBuildMode::OrChildren;
