@@ -305,6 +305,24 @@ public:
             m_DeltaContext->SetWeakAndBuildMode(mode);
     }
 
+    void SetBigramSpanWeight(float weight)
+    {
+        m_BigramSpanWeight = weight > 0.0f ? weight : 1.0f;
+        if (m_DeltaContext)
+            m_DeltaContext->SetBigramSpanWeight(m_BigramSpanWeight);
+    }
+    void SetUnigramSpanWeight(float weight)
+    {
+        m_UnigramSpanWeight = weight > 0.0f ? weight : 1.0f;
+        if (m_DeltaContext)
+            m_DeltaContext->SetUnigramSpanWeight(m_UnigramSpanWeight);
+    }
+
+    float GetSpanWeight(uint32_t wordSpan) const
+    {
+        return wordSpan >= 2 ? m_BigramSpanWeight : m_UnigramSpanWeight;
+    }
+
     void SetLeafTermCacheBytes(uint64_t bytes)
     {
         m_LeafTermCacheBytes = bytes > 0 ? bytes : LEAF_TERM_CACHE_BYTES;
@@ -937,6 +955,8 @@ private:
     bool                         m_WriteBuilt = false;
     uint64_t                     m_LeafTermCacheBytes = LEAF_TERM_CACHE_BYTES;
     WeakAndBuildMode             m_WeakAndBuildMode = WeakAndBuildMode::FlatPruned;
+    float                        m_UnigramSpanWeight = 1.0f;
+    float                        m_BigramSpanWeight = 2.0f;
 
     static constexpr uint32_t INDEX_BLOCK_CACHE_SLOT_COUNT =
         static_cast<uint32_t>(INDEX_BLOCK_CACHE_BYTES / sizeof(IndexBlock));

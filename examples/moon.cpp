@@ -997,6 +997,7 @@ struct BeirEvalOptions {
     std::string dataPath;
     std::string qrels = "test";
     std::string runOut;
+    std::string dumpFeaturesPath;
     std::string queryVectorsPath;
     std::string streams = "TB";
     std::string mode = "weakandbigram";
@@ -1004,6 +1005,7 @@ struct BeirEvalOptions {
     std::vector<int> at = {10, 100, 1000};
     uint64_t limit = 0;
     uint64_t vectorEf = 1000;
+    float bigramWeight = 2.0f;
     bool noMphf = false;
     uint64_t leafCacheMb = 0;
     bool leafCacheMatchMphf = false;
@@ -1027,6 +1029,30 @@ static bool ParseUInt64(const std::string& text, uint64_t& value)
     if (!end || *end != '\0') return false;
     value = static_cast<uint64_t>(parsed);
     return true;
+}
+
+static bool ParseFloat(const std::string& text, float& value)
+{
+    if (text.empty()) return false;
+    char* end = nullptr;
+    const float parsed = std::strtof(text.c_str(), &end);
+    if (!end || *end != '\0' || !std::isfinite(parsed)) return false;
+    value = parsed;
+    return true;
+}
+
+static float MoonDocDataPrior(const DocDataEntry& entry)
+{
+    const float docLength = static_cast<float>(std::max<uint32_t>(1, entry.DDE_DocLength));
+    static constexpr float TargetLogLength = 6.0f;
+    static constexpr float Width = 4.0f;
+    static constexpr float Weight = 0.15f;
+    const float distance = std::abs(std::log2(docLength) - TargetLogLength);
+    const float lengthQuality = std::max(0.0f, 1.0f - distance / Width);
+    return Weight * lengthQuality
+        + 0.10f * entry.DDE_QualityScore
+        + 0.05f * entry.DDE_AuthorityScore
+        - 0.10f * entry.DDE_SpamScore;
 }
 
 static bool ParseAtList(const std::string& text, std::vector<int>& values)
@@ -1251,6 +1277,9 @@ static bool ParseBeirEvalOptions(const std::vector<std::string>& args,
         } else if (arg == "-run-out") {
             if (i + 1 >= args.size()) { error = "Usage: moon -beir-eval -run-out <trec-run-path>"; return false; }
             options.runOut = args[++i];
+        } else if (arg == "-dump-features") {
+            if (i + 1 >= args.size()) { error = "Usage: moon -beir-eval -dump-features <features.tsv>"; return false; }
+            options.dumpFeaturesPath = args[++i];
         } else if (arg == "-query-vectors") {
             if (i + 1 >= args.size()) { error = "Usage: moon -beir-eval -query-vectors <qid-tab-vector.tsv>"; return false; }
             options.queryVectorsPath = args[++i];
@@ -1281,6 +1310,9 @@ static bool ParseBeirEvalOptions(const std::vector<std::string>& args,
         } else if (arg == "-vector-ef") {
             if (i + 1 >= args.size()) { error = "Usage: moon -beir-eval -vector-ef N"; return false; }
             if (!ParseUInt64(args[++i], options.vectorEf) || options.vectorEf == 0) { error = "-vector-ef must be a positive integer"; return false; }
+        } else if (arg == "-bigram-weight") {
+            if (i + 1 >= args.size()) { error = "Usage: moon -beir-eval -bigram-weight W"; return false; }
+            if (!ParseFloat(args[++i], options.bigramWeight) || options.bigramWeight <= 0.0f) { error = "-bigram-weight must be positive"; return false; }
         } else {
             error = "Unknown BEIR eval option: " + arg;
             return false;
@@ -1753,6 +1785,150 @@ static void WriteBeirRun(std::ofstream* output,
     }
 }
 
+struct BeirCandidateFeature {
+    const DocDataEntry* entry = nullptr;
+    std::string docIdText;
+    float weakScore = 0.0f;
+    float bigramScore = 0.0f;
+    uint8_t weakSourceMask = 0;
+    uint8_t bigramSourceMask = 0;
+};
+
+static float RawBranchScore(const SearchResult& result, const DocDataEntry& entry)
+{
+    return result.score - entry.DDE_StaticRank - MoonDocDataPrior(entry);
+}
+
+static void AddFeatureRows(IndexContext& ctx,
+                           std::unordered_map<uint64_t, BeirCandidateFeature>& rows,
+                           const std::vector<SearchResult>& results,
+                           bool isBigramBranch)
+{
+    for (const auto& result : results) {
+        const uint64_t docId = ReaderDocumentIDValue(result.doc_id);
+        const auto* entry = ctx.GetDocDataEntry(docId);
+        if (!entry)
+            continue;
+        auto& row = rows[docId];
+        row.entry = entry;
+        if (row.docIdText.empty())
+            row.docIdText = ctx.GetDocPath(docId);
+        const float rawScore = RawBranchScore(result, *entry);
+        if (isBigramBranch) {
+            row.bigramScore = std::max(row.bigramScore, rawScore);
+            row.bigramSourceMask |= ReaderDocumentIDSourceMask(result.doc_id);
+        } else {
+            row.weakScore = std::max(row.weakScore, rawScore);
+            row.weakSourceMask |= ReaderDocumentIDSourceMask(result.doc_id);
+        }
+    }
+}
+
+static void AddFeatureRowsFromReader(IndexContext& ctx,
+                                     std::unordered_map<uint64_t, BeirCandidateFeature>& rows,
+                                     std::shared_ptr<IndexReader> reader,
+                                     bool isBigramBranch)
+{
+    while (reader && !reader->IsEnd()) {
+        const uint64_t docId = reader->GetDocumentID();
+        const auto* entry = ctx.GetDocDataEntry(docId);
+        if (entry) {
+            auto& row = rows[docId];
+            row.entry = entry;
+            if (row.docIdText.empty())
+                row.docIdText = ctx.GetDocPath(docId);
+            const float rawScore = reader->GetScore(entry);
+            if (isBigramBranch) {
+                row.bigramScore = std::max(row.bigramScore, rawScore);
+                row.bigramSourceMask |= reader->GetSourceMask();
+            } else {
+                row.weakScore = std::max(row.weakScore, rawScore);
+                row.weakSourceMask |= reader->GetSourceMask();
+            }
+        }
+        reader->GoNext();
+    }
+}
+
+static void SplitWeakAndBigramRoots(EvalTree* tree,
+                                    std::shared_ptr<EvalNode>& weakRoot,
+                                    std::shared_ptr<EvalNode>& bigramRoot)
+{
+    if (!tree)
+        return;
+    if (tree->root && tree->root->GetType() == NodeType::Or) {
+        auto* orNode = static_cast<OrNode*>(tree->root.get());
+        if (!orNode->children.empty())
+            weakRoot = orNode->children[0];
+        if (orNode->children.size() > 1)
+            bigramRoot = orNode->children[1];
+    } else {
+        weakRoot = tree->root;
+    }
+}
+
+static std::unordered_map<uint64_t, BeirCandidateFeature> CollectBeirCandidateFeatures(
+    IndexContext& ctx,
+    EvalTree* tree)
+{
+    std::shared_ptr<EvalNode> weakRoot;
+    std::shared_ptr<EvalNode> bigramRoot;
+    SplitWeakAndBigramRoots(tree, weakRoot, bigramRoot);
+
+    std::unordered_map<uint64_t, BeirCandidateFeature> rows;
+    if (weakRoot) {
+        EvalTree weakTree;
+        weakTree.root = weakRoot;
+        AddFeatureRowsFromReader(ctx, rows, ctx.GetReader(&weakTree), false);
+    }
+    if (bigramRoot) {
+        EvalTree bigramTree;
+        bigramTree.root = bigramRoot;
+        AddFeatureRowsFromReader(ctx, rows, ctx.GetReader(&bigramTree), true);
+    }
+    return rows;
+}
+
+static void WriteFeatureRows(std::ofstream& output,
+                             const BeirQrels& qrels,
+                             const std::string& qid,
+                             const std::unordered_map<uint64_t, BeirCandidateFeature>& rows)
+{
+    std::vector<uint64_t> docIds;
+    docIds.reserve(rows.size());
+    for (const auto& [docId, _] : rows)
+        docIds.push_back(docId);
+    std::sort(docIds.begin(), docIds.end());
+
+    const auto qrelIt = qrels.find(qid);
+    for (const uint64_t docId : docIds) {
+        const auto& row = rows.at(docId);
+        if (!row.entry || row.docIdText.empty())
+            continue;
+        const bool label = qrelIt != qrels.end() && qrelIt->second.count(row.docIdText) != 0;
+        const float prior = MoonDocDataPrior(*row.entry);
+        output << qid << '\t'
+               << row.docIdText << '\t'
+               << (label ? 1 : 0) << '\t'
+               << row.weakScore << '\t'
+               << row.bigramScore << '\t'
+               << (row.weakScore != 0.0f ? 1 : 0) << '\t'
+               << (row.bigramScore != 0.0f ? 1 : 0) << '\t'
+               << static_cast<uint32_t>(row.weakSourceMask) << '\t'
+               << static_cast<uint32_t>(row.bigramSourceMask) << '\t'
+               << row.entry->DDE_StaticRank << '\t'
+               << prior << '\t'
+               << row.entry->DDE_DocLength << '\t'
+               << row.entry->DDE_QualityScore << '\t'
+               << row.entry->DDE_AuthorityScore << '\t'
+               << row.entry->DDE_SpamScore << '\t'
+               << row.entry->DDE_FeatureScore[0] << '\t'
+               << row.entry->DDE_FeatureScore[1] << '\t'
+               << row.entry->DDE_FeatureScore[2] << '\t'
+               << row.entry->DDE_FeatureScore[3] << '\n';
+    }
+}
+
 static std::string ResolveBeirQrelsPath(const BeirEvalOptions& options)
 {
     if (std::filesystem::is_regular_file(FsPathFromUtf8(options.qrels)))
@@ -1987,6 +2163,21 @@ static int RunBeirEval(const std::string& idxPath, const BeirEvalOptions& option
         }
     }
 
+    std::ofstream featureOutput;
+    if (!options.dumpFeaturesPath.empty()) {
+        if (options.mode != "weakandbigram") {
+            std::cerr << "-dump-features currently supports -mode weakandbigram only\n";
+            return 1;
+        }
+        featureOutput.open(FsPathFromUtf8(options.dumpFeaturesPath));
+        if (!featureOutput) {
+            std::cerr << "Could not open BEIR feature dump: " << options.dumpFeaturesPath << "\n";
+            return 1;
+        }
+        featureOutput << "qid\tdocid\tlabel\tweak_score\tbigram_score\tweak_hit\tbigram_hit\tweak_source\tbigram_source"
+                      << "\tstatic_rank\tdoc_prior\tdoc_len\tquality\tauthority\tspam\ttitle_len\tbody_len\tdiversity\tlength_quality\n";
+    }
+
     ExternalVectorMap queryVectors;
     if (!options.queryVectorsPath.empty()) {
         if (!LoadExternalVectors(options.queryVectorsPath, queryVectors)) {
@@ -2002,6 +2193,12 @@ static int RunBeirEval(const std::string& idxPath, const BeirEvalOptions& option
         ctx.SetLeafTermCacheBytes(leafCacheBytes);
     ctx.LoadIndex(idxPath.c_str());
     ctx.SetTermMphfEnabled(!options.noMphf);
+    if (options.mode == "weakandbigram" && options.dumpFeaturesPath.empty()) {
+        ctx.SetUnigramSpanWeight(1.8f);
+        ctx.SetBigramSpanWeight(0.2f);
+    } else {
+        ctx.SetBigramSpanWeight(options.bigramWeight);
+    }
     WeakAndBuildMode weakAndBuildMode = WeakAndBuildMode::FlatPruned;
     if (options.weakAndShape == "or")
         weakAndBuildMode = WeakAndBuildMode::OrChildren;
@@ -2030,6 +2227,17 @@ static int RunBeirEval(const std::string& idxPath, const BeirEvalOptions& option
             continue;
         }
         if (options.limit > 0 && evaluated >= options.limit) break;
+
+        if (featureOutput) {
+            auto tree = std::unique_ptr<EvalTree>(ctx.Compile(query.c_str(), options.streams.c_str(), QueryCompileMode::WeakAndBigram));
+            const auto rows = CollectBeirCandidateFeatures(ctx, tree.get());
+
+            WriteFeatureRows(featureOutput, qrels, qid, rows);
+            ++evaluated;
+            if (evaluated % 100 == 0)
+                std::cout << "  BEIR dumped " << evaluated << " queries\n";
+            continue;
+        }
 
         std::shared_ptr<IndexReader> reader;
         if (options.mode == "bow") {
@@ -2152,6 +2360,18 @@ static int RunBeirEval(const std::string& idxPath, const BeirEvalOptions& option
             std::cout << "  BEIR evaluated " << evaluated << " queries\n";
     }
 
+    if (featureOutput) {
+        std::cout << "BEIR feature dump index=" << idxPath
+                  << " data=" << options.dataPath
+                  << " qrels=" << qrelsPath
+                  << " streams=" << options.streams
+                  << " mode=" << options.mode
+                  << " bigram_weight=" << options.bigramWeight
+                  << " queries=" << evaluated
+                  << " output=" << options.dumpFeaturesPath << "\n";
+        return 0;
+    }
+
     if (evaluated == 0 || microRelevant == 0) {
         std::cerr << "No BEIR queries with qrels were evaluated\n";
         return 1;
@@ -2165,6 +2385,7 @@ static int RunBeirEval(const std::string& idxPath, const BeirEvalOptions& option
               << " streams=" << options.streams
               << " mode=" << options.mode
               << " weakand_shape=" << options.weakAndShape
+              << " bigram_weight=" << options.bigramWeight
               << " mphf=" << (options.noMphf ? "off" : "on")
               << " leaf_cache_mb=" << (leafCacheBytes ? (leafCacheBytes / (1024ull * 1024ull)) : (LEAF_TERM_CACHE_BYTES / (1024ull * 1024ull)))
               << " queries=" << evaluated

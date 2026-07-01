@@ -8,18 +8,18 @@
 
 namespace {
 
-float DocDataPrior(const DocDataEntry& entry)
+float DocDataScore(const DocDataEntry& entry)
 {
-    const float docLength = static_cast<float>(std::max<uint32_t>(1, entry.DDE_DocLength));
-    static constexpr float TargetLogLength = 6.0f; // about 64 tokens
-    static constexpr float Width = 4.0f;
-    static constexpr float Weight = 0.15f;
-    const float distance = std::abs(std::log2(docLength) - TargetLogLength);
-    const float lengthQuality = std::max(0.0f, 1.0f - distance / Width);
-    return Weight * lengthQuality
-        + 0.10f * entry.DDE_QualityScore
-        + 0.05f * entry.DDE_AuthorityScore
-        - 0.10f * entry.DDE_SpamScore;
+    // Fitted formula from the 2026-06-30 full-feature GPU sweep:
+    // score = 1.8*weak + 0.1*dump_bigram + 1.0*static + 0.0*prior
+    //       + 1.0*quality + 0.5*authority - 2.0*spam + 2.0*both + 0.0*bigram_only.
+    // Scheme A folds stream-side terms into leaf span weights:
+    // unigram span weight = 1.8; bigram span weight = 0.1 * dump_bigram_span_weight(2.0) = 0.2.
+    // The both-hit term is omitted so Execute() stays single-root and single-score.
+    return entry.DDE_StaticRank
+        + entry.DDE_QualityScore
+        + 0.5f * entry.DDE_AuthorityScore
+        - 2.0f * entry.DDE_SpamScore;
 }
 
 }
@@ -49,9 +49,7 @@ std::vector<SearchResult> IndexSearchExecutor::Execute(std::shared_ptr<IndexRead
         assert(m_Context);
         const DocDataEntry* entry = m_Context->GetDocDataEntry(docId);
         assert(entry);
-        float    score     = reader->GetScore(entry)
-                   + entry->DDE_StaticRank
-                   + DocDataPrior(*entry);
+        float    score     = reader->GetScore(entry) + DocDataScore(*entry);
 
         SearchResult result{MakeReaderDocumentID(docId, reader->GetSourceMask()), score, ""};
         if (!boundedTopK) {
@@ -95,9 +93,7 @@ std::vector<SearchResult> IndexSearchExecutor::ExecuteBounded(
         assert(m_Context);
         const DocDataEntry* entry = m_Context->GetDocDataEntry(docId);
         assert(entry);
-        float    score     = reader->GetScore(entry)
-                   + entry->DDE_StaticRank
-                   + DocDataPrior(*entry);
+        float    score     = reader->GetScore(entry) + DocDataScore(*entry);
 
         SearchResult result{MakeReaderDocumentID(docId, reader->GetSourceMask()), score, ""};
         if (!boundedTopK) {

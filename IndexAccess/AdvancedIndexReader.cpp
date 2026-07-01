@@ -26,7 +26,7 @@ void AdvancedIndexReader::Open(const char*      streamKey,
     m_Context         = context;
     m_DocFreq         = 0;
     m_WordSpan        = std::max(1u, wordSpan);
-    m_SpanWeight      = m_WordSpan >= 2 ? 2.0f : 1.0f;
+    m_SpanWeight      = m_Context->GetSpanWeight(m_WordSpan);
     m_Idf             = 0.0f;
     m_Bm25LengthBias  = 0.0f;
     m_Bm25LengthScale = 0.0f;
