@@ -21,13 +21,17 @@ public:
     explicit IndexSearchExecutor(const IndexContext* context);
 
     std::vector<SearchResult> Execute(std::shared_ptr<IndexReader> reader,
-                                      int topK = 10);
+                           int topK = 10,
+                           const std::vector<float>* vectorQuery = nullptr);
 
     std::vector<SearchResult> ExecuteBounded(std::shared_ptr<IndexReader> reader,
                                              int topK,
-                                             uint64_t maxVisitedDocs);
+                               uint64_t maxVisitedDocs,
+                               const std::vector<float>* vectorQuery = nullptr);
 
-    std::vector<SearchResult> Execute(IndexReader* reader, int topK = 10);
+        std::vector<SearchResult> Execute(IndexReader* reader,
+                           int topK = 10,
+                           const std::vector<float>* vectorQuery = nullptr);
 
     static void SetFittedDocWeights(float staticWeight,
                                     float qualityWeight,

@@ -26,6 +26,29 @@ float DocDataScore(const DocDataEntry& entry)
         - g_SpamPenalty * entry.DDE_SpamScore;
 }
 
+float VectorScoreFeature(const DocDataEntry& entry, const std::vector<float>* query)
+{
+    if (!query || query->size() != DOC_VECTOR_DIM || entry.DDE_VectorFlags == 0 || entry.DDE_VectorDim != DOC_VECTOR_DIM)
+        return 0.0f;
+
+    float dot = 0.0f;
+    float nq = 0.0f;
+    float nd = 0.0f;
+    for (size_t i = 0; i < DOC_VECTOR_DIM; ++i) {
+        const float q = (*query)[i];
+        const float d = static_cast<float>(entry.DDE_VectorData[i]) / 128.0f;
+        dot += q * d;
+        nq += q * q;
+        nd += d * d;
+    }
+    if (nq <= 0.0f || nd <= 0.0f)
+        return 0.0f;
+
+    const float cosine = dot / (std::sqrt(nq) * std::sqrt(nd));
+    const float feature = std::clamp((cosine - 0.30f) / 0.35f, 0.0f, 1.0f);
+    return 1.5f * feature;
+}
+
 }
 
 IndexSearchExecutor::IndexSearchExecutor(const IndexContext* context)
@@ -44,7 +67,8 @@ void IndexSearchExecutor::SetFittedDocWeights(float staticWeight,
 }
 
 std::vector<SearchResult> IndexSearchExecutor::Execute(std::shared_ptr<IndexReader> reader,
-                                                       int topK)
+                                                       int topK,
+                                                       const std::vector<float>* vectorQuery)
 {
     if (!reader || reader->IsEnd())
         return {};
@@ -64,7 +88,7 @@ std::vector<SearchResult> IndexSearchExecutor::Execute(std::shared_ptr<IndexRead
         assert(m_Context);
         const DocDataEntry* entry = m_Context->GetDocDataEntry(docId);
         assert(entry);
-        float    score     = reader->GetScore(entry) + DocDataScore(*entry);
+        float    score     = reader->GetScore(entry) + DocDataScore(*entry) + VectorScoreFeature(*entry, vectorQuery);
 
         SearchResult result{MakeReaderDocumentID(docId, reader->GetSourceMask()), score, ""};
         if (!boundedTopK) {
@@ -87,7 +111,8 @@ std::vector<SearchResult> IndexSearchExecutor::Execute(std::shared_ptr<IndexRead
 std::vector<SearchResult> IndexSearchExecutor::ExecuteBounded(
         std::shared_ptr<IndexReader> reader,
         int topK,
-        uint64_t maxVisitedDocs)
+        uint64_t maxVisitedDocs,
+        const std::vector<float>* vectorQuery)
 {
     if (!reader || reader->IsEnd() || maxVisitedDocs == 0)
         return {};
@@ -108,7 +133,7 @@ std::vector<SearchResult> IndexSearchExecutor::ExecuteBounded(
         assert(m_Context);
         const DocDataEntry* entry = m_Context->GetDocDataEntry(docId);
         assert(entry);
-        float    score     = reader->GetScore(entry) + DocDataScore(*entry);
+        float    score     = reader->GetScore(entry) + DocDataScore(*entry) + VectorScoreFeature(*entry, vectorQuery);
 
         SearchResult result{MakeReaderDocumentID(docId, reader->GetSourceMask()), score, ""};
         if (!boundedTopK) {
@@ -129,9 +154,11 @@ std::vector<SearchResult> IndexSearchExecutor::ExecuteBounded(
     return results;
 }
 
-std::vector<SearchResult> IndexSearchExecutor::Execute(IndexReader* reader, int topK)
+std::vector<SearchResult> IndexSearchExecutor::Execute(IndexReader* reader,
+                                                       int topK,
+                                                       const std::vector<float>* vectorQuery)
 {
-    return Execute(std::shared_ptr<IndexReader>(reader, [](IndexReader*){}), topK);
+    return Execute(std::shared_ptr<IndexReader>(reader, [](IndexReader*){}), topK, vectorQuery);
 }
 
 void IndexSearchExecutor::SortAndTruncate(std::vector<SearchResult>& results, int topK)

@@ -190,12 +190,8 @@ public:
             return empty;
         }
 
-        if (evalTree->HasTextQuery() && evalTree->HasVectorQuery()) {
-            std::vector<shared_ptr<IndexReader>> children;
-            children.push_back(BuildIndexReader(evalTree->root));
-            children.push_back(BuildVectorIndexReader(evalTree->vector_query, evalTree->vector_ef_search));
-            return make_shared<OrIndexReader>(std::move(children));
-        }
+        if (evalTree->HasTextQuery() && evalTree->HasVectorQuery())
+            return BuildIndexReader(evalTree->root);
 
         if (evalTree->HasVectorQuery())
             return BuildVectorIndexReader(evalTree->vector_query, evalTree->vector_ef_search);

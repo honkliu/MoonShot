@@ -711,13 +711,15 @@ static void CollectSearchResults(IndexContext& ctx,
         tree->vector_query = std::move(queryVector);
         tree->vector_ef_search = options.vectorEf;
 
-        for (const auto& result : executor->Execute(ctx.GetReader(tree.get()), static_cast<int>(options.topK)))
+        for (const auto& result : executor->Execute(ctx.GetReader(tree.get()), static_cast<int>(options.topK), &tree->vector_query))
             hits.push_back({&ctx, result});
         return;
     }
 
     if (!streams.empty()) {
-        for (const auto& result : executor->Execute(ctx.GetReader(query.c_str(), streams.c_str()), 0))
+        auto tree = std::unique_ptr<EvalTree>(ctx.Compile(query.c_str(), streams.c_str()));
+        const std::vector<float>* vectorQuery = tree && tree->HasTextQuery() && tree->HasVectorQuery() ? &tree->vector_query : nullptr;
+        for (const auto& result : executor->Execute(ctx.GetReader(tree.get()), 0, vectorQuery))
             hits.push_back({&ctx, result});
     }
 }
@@ -2279,7 +2281,8 @@ static int RunBeirEval(const std::string& idxPath, const BeirEvalOptions& option
             reader = BuildBeirBowReader(ctx, beirTokenizer, query, options.streams);
         } else if (options.mode == "weakandbigram") {
             auto tree = std::unique_ptr<EvalTree>(ctx.Compile(query.c_str(), options.streams.c_str(), QueryCompileMode::WeakAndBigram));
-            auto results = executor->Execute(ctx.GetReader(tree.get()), maxK);
+            auto results = executor->Execute(ctx.GetReader(tree.get()), maxK,
+                tree->HasTextQuery() && tree->HasVectorQuery() ? &tree->vector_query : nullptr);
 
             WriteBeirRun(options.runOut.empty() ? nullptr : &runOutput, ctx, qid, results, "moon-" + options.mode);
 

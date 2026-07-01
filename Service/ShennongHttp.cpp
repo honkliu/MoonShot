@@ -313,9 +313,10 @@ public:
             std::lock_guard<std::mutex> lock(m_QueryMutex);
             auto tree = std::unique_ptr<EvalTree>(m_Context.Compile(query.c_str(), streams.c_str()));
             if (tree && !tree->IsEmpty()) {
+                const std::vector<float>* vectorQuery = tree->HasTextQuery() && tree->HasVectorQuery() ? &tree->vector_query : nullptr;
                 auto reader = m_Context.GetReader(tree.get());
                 auto executor = std::unique_ptr<IndexSearchExecutor>(m_Context.GetExecutor());
-                results = executor->Execute(reader, 0);
+                results = executor->Execute(reader, 0, vectorQuery);
             }
         }
 
