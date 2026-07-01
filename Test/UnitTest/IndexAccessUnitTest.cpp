@@ -967,6 +967,24 @@ void TestBigram()
         AssertContains(results, 3, "weakand bigram: middle one adjacent bigram enters recall");
         AssertContains(results, 4, "weakand bigram: final one adjacent bigram enters recall");
         std::cout << "  WeakAndBigram tree: OR(WeakAnd, OR(bigrams)) verified\n";
+
+        auto boostTree = std::unique_ptr<EvalTree>(compiler.Compile(
+            "alpha beta gamma delta epsilon zeta", "T", nullptr, QueryCompileMode::WeakAndBigramBoost));
+        if (!boostTree || boostTree->IsEmpty() || boostTree->root->GetType() != NodeType::Boost)
+            throw std::runtime_error("WeakAndBigramBoost must compile to Boost(WeakAnd, OR(bigrams))");
+
+        auto* boostNode = static_cast<BoostNode*>(boostTree->root.get());
+        if (!boostNode->base || boostNode->base->GetType() != NodeType::WeakAnd
+            || !boostNode->boost || boostNode->boost->GetType() != NodeType::Or)
+            throw std::runtime_error("WeakAndBigramBoost must use WeakAnd as base and OR(bigrams) as boost");
+
+        auto boostedResults = localExec->Execute(localEngine.GetReader(boostTree.get()), 10);
+        AssertNotContains(boostedResults, 0, "weakand boost: bigram-only alpha beta must not enter recall");
+        AssertContains(boostedResults, 1, "weakand boost: weakand doc with bigrams enters recall");
+        AssertNotContains(boostedResults, 2, "weakand boost: bigram-only gamma delta must not enter recall");
+        AssertNotContains(boostedResults, 3, "weakand boost: bigram-only delta epsilon must not enter recall");
+        AssertNotContains(boostedResults, 4, "weakand boost: bigram-only epsilon zeta must not enter recall");
+        std::cout << "  WeakAndBigramBoost tree: Boost(WeakAnd, OR(bigrams)) verified\n";
     }
 }
 

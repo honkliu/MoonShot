@@ -8,10 +8,21 @@
 
 namespace {
 
-float g_StaticWeight = 1.0f;
-float g_QualityWeight = 1.0f;
-float g_AuthorityWeight = 0.5f;
-float g_SpamPenalty = 2.0f;
+QueryCompileModeParameters g_ScoringParameters = kWeakAndBigramParameters;
+
+float DocDataPrior(const DocDataEntry& entry)
+{
+    const float docLength = static_cast<float>(std::max<uint32_t>(1, entry.DDE_DocLength));
+    static constexpr float TargetLogLength = 6.0f;
+    static constexpr float Width = 4.0f;
+    static constexpr float Weight = 0.15f;
+    const float distance = std::abs(std::log2(docLength) - TargetLogLength);
+    const float lengthQuality = std::max(0.0f, 1.0f - distance / Width);
+    return Weight * lengthQuality
+        + 0.10f * entry.DDE_QualityScore
+        + 0.05f * entry.DDE_AuthorityScore
+        - 0.10f * entry.DDE_SpamScore;
+}
 
 float DocDataScore(const DocDataEntry& entry)
 {
@@ -20,10 +31,11 @@ float DocDataScore(const DocDataEntry& entry)
     //       + 1.0*quality + 0.5*authority - 2.0*spam + 0.0*both + 0.0*bigram_only.
     // Scheme A folds stream-side terms into leaf span weights:
     // unigram span weight = 1.8; bigram span weight = 0.1 * dump_bigram_span_weight(2.0) = 0.2.
-    return g_StaticWeight * entry.DDE_StaticRank
-        + g_QualityWeight * entry.DDE_QualityScore
-        + g_AuthorityWeight * entry.DDE_AuthorityScore
-        - g_SpamPenalty * entry.DDE_SpamScore;
+    return g_ScoringParameters.QMP_StaticWeight * entry.DDE_StaticRank
+        + g_ScoringParameters.QMP_PriorWeight * DocDataPrior(entry)
+        + g_ScoringParameters.QMP_QualityWeight * entry.DDE_QualityScore
+        + g_ScoringParameters.QMP_AuthorityWeight * entry.DDE_AuthorityScore
+        - g_ScoringParameters.QMP_SpamPenalty * entry.DDE_SpamScore;
 }
 
 float VectorScoreFeature(const DocDataEntry& entry, const std::vector<float>* query)
@@ -45,8 +57,7 @@ float VectorScoreFeature(const DocDataEntry& entry, const std::vector<float>* qu
         return 0.0f;
 
     const float cosine = dot / (std::sqrt(nq) * std::sqrt(nd));
-    const float feature = std::clamp((cosine - 0.30f) / 0.35f, 0.0f, 1.0f);
-    return 1.5f * feature;
+    return g_ScoringParameters.QMP_CosineWeight * cosine;
 }
 
 }
@@ -60,10 +71,17 @@ void IndexSearchExecutor::SetFittedDocWeights(float staticWeight,
                                               float authorityWeight,
                                               float spamPenalty)
 {
-    g_StaticWeight = staticWeight;
-    g_QualityWeight = qualityWeight;
-    g_AuthorityWeight = authorityWeight;
-    g_SpamPenalty = spamPenalty;
+    g_ScoringParameters = kWeakAndBigramParameters;
+    g_ScoringParameters.QMP_StaticWeight = staticWeight;
+    g_ScoringParameters.QMP_PriorWeight = 0.0f;
+    g_ScoringParameters.QMP_QualityWeight = qualityWeight;
+    g_ScoringParameters.QMP_AuthorityWeight = authorityWeight;
+    g_ScoringParameters.QMP_SpamPenalty = spamPenalty;
+}
+
+void IndexSearchExecutor::SetScoringParameters(const QueryCompileModeParameters& parameters)
+{
+    g_ScoringParameters = parameters;
 }
 
 std::vector<SearchResult> IndexSearchExecutor::Execute(std::shared_ptr<IndexReader> reader,

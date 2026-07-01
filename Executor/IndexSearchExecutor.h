@@ -38,6 +38,8 @@ public:
                                     float authorityWeight,
                                     float spamPenalty);
 
+    static void SetScoringParameters(const QueryCompileModeParameters& parameters);
+
 private:
     const IndexContext*          m_Context = nullptr;
 

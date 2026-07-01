@@ -942,7 +942,7 @@ static int RunInteractiveSearch(const std::string& idxPath, const SearchOptions&
               << "Mode: " << SearchModeName(options) << "\n"
               << std::flush;
 
-    if (options.vector)
+    if (options.vector && !options.inverted)
         WarmVectorGraph(ctx);
 
     std::cout << "Type a query, or /h for commands.\n";
@@ -1018,6 +1018,23 @@ struct BeirEvalOptions {
     float authorityWeight = 0.5f;
     float spamPenalty = 2.0f;
 };
+
+static QueryCompileMode BeirCompileMode(const std::string& mode)
+{
+    return (mode == "weakandbigramboost" || mode == "hybridboost")
+        ? QueryCompileMode::WeakAndBigramBoost
+        : QueryCompileMode::WeakAndBigram;
+}
+
+static bool IsWeakAndBigramMode(const std::string& mode)
+{
+    return mode == "weakandbigram" || mode == "weakandbigramboost";
+}
+
+static bool IsHybridMode(const std::string& mode)
+{
+    return mode == "hybrid" || mode == "hybridboost";
+}
 
 static bool ParseBatchSize(const std::string& text, uint64_t& batchSize)
 {
@@ -1323,9 +1340,9 @@ static bool ParseBeirEvalOptions(const std::vector<std::string>& args,
             if (i + 1 >= args.size()) { error = "Usage: moon -beir-eval -streams TB"; return false; }
             options.streams = args[++i];
         } else if (arg == "-mode") {
-            if (i + 1 >= args.size()) { error = "Usage: moon -beir-eval -mode bow|weakandbigram|compile"; return false; }
+            if (i + 1 >= args.size()) { error = "Usage: moon -beir-eval -mode bow|weakandbigram|weakandbigramboost|hybrid|hybridboost|compile"; return false; }
             options.mode = args[++i];
-            if (options.mode != "bow" && options.mode != "weakandbigram" && options.mode != "vector" && options.mode != "hybrid" && options.mode != "compile") { error = "-mode must be bow, weakandbigram, vector, hybrid, or compile"; return false; }
+            if (options.mode != "bow" && options.mode != "weakandbigram" && options.mode != "weakandbigramboost" && options.mode != "vector" && options.mode != "hybrid" && options.mode != "hybridboost" && options.mode != "compile") { error = "-mode must be bow, weakandbigram, weakandbigramboost, vector, hybrid, hybridboost, or compile"; return false; }
         } else if (arg == "-weakand-shape") {
             if (i + 1 >= args.size()) { error = "Usage: moon -beir-eval -weakand-shape flat|or|or-prune"; return false; }
             options.weakAndShape = args[++i];
@@ -1412,7 +1429,7 @@ static void PrintHelp(const std::string& idxPath)
         << "      Build an index from BEIR corpus.jsonl. Stored doc paths are BEIR ids.\n\n"
         << "  moon -idx <output-index> -beir-patch-vectors -src-index <index> -doc-vectors <vectors.i8bin>\n"
         << "      Copy an existing BEIR index and patch only DocData vector fields.\n\n"
-        << "  moon [-idx <index>] -beir-eval -data <beir-dir> [-qrels test] [-run-out out.trec] [-k 10,100,1000] [-streams TB] [-mode bow|weakandbigram|compile] [-weakand-shape flat|or|or-prune] [-no-mphf] [-leaf-cache-mb N] [-leaf-cache-match-mphf] [-limit N]\n"
+        << "  moon [-idx <index>] -beir-eval -data <beir-dir> [-qrels test] [-run-out out.trec] [-k 10,100,1000] [-streams TB] [-mode bow|weakandbigram|weakandbigramboost|vector|hybrid|hybridboost|compile] [-weakand-shape flat|or|or-prune] [-no-mphf] [-leaf-cache-mb N] [-leaf-cache-match-mphf] [-limit N]\n"
         << "      Evaluate Recall@k from BEIR queries.jsonl and qrels/<split>.tsv.\n"
         << "      Default mode is weakandbigram. bow is kept as a recall-ceiling baseline.\n\n"
         << "Examples:\n"
@@ -2230,12 +2247,20 @@ static int RunBeirEval(const std::string& idxPath, const BeirEvalOptions& option
         ctx.SetLeafTermCacheBytes(leafCacheBytes);
     ctx.LoadIndex(idxPath.c_str());
     ctx.SetTermMphfEnabled(!options.noMphf);
-    ctx.SetUnigramSpanWeight(options.unigramWeight);
-    ctx.SetBigramSpanWeight(options.bigramWeight);
-    IndexSearchExecutor::SetFittedDocWeights(options.staticWeight,
-                                             options.qualityWeight,
-                                             options.authorityWeight,
-                                             options.spamPenalty);
+    const QueryCompileMode compileMode = BeirCompileMode(options.mode);
+    if (compileMode == QueryCompileMode::WeakAndBigramBoost) {
+        const auto& parameters = GetQueryCompileModeParameters(compileMode);
+        ctx.SetUnigramSpanWeight(parameters.QMP_UnigramWeight);
+        ctx.SetBigramSpanWeight(parameters.QMP_BigramWeight);
+        IndexSearchExecutor::SetScoringParameters(parameters);
+    } else {
+        ctx.SetUnigramSpanWeight(options.unigramWeight);
+        ctx.SetBigramSpanWeight(options.bigramWeight);
+        IndexSearchExecutor::SetFittedDocWeights(options.staticWeight,
+                                                 options.qualityWeight,
+                                                 options.authorityWeight,
+                                                 options.spamPenalty);
+    }
     WeakAndBuildMode weakAndBuildMode = WeakAndBuildMode::FlatPruned;
     if (options.weakAndShape == "or")
         weakAndBuildMode = WeakAndBuildMode::OrChildren;
@@ -2279,8 +2304,8 @@ static int RunBeirEval(const std::string& idxPath, const BeirEvalOptions& option
         std::shared_ptr<IndexReader> reader;
         if (options.mode == "bow") {
             reader = BuildBeirBowReader(ctx, beirTokenizer, query, options.streams);
-        } else if (options.mode == "weakandbigram") {
-            auto tree = std::unique_ptr<EvalTree>(ctx.Compile(query.c_str(), options.streams.c_str(), QueryCompileMode::WeakAndBigram));
+        } else if (IsWeakAndBigramMode(options.mode)) {
+            auto tree = std::unique_ptr<EvalTree>(ctx.Compile(query.c_str(), options.streams.c_str(), compileMode));
             auto results = executor->Execute(ctx.GetReader(tree.get()), maxK,
                 tree->HasTextQuery() && tree->HasVectorQuery() ? &tree->vector_query : nullptr);
 
@@ -2313,7 +2338,7 @@ static int RunBeirEval(const std::string& idxPath, const BeirEvalOptions& option
             if (evaluated % 100 == 0)
                 std::cout << "  BEIR evaluated " << evaluated << " queries\n";
             continue;
-        } else if (options.mode == "vector" || options.mode == "hybrid") {
+        } else if (options.mode == "vector" || IsHybridMode(options.mode)) {
             std::vector<float> queryVector;
             auto vectorIt = queryVectors.find(qid);
             if (vectorIt != queryVectors.end()) {
@@ -2323,8 +2348,8 @@ static int RunBeirEval(const std::string& idxPath, const BeirEvalOptions& option
             }
 
             std::unique_ptr<EvalTree> tree;
-            if (options.mode == "hybrid") {
-                tree.reset(ctx.Compile(query.c_str(), options.streams.c_str(), QueryCompileMode::WeakAndBigram));
+            if (IsHybridMode(options.mode)) {
+                tree.reset(ctx.Compile(query.c_str(), options.streams.c_str(), compileMode));
             } else {
                 tree = std::make_unique<EvalTree>();
             }

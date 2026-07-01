@@ -332,12 +332,29 @@ private:
         return candidateOr;
     }
 
+    std::shared_ptr<EvalNode> BuildWeakAndBigramBoostExpression(
+            const std::vector<QueryTerm>& tokens)
+    {
+        auto terms = FilterWeakAndTerms(tokens);
+        auto base = BuildWeakAndBaseExpression(terms);
+        auto bigram = BuildAnyBigramQuery(terms);
+        if (!base || !bigram) return base;
+
+        auto boostNode = std::make_shared<BoostNode>();
+        boostNode->base = std::move(base);
+        boostNode->boost = std::move(bigram);
+        boostNode->boost_weight = GetQueryCompileModeParameters(QueryCompileMode::WeakAndBigramBoost).QMP_BigramBoostWeight;
+        return boostNode;
+    }
+
     std::shared_ptr<EvalNode> BuildImplicitExpression(
             const std::vector<QueryTerm>& tokens,
             QueryCompileMode mode = QueryCompileMode::Default)
     {
         if (mode == QueryCompileMode::WeakAndBigram)
             return BuildWeakAndBigramExpression(tokens);
+        if (mode == QueryCompileMode::WeakAndBigramBoost)
+            return BuildWeakAndBigramBoostExpression(tokens);
 
         if (tokens.empty())
             return nullptr;

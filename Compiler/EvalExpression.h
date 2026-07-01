@@ -8,8 +8,39 @@
 #include <cstdint>
 
 enum class NodeType { Term, And, Or, Not, WeakAnd, Boost };
-enum class QueryCompileMode { Default, WeakAndBigram };
+enum class QueryCompileMode { Default, WeakAndBigram, WeakAndBigramBoost };
 enum class WeakAndBuildMode { FlatPruned, OrChildren, OrChildrenPruned };
+
+struct QueryCompileModeParameters {
+    float QMP_UnigramWeight = 1.8f;
+    float QMP_BigramWeight = 0.2f;
+    float QMP_BigramBoostWeight = 0.0f;
+    float QMP_StaticWeight = 1.0f;
+    float QMP_PriorWeight = 0.0f;
+    float QMP_QualityWeight = 1.0f;
+    float QMP_AuthorityWeight = 0.5f;
+    float QMP_SpamPenalty = 2.0f;
+    float QMP_CosineWeight = 16.0f;
+};
+
+inline constexpr QueryCompileModeParameters kWeakAndBigramParameters{
+    1.8f, 0.2f, 0.0f,
+    1.0f, 0.0f, 1.0f, 0.5f, 2.0f,
+    16.0f
+};
+
+inline constexpr QueryCompileModeParameters kWeakAndBigramBoostParameters{
+    0.25f, 1.0f, 0.5f,
+    0.25f, 4.0f, 0.25f, 0.0f, 4.0f,
+    16.0f
+};
+
+inline const QueryCompileModeParameters& GetQueryCompileModeParameters(QueryCompileMode mode)
+{
+    return mode == QueryCompileMode::WeakAndBigramBoost
+        ? kWeakAndBigramBoostParameters
+        : kWeakAndBigramParameters;
+}
 
 /*
 * Bigram separator — mirrors REF's CreateBigramString().
