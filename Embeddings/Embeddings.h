@@ -38,18 +38,18 @@ struct VectorSearchResult {
 
 class FreshDiskAnnVectorIndex {
 public:
-    using NodeID = uint64_t;
+    using NodeID = uint32_t;
 
     struct Node {
-        size_t level = 0;
-        std::vector<std::vector<NodeID>> neighbors;
+        uint8_t level = 0;
+        uint32_t linkOffset = 0;
     };
 
     explicit FreshDiskAnnVectorIndex(size_t maxNeighbors = 32,
                                      size_t efConstruction = 200,
                                      std::shared_ptr<IEmbeddingModel> model = nullptr)
-        : m_MaxNeighbors(std::max<size_t>(maxNeighbors, 2))
-        , m_EfConstruction(std::max<size_t>(efConstruction, maxNeighbors))
+        : m_MaxNeighbors(std::min<size_t>(std::max<size_t>(maxNeighbors, 2), std::numeric_limits<uint8_t>::max()))
+        , m_EfConstruction(std::max<size_t>(efConstruction, m_MaxNeighbors))
         , m_Model(std::move(model))
     {}
 
@@ -58,6 +58,8 @@ public:
         m_Dim = DOC_VECTOR_DIM;
         m_Nodes.clear();
         m_DocIds.clear();
+        m_Links.clear();
+        m_LinkCounts.clear();
         m_DocData = nullptr;
         m_EntryPoint = npos();
         m_MaxLevel = 0;
@@ -71,6 +73,17 @@ public:
     bool Add(uint64_t docId)
     {
         return AddNode(docId);
+    }
+
+    void Reserve(size_t nodeCount)
+    {
+        m_Nodes.reserve(nodeCount);
+        m_DocIds.reserve(nodeCount);
+
+        const size_t expectedLayers = nodeCount + (nodeCount + 2) / 3;
+        m_LinkCounts.reserve(expectedLayers);
+        if (m_MaxNeighbors != 0 && expectedLayers <= std::numeric_limits<uint32_t>::max() / m_MaxNeighbors)
+            m_Links.reserve(expectedLayers * m_MaxNeighbors);
     }
 
     std::vector<VectorSearchResult> Search(const std::vector<float>& query,
@@ -111,30 +124,34 @@ public:
 private:
     bool AddNode(uint64_t docId)
     {
+        if (docId > std::numeric_limits<uint32_t>::max() || m_Nodes.size() >= static_cast<size_t>(npos()))
+            return false;
+
         Node node;
-        node.level = RandomLevel(docId);
-        node.neighbors.resize(node.level + 1);
+        node.level = static_cast<uint8_t>(RandomLevel(docId));
+        if (!AllocateLinks(node))
+            return false;
 
         const NodeID newNodeID = static_cast<NodeID>(m_Nodes.size());
-        m_DocIds.push_back(docId);
+        m_DocIds.push_back(static_cast<uint32_t>(docId));
         m_Nodes.push_back(std::move(node));
 
         if (m_EntryPoint == npos()) {
             m_EntryPoint = newNodeID;
-            m_MaxLevel = m_Nodes[static_cast<size_t>(newNodeID)].level;
+            m_MaxLevel = NodeLevel(newNodeID);
             return true;
         }
 
         NodeID entry = m_EntryPoint;
         const int8_t* newVector = GetNodeVector(newNodeID);
-        for (int level = static_cast<int>(m_MaxLevel); level > static_cast<int>(m_Nodes[static_cast<size_t>(newNodeID)].level); --level)
+        for (int level = static_cast<int>(m_MaxLevel); level > static_cast<int>(NodeLevel(newNodeID)); --level)
             entry = GreedySearchLayer(newVector, entry, static_cast<size_t>(level));
 
-        const size_t top = std::min(m_MaxLevel, m_Nodes[static_cast<size_t>(newNodeID)].level);
+        const size_t top = std::min(m_MaxLevel, NodeLevel(newNodeID));
         for (int level = static_cast<int>(top); level >= 0; --level) {
             auto candidates = SearchLayer(newVector, entry, m_EfConstruction, static_cast<size_t>(level));
             auto selected = SelectNeighbors(candidates, m_MaxNeighbors);
-            m_Nodes[static_cast<size_t>(newNodeID)].neighbors[static_cast<size_t>(level)] = selected;
+            SetNeighbors(newNodeID, static_cast<size_t>(level), selected);
 
             for (NodeID neighbor : selected)
                 LinkBack(neighbor, newNodeID, static_cast<size_t>(level));
@@ -143,9 +160,9 @@ private:
                 entry = candidates.front().second;
         }
 
-        if (m_Nodes[static_cast<size_t>(newNodeID)].level > m_MaxLevel) {
+        if (NodeLevel(newNodeID) > m_MaxLevel) {
             m_EntryPoint = newNodeID;
-            m_MaxLevel = m_Nodes[static_cast<size_t>(newNodeID)].level;
+            m_MaxLevel = NodeLevel(newNodeID);
         }
 
         return true;
@@ -173,7 +190,68 @@ private:
 
     const int8_t* GetNodeVector(NodeID nodeID) const
     {
-        return GetDocVector(m_DocIds[static_cast<size_t>(nodeID)]);
+        return GetDocVector(static_cast<uint64_t>(m_DocIds[static_cast<size_t>(nodeID)]));
+    }
+
+    size_t NodeLevel(NodeID nodeID) const
+    {
+        return static_cast<size_t>(m_Nodes[static_cast<size_t>(nodeID)].level);
+    }
+
+    bool AllocateLinks(Node& node)
+    {
+        const size_t layerCount = static_cast<size_t>(node.level) + 1;
+        if (layerCount > std::numeric_limits<uint32_t>::max() / m_MaxNeighbors)
+            return false;
+        const size_t slotCount = layerCount * m_MaxNeighbors;
+        if (m_Links.size() > std::numeric_limits<uint32_t>::max() - slotCount)
+            return false;
+
+        node.linkOffset = static_cast<uint32_t>(m_Links.size());
+        m_Links.resize(m_Links.size() + slotCount, npos());
+        m_LinkCounts.resize(m_LinkCounts.size() + layerCount, 0);
+        return true;
+    }
+
+    bool HasLevel(NodeID nodeID, size_t level) const
+    {
+        return level <= NodeLevel(nodeID);
+    }
+
+    size_t LinkOffset(NodeID nodeID, size_t level) const
+    {
+        return static_cast<size_t>(m_Nodes[static_cast<size_t>(nodeID)].linkOffset) + level * m_MaxNeighbors;
+    }
+
+    size_t LinkCountIndex(NodeID nodeID, size_t level) const
+    {
+        return static_cast<size_t>(m_Nodes[static_cast<size_t>(nodeID)].linkOffset) / m_MaxNeighbors + level;
+    }
+
+    template <typename Visitor>
+    void ForEachNeighbor(NodeID nodeID, size_t level, Visitor&& visitor) const
+    {
+        if (!HasLevel(nodeID, level)) return;
+        const size_t offset = LinkOffset(nodeID, level);
+        const size_t count = m_LinkCounts[LinkCountIndex(nodeID, level)];
+        for (size_t i = 0; i < count; ++i) {
+            const NodeID neighbor = m_Links[offset + i];
+            if (neighbor != npos())
+                visitor(neighbor);
+        }
+    }
+
+    void SetNeighbors(NodeID nodeID, size_t level, const std::vector<NodeID>& neighbors)
+    {
+        if (!HasLevel(nodeID, level)) return;
+        const size_t offset = LinkOffset(nodeID, level);
+        const size_t count = std::min(neighbors.size(), m_MaxNeighbors);
+        std::fill(m_Links.begin() + static_cast<std::ptrdiff_t>(offset),
+                  m_Links.begin() + static_cast<std::ptrdiff_t>(offset + m_MaxNeighbors),
+                  npos());
+        for (size_t i = 0; i < count; ++i)
+            m_Links[offset + i] = neighbors[i];
+        m_LinkCounts[LinkCountIndex(nodeID, level)] = static_cast<uint8_t>(count);
     }
 
     static float ScoreQueryToDoc(const std::vector<float>& query,
@@ -270,15 +348,15 @@ private:
         float bestScore = Score(best, query, metric);
         while (changed) {
             changed = false;
-            if (level >= m_Nodes[static_cast<size_t>(best)].neighbors.size()) break;
-            for (NodeID neighbor : m_Nodes[static_cast<size_t>(best)].neighbors[level]) {
+            if (!HasLevel(best, level)) break;
+            ForEachNeighbor(best, level, [&](NodeID neighbor) {
                 float score = Score(neighbor, query, metric);
                 if (score > bestScore) {
                     best = neighbor;
                     bestScore = score;
                     changed = true;
                 }
-            }
+            });
         }
         return best;
     }
@@ -307,16 +385,16 @@ private:
             candidates.pop();
             if (!results.empty() && current.first < results.top().first)
                 break;
-            if (level >= m_Nodes[static_cast<size_t>(current.second)].neighbors.size()) continue;
-            for (NodeID neighbor : m_Nodes[static_cast<size_t>(current.second)].neighbors[level]) {
-                if (!visited.insert(neighbor).second) continue;
+            if (!HasLevel(current.second, level)) continue;
+            ForEachNeighbor(current.second, level, [&](NodeID neighbor) {
+                if (!visited.insert(neighbor).second) return;
                 float score = Score(neighbor, query, metric);
                 if (results.size() < ef || score > results.top().first) {
                     candidates.push({score, neighbor});
                     results.push({score, neighbor});
                     if (results.size() > ef) results.pop();
                 }
-            }
+            });
         }
 
         std::vector<Candidate> out;
@@ -340,6 +418,7 @@ private:
             return a.second < b.second;
         });
         std::vector<NodeID> out;
+        out.reserve(std::min(maxNeighbors, sorted.size()));
         for (const auto& candidate : sorted) {
             if (out.size() >= maxNeighbors) break;
             out.push_back(candidate.second);
@@ -347,23 +426,54 @@ private:
         return out;
     }
 
+    void SortLayerByScore(NodeID node, size_t level, const int8_t* query)
+    {
+        const size_t offset = LinkOffset(node, level);
+        const size_t count = m_LinkCounts[LinkCountIndex(node, level)];
+        std::sort(m_Links.begin() + static_cast<std::ptrdiff_t>(offset),
+                  m_Links.begin() + static_cast<std::ptrdiff_t>(offset + count),
+                  [&](NodeID a, NodeID b) {
+                      float sa = Score(a, query);
+                      float sb = Score(b, query);
+                      if (sa != sb) return sa > sb;
+                      return a < b;
+                  });
+    }
+
     void LinkBack(NodeID node, NodeID neighbor, size_t level)
     {
-        auto& nodeRecord = m_Nodes[static_cast<size_t>(node)];
-        while (nodeRecord.neighbors.size() <= level)
-            nodeRecord.neighbors.emplace_back();
-        auto& links = nodeRecord.neighbors[level];
-        if (std::find(links.begin(), links.end(), neighbor) == links.end())
-            links.push_back(neighbor);
-        if (links.size() > m_MaxNeighbors) {
-            const int8_t* query = GetNodeVector(node);
-            std::sort(links.begin(), links.end(), [&](NodeID a, NodeID b) {
-                float sa = Score(a, query);
-                float sb = Score(b, query);
-                if (sa != sb) return sa > sb;
-                return a < b;
-            });
-            links.resize(m_MaxNeighbors);
+        if (!HasLevel(node, level)) return;
+
+        const size_t offset = LinkOffset(node, level);
+        const size_t countIndex = LinkCountIndex(node, level);
+        size_t count = m_LinkCounts[countIndex];
+        for (size_t i = 0; i < count; ++i) {
+            if (m_Links[offset + i] == neighbor)
+                return;
+        }
+
+        if (count < m_MaxNeighbors) {
+            m_Links[offset + count] = neighbor;
+            m_LinkCounts[countIndex] = static_cast<uint8_t>(count + 1);
+            return;
+        }
+
+        const int8_t* query = GetNodeVector(node);
+        const float neighborScore = Score(neighbor, query);
+        size_t worstIndex = 0;
+        float worstScore = Score(m_Links[offset], query);
+        for (size_t i = 1; i < count; ++i) {
+            const NodeID candidate = m_Links[offset + i];
+            const float candidateScore = Score(candidate, query);
+            if (candidateScore < worstScore || (candidateScore == worstScore && candidate > m_Links[offset + worstIndex])) {
+                worstIndex = i;
+                worstScore = candidateScore;
+            }
+        }
+
+        if (neighborScore > worstScore || (neighborScore == worstScore && neighbor < m_Links[offset + worstIndex])) {
+            m_Links[offset + worstIndex] = neighbor;
+            SortLayerByScore(node, level, query);
         }
     }
 
@@ -371,7 +481,9 @@ private:
     size_t m_MaxNeighbors = 32;
     size_t m_EfConstruction = 200;
     std::vector<Node> m_Nodes;
-    std::vector<uint64_t> m_DocIds;
+    std::vector<uint32_t> m_DocIds;
+    std::vector<NodeID> m_Links;
+    std::vector<uint8_t> m_LinkCounts;
     const uint8_t* m_DocData = nullptr;
     NodeID m_EntryPoint = npos();
     size_t m_MaxLevel = 0;

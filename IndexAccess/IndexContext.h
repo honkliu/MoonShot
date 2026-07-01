@@ -1024,6 +1024,15 @@ private:
         m_VectorIndex.Clear();
         m_VectorIndex.SetDocData(m_DocData);
         if (m_DocData) {
+            uint64_t vectorDocCount = 0;
+            for (uint64_t docId = 0; docId < m_IndexFileHeader.IFH_NumDocuments; ++docId) {
+                const auto* entry = reinterpret_cast<const DocDataEntry*>(m_DocData + docId * DOC_REC_SIZE);
+                if (entry->DDE_DocID == docId && entry->DDE_VectorFlags != 0)
+                    ++vectorDocCount;
+            }
+            if (vectorDocCount < std::numeric_limits<uint32_t>::max())
+                m_VectorIndex.Reserve(static_cast<size_t>(vectorDocCount));
+
             for (uint64_t docId = 0; docId < m_IndexFileHeader.IFH_NumDocuments; ++docId) {
                 const auto* entry = reinterpret_cast<const DocDataEntry*>(m_DocData + docId * DOC_REC_SIZE);
                 if (entry->DDE_DocID == docId && entry->DDE_VectorFlags != 0)
