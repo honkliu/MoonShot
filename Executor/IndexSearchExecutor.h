@@ -29,6 +29,11 @@ public:
 
     std::vector<SearchResult> Execute(IndexReader* reader, int topK = 10);
 
+    static void SetFittedDocWeights(float staticWeight,
+                                    float qualityWeight,
+                                    float authorityWeight,
+                                    float spamPenalty);
+
 private:
     const IndexContext*          m_Context = nullptr;
 

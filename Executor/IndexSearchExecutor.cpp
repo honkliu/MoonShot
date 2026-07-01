@@ -8,17 +8,22 @@
 
 namespace {
 
+float g_StaticWeight = 1.0f;
+float g_QualityWeight = 1.0f;
+float g_AuthorityWeight = 0.5f;
+float g_SpamPenalty = 2.0f;
+
 float DocDataScore(const DocDataEntry& entry)
 {
     // Fitted formula from the 2026-06-30 full-feature GPU sweep:
-    // score = 2.0*weak + 0.175*dump_bigram + 0.25*static + 0.0*prior
-    //       + 6.0*quality + 0.5*authority - 0.25*spam + 0.0*both + 0.0*bigram_only.
+    // score = 1.8*weak + 0.1*dump_bigram + 1.0*static + 0.0*prior
+    //       + 1.0*quality + 0.5*authority - 2.0*spam + 0.0*both + 0.0*bigram_only.
     // Scheme A folds stream-side terms into leaf span weights:
-    // unigram span weight = 2.0; bigram span weight = 0.175 * dump_bigram_span_weight(2.0) = 0.35.
-    return 0.25f * entry.DDE_StaticRank
-        + 6.0f * entry.DDE_QualityScore
-        + 0.5f * entry.DDE_AuthorityScore
-        - 0.25f * entry.DDE_SpamScore;
+    // unigram span weight = 1.8; bigram span weight = 0.1 * dump_bigram_span_weight(2.0) = 0.2.
+    return g_StaticWeight * entry.DDE_StaticRank
+        + g_QualityWeight * entry.DDE_QualityScore
+        + g_AuthorityWeight * entry.DDE_AuthorityScore
+        - g_SpamPenalty * entry.DDE_SpamScore;
 }
 
 }
@@ -26,6 +31,17 @@ float DocDataScore(const DocDataEntry& entry)
 IndexSearchExecutor::IndexSearchExecutor(const IndexContext* context)
     : m_Context(context)
 {}
+
+void IndexSearchExecutor::SetFittedDocWeights(float staticWeight,
+                                              float qualityWeight,
+                                              float authorityWeight,
+                                              float spamPenalty)
+{
+    g_StaticWeight = staticWeight;
+    g_QualityWeight = qualityWeight;
+    g_AuthorityWeight = authorityWeight;
+    g_SpamPenalty = spamPenalty;
+}
 
 std::vector<SearchResult> IndexSearchExecutor::Execute(std::shared_ptr<IndexReader> reader,
                                                        int topK)

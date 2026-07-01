@@ -1005,10 +1005,16 @@ struct BeirEvalOptions {
     std::vector<int> at = {10, 100, 1000};
     uint64_t limit = 0;
     uint64_t vectorEf = 1000;
-    float bigramWeight = 0.35f;
+    float bigramWeight = 0.2f;
     bool noMphf = false;
     uint64_t leafCacheMb = 0;
     bool leafCacheMatchMphf = false;
+    float unigramWeight = 1.8f;
+    float fittedBigramWeight = 0.1f;
+    float staticWeight = 1.0f;
+    float qualityWeight = 1.0f;
+    float authorityWeight = 0.5f;
+    float spamPenalty = 2.0f;
 };
 
 static bool ParseBatchSize(const std::string& text, uint64_t& batchSize)
@@ -1071,6 +1077,31 @@ static bool ParseAtList(const std::string& text, std::vector<int>& values)
     std::sort(values.begin(), values.end());
     values.erase(std::unique(values.begin(), values.end()), values.end());
     return !values.empty();
+}
+
+static bool ParseSchemeAWeights(const std::string& text,
+                                BeirEvalOptions& options)
+{
+    std::vector<float> values;
+    std::stringstream ss(text);
+    std::string item;
+    while (std::getline(ss, item, ',')) {
+        item = Trim(std::move(item));
+        float value = 0.0f;
+        if (!ParseFloat(item, value))
+            return false;
+        values.push_back(value);
+    }
+    if (values.size() != 6)
+        return false;
+    options.unigramWeight = values[0];
+    options.fittedBigramWeight = values[1];
+    options.staticWeight = values[2];
+    options.qualityWeight = values[3];
+    options.authorityWeight = values[4];
+    options.spamPenalty = values[5];
+    options.bigramWeight = 2.0f * options.fittedBigramWeight;
+    return options.unigramWeight > 0.0f && options.fittedBigramWeight >= 0.0f;
 }
 
 static bool ParseSearchOptions(const std::vector<std::string>& args,
@@ -1313,6 +1344,10 @@ static bool ParseBeirEvalOptions(const std::vector<std::string>& args,
         } else if (arg == "-bigram-weight") {
             if (i + 1 >= args.size()) { error = "Usage: moon -beir-eval -bigram-weight W"; return false; }
             if (!ParseFloat(args[++i], options.bigramWeight) || options.bigramWeight <= 0.0f) { error = "-bigram-weight must be positive"; return false; }
+            options.fittedBigramWeight = 0.5f * options.bigramWeight;
+        } else if (arg == "-scheme-a-weights") {
+            if (i + 1 >= args.size()) { error = "Usage: moon -beir-eval -scheme-a-weights weak,bigram,static,quality,authority,spam"; return false; }
+            if (!ParseSchemeAWeights(args[++i], options)) { error = "-scheme-a-weights must be six comma-separated floats: weak,bigram,static,quality,authority,spam"; return false; }
         } else {
             error = "Unknown BEIR eval option: " + arg;
             return false;
@@ -2193,7 +2228,12 @@ static int RunBeirEval(const std::string& idxPath, const BeirEvalOptions& option
         ctx.SetLeafTermCacheBytes(leafCacheBytes);
     ctx.LoadIndex(idxPath.c_str());
     ctx.SetTermMphfEnabled(!options.noMphf);
+    ctx.SetUnigramSpanWeight(options.unigramWeight);
     ctx.SetBigramSpanWeight(options.bigramWeight);
+    IndexSearchExecutor::SetFittedDocWeights(options.staticWeight,
+                                             options.qualityWeight,
+                                             options.authorityWeight,
+                                             options.spamPenalty);
     WeakAndBuildMode weakAndBuildMode = WeakAndBuildMode::FlatPruned;
     if (options.weakAndShape == "or")
         weakAndBuildMode = WeakAndBuildMode::OrChildren;
