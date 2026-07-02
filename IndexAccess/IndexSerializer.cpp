@@ -19,6 +19,7 @@
 #include <string>
 #include <algorithm>
 #include <cassert>
+#include <iostream>
 #include <limits>
 
 /* ── helpers ─────────────────────────────────────────────────────────────── */
@@ -328,8 +329,10 @@ BuildBlocksResult IndexSerializer::BuildBlocks(const PostingStore& store)
     uint32_t leafEntryCount = 0;
     char firstLeafTerm[HEAD_TERM_KEY_MAX] = {};
     uint16_t firstLeafTermLength = 0;
+    const bool buildMphf = terms.size() <= 500000;
     std::vector<TermMphfBuildTerm> mphfTerms;
-    mphfTerms.reserve(terms.size());
+    if (buildMphf)
+        mphfTerms.reserve(terms.size());
 
     auto flush_leaf_block = [&]() {
         if (leafEntryCount == 0) return;
@@ -380,15 +383,17 @@ BuildBlocksResult IndexSerializer::BuildBlocks(const PostingStore& store)
         leafWriteOffset += entryBytes;
         ++leafEntryCount;
         ++res.BBR_TotalTerms;
-        TermMphfBuildTerm mphfTerm{};
-        mphfTerm.Term = &term;
-        mphfTerm.DocFreq = docFreq;
-        mphfTerm.IndexBlockID = indexBlockID;
-        mphfTerm.IndexOffset = indexOffset;
-        mphfTerm.IndexLength = indexLength;
-        mphfTerm.ContinuationBlockCount = continuationBlockCount;
-        mphfTerm.Flags = flags;
-        mphfTerms.push_back(std::move(mphfTerm));
+        if (buildMphf) {
+            TermMphfBuildTerm mphfTerm{};
+            mphfTerm.Term = &term;
+            mphfTerm.DocFreq = docFreq;
+            mphfTerm.IndexBlockID = indexBlockID;
+            mphfTerm.IndexOffset = indexOffset;
+            mphfTerm.IndexLength = indexLength;
+            mphfTerm.ContinuationBlockCount = continuationBlockCount;
+            mphfTerm.Flags = flags;
+            mphfTerms.push_back(std::move(mphfTerm));
+        }
     };
 
     auto flush = [&]() {
@@ -474,7 +479,8 @@ BuildBlocksResult IndexSerializer::BuildBlocks(const PostingStore& store)
 
     if (wptr > 0) flush();
     flush_leaf_block();
-    build_term_mphf(mphfTerms, res);
+    if (buildMphf)
+        build_term_mphf(mphfTerms, res);
 
     return res;
 }
@@ -489,42 +495,69 @@ bool IndexSerializer::Save(const IndexFileHeader& header,
     if (!path || !*path) return false;
 
     FileAccess file(path);
-    if (!file.InitWrite()) return false;
+    if (!file.InitWrite()) {
+        std::cerr << "IndexSerializer::Save failed: InitWrite " << path << "\n";
+        return false;
+    }
 
-    if (!file.PutData(&header, sizeof(header))) return false;
+    if (!file.PutData(&header, sizeof(header))) {
+        std::cerr << "IndexSerializer::Save failed: header\n";
+        return false;
+    }
 
     if (header.IFH_HeadTermEntryCount > 0) {
         const uint64_t bytes = sizeof(HeadTermEntry) * header.IFH_HeadTermEntryCount;
-        if (!file.PutData(blockTable.m_HeadTermEntries.get(), bytes)) return false;
+        if (!file.PutData(blockTable.m_HeadTermEntries.get(), bytes)) {
+            std::cerr << "IndexSerializer::Save failed: HeadTermEntry bytes=" << bytes << "\n";
+            return false;
+        }
     }
 
     if (header.IFH_LeafTermBlockCount > 0) {
         const uint64_t bytes = sizeof(LeafTermBlock) * header.IFH_LeafTermBlockCount;
-        if (!file.PutData(blockTable.m_LeafTermPool.BCP_Pages, bytes)) return false;
+        if (!file.PutData(blockTable.m_LeafTermPool.BCP_Pages, bytes)) {
+            std::cerr << "IndexSerializer::Save failed: LeafTermBlock bytes=" << bytes << "\n";
+            return false;
+        }
     }
 
     if (header.IFH_NumDocuments > 0) {
         const uint64_t bytes = DOC_REC_SIZE * header.IFH_NumDocuments;
-        if (!file.PutData(docData, bytes)) return false;
+        if (!file.PutData(docData, bytes)) {
+            std::cerr << "IndexSerializer::Save failed: DocData bytes=" << bytes << "\n";
+            return false;
+        }
     }
 
     if (header.IFH_IndexBlockCount > 0) {
         const uint64_t bytes = sizeof(IndexBlock) * header.IFH_IndexBlockCount;
-        if (!file.PutData(blockTable.m_IndexPool.BCP_Pages, bytes)) return false;
+        if (!file.PutData(blockTable.m_IndexPool.BCP_Pages, bytes)) {
+            std::cerr << "IndexSerializer::Save failed: IndexBlock bytes=" << bytes << "\n";
+            return false;
+        }
     }
 
     if (header.IFH_TermMphfHeaderCount > 0) {
-        if (!file.PutData(&blockTable.m_TermMphfHeader, sizeof(TermMphfHeader))) return false;
+        if (!file.PutData(&blockTable.m_TermMphfHeader, sizeof(TermMphfHeader))) {
+            std::cerr << "IndexSerializer::Save failed: TermMphfHeader\n";
+            return false;
+        }
     }
 
     if (header.IFH_TermMphfDisplacementCount > 0) {
         const uint64_t bytes = sizeof(int32_t) * header.IFH_TermMphfDisplacementCount;
-        if (!file.PutData(blockTable.m_TermMphfDisplacements.get(), bytes)) return false;
+        if (!file.PutData(blockTable.m_TermMphfDisplacements.get(), bytes)) {
+            std::cerr << "IndexSerializer::Save failed: TermMphfDisplacement bytes=" << bytes << "\n";
+            return false;
+        }
     }
 
     if (header.IFH_TermMphfEntryPageCount > 0) {
         const uint64_t bytes = sizeof(IndexBlock) * header.IFH_TermMphfEntryPageCount;
-        if (!file.PutData(blockTable.m_TermMphfEntryPages, bytes)) return false;
+        if (!file.PutData(blockTable.m_TermMphfEntryPages, bytes)) {
+            std::cerr << "IndexSerializer::Save failed: TermMphfEntryPage bytes=" << bytes << "\n";
+            return false;
+        }
     }
 
     return true;

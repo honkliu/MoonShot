@@ -1176,9 +1176,7 @@ private:
 
         auto br = IndexSerializer::BuildBlocks(*m_Store);
         if (br.BBR_TotalTerms > 0 && (br.BBR_TermMphfDisplacements.empty() || br.BBR_TermMphfEntryPages.empty())) {
-            std::cerr << "Failed to build TermMPHF for non-empty index\n";
-            ResetRuntimeState(blockTable, vectorIndex, header, docData, built);
-            return false;
+            std::cerr << "TermMPHF unavailable; falling back to Head/Leaf lookup\n";
         }
         if (br.BBR_IndexBlocks.size() > UINT32_MAX
             || br.BBR_LeafTermBlocks.size() > UINT32_MAX

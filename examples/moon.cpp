@@ -2161,16 +2161,19 @@ static int RunBeirBuild(const std::string& idxPath, const BeirBuildOptions& opti
     while (std::getline(corpus, line)) {
         if (options.limit > 0 && docId >= options.limit) break;
         std::string id;
+        std::string url;
         std::string title;
         std::string text;
         if (!ExtractJsonString(line, "_id", id) || !ExtractJsonString(line, "text", text)) {
             ++skipped;
             continue;
         }
+        ExtractJsonString(line, "url", url);
         ExtractJsonString(line, "title", title);
         Document doc;
         doc.doc_id = docId;
         doc.path = id;
+        doc.url = url;
         doc.title = title;
         doc.body = text;
         doc.importance = 0.1f;
