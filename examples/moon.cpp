@@ -2310,10 +2310,15 @@ static int RunBeirEval(const std::string& idxPath, const BeirEvalOptions& option
     } else {
         ctx.SetUnigramSpanWeight(options.unigramWeight);
         ctx.SetBigramSpanWeight(options.bigramWeight);
-        IndexSearchExecutor::SetFittedDocWeights(options.staticWeight,
-                                                 options.qualityWeight,
-                                                 options.authorityWeight,
-                                                 options.spamPenalty);
+        auto parameters = kWeakAndBigramParameters;
+        parameters.QMP_UnigramWeight = options.unigramWeight;
+        parameters.QMP_BigramWeight = options.bigramWeight;
+        parameters.QMP_StaticWeight = options.staticWeight;
+        parameters.QMP_PriorWeight = 0.0f;
+        parameters.QMP_QualityWeight = options.qualityWeight;
+        parameters.QMP_AuthorityWeight = options.authorityWeight;
+        parameters.QMP_SpamPenalty = options.spamPenalty;
+        IndexSearchExecutor::SetScoringParameters(parameters);
     }
     WeakAndBuildMode weakAndBuildMode = WeakAndBuildMode::FlatPruned;
     if (options.weakAndShape == "or")
@@ -2392,7 +2397,7 @@ static int RunBeirEval(const std::string& idxPath, const BeirEvalOptions& option
                 tree->vector_query = std::move(queryVector);
             tree->vector_ef_search = static_cast<size_t>(options.vectorEf);
 
-            auto results = executor->Execute(ctx.GetReader(tree.get()), maxK,
+            results = executor->Execute(ctx.GetReader(tree.get()), maxK,
                 tree->HasTextQuery() && tree->HasVectorQuery() ? &tree->vector_query : nullptr);
 
             if (results.size() > static_cast<size_t>(maxK))

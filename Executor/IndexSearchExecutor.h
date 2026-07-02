@@ -29,14 +29,9 @@ public:
                                uint64_t maxVisitedDocs,
                                const std::vector<float>* vectorQuery = nullptr);
 
-        std::vector<SearchResult> Execute(IndexReader* reader,
+    std::vector<SearchResult> Execute(IndexReader* reader,
                            int topK = 10,
                            const std::vector<float>* vectorQuery = nullptr);
-
-    static void SetFittedDocWeights(float staticWeight,
-                                    float qualityWeight,
-                                    float authorityWeight,
-                                    float spamPenalty);
 
     static void SetScoringParameters(const QueryCompileModeParameters& parameters);
 

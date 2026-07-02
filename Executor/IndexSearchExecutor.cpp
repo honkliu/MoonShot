@@ -66,19 +66,6 @@ IndexSearchExecutor::IndexSearchExecutor(const IndexContext* context)
     : m_Context(context)
 {}
 
-void IndexSearchExecutor::SetFittedDocWeights(float staticWeight,
-                                              float qualityWeight,
-                                              float authorityWeight,
-                                              float spamPenalty)
-{
-    g_ScoringParameters = kWeakAndBigramParameters;
-    g_ScoringParameters.QMP_StaticWeight = staticWeight;
-    g_ScoringParameters.QMP_PriorWeight = 0.0f;
-    g_ScoringParameters.QMP_QualityWeight = qualityWeight;
-    g_ScoringParameters.QMP_AuthorityWeight = authorityWeight;
-    g_ScoringParameters.QMP_SpamPenalty = spamPenalty;
-}
-
 void IndexSearchExecutor::SetScoringParameters(const QueryCompileModeParameters& parameters)
 {
     g_ScoringParameters = parameters;
@@ -101,14 +88,17 @@ std::vector<SearchResult> IndexSearchExecutor::Execute(std::shared_ptr<IndexRead
         return a.score > b.score;
     };
 
+    float score = 0.0;
+
     while (!reader->IsEnd()) {
         uint64_t docId     = reader->GetDocumentID();
-        assert(m_Context);
+
         const DocDataEntry* entry = m_Context->GetDocDataEntry(docId);
-        assert(entry);
-        float    score     = reader->GetScore(entry) + DocDataScore(*entry) + VectorScoreFeature(*entry, vectorQuery);
+
+        score = reader->GetScore(entry) + DocDataScore(*entry) + VectorScoreFeature(*entry, vectorQuery);
 
         SearchResult result{MakeReaderDocumentID(docId, reader->GetSourceMask()), score, ""};
+        
         if (!boundedTopK) {
             results.push_back(std::move(result));
         } else if (results.size() < heapLimit) {
