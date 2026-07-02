@@ -96,9 +96,9 @@ public:
 
     uint64_t AllocateDocumentID() const
     {
-        uint64_t nextId = m_IndexFileHeader.IFH_NumDocuments;
+        uint64_t nextId = DocDataFirstDocId(m_DocData, m_IndexFileHeader) + m_IndexFileHeader.IFH_NumDocuments;
         if (m_DeltaContext)
-            nextId = std::max(nextId, m_DeltaContext->DocumentCount());
+            nextId = std::max(nextId, DocDataFirstDocId(m_DeltaContext->m_DocData, m_DeltaContext->m_IndexFileHeader) + m_DeltaContext->m_IndexFileHeader.IFH_NumDocuments);
 
         for (const auto& [docId, _] : m_Store->AllDocStats())
             nextId = std::max(nextId, docId + 1);
@@ -252,10 +252,11 @@ public:
     const DocDataEntry* GetDocDataEntry(uint64_t docId) const
     {
         docId = ReaderDocumentIDValue(docId);
-        if (!m_DocData || docId >= m_IndexFileHeader.IFH_NumDocuments)
+        const uint64_t firstDocId = DocDataFirstDocId(m_DocData, m_IndexFileHeader);
+        if (!m_DocData || docId < firstDocId || docId - firstDocId >= m_IndexFileHeader.IFH_NumDocuments)
             return m_DeltaContext ? m_DeltaContext->GetDocDataEntry(docId) : nullptr;
 
-        const auto* entry = reinterpret_cast<const DocDataEntry*>(m_DocData + docId * DOC_REC_SIZE);
+        const auto* entry = reinterpret_cast<const DocDataEntry*>(m_DocData + (docId - firstDocId) * DOC_REC_SIZE);
         if (entry->DDE_DocID == docId)
             return entry;
         return m_DeltaContext ? m_DeltaContext->GetDocDataEntry(docId) : nullptr;
@@ -468,11 +469,10 @@ public:
             if (!docFile.InitWrite()) { cleanupTempFiles(); return false; }
 
             const uint64_t baseDocCount = m_IndexFileHeader.IFH_NumDocuments;
-            const uint64_t deltaFirstDocId = baseDocCount;
-            const uint64_t deltaDocLimit = delta.m_IndexFileHeader.IFH_NumDocuments;
-            if (deltaDocLimit < deltaFirstDocId) { cleanupTempFiles(); return false; }
-            const uint64_t deltaDocCount = deltaDocLimit - deltaFirstDocId;
-            mergedDocs = deltaFirstDocId + deltaDocCount;
+            const uint64_t deltaFirstDocId = DocDataFirstDocId(delta.m_DocData, delta.m_IndexFileHeader);
+            const uint64_t deltaDocCount = delta.m_IndexFileHeader.IFH_NumDocuments;
+            if (deltaDocCount > 0 && deltaFirstDocId != baseDocCount) { cleanupTempFiles(); return false; }
+            mergedDocs = baseDocCount + deltaDocCount;
 
             uint64_t totalDocLength = static_cast<uint64_t>(static_cast<double>(m_IndexFileHeader.IFH_AvgDocLength) * static_cast<double>(baseDocCount));
 
@@ -481,10 +481,10 @@ public:
 
             if (deltaDocCount > 0) {
                 const uint64_t deltaDocBytes = deltaDocCount * DOC_REC_SIZE;
-                const uint8_t* deltaDocData = delta.m_DocData + deltaFirstDocId * DOC_REC_SIZE;
+                const uint8_t* deltaDocData = delta.m_DocData;
                 if (!docFile.PutData(deltaDocData, deltaDocBytes)) { cleanupTempFiles(); return false; }
 
-                totalDocLength += static_cast<uint64_t>(static_cast<double>(delta.m_IndexFileHeader.IFH_AvgDocLength) * static_cast<double>(deltaDocLimit));
+                totalDocLength += static_cast<uint64_t>(static_cast<double>(delta.m_IndexFileHeader.IFH_AvgDocLength) * static_cast<double>(deltaDocCount));
             }
 
             avgDocLength = mergedDocs ? static_cast<float>(totalDocLength) / static_cast<float>(mergedDocs) : 1.0f;
@@ -894,8 +894,7 @@ public:
 
         ClearDocDataOnly();
 
-        if (m_IndexFileHeader.IFH_NumDocuments > UINT64_MAX / DOC_REC_SIZE)
-        {
+        if (m_IndexFileHeader.IFH_NumDocuments > UINT64_MAX / DOC_REC_SIZE) {
             std::cerr << "Invalid DocData count in: " << m_IndexPath << "\n";
             ResetLoadedRuntimeState();
             return;
@@ -918,7 +917,12 @@ public:
             }
         }
 
-        m_VectorIndex.SetDocData(m_DocData);
+        if (m_IndexFileHeader.IFH_NumDocuments > 0 && !m_DocData) {
+            std::cerr << "Invalid DocData entries in: " << m_IndexPath << "\n";
+            ResetLoadedRuntimeState();
+            return;
+        }
+        m_VectorIndex.SetDocData(m_DocData, DocDataFirstDocId(m_DocData, m_IndexFileHeader));
         m_VectorBuilt = false;
 
         m_Executor = IndexSearchExecutor(this);
@@ -966,6 +970,13 @@ private:
         static_cast<uint32_t>(INDEX_BLOCK_CACHE_BYTES / sizeof(IndexBlock));
     static constexpr uint32_t LEAF_TERM_BLOCK_CACHE_SLOT_COUNT =
         static_cast<uint32_t>(LEAF_TERM_CACHE_BYTES / sizeof(LeafTermBlock));
+
+    static uint64_t DocDataFirstDocId(const uint8_t* docData, const IndexFileHeader& header)
+    {
+        return docData && header.IFH_NumDocuments > 0
+            ? reinterpret_cast<const DocDataEntry*>(docData)->DDE_DocID
+            : 0;
+    }
 
     uint32_t LeafTermBlockCacheSlotCount() const
     {
@@ -1025,19 +1036,22 @@ private:
         if (showProgress)
             std::cout << "\n  vector runtime: scanning " << m_IndexFileHeader.IFH_NumDocuments << " DocData records\n";
         m_VectorIndex.Clear();
-        m_VectorIndex.SetDocData(m_DocData);
+        const uint64_t firstDocId = DocDataFirstDocId(m_DocData, m_IndexFileHeader);
+        m_VectorIndex.SetDocData(m_DocData, firstDocId);
         if (m_DocData) {
             uint64_t vectorDocCount = 0;
-            for (uint64_t docId = 0; docId < m_IndexFileHeader.IFH_NumDocuments; ++docId) {
-                const auto* entry = reinterpret_cast<const DocDataEntry*>(m_DocData + docId * DOC_REC_SIZE);
+            for (uint64_t slot = 0; slot < m_IndexFileHeader.IFH_NumDocuments; ++slot) {
+                const uint64_t docId = firstDocId + slot;
+                const auto* entry = reinterpret_cast<const DocDataEntry*>(m_DocData + slot * DOC_REC_SIZE);
                 if (entry->DDE_DocID == docId && entry->DDE_VectorFlags != 0)
                     ++vectorDocCount;
             }
             if (vectorDocCount < std::numeric_limits<uint32_t>::max())
                 m_VectorIndex.Reserve(static_cast<size_t>(vectorDocCount));
 
-            for (uint64_t docId = 0; docId < m_IndexFileHeader.IFH_NumDocuments; ++docId) {
-                const auto* entry = reinterpret_cast<const DocDataEntry*>(m_DocData + docId * DOC_REC_SIZE);
+            for (uint64_t slot = 0; slot < m_IndexFileHeader.IFH_NumDocuments; ++slot) {
+                const uint64_t docId = firstDocId + slot;
+                const auto* entry = reinterpret_cast<const DocDataEntry*>(m_DocData + slot * DOC_REC_SIZE);
                 if (entry->DDE_DocID == docId && entry->DDE_VectorFlags != 0)
                     m_VectorIndex.Add(docId);
                 if (showProgress && docId > 0 && docId % 100000 == 0)
@@ -1102,23 +1116,28 @@ private:
             return true;
         }
 
+        uint64_t minDocId = UINT64_MAX;
         uint64_t maxDocId = 0;
-        for (const auto& [docId, _] : m_Store->AllDocStats())
+        for (const auto& [docId, _] : m_Store->AllDocStats()) {
+            minDocId = std::min(minDocId, docId);
             maxDocId = std::max(maxDocId, docId);
+        }
+        const uint64_t docDataFirstDocId = minDocId == UINT64_MAX ? 0 : minDocId;
+        const uint64_t docDataRecordCount = maxDocId >= docDataFirstDocId ? (maxDocId - docDataFirstDocId + 1) : 0;
 
         ClearDocDataOnly(docData, vectorIndex);
-        docData = static_cast<uint8_t*>(PinnedMemAlloc((maxDocId + 1) * DOC_REC_SIZE));
+        docData = static_cast<uint8_t*>(PinnedMemAlloc(docDataRecordCount * DOC_REC_SIZE));
         if (!docData) {
             ResetRuntimeState(blockTable, vectorIndex, header, docData, built);
             return false;
         }
-        std::memset(docData, 0, static_cast<size_t>((maxDocId + 1) * DOC_REC_SIZE));
-        for (uint64_t docId = 0; docId <= maxDocId; ++docId)
-            reinterpret_cast<DocDataEntry*>(docData + docId * DOC_REC_SIZE)->DDE_DocID = UINT64_MAX;
+        std::memset(docData, 0, static_cast<size_t>(docDataRecordCount * DOC_REC_SIZE));
+        for (uint64_t slot = 0; slot < docDataRecordCount; ++slot)
+            reinterpret_cast<DocDataEntry*>(docData + slot * DOC_REC_SIZE)->DDE_DocID = UINT64_MAX;
 
         uint64_t totalLen = 0;
         for (const auto& [docId, stats] : m_Store->AllDocStats()) {
-            auto* entry = reinterpret_cast<DocDataEntry*>(docData + docId * DOC_REC_SIZE);
+            auto* entry = reinterpret_cast<DocDataEntry*>(docData + (docId - docDataFirstDocId) * DOC_REC_SIZE);
             entry->DDE_DocID = docId;
             entry->DDE_StaticRank = stats.importance;
             entry->DDE_DocLength = stats.doc_len;
@@ -1149,7 +1168,7 @@ private:
             totalLen += stats.doc_len;
         }
 
-        const uint64_t totalDocs = maxDocId + 1;
+        const uint64_t totalDocs = docDataRecordCount;
         std::memcpy(header.IFH_Magic, INDEX_FILE_MAGIC, sizeof(INDEX_FILE_MAGIC));
         header.IFH_Version = INDEX_FORMAT_VERSION;
         header.IFH_NumDocuments = totalDocs;
@@ -1183,7 +1202,7 @@ private:
         header.IFH_LeafTermBlockOffset = header.IFH_HeadTermEntryOffset + static_cast<uint64_t>(headCount) * sizeof(HeadTermEntry);
         header.IFH_LeafTermBlockCount = leafTermBlockCount;
         header.IFH_DocDataOffset = header.IFH_LeafTermBlockOffset + static_cast<uint64_t>(leafTermBlockCount) * sizeof(LeafTermBlock);
-        header.IFH_IndexBlockOffset = header.IFH_DocDataOffset + header.IFH_NumDocuments * DOC_REC_SIZE;
+        header.IFH_IndexBlockOffset = header.IFH_DocDataOffset + docDataRecordCount * DOC_REC_SIZE;
         header.IFH_IndexBlockCount = indexBlockCount;
         header.IFH_TermMphfHeaderOffset = header.IFH_IndexBlockOffset + static_cast<uint64_t>(indexBlockCount) * sizeof(IndexBlock);
         header.IFH_TermMphfHeaderCount = mphfDisplacementCount > 0 && mphfEntryPageCount > 0 ? 1 : 0;
@@ -1225,7 +1244,7 @@ private:
         }
 
         if (buildVectorIndex) {
-            vectorIndex.SetDocData(docData);
+            vectorIndex.SetDocData(docData, docDataFirstDocId);
             for (const auto& [docId, _] : m_Store->AllDocStats()) {
                 if (m_Store->HasDocVector(docId))
                     vectorIndex.Add(docId);

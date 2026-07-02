@@ -163,7 +163,7 @@ static PathMap LoadPathMapFromIndex(const std::string& idxPath, uint64_t& nextId
         return m;
 
     IndexContext ctx("", idxPath.c_str(), false);
-    for (uint64_t id = 0; id < ctx.DocumentCount(); ++id) {
+    for (uint64_t id = 0; id < ctx.AllocateDocumentID(); ++id) {
         const std::string path = ctx.GetDocPath(id);
         if (!path.empty()) {
             m[path] = id;
@@ -450,8 +450,6 @@ struct SearchOptions {
     std::string bgeScript;
     std::string bgeModel = "BAAI/bge-small-en-v1.5";
 };
-
-static uint64_t CountStoredDocuments(IndexContext& ctx, uint64_t firstDocId);
 
 static std::string SearchStreamSet(const SearchOptions& options)
 {
@@ -835,10 +833,7 @@ static void PrintInteractiveHelp()
 
 static uint64_t NextInteractiveDocId(IndexContext& ctx)
 {
-    uint64_t nextDocId = ctx.AllocateDocumentID();
-    if (auto* delta = ctx.GetDeltaContext())
-        nextDocId = std::max(nextDocId, delta->DocumentCount());
-    return nextDocId;
+    return ctx.AllocateDocumentID();
 }
 
 static bool AddInteractiveFiles(IndexContext& ctx,
@@ -1005,9 +1000,9 @@ static int RunInteractiveSearch(const std::string& idxPath, const SearchOptions&
     const auto loadMs = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - loadStart).count();
 
-    uint64_t totalDocuments = CountStoredDocuments(ctx, 0);
+    uint64_t totalDocuments = ctx.DocumentCount();
     if (auto* delta = ctx.GetDeltaContext())
-        totalDocuments += CountStoredDocuments(*delta, ctx.DocumentCount());
+        totalDocuments += delta->DocumentCount();
 
     std::cout << "moon search — "
               << totalDocuments
@@ -1561,16 +1556,6 @@ static bool HasSearchResults(IndexContext& ctx, const std::string& query)
     return !results.empty();
 }
 
-static uint64_t CountStoredDocuments(IndexContext& ctx, uint64_t firstDocId = 0)
-{
-    uint64_t count = 0;
-    for (uint64_t docId = firstDocId; docId < ctx.DocumentCount(); ++docId) {
-        if (!ctx.GetDocPath(docId).empty())
-            ++count;
-    }
-    return count;
-}
-
 static std::string BeirFilePath(const std::string& dataPath, const std::string& relativePath)
 {
     auto path = FsPathFromUtf8(dataPath);
@@ -1666,10 +1651,8 @@ struct ExternalVectorStream {
     uint32_t dim = static_cast<uint32_t>(DOC_VECTOR_DIM);
     uint32_t idBytes = 0;
 };
-
 static bool OpenExternalVectorStream(const std::string& path, ExternalVectorStream& stream);
 static bool ReadExternalVectorRecord(ExternalVectorStream& stream, std::string& id, ExternalVector& vector);
-
 static bool LoadBeirQrels(const std::string& path, BeirQrels& qrels)
 {
     std::ifstream in(FsPathFromUtf8(path));

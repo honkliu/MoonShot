@@ -65,9 +65,10 @@ public:
         m_MaxLevel = 0;
     }
 
-    void SetDocData(const uint8_t* docData)
+    void SetDocData(const uint8_t* docData, uint64_t firstDocId = 0)
     {
         m_DocData = docData;
+        m_DocDataFirstDocId = firstDocId;
     }
 
     bool Add(uint64_t docId)
@@ -185,7 +186,7 @@ private:
 
     const int8_t* GetDocVector(uint64_t docId) const
     {
-        return reinterpret_cast<const int8_t*>(m_DocData + docId * DOC_REC_SIZE + DOC_VECTOR_OFFSET);
+        return reinterpret_cast<const int8_t*>(m_DocData + (docId - m_DocDataFirstDocId) * DOC_REC_SIZE + DOC_VECTOR_OFFSET);
     }
 
     const int8_t* GetNodeVector(NodeID nodeID) const
@@ -485,6 +486,7 @@ private:
     std::vector<NodeID> m_Links;
     std::vector<uint8_t> m_LinkCounts;
     const uint8_t* m_DocData = nullptr;
+    uint64_t m_DocDataFirstDocId = 0;
     NodeID m_EntryPoint = npos();
     size_t m_MaxLevel = 0;
     mutable std::shared_ptr<IEmbeddingModel> m_Model;
