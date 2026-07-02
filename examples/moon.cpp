@@ -1821,6 +1821,27 @@ static std::shared_ptr<IndexReader> BuildBeirBowReader(IndexContext& ctx,
     return ctx.GetReader(&tree);
 }
 
+enum class BeirEvalPath {
+    FeatureDump,
+    Bow,
+    WeakAndBigram,
+    VectorOrHybrid,
+    DefaultReader,
+};
+
+static BeirEvalPath SelectBeirEvalPath(const BeirEvalOptions& options, bool dumpFeatures)
+{
+    if (dumpFeatures)
+        return BeirEvalPath::FeatureDump;
+    if (options.mode == "bow")
+        return BeirEvalPath::Bow;
+    if (IsWeakAndBigramMode(options.mode))
+        return BeirEvalPath::WeakAndBigram;
+    if (options.mode == "vector" || IsHybridMode(options.mode))
+        return BeirEvalPath::VectorOrHybrid;
+    return BeirEvalPath::DefaultReader;
+}
+
 static void WriteBeirRun(std::ofstream* output,
                          IndexContext& ctx,
                          const std::string& qid,
@@ -1836,6 +1857,39 @@ static void WriteBeirRun(std::ofstream* output,
             continue;
         *output << qid << " Q0 " << docId << ' ' << (rank + 1) << ' '
                 << std::setprecision(9) << results[rank].score << ' ' << tag << '\n';
+    }
+}
+
+static void AddBeirRecallForResults(IndexContext& ctx,
+                                    const std::vector<SearchResult>& results,
+                                    const std::unordered_set<std::string>& relevant,
+                                    const std::vector<int>& at,
+                                    std::vector<double>& macroRecall,
+                                    std::vector<uint64_t>& microHits,
+                                    uint64_t& microRelevant)
+{
+    std::vector<uint64_t> cumulativeHits(at.size(), 0);
+    uint64_t hitCount = 0;
+    size_t nextAt = 0;
+    for (size_t rank = 0; rank < results.size(); ++rank) {
+        const std::string docIdText = ctx.GetDocPath(results[rank].doc_id);
+        if (relevant.count(docIdText))
+            ++hitCount;
+        while (nextAt < at.size() && rank + 1 == static_cast<size_t>(at[nextAt])) {
+            cumulativeHits[nextAt] = hitCount;
+            ++nextAt;
+        }
+    }
+    while (nextAt < at.size()) {
+        cumulativeHits[nextAt] = hitCount;
+        ++nextAt;
+    }
+
+    const uint64_t relevantCount = static_cast<uint64_t>(relevant.size());
+    microRelevant += relevantCount;
+    for (size_t i = 0; i < at.size(); ++i) {
+        macroRecall[i] += static_cast<double>(cumulativeHits[i]) / static_cast<double>(relevantCount);
+        microHits[i] += cumulativeHits[i];
     }
 }
 
@@ -2275,6 +2329,12 @@ static int RunBeirEval(const std::string& idxPath, const BeirEvalOptions& option
     uint64_t microRelevant = 0;
     uint64_t evaluated = 0;
     uint64_t missingQrels = 0;
+    const bool dumpFeatures = featureOutput.is_open();
+    const BeirEvalPath evalPath = SelectBeirEvalPath(options, dumpFeatures);
+    const bool isHybridEval = IsHybridMode(options.mode);
+    const bool hasExternalQueryVectors = !queryVectors.empty();
+    std::ofstream* runWriter = options.runOut.empty() ? nullptr : &runOutput;
+    const std::string runTag = "moon-" + options.mode;
 
     std::string line;
     auto start = std::chrono::steady_clock::now();
@@ -2290,7 +2350,7 @@ static int RunBeirEval(const std::string& idxPath, const BeirEvalOptions& option
         }
         if (options.limit > 0 && evaluated >= options.limit) break;
 
-        if (featureOutput) {
+        if (evalPath == BeirEvalPath::FeatureDump) {
             auto tree = std::unique_ptr<EvalTree>(ctx.Compile(query.c_str(), options.streams.c_str(), QueryCompileMode::WeakAndBigram));
             const auto rows = CollectBeirCandidateFeatures(ctx, tree.get());
 
@@ -2301,54 +2361,29 @@ static int RunBeirEval(const std::string& idxPath, const BeirEvalOptions& option
             continue;
         }
 
-        std::shared_ptr<IndexReader> reader;
-        if (options.mode == "bow") {
-            reader = BuildBeirBowReader(ctx, beirTokenizer, query, options.streams);
-        } else if (IsWeakAndBigramMode(options.mode)) {
+        std::vector<SearchResult> results;
+        switch (evalPath) {
+        case BeirEvalPath::Bow: {
+            results = executor->Execute(BuildBeirBowReader(ctx, beirTokenizer, query, options.streams), maxK);
+            break;
+        }
+        case BeirEvalPath::WeakAndBigram: {
             auto tree = std::unique_ptr<EvalTree>(ctx.Compile(query.c_str(), options.streams.c_str(), compileMode));
-            auto results = executor->Execute(ctx.GetReader(tree.get()), maxK,
+            results = executor->Execute(ctx.GetReader(tree.get()), maxK,
                 tree->HasTextQuery() && tree->HasVectorQuery() ? &tree->vector_query : nullptr);
-
-            WriteBeirRun(options.runOut.empty() ? nullptr : &runOutput, ctx, qid, results, "moon-" + options.mode);
-
-            std::vector<uint64_t> cumulativeHits(options.at.size(), 0);
-            uint64_t hitCount = 0;
-            size_t nextAt = 0;
-            for (size_t rank = 0; rank < results.size(); ++rank) {
-                const std::string docIdText = ctx.GetDocPath(results[rank].doc_id);
-                if (qrelIt->second.count(docIdText))
-                    ++hitCount;
-                while (nextAt < options.at.size() && rank + 1 == static_cast<size_t>(options.at[nextAt])) {
-                    cumulativeHits[nextAt] = hitCount;
-                    ++nextAt;
-                }
-            }
-            while (nextAt < options.at.size()) {
-                cumulativeHits[nextAt] = hitCount;
-                ++nextAt;
-            }
-
-            const uint64_t relevantCount = static_cast<uint64_t>(qrelIt->second.size());
-            microRelevant += relevantCount;
-            for (size_t i = 0; i < options.at.size(); ++i) {
-                macroRecall[i] += static_cast<double>(cumulativeHits[i]) / static_cast<double>(relevantCount);
-                microHits[i] += cumulativeHits[i];
-            }
-            ++evaluated;
-            if (evaluated % 100 == 0)
-                std::cout << "  BEIR evaluated " << evaluated << " queries\n";
-            continue;
-        } else if (options.mode == "vector" || IsHybridMode(options.mode)) {
+            break;
+        }
+        case BeirEvalPath::VectorOrHybrid: {
             std::vector<float> queryVector;
             auto vectorIt = queryVectors.find(qid);
             if (vectorIt != queryVectors.end()) {
                 queryVector = ToVector(vectorIt->second);
-            } else if (queryVectors.empty()) {
+            } else if (!hasExternalQueryVectors) {
                 queryVector = ctx.CompileToVector(query.c_str());
             }
 
             std::unique_ptr<EvalTree> tree;
-            if (IsHybridMode(options.mode)) {
+            if (isHybridEval) {
                 tree.reset(ctx.Compile(query.c_str(), options.streams.c_str(), compileMode));
             } else {
                 tree = std::make_unique<EvalTree>();
@@ -2357,73 +2392,29 @@ static int RunBeirEval(const std::string& idxPath, const BeirEvalOptions& option
                 tree->vector_query = std::move(queryVector);
             tree->vector_ef_search = static_cast<size_t>(options.vectorEf);
 
-            auto results = executor->Execute(ctx.GetReader(tree.get()), maxK);
+            auto results = executor->Execute(ctx.GetReader(tree.get()), maxK,
+                tree->HasTextQuery() && tree->HasVectorQuery() ? &tree->vector_query : nullptr);
 
             if (results.size() > static_cast<size_t>(maxK))
                 results.resize(static_cast<size_t>(maxK));
-            WriteBeirRun(options.runOut.empty() ? nullptr : &runOutput, ctx, qid, results, "moon-" + options.mode);
-
-            std::vector<uint64_t> cumulativeHits(options.at.size(), 0);
-            uint64_t hitCount = 0;
-            size_t nextAt = 0;
-            for (size_t rank = 0; rank < results.size(); ++rank) {
-                const std::string docIdText = ctx.GetDocPath(results[rank].doc_id);
-                if (qrelIt->second.count(docIdText))
-                    ++hitCount;
-                while (nextAt < options.at.size() && rank + 1 == static_cast<size_t>(options.at[nextAt])) {
-                    cumulativeHits[nextAt] = hitCount;
-                    ++nextAt;
-                }
-            }
-            while (nextAt < options.at.size()) {
-                cumulativeHits[nextAt] = hitCount;
-                ++nextAt;
-            }
-
-            const uint64_t relevantCount = static_cast<uint64_t>(qrelIt->second.size());
-            microRelevant += relevantCount;
-            for (size_t i = 0; i < options.at.size(); ++i) {
-                macroRecall[i] += static_cast<double>(cumulativeHits[i]) / static_cast<double>(relevantCount);
-                microHits[i] += cumulativeHits[i];
-            }
-            ++evaluated;
-            if (evaluated % 100 == 0)
-                std::cout << "  BEIR evaluated " << evaluated << " queries\n";
-            continue;
-        } else {
-            reader = ctx.GetReader(query.c_str(), options.streams.c_str());
+            break;
         }
-        auto results = executor->Execute(reader, maxK);
-        WriteBeirRun(options.runOut.empty() ? nullptr : &runOutput, ctx, qid, results, "moon-" + options.mode);
-        std::vector<uint64_t> cumulativeHits(options.at.size(), 0);
-        uint64_t hitCount = 0;
-        size_t nextAt = 0;
-        for (size_t rank = 0; rank < results.size(); ++rank) {
-            const std::string docIdText = ctx.GetDocPath(results[rank].doc_id);
-            if (qrelIt->second.count(docIdText))
-                ++hitCount;
-            while (nextAt < options.at.size() && rank + 1 == static_cast<size_t>(options.at[nextAt])) {
-                cumulativeHits[nextAt] = hitCount;
-                ++nextAt;
-            }
+        case BeirEvalPath::DefaultReader: {
+            results = executor->Execute(ctx.GetReader(query.c_str(), options.streams.c_str()), maxK);
+            break;
         }
-        while (nextAt < options.at.size()) {
-            cumulativeHits[nextAt] = hitCount;
-            ++nextAt;
+        case BeirEvalPath::FeatureDump:
+            break;
         }
 
-        const uint64_t relevantCount = static_cast<uint64_t>(qrelIt->second.size());
-        microRelevant += relevantCount;
-        for (size_t i = 0; i < options.at.size(); ++i) {
-            macroRecall[i] += static_cast<double>(cumulativeHits[i]) / static_cast<double>(relevantCount);
-            microHits[i] += cumulativeHits[i];
-        }
+        WriteBeirRun(runWriter, ctx, qid, results, runTag);
+        AddBeirRecallForResults(ctx, results, qrelIt->second, options.at, macroRecall, microHits, microRelevant);
         ++evaluated;
         if (evaluated % 100 == 0)
             std::cout << "  BEIR evaluated " << evaluated << " queries\n";
     }
 
-    if (featureOutput) {
+    if (dumpFeatures) {
         std::cout << "BEIR feature dump index=" << idxPath
                   << " data=" << options.dataPath
                   << " qrels=" << qrelsPath
