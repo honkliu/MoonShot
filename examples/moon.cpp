@@ -499,6 +499,9 @@ static std::string DefaultBgeScript()
     return std::filesystem::is_regular_file(FsPathFromUtf8(local)) ? local : "Tools/embed_query.py";
 }
 
+static constexpr size_t BGE_MAX_TEXT_BYTES = 65536;
+static constexpr const char* BGE_DOCUMENT_MARKER = "__MOONSHOT_BGE_DOCUMENT__\n";
+
 static bool ReadSingleI8Vector(const std::string& path, std::vector<float>& vector)
 {
     static constexpr char Magic[8] = {'M','S','V','E','C','I','8','1'};
@@ -566,11 +569,12 @@ static void CloseSocketHandle(intptr_t socketHandle)
 #endif
 }
 
-static bool EmbedQueryWithBgeService(const std::string& query,
-                                     const SearchOptions& options,
-                                     std::vector<float>& vector)
+static bool EmbedTextWithBgeService(const std::string& text,
+                                    const SearchOptions& options,
+                                    bool documentMode,
+                                    std::vector<float>& vector)
 {
-    if (query.empty() || query.size() > 65536)
+    if (text.empty())
         return false;
 
 #ifdef _WIN32
@@ -617,31 +621,40 @@ static bool EmbedQueryWithBgeService(const std::string& query,
     if (socketHandle == -1)
         return false;
 
-    const uint32_t length = static_cast<uint32_t>(query.size());
+    std::string requestPayload;
+    if (documentMode)
+        requestPayload = std::string(BGE_DOCUMENT_MARKER) + text;
+    else
+        requestPayload = text;
+    if (requestPayload.size() > BGE_MAX_TEXT_BYTES)
+        requestPayload.resize(BGE_MAX_TEXT_BYTES);
+
+    const uint32_t length = static_cast<uint32_t>(requestPayload.size());
     bool ok = SocketSendAll(socketHandle, reinterpret_cast<const char*>(&length), sizeof(length))
-        && SocketSendAll(socketHandle, query.data(), query.size());
+        && SocketSendAll(socketHandle, requestPayload.data(), requestPayload.size());
     uint32_t dim = 0;
-    std::array<int8_t, DOC_VECTOR_DIM> payload{};
+    std::array<int8_t, DOC_VECTOR_DIM> responsePayload{};
     ok = ok
         && SocketRecvAll(socketHandle, reinterpret_cast<char*>(&dim), sizeof(dim))
         && dim == DOC_VECTOR_DIM
-        && SocketRecvAll(socketHandle, reinterpret_cast<char*>(payload.data()), payload.size());
+        && SocketRecvAll(socketHandle, reinterpret_cast<char*>(responsePayload.data()), responsePayload.size());
     CloseSocketHandle(socketHandle);
     if (!ok)
         return false;
 
     vector.assign(DOC_VECTOR_DIM, 0.0f);
     for (size_t i = 0; i < DOC_VECTOR_DIM; ++i)
-        vector[i] = static_cast<float>(payload[i]) / 128.0f;
+        vector[i] = static_cast<float>(responsePayload[i]) / 128.0f;
     return true;
 }
 
-static bool EmbedQueryWithBge(const std::string& query,
-                              const SearchOptions& options,
-                              std::vector<float>& vector)
+static bool EmbedTextWithBge(const std::string& text,
+                             const SearchOptions& options,
+                             bool documentMode,
+                             std::vector<float>& vector)
 {
     if (!options.bgeSidecar) {
-        if (EmbedQueryWithBgeService(query, options, vector))
+        if (EmbedTextWithBgeService(text, options, documentMode, vector))
             return true;
         std::cerr << "BGE embedding service unavailable at " << options.bgeHost << ":" << options.bgePort
                   << " (start Tools/bge_embedding_service.py or pass -bge-sidecar)\n";
@@ -650,12 +663,13 @@ static bool EmbedQueryWithBge(const std::string& query,
 
     const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
     const auto tempDir = std::filesystem::temp_directory_path();
-    const auto textPath = tempDir / ("moonshot_bge_query_" + std::to_string(stamp) + ".txt");
-    const auto vectorPath = tempDir / ("moonshot_bge_query_" + std::to_string(stamp) + ".i8bin");
+    const auto prefix = documentMode ? "moonshot_bge_doc_" : "moonshot_bge_query_";
+    const auto textPath = tempDir / (std::string(prefix) + std::to_string(stamp) + ".txt");
+    const auto vectorPath = tempDir / (std::string(prefix) + std::to_string(stamp) + ".i8bin");
     {
         std::ofstream out(textPath, std::ios::binary);
         if (!out) return false;
-        out << query;
+        out << text;
     }
 
     const std::string python = options.bgePython.empty() ? DefaultBgePython() : options.bgePython;
@@ -664,7 +678,8 @@ static bool EmbedQueryWithBge(const std::string& query,
         + " " + QuoteShellArg(script)
         + " --text-file " + QuoteShellArg(PathToUtf8(textPath))
         + " --output " + QuoteShellArg(PathToUtf8(vectorPath))
-        + " --model " + QuoteShellArg(options.bgeModel);
+        + " --model " + QuoteShellArg(options.bgeModel)
+        + (documentMode ? " --no-default-prefix" : "");
     const int exitCode = std::system(command.c_str());
     const bool ok = exitCode == 0 && ReadSingleI8Vector(PathToUtf8(vectorPath), vector);
     std::error_code ec;
@@ -672,8 +687,22 @@ static bool EmbedQueryWithBge(const std::string& query,
     ec.clear();
     std::filesystem::remove(vectorPath, ec);
     if (!ok)
-        std::cerr << "BGE query embedding failed; command was: " << command << "\n";
+        std::cerr << "BGE " << (documentMode ? "document" : "query") << " embedding failed; command was: " << command << "\n";
     return ok;
+}
+
+static bool EmbedQueryWithBge(const std::string& query,
+                              const SearchOptions& options,
+                              std::vector<float>& vector)
+{
+    return EmbedTextWithBge(query, options, false, vector);
+}
+
+static bool EmbedDocumentWithBge(const std::string& text,
+                                 const SearchOptions& options,
+                                 std::vector<float>& vector)
+{
+    return EmbedTextWithBge(text, options, true, vector);
 }
 
 static std::string SourceMaskText(uint8_t sourceMask)
@@ -796,8 +825,8 @@ static void PrintInteractiveHelp()
         << "Commands:\n"
         << "  /h                         Show this help\n"
         << "  /q                         Quit\n"
-        << "  /a <file>                  Add one document to memory\n"
-        << "  /a <dir> -e md,txt [-r]    Add documents from a directory\n"
+        << "  /a <file>                  Add one document to memory; -bge also stores a BGE vector\n"
+        << "  /a <dir> -e md,txt [-r]    Add documents from a directory; -bge also stores BGE vectors\n"
         << "  /s                         Save pending additions as delta and publish it\n"
         << "  /m                         Merge delta into the main index and reload\n"
         << "Queries:\n"
@@ -814,19 +843,63 @@ static uint64_t NextInteractiveDocId(IndexContext& ctx)
 
 static bool AddInteractiveFiles(IndexContext& ctx,
                                 const std::vector<FileItem>& files,
+                                const SearchOptions& options,
                                 uint64_t& kept,
                                 uint64_t& skipped)
 {
     uint64_t nextDocId = NextInteractiveDocId(ctx);
     std::string firstContent;
+    uint64_t bgeVectors = 0;
     for (const auto& file : files) {
-        if (AddFileDocument(ctx, file, nextDocId, kept, skipped, &firstContent))
-            ++nextDocId;
+        if (!options.bge) {
+            if (AddFileDocument(ctx, file, nextDocId, kept, skipped, &firstContent))
+                ++nextDocId;
+            continue;
+        }
+
+        std::string content = ReadFile(file.path);
+        if (content.empty()) {
+            std::cerr << "  skipping (empty/unreadable): " << file.path << "\n";
+            ++skipped;
+            continue;
+        }
+
+        if (firstContent.empty())
+            firstContent = content;
+
+        Document doc;
+        doc.doc_id = nextDocId;
+        doc.path = file.path;
+        doc.title = Stem(file.path);
+        doc.body = std::move(content);
+
+        ctx.AddDocument(doc, false);
+
+        std::string embeddingText = doc.title;
+        if (!doc.body.empty()) {
+            if (!embeddingText.empty())
+                embeddingText.push_back('\n');
+            embeddingText += doc.body;
+        }
+        if (embeddingText.size() > BGE_MAX_TEXT_BYTES - std::strlen(BGE_DOCUMENT_MARKER))
+            embeddingText.resize(BGE_MAX_TEXT_BYTES - std::strlen(BGE_DOCUMENT_MARKER));
+
+        std::vector<float> vector;
+        if (EmbedDocumentWithBge(embeddingText, options, vector)) {
+            ctx.GetWriter()->SetDocVector(nextDocId, std::move(vector));
+            ++bgeVectors;
+        } else {
+            std::cerr << "  warning: BGE document embedding failed; added without vector: " << file.path << "\n";
+        }
+        ++kept;
+        ++nextDocId;
     }
+    if (options.bge)
+        std::cout << "  embedded " << bgeVectors << " BGE document vector(s)\n";
     return kept > 0;
 }
 
-static bool HandleAddCommand(IndexContext& ctx, const std::vector<std::string>& args)
+static bool HandleAddCommand(IndexContext& ctx, const SearchOptions& options, const std::vector<std::string>& args)
 {
     if (args.size() < 2) {
         std::cout << "usage: /a <file> | /a <dir> -e md,txt [-r]\n";
@@ -862,7 +935,7 @@ static bool HandleAddCommand(IndexContext& ctx, const std::vector<std::string>& 
 
     uint64_t kept = 0;
     uint64_t skipped = 0;
-    AddInteractiveFiles(ctx, files, kept, skipped);
+    AddInteractiveFiles(ctx, files, options, kept, skipped);
     std::cout << "added " << kept << " document(s) to memory";
     if (skipped) std::cout << " (skipped " << skipped << ")";
     std::cout << "; run /s to publish as delta\n";
@@ -910,6 +983,7 @@ static bool MergeInteractiveDelta(IndexContext& ctx, const std::string& idxPath)
 
 static bool HandleInteractiveCommand(IndexContext& ctx,
                                      const std::string& idxPath,
+                                     const SearchOptions& options,
                                      const std::string& line,
                                      bool& shouldQuit)
 {
@@ -917,7 +991,7 @@ static bool HandleInteractiveCommand(IndexContext& ctx,
     if (args.empty()) return true;
     if (args[0] == "/q") { shouldQuit = true; return true; }
     if (args[0] == "/h") { PrintInteractiveHelp(); return true; }
-    if (args[0] == "/a") return HandleAddCommand(ctx, args);
+    if (args[0] == "/a") return HandleAddCommand(ctx, options, args);
     if (args[0] == "/s") return SaveInteractiveDelta(ctx, idxPath);
     if (args[0] == "/m") return MergeInteractiveDelta(ctx, idxPath);
     std::cout << "unknown command: " << args[0] << " (try /h)\n";
@@ -956,7 +1030,7 @@ static int RunInteractiveSearch(const std::string& idxPath, const SearchOptions&
         if (line.empty()) continue;
         if (!line.empty() && line[0] == '/') {
             bool shouldQuit = false;
-            HandleInteractiveCommand(ctx, idxPath, line, shouldQuit);
+            HandleInteractiveCommand(ctx, idxPath, options, line, shouldQuit);
             if (shouldQuit) break;
             continue;
         }
