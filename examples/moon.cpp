@@ -2301,6 +2301,7 @@ static int RunBeirEval(const std::string& idxPath, const BeirEvalOptions& option
         ctx.SetLeafTermCacheBytes(leafCacheBytes);
     ctx.LoadIndex(idxPath.c_str());
     ctx.SetTermMphfEnabled(!options.noMphf);
+    ctx.SetDirectBlockAccessEnabled(true);
     const QueryCompileMode compileMode = BeirCompileMode(options.mode);
     if (compileMode == QueryCompileMode::WeakAndBigramBoost) {
         const auto& parameters = GetQueryCompileModeParameters(compileMode);

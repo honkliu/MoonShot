@@ -336,6 +336,21 @@ class IndexBlockTable
             m_TermMphfEnabled = enabled;
         }
 
+        void SetDirectBlockAccessEnabled(bool enabled)
+        {
+            if (m_DirectBlockAccess == enabled)
+                return;
+
+            m_DirectBlockAccess = enabled;
+            if (m_DirectBlockAccess) {
+                ExitBlockThread(m_IndexPool);
+                ExitBlockThread(m_LeafTermPool);
+            } else {
+                StartBlockThread(m_IndexPool);
+                StartBlockThread(m_LeafTermPool);
+            }
+        }
+
         void HandOverBlockTable(IndexBlockTable& source)
         {
             if (this == &source) return;
@@ -413,6 +428,15 @@ class IndexBlockTable
                 return pool.BCP_Pages + static_cast<size_t>(slot) * PAGE_SIZE;
             }
 
+            if (m_DirectBlockAccess) {
+                BlockRequest request;
+                request.Type = BlockRequestType::Get;
+                request.BlockSeq = block_seq;
+                ProcessGetBlock(pool, request);
+                *slotOut = request.Slot;
+                return request.Address;
+            }
+
             BlockRequest request;
             request.Type = BlockRequestType::Get;
             request.BlockSeq = block_seq;
@@ -432,6 +456,14 @@ class IndexBlockTable
             BlockCachePool& pool = kind == BlockKind::Index ? m_IndexPool : m_LeafTermPool;
             if (sequential && pool.BCP_SlotTable && slot < pool.BCP_SlotCount && pool.BCP_SlotTable[slot].Ref > 0) {
                 --pool.BCP_SlotTable[slot].Ref;
+                return;
+            }
+
+            if (m_DirectBlockAccess) {
+                BlockRequest request;
+                request.Type = BlockRequestType::Release;
+                request.Slot = slot;
+                ProcessReleaseBlock(pool, request);
                 return;
             }
 
@@ -563,6 +595,7 @@ class IndexBlockTable
         uint8_t*                                m_TermMphfEntryPages = nullptr;
         uint32_t                                m_TermMphfEntryPageCount = 0;
         bool                                    m_TermMphfEnabled = true;
+        bool                                    m_DirectBlockAccess = false;
 
         /* Level-1: fixed directory — (HTE_FirstTerm → HTE_LeafTermBlockID), sorted by HTE_FirstTerm */
         std::unique_ptr<HeadTermEntry[]>         m_HeadTermEntries;
@@ -719,6 +752,8 @@ class IndexBlockTable
 
         void StartBlockThread(BlockCachePool& pool)
         {
+            if (m_DirectBlockAccess)
+                return;
             if (pool.BCP_Pages && pool.BCP_SlotCount && !pool.BCP_Thread.joinable()) {
                 pool.BCP_ExitThread = false;
                 BlockCachePool* target = &pool;

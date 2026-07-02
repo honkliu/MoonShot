@@ -294,6 +294,13 @@ public:
             m_DeltaContext->SetTermMphfEnabled(enabled);
     }
 
+    void SetDirectBlockAccessEnabled(bool enabled)
+    {
+        m_BlockTable.SetDirectBlockAccessEnabled(enabled);
+        if (m_DeltaContext)
+            m_DeltaContext->SetDirectBlockAccessEnabled(enabled);
+    }
+
     void SetWeakAndBuildMode(WeakAndBuildMode mode)
     {
         m_WeakAndBuildMode = mode;
