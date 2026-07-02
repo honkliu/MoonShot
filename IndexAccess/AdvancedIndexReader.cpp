@@ -35,14 +35,14 @@ void AdvancedIndexReader::Open(const char*      streamKey,
     delete[] m_Word;
     m_Word = new char[std::strlen(streamKey) + 1];
     std::strcpy(m_Word, streamKey);
-    const char stream = m_Word[std::strlen(m_Word) - 1];
-    m_SourceMask = ReaderSourceMaskForStream(stream);
+    m_Stream = m_Word[std::strlen(m_Word) - 1];
+    m_SourceMask = ReaderSourceMaskForStream(m_Stream);
 
     m_BlockTable      = blockTable;
     m_Context         = context;
     m_DocFreq         = 0;
     m_WordSpan        = std::max(1u, wordSpan);
-    m_SpanWeight      = m_Context->GetSpanWeight(m_WordSpan) * StreamWeight(stream, m_Context->GetQueryParameters());
+    m_SpanWeight      = m_Context->GetSpanWeight(m_WordSpan) * StreamWeight(m_Stream, m_Context->GetQueryParameters());
     m_Idf             = 0.0f;
     m_Bm25LengthBias  = 0.0f;
     m_Bm25LengthScale = 0.0f;
@@ -69,7 +69,7 @@ void AdvancedIndexReader::Open(const char*      streamKey,
         m_Idf = std::max(0.0f,
             std::log((totalDocs - df + 0.5f) / (df + 0.5f) + 1.0f));
         m_Bm25LengthBias = K1 * (1.0f - B);
-        m_Bm25LengthScale = K1 * B / header.IFH_AvgDocLength;
+        m_Bm25LengthScale = K1 * B / std::max(1.0f, m_Context->GetAverageStreamLength(m_Stream));
 
         IndexBlock* block = reinterpret_cast<IndexBlock*>(
             m_BlockTable->GetBlock(BlockKind::Index, m_BlockSeqNumber, &m_BlockSlotNumber));
@@ -143,7 +143,7 @@ uint32_t AdvancedIndexReader::GetTermFreq() {
 }
 float AdvancedIndexReader::GetScore(const DocDataEntry* entry) {
     assert(entry);
-    const uint32_t docLength = entry->DDE_DocLength;
+    const uint32_t docLength = IndexContext::GetStreamLength(*entry, m_Stream);
     assert(docLength > 0);
 
     const float tf = static_cast<float>(m_Decoder.GetTermFreq());

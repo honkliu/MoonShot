@@ -323,6 +323,37 @@ public:
 
     const QueryCompileModeParameters& GetQueryParameters() const { return m_QueryParameters; }
 
+    float GetAverageStreamLength(char stream) const
+    {
+        EnsureStreamLengthStats();
+        switch (stream) {
+        case 'T': return m_AvgTitleLength;
+        case 'B': return m_AvgBodyLength;
+        case 'U': return m_AvgUrlLength;
+        case 'A': return m_AvgAnchorLength;
+        case 'M': return m_AvgMetaLength;
+        default: return std::max(1.0f, m_IndexFileHeader.IFH_AvgDocLength);
+        }
+    }
+
+    static uint32_t GetStreamLength(const DocDataEntry& entry, char stream)
+    {
+        const uint32_t docLength = std::max<uint32_t>(1, entry.DDE_DocLength);
+        auto featureLength = [&](size_t index) {
+            return static_cast<uint32_t>(std::max(0.0f, entry.DDE_FeatureScore[index]));
+        };
+        uint32_t streamLength = 0;
+        switch (stream) {
+        case 'T': streamLength = featureLength(0); break;
+        case 'B': streamLength = featureLength(1); break;
+        case 'U': streamLength = featureLength(4); break;
+        case 'A': streamLength = featureLength(5); break;
+        case 'M': streamLength = featureLength(6); break;
+        default: break;
+        }
+        return streamLength > 0 ? streamLength : docLength;
+    }
+
     void SetLeafTermCacheBytes(uint64_t bytes)
     {
         m_LeafTermCacheBytes = bytes > 0 ? bytes : LEAF_TERM_CACHE_BYTES;
@@ -959,6 +990,13 @@ private:
     uint64_t                     m_LeafTermCacheBytes = LEAF_TERM_CACHE_BYTES;
     WeakAndBuildMode             m_WeakAndBuildMode = WeakAndBuildMode::FlatPruned;
     QueryCompileModeParameters   m_QueryParameters = kWeakAndBigramParameters;
+    mutable const uint8_t*        m_StreamLengthStatsDocData = nullptr;
+    mutable uint64_t              m_StreamLengthStatsDocCount = 0;
+    mutable float                 m_AvgTitleLength = 1.0f;
+    mutable float                 m_AvgBodyLength = 1.0f;
+    mutable float                 m_AvgUrlLength = 1.0f;
+    mutable float                 m_AvgAnchorLength = 1.0f;
+    mutable float                 m_AvgMetaLength = 1.0f;
 
     static constexpr uint32_t INDEX_BLOCK_CACHE_SLOT_COUNT =
         static_cast<uint32_t>(INDEX_BLOCK_CACHE_BYTES / sizeof(IndexBlock));
@@ -1060,6 +1098,58 @@ private:
         }
     }
 
+    void EnsureStreamLengthStats() const
+    {
+        if (m_StreamLengthStatsDocData == m_DocData
+            && m_StreamLengthStatsDocCount == m_IndexFileHeader.IFH_NumDocuments)
+            return;
+
+        m_StreamLengthStatsDocData = m_DocData;
+        m_StreamLengthStatsDocCount = m_IndexFileHeader.IFH_NumDocuments;
+        m_AvgTitleLength = 1.0f;
+        m_AvgBodyLength = std::max(1.0f, m_IndexFileHeader.IFH_AvgDocLength);
+        m_AvgUrlLength = std::max(1.0f, m_IndexFileHeader.IFH_AvgDocLength);
+        m_AvgAnchorLength = std::max(1.0f, m_IndexFileHeader.IFH_AvgDocLength);
+        m_AvgMetaLength = std::max(1.0f, m_IndexFileHeader.IFH_AvgDocLength);
+        if (!m_DocData || m_IndexFileHeader.IFH_NumDocuments == 0)
+            return;
+
+        double titleTotal = 0.0;
+        double bodyTotal = 0.0;
+        double urlTotal = 0.0;
+        double anchorTotal = 0.0;
+        double metaTotal = 0.0;
+        uint64_t titleDocs = 0;
+        uint64_t bodyDocs = 0;
+        uint64_t urlDocs = 0;
+        uint64_t anchorDocs = 0;
+        uint64_t metaDocs = 0;
+        const uint64_t firstDocId = DocDataFirstDocId(m_DocData, m_IndexFileHeader);
+        for (uint64_t slot = 0; slot < m_IndexFileHeader.IFH_NumDocuments; ++slot) {
+            const uint64_t docId = firstDocId + slot;
+            const auto* entry = reinterpret_cast<const DocDataEntry*>(m_DocData + slot * DOC_REC_SIZE);
+            if (entry->DDE_DocID != docId)
+                continue;
+            auto addLength = [](float value, double& total, uint64_t& count) {
+                if (value > 0.0f) {
+                    total += static_cast<double>(value);
+                    ++count;
+                }
+            };
+            addLength(entry->DDE_FeatureScore[0], titleTotal, titleDocs);
+            addLength(entry->DDE_FeatureScore[1], bodyTotal, bodyDocs);
+            addLength(entry->DDE_FeatureScore[4], urlTotal, urlDocs);
+            addLength(entry->DDE_FeatureScore[5], anchorTotal, anchorDocs);
+            addLength(entry->DDE_FeatureScore[6], metaTotal, metaDocs);
+        }
+
+        if (titleDocs > 0) m_AvgTitleLength = static_cast<float>(titleTotal / static_cast<double>(titleDocs));
+        if (bodyDocs > 0) m_AvgBodyLength = static_cast<float>(bodyTotal / static_cast<double>(bodyDocs));
+        if (urlDocs > 0) m_AvgUrlLength = static_cast<float>(urlTotal / static_cast<double>(urlDocs));
+        if (anchorDocs > 0) m_AvgAnchorLength = static_cast<float>(anchorTotal / static_cast<double>(anchorDocs));
+        if (metaDocs > 0) m_AvgMetaLength = static_cast<float>(metaTotal / static_cast<double>(metaDocs));
+    }
+
     static std::string DeltaIndexPath(const std::string& path)
     {
         const size_t slash = path.find_last_of("/\\");
@@ -1150,6 +1240,9 @@ private:
             entry->DDE_FeatureScore[1] = static_cast<float>(stats.body_len);
             entry->DDE_FeatureScore[2] = diversity;
             entry->DDE_FeatureScore[3] = lengthQuality;
+            entry->DDE_FeatureScore[4] = static_cast<float>(stats.url_len);
+            entry->DDE_FeatureScore[5] = static_cast<float>(stats.anchor_len);
+            entry->DDE_FeatureScore[6] = static_cast<float>(stats.meta_len);
             if (m_Store->HasDocVector(docId)) {
                 entry->DDE_VectorFlags = 1;
                 entry->DDE_VectorDim = static_cast<uint16_t>(DOC_VECTOR_DIM);

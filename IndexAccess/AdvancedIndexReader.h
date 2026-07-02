@@ -88,6 +88,7 @@ class AdvancedIndexReader : public IndexReader
         uint32_t                    m_BlockSeqNumber  = 0;
         uint32_t                    m_BlockSlotNumber = UINT32_MAX;
         uint32_t                    m_DocFreq         = 0;
+        char                        m_Stream          = 'B';
         uint8_t                     m_SourceMask      = 0;
         uint32_t                    m_WordSpan        = 1;
         float                       m_SpanWeight      = 1.0f;
