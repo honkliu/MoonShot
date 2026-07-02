@@ -8,7 +8,7 @@
 #include <cstdint>
 
 enum class NodeType { Term, And, Or, Not, WeakAnd, Boost };
-enum class QueryCompileMode { Default, WeakAndBigram, WeakAndBigramBoost };
+enum class QueryCompileMode { Default, WeakAndBigram, WeakAndBigramBoost, WeakAndBigramBoostForDoc };
 enum class WeakAndBuildMode { FlatPruned, OrChildren, OrChildrenPruned };
 
 struct QueryCompileModeParameters {
@@ -21,25 +21,43 @@ struct QueryCompileModeParameters {
     float QMP_AuthorityWeight = 0.5f;
     float QMP_SpamPenalty = 2.0f;
     float QMP_CosineWeight = 16.0f;
+    float QMP_AnchorWeight = 1.0f;
+    float QMP_UrlWeight = 1.0f;
+    float QMP_TitleWeight = 1.0f;
+    float QMP_BodyWeight = 1.0f;
 };
 
 inline constexpr QueryCompileModeParameters kWeakAndBigramParameters{
     1.8f, 0.2f, 0.0f,
     1.0f, 0.0f, 1.0f, 0.5f, 2.0f,
-    16.0f
+    16.0f,
+    1.0f, 1.0f, 1.0f, 1.0f
 };
 
 inline constexpr QueryCompileModeParameters kWeakAndBigramBoostParameters{
     0.25f, 1.0f, 0.5f,
     0.25f, 4.0f, 0.25f, 0.0f, 4.0f,
-    16.0f
+    16.0f,
+    1.0f, 1.0f, 1.0f, 1.0f
+};
+
+inline constexpr QueryCompileModeParameters kWeakAndBigramBoostForDocParameters{
+    0.15f, 0.5f, 0.25f,
+    0.0f, 0.0f, 0.0f, 0.0f, 1.0f,
+    64.0f,
+    0.5f, 0.35f, 2.0f, 1.0f
 };
 
 inline const QueryCompileModeParameters& GetQueryCompileModeParameters(QueryCompileMode mode)
 {
-    return mode == QueryCompileMode::WeakAndBigramBoost
-        ? kWeakAndBigramBoostParameters
-        : kWeakAndBigramParameters;
+    switch (mode) {
+    case QueryCompileMode::WeakAndBigramBoost:
+        return kWeakAndBigramBoostParameters;
+    case QueryCompileMode::WeakAndBigramBoostForDoc:
+        return kWeakAndBigramBoostForDocParameters;
+    default:
+        return kWeakAndBigramParameters;
+    }
 }
 
 /*

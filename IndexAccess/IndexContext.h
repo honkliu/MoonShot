@@ -309,23 +309,19 @@ public:
             m_DeltaContext->SetWeakAndBuildMode(mode);
     }
 
-    void SetBigramSpanWeight(float weight)
+    void SetQueryParameters(const QueryCompileModeParameters& parameters)
     {
-        m_BigramSpanWeight = weight > 0.0f ? weight : 1.0f;
+        m_QueryParameters = parameters;
         if (m_DeltaContext)
-            m_DeltaContext->SetBigramSpanWeight(m_BigramSpanWeight);
-    }
-    void SetUnigramSpanWeight(float weight)
-    {
-        m_UnigramSpanWeight = weight > 0.0f ? weight : 1.0f;
-        if (m_DeltaContext)
-            m_DeltaContext->SetUnigramSpanWeight(m_UnigramSpanWeight);
+            m_DeltaContext->SetQueryParameters(m_QueryParameters);
     }
 
     float GetSpanWeight(uint32_t wordSpan) const
     {
-        return wordSpan >= 2 ? m_BigramSpanWeight : m_UnigramSpanWeight;
+        return wordSpan >= 2 ? m_QueryParameters.QMP_BigramWeight : m_QueryParameters.QMP_UnigramWeight;
     }
+
+    const QueryCompileModeParameters& GetQueryParameters() const { return m_QueryParameters; }
 
     void SetLeafTermCacheBytes(uint64_t bytes)
     {
@@ -962,9 +958,7 @@ private:
     bool                         m_WriteBuilt = false;
     uint64_t                     m_LeafTermCacheBytes = LEAF_TERM_CACHE_BYTES;
     WeakAndBuildMode             m_WeakAndBuildMode = WeakAndBuildMode::FlatPruned;
-    // Scheme A tuned defaults: stream score = 1.8*unigram + 0.2*raw_bigram.
-    float                        m_UnigramSpanWeight = 1.8f;
-    float                        m_BigramSpanWeight = 0.2f;
+    QueryCompileModeParameters   m_QueryParameters = kWeakAndBigramParameters;
 
     static constexpr uint32_t INDEX_BLOCK_CACHE_SLOT_COUNT =
         static_cast<uint32_t>(INDEX_BLOCK_CACHE_BYTES / sizeof(IndexBlock));

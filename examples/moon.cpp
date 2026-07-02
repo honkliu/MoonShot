@@ -1076,33 +1076,28 @@ struct BeirEvalOptions {
     std::vector<int> at = {10, 100, 1000};
     uint64_t limit = 0;
     uint64_t vectorEf = 1000;
-    float bigramWeight = 0.2f;
     bool noMphf = false;
     uint64_t leafCacheMb = 0;
     bool leafCacheMatchMphf = false;
-    float unigramWeight = 1.8f;
-    float fittedBigramWeight = 0.1f;
-    float staticWeight = 1.0f;
-    float qualityWeight = 1.0f;
-    float authorityWeight = 0.5f;
-    float spamPenalty = 2.0f;
 };
 
 static QueryCompileMode BeirCompileMode(const std::string& mode)
 {
-    return (mode == "weakandbigramboost" || mode == "hybridboost")
-        ? QueryCompileMode::WeakAndBigramBoost
-        : QueryCompileMode::WeakAndBigram;
+    if (mode == "weakandbigramboostdoc" || mode == "hybridboostdoc")
+        return QueryCompileMode::WeakAndBigramBoostForDoc;
+    if (mode == "weakandbigramboost" || mode == "hybridboost")
+        return QueryCompileMode::WeakAndBigramBoost;
+    return QueryCompileMode::WeakAndBigram;
 }
 
 static bool IsWeakAndBigramMode(const std::string& mode)
 {
-    return mode == "weakandbigram" || mode == "weakandbigramboost";
+    return mode == "weakandbigram" || mode == "weakandbigramboost" || mode == "weakandbigramboostdoc";
 }
 
 static bool IsHybridMode(const std::string& mode)
 {
-    return mode == "hybrid" || mode == "hybridboost";
+    return mode == "hybrid" || mode == "hybridboost" || mode == "hybridboostdoc";
 }
 
 static bool ParseBatchSize(const std::string& text, uint64_t& batchSize)
@@ -1122,16 +1117,6 @@ static bool ParseUInt64(const std::string& text, uint64_t& value)
     unsigned long long parsed = std::strtoull(text.c_str(), &end, 10);
     if (!end || *end != '\0') return false;
     value = static_cast<uint64_t>(parsed);
-    return true;
-}
-
-static bool ParseFloat(const std::string& text, float& value)
-{
-    if (text.empty()) return false;
-    char* end = nullptr;
-    const float parsed = std::strtof(text.c_str(), &end);
-    if (!end || *end != '\0' || !std::isfinite(parsed)) return false;
-    value = parsed;
     return true;
 }
 
@@ -1165,31 +1150,6 @@ static bool ParseAtList(const std::string& text, std::vector<int>& values)
     std::sort(values.begin(), values.end());
     values.erase(std::unique(values.begin(), values.end()), values.end());
     return !values.empty();
-}
-
-static bool ParseSchemeAWeights(const std::string& text,
-                                BeirEvalOptions& options)
-{
-    std::vector<float> values;
-    std::stringstream ss(text);
-    std::string item;
-    while (std::getline(ss, item, ',')) {
-        item = Trim(std::move(item));
-        float value = 0.0f;
-        if (!ParseFloat(item, value))
-            return false;
-        values.push_back(value);
-    }
-    if (values.size() != 6)
-        return false;
-    options.unigramWeight = values[0];
-    options.fittedBigramWeight = values[1];
-    options.staticWeight = values[2];
-    options.qualityWeight = values[3];
-    options.authorityWeight = values[4];
-    options.spamPenalty = values[5];
-    options.bigramWeight = 2.0f * options.fittedBigramWeight;
-    return options.unigramWeight > 0.0f && options.fittedBigramWeight >= 0.0f;
 }
 
 static bool ParseSearchOptions(const std::vector<std::string>& args,
@@ -1409,9 +1369,9 @@ static bool ParseBeirEvalOptions(const std::vector<std::string>& args,
             if (i + 1 >= args.size()) { error = "Usage: moon -beir-eval -streams TB"; return false; }
             options.streams = args[++i];
         } else if (arg == "-mode") {
-            if (i + 1 >= args.size()) { error = "Usage: moon -beir-eval -mode bow|weakandbigram|weakandbigramboost|hybrid|hybridboost|compile"; return false; }
+            if (i + 1 >= args.size()) { error = "Usage: moon -beir-eval -mode bow|weakandbigram|weakandbigramboost|weakandbigramboostdoc|vector|hybrid|hybridboost|hybridboostdoc|compile"; return false; }
             options.mode = args[++i];
-            if (options.mode != "bow" && options.mode != "weakandbigram" && options.mode != "weakandbigramboost" && options.mode != "vector" && options.mode != "hybrid" && options.mode != "hybridboost" && options.mode != "compile") { error = "-mode must be bow, weakandbigram, weakandbigramboost, vector, hybrid, hybridboost, or compile"; return false; }
+            if (options.mode != "bow" && options.mode != "weakandbigram" && options.mode != "weakandbigramboost" && options.mode != "weakandbigramboostdoc" && options.mode != "vector" && options.mode != "hybrid" && options.mode != "hybridboost" && options.mode != "hybridboostdoc" && options.mode != "compile") { error = "-mode must be bow, weakandbigram, weakandbigramboost, weakandbigramboostdoc, vector, hybrid, hybridboost, hybridboostdoc, or compile"; return false; }
         } else if (arg == "-weakand-shape") {
             if (i + 1 >= args.size()) { error = "Usage: moon -beir-eval -weakand-shape flat|or|or-prune"; return false; }
             options.weakAndShape = args[++i];
@@ -1429,13 +1389,6 @@ static bool ParseBeirEvalOptions(const std::vector<std::string>& args,
         } else if (arg == "-vector-ef") {
             if (i + 1 >= args.size()) { error = "Usage: moon -beir-eval -vector-ef N"; return false; }
             if (!ParseUInt64(args[++i], options.vectorEf) || options.vectorEf == 0) { error = "-vector-ef must be a positive integer"; return false; }
-        } else if (arg == "-bigram-weight") {
-            if (i + 1 >= args.size()) { error = "Usage: moon -beir-eval -bigram-weight W"; return false; }
-            if (!ParseFloat(args[++i], options.bigramWeight) || options.bigramWeight <= 0.0f) { error = "-bigram-weight must be positive"; return false; }
-            options.fittedBigramWeight = 0.5f * options.bigramWeight;
-        } else if (arg == "-scheme-a-weights") {
-            if (i + 1 >= args.size()) { error = "Usage: moon -beir-eval -scheme-a-weights weak,bigram,static,quality,authority,spam"; return false; }
-            if (!ParseSchemeAWeights(args[++i], options)) { error = "-scheme-a-weights must be six comma-separated floats: weak,bigram,static,quality,authority,spam"; return false; }
         } else {
             error = "Unknown BEIR eval option: " + arg;
             return false;
@@ -1498,7 +1451,7 @@ static void PrintHelp(const std::string& idxPath)
         << "      Build an index from BEIR corpus.jsonl. Stored doc paths are BEIR ids.\n\n"
         << "  moon -idx <output-index> -beir-patch-vectors -src-index <index> -doc-vectors <vectors.i8bin>\n"
         << "      Copy an existing BEIR index and patch only DocData vector fields.\n\n"
-        << "  moon [-idx <index>] -beir-eval -data <beir-dir> [-qrels test] [-run-out out.trec] [-k 10,100,1000] [-streams TB] [-mode bow|weakandbigram|weakandbigramboost|vector|hybrid|hybridboost|compile] [-weakand-shape flat|or|or-prune] [-no-mphf] [-leaf-cache-mb N] [-leaf-cache-match-mphf] [-limit N]\n"
+        << "  moon [-idx <index>] -beir-eval -data <beir-dir> [-qrels test] [-run-out out.trec] [-k 10,100,1000] [-streams TB] [-mode bow|weakandbigram|weakandbigramboost|weakandbigramboostdoc|vector|hybrid|hybridboost|hybridboostdoc|compile] [-weakand-shape flat|or|or-prune] [-no-mphf] [-leaf-cache-mb N] [-leaf-cache-match-mphf] [-limit N]\n"
         << "      Evaluate Recall@k from BEIR queries.jsonl and qrels/<split>.tsv.\n"
         << "      Default mode is weakandbigram. bow is kept as a recall-ceiling baseline.\n\n"
         << "Examples:\n"
@@ -2363,24 +2316,9 @@ static int RunBeirEval(const std::string& idxPath, const BeirEvalOptions& option
     ctx.SetTermMphfEnabled(!options.noMphf);
     ctx.SetDirectBlockAccessEnabled(true);
     const QueryCompileMode compileMode = BeirCompileMode(options.mode);
-    if (compileMode == QueryCompileMode::WeakAndBigramBoost) {
-        const auto& parameters = GetQueryCompileModeParameters(compileMode);
-        ctx.SetUnigramSpanWeight(parameters.QMP_UnigramWeight);
-        ctx.SetBigramSpanWeight(parameters.QMP_BigramWeight);
-        IndexSearchExecutor::SetScoringParameters(parameters);
-    } else {
-        ctx.SetUnigramSpanWeight(options.unigramWeight);
-        ctx.SetBigramSpanWeight(options.bigramWeight);
-        auto parameters = kWeakAndBigramParameters;
-        parameters.QMP_UnigramWeight = options.unigramWeight;
-        parameters.QMP_BigramWeight = options.bigramWeight;
-        parameters.QMP_StaticWeight = options.staticWeight;
-        parameters.QMP_PriorWeight = 0.0f;
-        parameters.QMP_QualityWeight = options.qualityWeight;
-        parameters.QMP_AuthorityWeight = options.authorityWeight;
-        parameters.QMP_SpamPenalty = options.spamPenalty;
-        IndexSearchExecutor::SetScoringParameters(parameters);
-    }
+    auto parameters = GetQueryCompileModeParameters(compileMode);
+    ctx.SetQueryParameters(parameters);
+    IndexSearchExecutor::SetScoringParameters(parameters);
     WeakAndBuildMode weakAndBuildMode = WeakAndBuildMode::FlatPruned;
     if (options.weakAndShape == "or")
         weakAndBuildMode = WeakAndBuildMode::OrChildren;
@@ -2486,7 +2424,7 @@ static int RunBeirEval(const std::string& idxPath, const BeirEvalOptions& option
                   << " qrels=" << qrelsPath
                   << " streams=" << options.streams
                   << " mode=" << options.mode
-                  << " bigram_weight=" << options.bigramWeight
+                  << " bigram_weight=" << parameters.QMP_BigramWeight
                   << " queries=" << evaluated
                   << " output=" << options.dumpFeaturesPath << "\n";
         return 0;
@@ -2505,7 +2443,7 @@ static int RunBeirEval(const std::string& idxPath, const BeirEvalOptions& option
               << " streams=" << options.streams
               << " mode=" << options.mode
               << " weakand_shape=" << options.weakAndShape
-              << " bigram_weight=" << options.bigramWeight
+              << " bigram_weight=" << parameters.QMP_BigramWeight
               << " mphf=" << (options.noMphf ? "off" : "on")
               << " leaf_cache_mb=" << (leafCacheBytes ? (leafCacheBytes / (1024ull * 1024ull)) : (LEAF_TERM_CACHE_BYTES / (1024ull * 1024ull)))
               << " queries=" << evaluated

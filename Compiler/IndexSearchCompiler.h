@@ -333,7 +333,8 @@ private:
     }
 
     std::shared_ptr<EvalNode> BuildWeakAndBigramBoostExpression(
-            const std::vector<QueryTerm>& tokens)
+            const std::vector<QueryTerm>& tokens,
+            QueryCompileMode mode)
     {
         auto terms = FilterWeakAndTerms(tokens);
         auto base = BuildWeakAndBaseExpression(terms);
@@ -343,7 +344,7 @@ private:
         auto boostNode = std::make_shared<BoostNode>();
         boostNode->base = std::move(base);
         boostNode->boost = std::move(bigram);
-        boostNode->boost_weight = GetQueryCompileModeParameters(QueryCompileMode::WeakAndBigramBoost).QMP_BigramBoostWeight;
+        boostNode->boost_weight = GetQueryCompileModeParameters(mode).QMP_BigramBoostWeight;
         return boostNode;
     }
 
@@ -353,8 +354,8 @@ private:
     {
         if (mode == QueryCompileMode::WeakAndBigram)
             return BuildWeakAndBigramExpression(tokens);
-        if (mode == QueryCompileMode::WeakAndBigramBoost)
-            return BuildWeakAndBigramBoostExpression(tokens);
+        if (mode == QueryCompileMode::WeakAndBigramBoost || mode == QueryCompileMode::WeakAndBigramBoostForDoc)
+            return BuildWeakAndBigramBoostExpression(tokens, mode);
 
         if (tokens.empty())
             return nullptr;

@@ -5,6 +5,21 @@
 #include <cstring>
 #include <cmath>
 
+namespace {
+
+float StreamWeight(char stream, const QueryCompileModeParameters& parameters)
+{
+    switch (stream) {
+    case 'A': return parameters.QMP_AnchorWeight;
+    case 'U': return parameters.QMP_UrlWeight;
+    case 'T': return parameters.QMP_TitleWeight;
+    case 'B': return parameters.QMP_BodyWeight;
+    default: return 1.0f;
+    }
+}
+
+}
+
 void AdvancedIndexReader::Open(const char*      streamKey,
                                 IndexBlockTable* blockTable,
                                 const IndexContext* context,
@@ -20,13 +35,14 @@ void AdvancedIndexReader::Open(const char*      streamKey,
     delete[] m_Word;
     m_Word = new char[std::strlen(streamKey) + 1];
     std::strcpy(m_Word, streamKey);
-    m_SourceMask = ReaderSourceMaskForStream(m_Word[std::strlen(m_Word) - 1]);
+    const char stream = m_Word[std::strlen(m_Word) - 1];
+    m_SourceMask = ReaderSourceMaskForStream(stream);
 
     m_BlockTable      = blockTable;
     m_Context         = context;
     m_DocFreq         = 0;
     m_WordSpan        = std::max(1u, wordSpan);
-    m_SpanWeight      = m_Context->GetSpanWeight(m_WordSpan);
+    m_SpanWeight      = m_Context->GetSpanWeight(m_WordSpan) * StreamWeight(stream, m_Context->GetQueryParameters());
     m_Idf             = 0.0f;
     m_Bm25LengthBias  = 0.0f;
     m_Bm25LengthScale = 0.0f;
