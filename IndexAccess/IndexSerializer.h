@@ -8,16 +8,17 @@
 #include <string>
 
 /*
- * Binary index file format (version 16).
+ * Binary index file format (version 20).
  *
  * Layout:
  *   [Header]           magic, version, fixed section offsets and counts
+ *   [PathPrefix]       fixed 10-page sidecar, directory-prefix string table
  *   [HeadTermEntry]    fixed 32B records, count = IFH_HeadTermEntryCount
  *   [LeafTermBlock]    fixed 4096B blocks, count = IFH_LeafTermBlockCount
  *                          LTB_Directory[0..94]: LeafTermEntry offsets from block base
  *                          LTB_Directory[95]: entry count
  *                          LTB_Data: packed 32B LeafTermEntry records + LTE_Term bytes
- *   [DocData]          N x 1024B records
+ *   [DocData]          N x 256B records
  *   [Blocks]           raw IndexBlock structs
  *                        first block: packed docID-varbyte + scale16 uint8 tf pairs
  *                        continuation block: 12B IndexBlockContinuationHeader + pairs
@@ -43,6 +44,7 @@ public:
     static bool Save(const IndexFileHeader& header,
                      const IndexBlockTable& blockTable,
                      const uint8_t* docData,
+                     const uint8_t* pathPrefixSidecar,
                      const char* path);
     static bool IsValidIndex(const char* path);
     static BuildBlocksResult BuildBlocks(const PostingStore& store);

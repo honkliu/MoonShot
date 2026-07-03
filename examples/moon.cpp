@@ -2647,34 +2647,18 @@ static int RunIndexCommand(const std::string& idxPath, const IndexOptions& optio
         std::filesystem::remove(FsPathFromUtf8(deltaPath), removeError);
     }
 
-    uint64_t baseNextId = 0;
-    uint64_t deltaNextId = 0;
-    PathMap baseMap = LoadPathMapFromIndex(idxPath, baseNextId);
-    PathMap deltaMap = LoadPathMapFromIndex(deltaPath, deltaNextId);
-    PathMap indexedMap = baseMap;
-    uint64_t nextId = baseNextId;
-    for (const auto& [path, _] : deltaMap) {
-        if (!indexedMap.count(path))
-            indexedMap[path] = nextId++;
+    uint64_t nextId = 0;
+    if (IndexSerializer::IsValidIndex(idxPath.c_str())) {
+        IndexContext existingContext("", idxPath.c_str(), false);
+        nextId = existingContext.AllocateDocumentID();
     }
-    PathMap knownMap = indexedMap;
 
-    uint64_t added = 0, existing = 0;
+    uint64_t added = 0;
     std::vector<std::pair<std::string, uint64_t>> pendingFiles;
     for (const auto& file : files) {
-        if (knownMap.count(file.path)) {
-            ++existing;
-        } else {
-            const uint64_t docId = nextId++;
-            pendingFiles.push_back({file.path, docId});
-            knownMap[file.path] = docId;
-            ++added;
-        }
-    }
-
-    if (added == 0) {
-        std::cout << "No new files to index\n";
-        return 0;
+        const uint64_t docId = nextId++;
+        pendingFiles.push_back({file.path, docId});
+        ++added;
     }
 
     uint64_t totalKept = 0;
@@ -2688,14 +2672,12 @@ static int RunIndexCommand(const std::string& idxPath, const IndexOptions& optio
         PathMap batchMap;
         for (size_t i = offset; i < end; ++i) {
             batchMap[pendingFiles[i].first] = pendingFiles[i].second;
-            indexedMap[pendingFiles[i].first] = pendingFiles[i].second;
         }
 
         uint64_t kept = 0;
         uint64_t skipped = 0;
         std::cout << "Batch " << (savedBatches + 1) << ": adding "
-                  << batchNewCount << " new file(s), merging "
-                  << indexedMap.size() << " total document(s) into " << idxPath << "\n";
+                  << batchNewCount << " file(s) into " << idxPath << "\n";
         if (!BuildIndexFile(batchPath, batchMap, options.embedding, kept, skipped, &reportedSkippedPaths)) {
             std::cerr << "Failed to save batch index: " << batchPath << "\n";
             return 1;
@@ -2731,20 +2713,20 @@ static int RunIndexCommand(const std::string& idxPath, const IndexOptions& optio
             std::cout << "  merged in " << mergeMs << " ms\n";
         }
 
-        baseNextId = 0;
-        baseMap = LoadPathMapFromIndex(idxPath, baseNextId);
-        indexedMap = baseMap;
+        if (IndexSerializer::IsValidIndex(idxPath.c_str())) {
+            IndexContext loadedContext("", idxPath.c_str(), false);
+            totalKept = loadedContext.DocumentCount();
+        }
         std::error_code removeError;
         std::filesystem::remove(FsPathFromUtf8(deltaPath), removeError);
 
-        totalKept = static_cast<uint64_t>(baseMap.size());
         totalSkipped += skipped;
         ++savedBatches;
     }
 
     std::cout << "Indexed input: " << inputPath << "\n"
               << "Files:   " << files.size()
-              << " (new " << added << ", existing " << existing << ")\n"
+              << " (appended " << added << ")\n"
               << "Batch size: " << options.batchSize << "\n"
               << "Saved batches: " << savedBatches << "\n"
               << "Saved:   " << totalKept << " document(s)";

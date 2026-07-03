@@ -16,6 +16,7 @@
 #include "MemOperation.h"
 
 #include <memory>
+#include <array>
 #include <string>
 #include <string_view>
 #include <algorithm>
@@ -28,6 +29,7 @@
 #include <iostream>
 #include <limits>
 #include <utility>
+#include <unordered_map>
 #include <vector>
 
 using std::shared_ptr;
@@ -155,7 +157,7 @@ public:
             return;
         }
 
-        if (BuildRuntime(m_BlockTable, m_VectorIndex, m_IndexFileHeader, m_DocData, m_Built)) {
+        if (BuildRuntime(m_BlockTable, m_VectorIndex, m_IndexFileHeader, m_DocData, m_PathPrefixSidecar, m_PathPrefixes, m_Built)) {
             m_LoadedFromDisk = false;
             m_VectorBuilt = true;
         }
@@ -243,10 +245,14 @@ public:
 
     std::string GetDocPath(uint64_t docId) const
     {
-        const auto* entry = GetDocDataEntry(docId);
-        if (!entry || entry->DDE_PathLength == 0 || entry->DDE_PathLength > DOC_PATH_MAX)
-            return {};
-        return std::string(reinterpret_cast<const char*>(entry->DDE_Path), entry->DDE_PathLength);
+        docId = ReaderDocumentIDValue(docId);
+        const uint64_t firstDocId = DocDataFirstDocId(m_DocData, m_IndexFileHeader);
+        if (m_DocData && docId >= firstDocId && docId - firstDocId < m_IndexFileHeader.IFH_NumDocuments) {
+            const auto* entry = reinterpret_cast<const DocDataEntry*>(m_DocData + (docId - firstDocId) * DOC_REC_SIZE);
+            if (entry->DDE_DocID == docId)
+                return DecodeDocPath(*entry, m_PathPrefixes);
+        }
+        return m_DeltaContext ? m_DeltaContext->GetDocPath(docId) : std::string{};
     }
 
     const DocDataEntry* GetDocDataEntry(uint64_t docId) const
@@ -410,7 +416,7 @@ public:
         if (!savingDeltaIndex)
             m_IndexPath = savePath;
 
-        if (!BuildRuntime(m_WriteBlockTable, m_WriteVectorIndex, m_WriteIndexFileHeader, m_WriteDocData, m_WriteBuilt, false))
+        if (!BuildRuntime(m_WriteBlockTable, m_WriteVectorIndex, m_WriteIndexFileHeader, m_WriteDocData, m_WritePathPrefixSidecar, m_WritePathPrefixes, m_WriteBuilt, false))
             return false;
 
         if (overwritingLoadedIndex) {
@@ -421,7 +427,7 @@ public:
             m_LoadedFromDisk = false;
         }
 
-        if (!IndexSerializer::Save(m_WriteIndexFileHeader, m_WriteBlockTable, m_WriteDocData, path)) return false;
+        if (!IndexSerializer::Save(m_WriteIndexFileHeader, m_WriteBlockTable, m_WriteDocData, m_WritePathPrefixSidecar.data(), path)) return false;
 
         if (!savingDeltaIndex)
             return true;
@@ -432,6 +438,8 @@ public:
         delta->m_VectorIndex = std::move(m_WriteVectorIndex);
         delta->m_IndexFileHeader = m_WriteIndexFileHeader;
         delta->m_DocData = m_WriteDocData;
+        delta->m_PathPrefixSidecar = m_WritePathPrefixSidecar;
+        delta->m_PathPrefixes = m_WritePathPrefixes;
         delta->m_Built = true;
         delta->m_LoadedFromDisk = true;
         delta->m_VectorBuilt = false;
@@ -439,6 +447,8 @@ public:
 
         m_WriteDocData = nullptr;
         m_WriteIndexFileHeader = {};
+        m_WritePathPrefixSidecar = {};
+        m_WritePathPrefixes.clear();
         m_WriteBuilt = false;
         m_WriteVectorIndex.Clear();
 
@@ -492,11 +502,13 @@ public:
               << " deltaIndexBlocks=" << delta.m_IndexFileHeader.IFH_IndexBlockCount
               << "\n";
 
-        // Step 2: Write DocData to a temp stream by appending resident base
-        // DocData first and resident delta DocData second. No old raw source
-        // file is opened here.
+        // Step 2: Write DocData to a temp stream. Path prefix ids are local to
+        // each index, so decode base/delta full paths and re-intern them into
+        // the merged sidecar while copying DocData records.
         uint64_t mergedDocs = 0;
         float avgDocLength = 1.0f;
+        std::array<uint8_t, PATH_PREFIX_SIDECAR_BYTES> mergedPathPrefixSidecar{};
+        std::vector<std::string> mergedPathPrefixes;
         {
             auto stepStart = std::chrono::steady_clock::now();
             FileAccess docFile(docDataTempPath.c_str());
@@ -509,17 +521,38 @@ public:
             mergedDocs = baseDocCount + deltaDocCount;
 
             uint64_t totalDocLength = static_cast<uint64_t>(static_cast<double>(m_IndexFileHeader.IFH_AvgDocLength) * static_cast<double>(baseDocCount));
+            PathPrefixBuildState pathState;
 
-            const uint64_t baseDocBytes = baseDocCount * DOC_REC_SIZE;
-            if (baseDocBytes > 0 && !docFile.PutData(m_DocData, baseDocBytes)) { cleanupTempFiles(); return false; }
+            auto writeDocDataRecords = [&](const uint8_t* sourceDocData,
+                                           const IndexFileHeader& sourceHeader,
+                                           const std::vector<std::string>& sourcePrefixes) -> bool {
+                if (!sourceDocData || sourceHeader.IFH_NumDocuments == 0)
+                    return true;
+                const uint64_t firstDocId = DocDataFirstDocId(sourceDocData, sourceHeader);
+                for (uint64_t slot = 0; slot < sourceHeader.IFH_NumDocuments; ++slot) {
+                    DocDataEntry entry{};
+                    std::memcpy(&entry, sourceDocData + slot * DOC_REC_SIZE, sizeof(entry));
+                    const uint64_t expectedDocId = firstDocId + slot;
+                    if (entry.DDE_DocID == expectedDocId) {
+                        const std::string fullPath = DecodeDocPath(entry, sourcePrefixes);
+                        EncodeDocPath(entry, fullPath, pathState);
+                    }
+                    if (!docFile.PutData(&entry, sizeof(entry)))
+                        return false;
+                }
+                return true;
+            };
+
+            if (!writeDocDataRecords(m_DocData, m_IndexFileHeader, m_PathPrefixes)) { cleanupTempFiles(); return false; }
 
             if (deltaDocCount > 0) {
-                const uint64_t deltaDocBytes = deltaDocCount * DOC_REC_SIZE;
-                const uint8_t* deltaDocData = delta.m_DocData;
-                if (!docFile.PutData(deltaDocData, deltaDocBytes)) { cleanupTempFiles(); return false; }
+                if (!writeDocDataRecords(delta.m_DocData, delta.m_IndexFileHeader, delta.m_PathPrefixes)) { cleanupTempFiles(); return false; }
 
                 totalDocLength += static_cast<uint64_t>(static_cast<double>(delta.m_IndexFileHeader.IFH_AvgDocLength) * static_cast<double>(deltaDocCount));
             }
+
+            mergedPathPrefixes = pathState.Prefixes;
+            BuildPathPrefixSidecarBytes(mergedPathPrefixes, mergedPathPrefixSidecar);
 
             avgDocLength = mergedDocs ? static_cast<float>(totalDocLength) / static_cast<float>(mergedDocs) : 1.0f;
             std::cout << "  merge step2 wrote docdata bytes=" << (mergedDocs * DOC_REC_SIZE)
@@ -683,6 +716,7 @@ public:
 
             IndexFileHeader header{};
             if (!output.PutData(&header, sizeof(header))) { cleanupTempFiles(); return false; }
+            if (!output.PutData(mergedPathPrefixSidecar.data(), PATH_PREFIX_SIDECAR_BYTES)) { cleanupTempFiles(); return false; }
             if (!AppendFile(output, headTempPath)) { cleanupTempFiles(); return false; }
             if (!AppendFile(output, leafTempPath)) { cleanupTempFiles(); return false; }
             if (!AppendFile(output, docDataTempPath)) { cleanupTempFiles(); return false; }
@@ -696,7 +730,7 @@ public:
             header.IFH_NumDocuments = mergedDocs;
             header.IFH_NumTerms = totalTerms;
             header.IFH_AvgDocLength = avgDocLength;
-            header.IFH_HeadTermEntryOffset = sizeof(IndexFileHeader);
+            header.IFH_HeadTermEntryOffset = sizeof(IndexFileHeader) + PATH_PREFIX_SIDECAR_BYTES;
             header.IFH_HeadTermEntryCount = headEntryCount;
             header.IFH_LeafTermBlockOffset = header.IFH_HeadTermEntryOffset + header.IFH_HeadTermEntryCount * sizeof(HeadTermEntry);
             header.IFH_LeafTermBlockCount = headEntryCount;
@@ -764,6 +798,15 @@ public:
         {
             std::cerr << "Failed to load index: " << m_IndexPath
                       << " (unsupported/corrupt format; rebuild with current moon.exe)\n";
+            ResetLoadedRuntimeState();
+            return;
+        }
+
+        if (!indexFile.SetPosition(sizeof(IndexFileHeader))
+            || indexFile.GetData(m_PathPrefixSidecar.data(), PATH_PREFIX_SIDECAR_BYTES) != static_cast<int>(PATH_PREFIX_SIDECAR_BYTES)
+            || !LoadPathPrefixSidecarBytes(m_PathPrefixSidecar.data(), m_PathPrefixes))
+        {
+            std::cerr << "Failed to read PathPrefix sidecar for: " << m_IndexPath << "\n";
             ResetLoadedRuntimeState();
             return;
         }
@@ -971,12 +1014,16 @@ private:
     bool                         m_VectorBuilt;
     IndexFileHeader              m_IndexFileHeader{};
     uint8_t*                     m_DocData = nullptr;
+    std::array<uint8_t, PATH_PREFIX_SIDECAR_BYTES> m_PathPrefixSidecar{};
+    std::vector<std::string>     m_PathPrefixes;
     std::unique_ptr<IndexContext> m_DeltaContext;
 
     IndexBlockTable              m_WriteBlockTable;
     FreshDiskAnnVectorIndex      m_WriteVectorIndex;
     IndexFileHeader              m_WriteIndexFileHeader{};
     uint8_t*                     m_WriteDocData = nullptr;
+    std::array<uint8_t, PATH_PREFIX_SIDECAR_BYTES> m_WritePathPrefixSidecar{};
+    std::vector<std::string>     m_WritePathPrefixes;
     bool                         m_WriteBuilt = false;
     uint64_t                     m_LeafTermCacheBytes = LEAF_TERM_CACHE_BYTES;
     WeakAndBuildMode             m_WeakAndBuildMode = WeakAndBuildMode::FlatPruned;
@@ -999,6 +1046,152 @@ private:
         return docData && header.IFH_NumDocuments > 0
             ? reinterpret_cast<const DocDataEntry*>(docData)->DDE_DocID
             : 0;
+    }
+
+    struct PathPrefixBuildState {
+        std::unordered_map<std::string, uint16_t> PrefixToId;
+        std::vector<std::string> Prefixes;
+        uint32_t StringBytes = 0;
+    };
+
+    static void SplitPathForSidecar(const std::string& fullPath, std::string& prefix, std::string& filename)
+    {
+        const size_t slash = fullPath.find_last_of("/\\");
+        if (slash == std::string::npos) {
+            prefix.clear();
+            filename = fullPath;
+            return;
+        }
+        prefix = fullPath.substr(0, slash);
+        filename = fullPath.substr(slash + 1);
+    }
+
+    static bool PathPrefixSidecarCanHold(uint32_t prefixCount, uint32_t stringBytes)
+    {
+        const uint64_t bytes = sizeof(PathPrefixSidecarHeader)
+            + static_cast<uint64_t>(prefixCount) * sizeof(PathPrefixSidecarEntry)
+            + stringBytes;
+        return bytes <= PATH_PREFIX_SIDECAR_BYTES;
+    }
+
+    static uint16_t InternPathPrefix(PathPrefixBuildState& state, const std::string& prefix)
+    {
+        auto it = state.PrefixToId.find(prefix);
+        if (it != state.PrefixToId.end())
+            return it->second;
+        if (state.Prefixes.size() >= DOC_PATH_PREFIX_INVALID)
+            return DOC_PATH_PREFIX_INVALID;
+        const uint32_t nextCount = static_cast<uint32_t>(state.Prefixes.size() + 1);
+        const uint32_t nextStringBytes = state.StringBytes + static_cast<uint32_t>(prefix.size());
+        if (!PathPrefixSidecarCanHold(nextCount, nextStringBytes))
+            return DOC_PATH_PREFIX_INVALID;
+        const uint16_t id = static_cast<uint16_t>(state.Prefixes.size());
+        state.Prefixes.push_back(prefix);
+        state.PrefixToId.emplace(prefix, id);
+        state.StringBytes = nextStringBytes;
+        return id;
+    }
+
+    static void EncodeDocPath(DocDataEntry& entry, const std::string& fullPath, PathPrefixBuildState& state)
+    {
+        entry.DDE_PathLength = 0;
+        std::memset(entry.DDE_Path, 0, sizeof(entry.DDE_Path));
+        if (fullPath.empty())
+            return;
+
+        std::string prefix;
+        std::string filename;
+        SplitPathForSidecar(fullPath, prefix, filename);
+        const uint16_t prefixId = InternPathPrefix(state, prefix);
+        const uint16_t filenameBytes = static_cast<uint16_t>(std::min(filename.size(), DOC_PATH_FILENAME_MAX));
+        std::memcpy(entry.DDE_Path, &prefixId, sizeof(prefixId));
+        if (filenameBytes > 0)
+            std::memcpy(entry.DDE_Path + DOC_PATH_PREFIX_ID_BYTES, filename.data(), filenameBytes);
+        entry.DDE_PathLength = static_cast<uint16_t>(DOC_PATH_PREFIX_ID_BYTES + filenameBytes);
+    }
+
+    static void BuildPathPrefixSidecarBytes(const std::vector<std::string>& prefixes,
+                                            std::array<uint8_t, PATH_PREFIX_SIDECAR_BYTES>& sidecar)
+    {
+        sidecar = {};
+        PathPrefixSidecarHeader header{};
+        std::memcpy(header.PPSH_Magic, PATH_PREFIX_SIDECAR_MAGIC, sizeof(PATH_PREFIX_SIDECAR_MAGIC));
+        header.PPSH_Version = PATH_PREFIX_SIDECAR_VERSION;
+        header.PPSH_PrefixCount = static_cast<uint16_t>(std::min<size_t>(prefixes.size(), DOC_PATH_PREFIX_INVALID));
+        header.PPSH_EntryOffset = sizeof(PathPrefixSidecarHeader);
+        header.PPSH_StringOffset = header.PPSH_EntryOffset + header.PPSH_PrefixCount * sizeof(PathPrefixSidecarEntry);
+        uint32_t cursor = 0;
+        for (uint16_t i = 0; i < header.PPSH_PrefixCount; ++i)
+            cursor += static_cast<uint32_t>(prefixes[i].size());
+        header.PPSH_StringBytes = cursor;
+        std::memcpy(sidecar.data(), &header, sizeof(header));
+
+        cursor = 0;
+        for (uint16_t i = 0; i < header.PPSH_PrefixCount; ++i) {
+            PathPrefixSidecarEntry entry{};
+            entry.PPSE_Offset = cursor;
+            entry.PPSE_Length = static_cast<uint16_t>(prefixes[i].size());
+            const size_t entryOffset = header.PPSH_EntryOffset + static_cast<size_t>(i) * sizeof(PathPrefixSidecarEntry);
+            std::memcpy(sidecar.data() + entryOffset, &entry, sizeof(entry));
+            if (entry.PPSE_Length > 0) {
+                std::memcpy(sidecar.data() + header.PPSH_StringOffset + cursor, prefixes[i].data(), entry.PPSE_Length);
+                cursor += entry.PPSE_Length;
+            }
+        }
+    }
+
+    static bool LoadPathPrefixSidecarBytes(const uint8_t* sidecar, std::vector<std::string>& prefixes)
+    {
+        prefixes.clear();
+        if (!sidecar)
+            return false;
+        PathPrefixSidecarHeader header{};
+        std::memcpy(&header, sidecar, sizeof(header));
+        if (std::memcmp(header.PPSH_Magic, PATH_PREFIX_SIDECAR_MAGIC, sizeof(PATH_PREFIX_SIDECAR_MAGIC)) != 0
+            || header.PPSH_Version != PATH_PREFIX_SIDECAR_VERSION
+            || header.PPSH_EntryOffset < sizeof(PathPrefixSidecarHeader)
+            || header.PPSH_StringOffset > PATH_PREFIX_SIDECAR_BYTES
+            || header.PPSH_StringBytes > PATH_PREFIX_SIDECAR_BYTES
+            || header.PPSH_StringOffset + header.PPSH_StringBytes > PATH_PREFIX_SIDECAR_BYTES)
+            return false;
+        const uint64_t entryBytes = static_cast<uint64_t>(header.PPSH_PrefixCount) * sizeof(PathPrefixSidecarEntry);
+        if (header.PPSH_EntryOffset + entryBytes > PATH_PREFIX_SIDECAR_BYTES)
+            return false;
+
+        prefixes.reserve(header.PPSH_PrefixCount);
+        for (uint16_t i = 0; i < header.PPSH_PrefixCount; ++i) {
+            PathPrefixSidecarEntry entry{};
+            const size_t entryOffset = header.PPSH_EntryOffset + static_cast<size_t>(i) * sizeof(PathPrefixSidecarEntry);
+            std::memcpy(&entry, sidecar + entryOffset, sizeof(entry));
+            if (entry.PPSE_Offset + entry.PPSE_Length > header.PPSH_StringBytes)
+                return false;
+            const char* text = reinterpret_cast<const char*>(sidecar + header.PPSH_StringOffset + entry.PPSE_Offset);
+            prefixes.emplace_back(text, entry.PPSE_Length);
+        }
+        return true;
+    }
+
+    static std::string DecodeDocPath(const DocDataEntry& entry, const std::vector<std::string>& prefixes)
+    {
+        if (entry.DDE_PathLength == 0 || entry.DDE_PathLength > DOC_PATH_MAX)
+            return {};
+        if (entry.DDE_PathLength < DOC_PATH_PREFIX_ID_BYTES)
+            return std::string(reinterpret_cast<const char*>(entry.DDE_Path), entry.DDE_PathLength);
+
+        uint16_t prefixId = DOC_PATH_PREFIX_INVALID;
+        std::memcpy(&prefixId, entry.DDE_Path, sizeof(prefixId));
+        const char* filenameData = reinterpret_cast<const char*>(entry.DDE_Path + DOC_PATH_PREFIX_ID_BYTES);
+        const size_t filenameLen = entry.DDE_PathLength - DOC_PATH_PREFIX_ID_BYTES;
+        const std::string filename(filenameData, filenameLen);
+        if (prefixId == DOC_PATH_PREFIX_INVALID || prefixId >= prefixes.size())
+            return filename;
+        if (prefixes[prefixId].empty())
+            return filename;
+        const char last = prefixes[prefixId].back();
+        if (last == '/' || last == '\\')
+            return prefixes[prefixId] + filename;
+        const char sep = prefixes[prefixId].find('\\') != std::string::npos ? '\\' : '/';
+        return prefixes[prefixId] + sep + filename;
     }
 
     uint32_t LeafTermBlockCacheSlotCount() const
@@ -1025,6 +1218,8 @@ private:
         ClearDocDataOnly();
         ClearBlockPageDataOnly();
         m_IndexFileHeader = {};
+        m_PathPrefixSidecar = {};
+        m_PathPrefixes.clear();
         m_VectorBuilt = false;
     }
 
@@ -1033,6 +1228,8 @@ private:
         ClearDocDataOnly(m_WriteDocData, m_WriteVectorIndex);
         m_WriteBlockTable.SetBlockMemory(nullptr, nullptr);
         m_WriteIndexFileHeader = {};
+        m_WritePathPrefixSidecar = {};
+        m_WritePathPrefixes.clear();
         m_WriteBuilt = false;
     }
 
@@ -1169,11 +1366,15 @@ private:
                            FreshDiskAnnVectorIndex& vectorIndex,
                            IndexFileHeader& header,
                            uint8_t*& docData,
+                           std::array<uint8_t, PATH_PREFIX_SIDECAR_BYTES>& pathPrefixSidecar,
+                           std::vector<std::string>& pathPrefixes,
                            bool& built)
     {
         ClearDocDataOnly(docData, vectorIndex);
         blockTable.SetBlockMemory(nullptr, nullptr);
         header = {};
+        pathPrefixSidecar = {};
+        pathPrefixes.clear();
         built = false;
     }
 
@@ -1181,6 +1382,8 @@ private:
                       FreshDiskAnnVectorIndex& vectorIndex,
                       IndexFileHeader& header,
                       uint8_t*& docData,
+                      std::array<uint8_t, PATH_PREFIX_SIDECAR_BYTES>& pathPrefixSidecar,
+                      std::vector<std::string>& pathPrefixes,
                       bool& built,
                       bool buildVectorIndex = true)
     {
@@ -1203,7 +1406,7 @@ private:
         ClearDocDataOnly(docData, vectorIndex);
         docData = static_cast<uint8_t*>(PinnedMemAlloc(docDataRecordCount * DOC_REC_SIZE));
         if (!docData) {
-            ResetRuntimeState(blockTable, vectorIndex, header, docData, built);
+            ResetRuntimeState(blockTable, vectorIndex, header, docData, pathPrefixSidecar, pathPrefixes, built);
             return false;
         }
         std::memset(docData, 0, static_cast<size_t>(docDataRecordCount * DOC_REC_SIZE));
@@ -1211,6 +1414,7 @@ private:
             reinterpret_cast<DocDataEntry*>(docData + slot * DOC_REC_SIZE)->DDE_DocID = UINT32_MAX;
 
         uint64_t totalLen = 0;
+        PathPrefixBuildState pathState;
         for (const auto& [docId, stats] : m_Store->AllDocStats()) {
             auto* entry = reinterpret_cast<DocDataEntry*>(docData + (docId - docDataFirstDocId) * DOC_REC_SIZE);
             assert(docId <= UINT32_MAX);
@@ -1239,11 +1443,11 @@ private:
                 entry->DDE_VectorFormat = 1;
                 std::memcpy(entry->DDE_VectorData, m_Store->GetDocVector(docId), DOC_VECTOR_STORAGE_MAX_DIM);
             }
-            entry->DDE_PathLength = static_cast<uint16_t>(std::min(stats.path.size(), DOC_PATH_MAX));
-            if (entry->DDE_PathLength > 0)
-                std::memcpy(entry->DDE_Path, stats.path.data(), entry->DDE_PathLength);
+            EncodeDocPath(*entry, stats.path, pathState);
             totalLen += stats.doc_len;
         }
+        pathPrefixes = pathState.Prefixes;
+        BuildPathPrefixSidecarBytes(pathPrefixes, pathPrefixSidecar);
 
         const uint64_t totalDocs = docDataRecordCount;
         std::memcpy(header.IFH_Magic, INDEX_FILE_MAGIC, sizeof(INDEX_FILE_MAGIC));
@@ -1258,7 +1462,7 @@ private:
             || br.BBR_TermMphfDisplacements.size() > UINT32_MAX
             || br.BBR_TermMphfEntryPages.size() > UINT32_MAX) {
             std::cerr << "Built index section count exceeds runtime limit\n";
-            ResetRuntimeState(blockTable, vectorIndex, header, docData, built);
+            ResetRuntimeState(blockTable, vectorIndex, header, docData, pathPrefixSidecar, pathPrefixes, built);
             return false;
         }
 
@@ -1269,7 +1473,7 @@ private:
         const uint32_t mphfEntryPageCount = static_cast<uint32_t>(br.BBR_TermMphfEntryPages.size());
 
         header.IFH_NumTerms = br.BBR_TotalTerms;
-        header.IFH_HeadTermEntryOffset = sizeof(IndexFileHeader);
+        header.IFH_HeadTermEntryOffset = sizeof(IndexFileHeader) + PATH_PREFIX_SIDECAR_BYTES;
         header.IFH_HeadTermEntryCount = headCount;
         header.IFH_LeafTermBlockOffset = header.IFH_HeadTermEntryOffset + static_cast<uint64_t>(headCount) * sizeof(HeadTermEntry);
         header.IFH_LeafTermBlockCount = leafTermBlockCount;
@@ -1286,7 +1490,7 @@ private:
         auto* indexBlocks = blockTable.Init(BlockKind::Index, nullptr, 0, indexBlockCount, indexBlockCount);
         auto* leafTermBlocks = blockTable.Init(BlockKind::LeafTerm, nullptr, 0, leafTermBlockCount, leafTermBlockCount);
         if ((indexBlockCount > 0 && !indexBlocks) || (leafTermBlockCount > 0 && !leafTermBlocks)) {
-            ResetRuntimeState(blockTable, vectorIndex, header, docData, built);
+            ResetRuntimeState(blockTable, vectorIndex, header, docData, pathPrefixSidecar, pathPrefixes, built);
             return false;
         }
 
@@ -1308,7 +1512,7 @@ private:
             std::memcpy(displacements.get(), br.BBR_TermMphfDisplacements.data(), static_cast<size_t>(mphfDisplacementCount) * sizeof(int32_t));
             auto* entryPages = static_cast<uint8_t*>(PinnedMemAlloc(static_cast<uint64_t>(mphfEntryPageCount) * sizeof(IndexBlock)));
             if (!entryPages) {
-                ResetRuntimeState(blockTable, vectorIndex, header, docData, built);
+                ResetRuntimeState(blockTable, vectorIndex, header, docData, pathPrefixSidecar, pathPrefixes, built);
                 return false;
             }
             std::memcpy(entryPages, br.BBR_TermMphfEntryPages.data(), static_cast<size_t>(mphfEntryPageCount) * sizeof(IndexBlock));

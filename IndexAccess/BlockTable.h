@@ -26,11 +26,18 @@ static constexpr size_t DOC_REC_SIZE = 256;
 static constexpr size_t DOC_VECTOR_DIM = 128;
 static constexpr size_t DOC_VECTOR_STORAGE_MAX_DIM = DOC_VECTOR_DIM;  // fixed int8[128]
 static constexpr size_t DOC_PATH_MAX = 64;
+static constexpr size_t DOC_PATH_PREFIX_ID_BYTES = 2;
+static constexpr size_t DOC_PATH_FILENAME_MAX = DOC_PATH_MAX - DOC_PATH_PREFIX_ID_BYTES;
+static constexpr uint16_t DOC_PATH_PREFIX_INVALID = UINT16_MAX;
 static constexpr size_t HEAD_TERM_KEY_MAX = 26;
 static constexpr size_t LEAF_TERM_DIRECTORY_COUNT = 161;
 static constexpr size_t LEAF_TERM_DATA_OFFSET = LEAF_TERM_DIRECTORY_COUNT * sizeof(uint16_t);
+static constexpr size_t PATH_PREFIX_SIDECAR_PAGE_COUNT = 10;
+static constexpr size_t PATH_PREFIX_SIDECAR_BYTES = PATH_PREFIX_SIDECAR_PAGE_COUNT * PAGE_SIZE;
 static constexpr uint8_t  INDEX_FILE_MAGIC[8] = {'M','O','O','N','S','H','O','T'};
-static constexpr uint32_t INDEX_FORMAT_VERSION = 19;
+static constexpr uint32_t INDEX_FORMAT_VERSION = 20;
+static constexpr uint8_t  PATH_PREFIX_SIDECAR_MAGIC[8] = {'M','S','P','A','T','H','S','\0'};
+static constexpr uint16_t PATH_PREFIX_SIDECAR_VERSION = 1;
 
 static constexpr uint64_t INDEX_BLOCK_CACHE_BYTES = 100ull * 1024ull * 1024ull;
 static constexpr uint64_t LEAF_TERM_CACHE_BYTES = 100ull * 1024ull * 1024ull;
@@ -102,6 +109,27 @@ struct TermMphfHeader {
     uint64_t TMH_FingerprintSeed = 0;
 };
 #pragma pack(pop)
+
+#pragma pack(push,1)
+struct PathPrefixSidecarHeader {
+    uint8_t  PPSH_Magic[8] = {'M','S','P','A','T','H','S','\0'};
+    uint16_t PPSH_Version = PATH_PREFIX_SIDECAR_VERSION;
+    uint16_t PPSH_PrefixCount = 0;
+    uint32_t PPSH_EntryOffset = sizeof(PathPrefixSidecarHeader);
+    uint32_t PPSH_StringOffset = sizeof(PathPrefixSidecarHeader);
+    uint32_t PPSH_StringBytes = 0;
+    uint8_t  PPSH_Reserved[8] = {};
+};
+
+struct PathPrefixSidecarEntry {
+    uint32_t PPSE_Offset = 0;
+    uint16_t PPSE_Length = 0;
+    uint16_t PPSE_Flags = 0;
+};
+#pragma pack(pop)
+
+static_assert(sizeof(PathPrefixSidecarHeader) == 32);
+static_assert(sizeof(PathPrefixSidecarEntry) == 8);
 
 #pragma pack(push,1)
 struct DocDataEntry {

@@ -493,6 +493,7 @@ BuildBlocksResult IndexSerializer::BuildBlocks(const PostingStore& store)
 bool IndexSerializer::Save(const IndexFileHeader& header,
                            const IndexBlockTable& blockTable,
                            const uint8_t* docData,
+                           const uint8_t* pathPrefixSidecar,
                            const char* path)
 {
     if (!path || !*path) return false;
@@ -505,6 +506,11 @@ bool IndexSerializer::Save(const IndexFileHeader& header,
 
     if (!file.PutData(&header, sizeof(header))) {
         std::cerr << "IndexSerializer::Save failed: header\n";
+        return false;
+    }
+
+    if (!pathPrefixSidecar || !file.PutData(pathPrefixSidecar, PATH_PREFIX_SIDECAR_BYTES)) {
+        std::cerr << "IndexSerializer::Save failed: PathPrefix sidecar\n";
         return false;
     }
 
