@@ -43,6 +43,9 @@
 #include <vector>
 #include <filesystem>
 #include <chrono>
+#include <atomic>
+#include <mutex>
+#include <thread>
 
 #ifdef _WIN32
 #  include <winsock2.h>
@@ -1099,6 +1102,7 @@ struct BeirEvalOptions {
     std::vector<int> at = {10, 100, 1000};
     uint64_t limit = 0;
     uint64_t vectorEf = 1000;
+    uint64_t queryThreads = 1;
     bool noMphf = false;
     uint64_t leafCacheMb = 0;
     bool leafCacheMatchMphf = false;
@@ -1433,6 +1437,9 @@ static bool ParseBeirEvalOptions(const std::vector<std::string>& args,
         } else if (arg == "-vector-ef") {
             if (i + 1 >= args.size()) { error = "Usage: moon -beir-eval -vector-ef N"; return false; }
             if (!ParseUInt64(args[++i], options.vectorEf) || options.vectorEf == 0) { error = "-vector-ef must be a positive integer"; return false; }
+        } else if (arg == "-query-threads") {
+            if (i + 1 >= args.size()) { error = "Usage: moon -beir-eval -query-threads N"; return false; }
+            if (!ParseUInt64(args[++i], options.queryThreads) || options.queryThreads == 0) { error = "-query-threads must be a positive integer"; return false; }
         } else {
             error = "Unknown BEIR eval option: " + arg;
             return false;
@@ -2382,6 +2389,184 @@ static int RunBeirEval(const std::string& idxPath, const BeirEvalOptions& option
     const bool hasExternalQueryVectors = !queryVectors.empty();
     std::ofstream* runWriter = options.runOut.empty() ? nullptr : &runOutput;
     const std::string runTag = "moon-" + options.mode;
+
+    struct BeirEvalTask {
+        std::string qid;
+        std::string query;
+        const std::unordered_set<std::string>* relevant = nullptr;
+    };
+
+    if (options.queryThreads > 1 && !dumpFeatures) {
+        std::vector<BeirEvalTask> tasks;
+        std::string taskLine;
+        while (std::getline(queries, taskLine)) {
+            std::string qid;
+            std::string query;
+            if (!ExtractJsonString(taskLine, "_id", qid) || !ExtractJsonString(taskLine, "text", query))
+                continue;
+            auto qrelIt = qrels.find(qid);
+            if (qrelIt == qrels.end() || qrelIt->second.empty()) {
+                ++missingQrels;
+                continue;
+            }
+            if (options.limit > 0 && tasks.size() >= options.limit) break;
+            tasks.push_back({std::move(qid), std::move(query), &qrelIt->second});
+        }
+
+        const auto elapsedStart = std::chrono::steady_clock::now();
+        const uint64_t threadCount = std::min<uint64_t>(options.queryThreads, std::max<uint64_t>(1, tasks.size()));
+        std::atomic<uint64_t> nextTask{0};
+        std::atomic<uint64_t> progress{0};
+        std::mutex compileMutex;
+        std::mutex outputMutex;
+
+        struct ThreadRecallState {
+            std::vector<double> macroRecall;
+            std::vector<uint64_t> microHits;
+            uint64_t microRelevant = 0;
+            uint64_t evaluated = 0;
+        };
+
+        std::vector<ThreadRecallState> threadStates(static_cast<size_t>(threadCount));
+        for (auto& state : threadStates) {
+            state.macroRecall.assign(options.at.size(), 0.0);
+            state.microHits.assign(options.at.size(), 0);
+        }
+
+        auto evaluateTask = [&](const BeirEvalTask& task, IndexSearchExecutor& localExecutor, SmartTokenizer& localTokenizer) {
+            switch (evalPath) {
+            case BeirEvalPath::Bow:
+                return localExecutor.Execute(BuildBeirBowReader(ctx, localTokenizer, task.query, options.streams), maxK);
+            case BeirEvalPath::WeakAndBigram: {
+                std::unique_ptr<EvalTree> tree;
+                {
+                    std::lock_guard<std::mutex> lock(compileMutex);
+                    tree.reset(ctx.Compile(task.query.c_str(), options.streams.c_str(), compileMode));
+                }
+                return localExecutor.Execute(ctx.GetReader(tree.get()), maxK,
+                    tree->HasTextQuery() && tree->HasVectorQuery() ? &tree->vector_query : nullptr);
+            }
+            case BeirEvalPath::VectorOrHybrid: {
+                std::vector<float> queryVector;
+                auto vectorIt = queryVectors.find(task.qid);
+                if (vectorIt != queryVectors.end()) {
+                    queryVector = ToVector(vectorIt->second);
+                } else if (!hasExternalQueryVectors) {
+                    std::lock_guard<std::mutex> lock(compileMutex);
+                    queryVector = ctx.CompileToVector(task.query.c_str());
+                }
+
+                std::unique_ptr<EvalTree> tree;
+                if (isHybridEval) {
+                    std::lock_guard<std::mutex> lock(compileMutex);
+                    tree.reset(ctx.Compile(task.query.c_str(), options.streams.c_str(), compileMode));
+                } else {
+                    tree = std::make_unique<EvalTree>();
+                }
+                if (!queryVector.empty())
+                    tree->vector_query = std::move(queryVector);
+                tree->vector_ef_search = static_cast<size_t>(options.vectorEf);
+
+                auto results = localExecutor.Execute(ctx.GetReader(tree.get()), maxK,
+                    tree->HasTextQuery() && tree->HasVectorQuery() ? &tree->vector_query : nullptr);
+                if (results.size() > static_cast<size_t>(maxK))
+                    results.resize(static_cast<size_t>(maxK));
+                return results;
+            }
+            case BeirEvalPath::DefaultReader: {
+                std::shared_ptr<IndexReader> reader;
+                {
+                    std::lock_guard<std::mutex> lock(compileMutex);
+                    reader = ctx.GetReader(task.query.c_str(), options.streams.c_str());
+                }
+                return localExecutor.Execute(reader, maxK);
+            }
+            case BeirEvalPath::FeatureDump:
+                return std::vector<SearchResult>{};
+            }
+            return std::vector<SearchResult>{};
+        };
+
+        std::vector<std::thread> workers;
+        workers.reserve(static_cast<size_t>(threadCount));
+        for (uint64_t threadIndex = 0; threadIndex < threadCount; ++threadIndex) {
+            workers.emplace_back([&, threadIndex]() {
+                IndexSearchExecutor localExecutor(&ctx);
+                SmartTokenizer localTokenizer;
+                auto& state = threadStates[static_cast<size_t>(threadIndex)];
+                while (true) {
+                    const uint64_t taskIndex = nextTask.fetch_add(1, std::memory_order_relaxed);
+                    if (taskIndex >= tasks.size()) break;
+                    const auto& task = tasks[static_cast<size_t>(taskIndex)];
+                    auto results = evaluateTask(task, localExecutor, localTokenizer);
+                    if (runWriter) {
+                        std::lock_guard<std::mutex> lock(outputMutex);
+                        WriteBeirRun(runWriter, ctx, task.qid, results, runTag);
+                    }
+                    AddBeirRecallForResults(ctx, results, *task.relevant, options.at, state.macroRecall, state.microHits, state.microRelevant);
+                    ++state.evaluated;
+                    const uint64_t done = progress.fetch_add(1, std::memory_order_relaxed) + 1;
+                    if (done % 100 == 0) {
+                        std::lock_guard<std::mutex> lock(outputMutex);
+                        std::cout << "  BEIR evaluated " << done << " queries\n";
+                    }
+                }
+            });
+        }
+        for (auto& worker : workers)
+            worker.join();
+
+        for (const auto& state : threadStates) {
+            evaluated += state.evaluated;
+            microRelevant += state.microRelevant;
+            for (size_t i = 0; i < options.at.size(); ++i) {
+                macroRecall[i] += state.macroRecall[i];
+                microHits[i] += state.microHits[i];
+            }
+        }
+
+        if (evaluated == 0 || microRelevant == 0) {
+            std::cerr << "No BEIR queries with qrels were evaluated\n";
+            return 1;
+        }
+
+        const auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - elapsedStart).count();
+        std::cout << "BEIR eval index=" << idxPath
+                  << " data=" << options.dataPath
+                  << " qrels=" << qrelsPath
+                  << " streams=" << options.streams
+                  << " mode=" << options.mode
+                  << " weakand_shape=" << options.weakAndShape
+                  << " bigram_weight=" << parameters.QMP_BigramWeight
+                  << " mphf=" << (options.noMphf ? "off" : "on")
+                  << " leaf_cache_mb=" << (leafCacheBytes ? (leafCacheBytes / (1024ull * 1024ull)) : (LEAF_TERM_CACHE_BYTES / (1024ull * 1024ull)))
+                  << " query_threads=" << threadCount
+                  << " queries=" << evaluated
+                  << " missing_qrels=" << missingQrels
+                  << " elapsed_ms=" << elapsedMs << "\n";
+        if (std::getenv("MOONSHOT_BLOCK_STATS")) {
+            const auto stats = ctx.GetBlockAccessStats();
+            std::cout << "BlockAccess direct_gets=" << stats.DirectGets
+                      << " direct_releases=" << stats.DirectReleases
+                      << " worker_gets=" << stats.WorkerGets
+                      << " worker_releases=" << stats.WorkerReleases
+                      << " cache_hits=" << stats.CacheHits
+                      << " cache_misses=" << stats.CacheMisses
+                      << " disk_reads=" << stats.DiskReads << "\n";
+        }
+        std::cout << std::fixed << std::setprecision(4);
+        for (size_t i = 0; i < options.at.size(); ++i) {
+            const double macro = macroRecall[i] / static_cast<double>(evaluated);
+            const double micro = static_cast<double>(microHits[i]) / static_cast<double>(microRelevant);
+            std::cout << "Recall@" << options.at[i]
+                      << " macro=" << macro
+                      << " micro=" << micro
+                      << " hits=" << microHits[i]
+                      << "/" << microRelevant << "\n";
+        }
+        return 0;
+    }
 
     std::string line;
     auto start = std::chrono::steady_clock::now();
