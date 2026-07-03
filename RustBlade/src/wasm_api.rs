@@ -14,6 +14,10 @@ use crate::block_table::{
     INDEX_FORMAT_VERSION,
     PAGE_SIZE,
     DOC_REC_SIZE,
+    DOC_PATH_MAX,
+    DOC_PATH_OFFSET,
+    DOC_PATH_PREFIX_ID_BYTES,
+    DOC_PATH_PREFIX_INVALID,
 };
 use crate::index_context::IndexContext;
 use crate::executor::IndexSearchExecutor;
@@ -71,7 +75,7 @@ pub fn parse_index(data: &[u8]) -> String {
 fn parse_index_inner(data: &[u8]) -> Result<String, String> {
     let header = parse_header(data)?;
     let mut store = PostingStore::new();
-    let (head_entries, leaf_blocks, blocks, _, _, _, _, _, _) = IndexSerializer::decode(&mut store, data)
+    let (head_entries, leaf_blocks, blocks, docdata, _, prefixes, _, _, _) = IndexSerializer::decode(&mut store, data)
         .map_err(|error| format!("{error:?}"))?;
 
     let mut block_entry_map: HashMap<u32, Vec<LeafTermEntry>> = HashMap::new();
@@ -155,16 +159,32 @@ fn parse_index_inner(data: &[u8]) -> Result<String, String> {
     out.push_str("]},");
 
     out.push_str(r#""docdata":["#);
-    let mut docs: Vec<_> = store.AllDocStats().iter().collect();
-    docs.sort_by_key(|(doc_id, _)| *doc_id);
-    for (index, (doc_id, stats)) in docs.iter().enumerate() {
+    let mut docs: Vec<(u64, f32, u32, String)> = Vec::new();
+    let first_doc_id = if header.num_docs > 0 && docdata.len() >= DOC_REC_SIZE { u32_at(&docdata, 0) as u64 } else { 0 };
+    for slot in 0..header.num_docs as usize {
+        let offset = slot * DOC_REC_SIZE;
+        if offset + DOC_REC_SIZE > docdata.len() { break; }
+        let doc_id = u32_at(&docdata, offset) as u64;
+        if doc_id != first_doc_id + slot as u64 { continue; }
+        let importance = u16_at(&docdata, offset + 4) as f32 / 65535.0;
+        let doc_len = u32_at(&docdata, offset + 30);
+        let path_len = (u16_at(&docdata, offset + 18) as usize).min(DOC_PATH_MAX);
+        let path = if path_len > 0 {
+            decode_doc_path(&docdata[offset + DOC_PATH_OFFSET..offset + DOC_PATH_OFFSET + path_len], &prefixes)
+        } else {
+            String::new()
+        };
+        docs.push((doc_id, importance, doc_len, path));
+    }
+    docs.sort_by_key(|(doc_id, _, _, _)| *doc_id);
+    for (index, (doc_id, importance, doc_len, path)) in docs.iter().enumerate() {
         if index > 0 { out.push(','); }
         out.push_str(&format!(
             r#"{{"doc_id":"{}","importance":{:.4},"doc_len":{},"path":{}}}"#,
             doc_id,
-            stats.importance,
-            stats.doc_len,
-            serde_json::to_string(&stats.path).unwrap_or_default()
+            importance,
+            doc_len,
+            serde_json::to_string(path).unwrap_or_default()
         ));
     }
     out.push_str("],");
@@ -265,15 +285,43 @@ fn decode_postings(data: &[u8]) -> Vec<(u64, u32)> {
 #[wasm_bindgen]
 pub fn search_index(data: &[u8], query: &str, streams: &str) -> String {
     let mut context = IndexContext::new();
-    if context.LoadFromBytes(data).is_err() {
-        return r#"{"error":"Failed to load index"}"#.to_string();
+    if let Err(error) = context.LoadFromBytes(data) {
+        return format!(r#"{{"error":"Failed to load index: {error:?}"}}"#);
     }
     let tree = context.Compile(query, streams);
     let mut reader = context.GetReader(tree);
-    let store = context.GetStore();
-    let store = store.lock().unwrap();
-    let executor = IndexSearchExecutor::new(&store);
-    let results = executor.Execute(reader.as_mut(), 0);
+    let results = {
+        let store = context.GetStore();
+        let store = store.lock().unwrap();
+        let executor = IndexSearchExecutor::new(&store);
+        executor.Execute(reader.as_mut(), 0)
+    };
+    let mut out = String::from("[");
+    for (index, result) in results.iter().enumerate() {
+        if index > 0 { out.push(','); }
+        let path = context.GetDocPath(result.doc_id);
+        out.push_str(&format!(
+            r#"{{"doc_id":"{}","score":{:.4},"path":{}}}"#,
+            result.doc_id,
+            result.score,
+            serde_json::to_string(&path).unwrap_or_default()
+        ));
+    }
+    out.push(']');
+    out
+}
+
+#[wasm_bindgen]
+pub fn vector_search_index(data: &[u8], query_vector_json: &str, top_k: usize, ef_search: usize) -> String {
+    let mut context = IndexContext::new();
+    if let Err(error) = context.LoadFromBytes(data) {
+        return format!(r#"{{"error":"Failed to load index: {error:?}"}}"#);
+    }
+    let query_vector: Vec<f32> = match serde_json::from_str(query_vector_json) {
+        Ok(vector) => vector,
+        Err(error) => return format!(r#"{{"error":"Invalid query vector: {error}"}}"#),
+    };
+    let results = context.VectorSearch(&query_vector, top_k.max(1), ef_search.max(top_k.max(1)));
     let mut out = String::from("[");
     for (index, result) in results.iter().enumerate() {
         if index > 0 { out.push(','); }
@@ -342,8 +390,28 @@ fn parse_header(data: &[u8]) -> Result<Header, String> {
 fn u32_at(data: &[u8], offset: usize) -> u32 {
     u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap())
 }
+fn u16_at(data: &[u8], offset: usize) -> u16 {
+    u16::from_le_bytes(data[offset..offset + 2].try_into().unwrap())
+}
 fn u64_at(data: &[u8], offset: usize) -> u64 {
     u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap())
+}
+
+fn decode_doc_path(payload: &[u8], prefixes: &[String]) -> String {
+    if payload.is_empty() { return String::new(); }
+    if payload.len() < DOC_PATH_PREFIX_ID_BYTES {
+        return std::str::from_utf8(payload).unwrap_or("").to_string();
+    }
+    let prefix_id = u16::from_le_bytes(payload[0..2].try_into().unwrap());
+    let filename = std::str::from_utf8(&payload[2..]).unwrap_or("");
+    if prefix_id == DOC_PATH_PREFIX_INVALID || prefix_id as usize >= prefixes.len() {
+        return filename.to_string();
+    }
+    let prefix = &prefixes[prefix_id as usize];
+    if prefix.is_empty() { return filename.to_string(); }
+    let separator = if prefix.contains('\\') { '\\' } else { '/' };
+    if prefix.ends_with(['/', '\\']) { format!("{prefix}{filename}") }
+    else { format!("{prefix}{separator}{filename}") }
 }
 fn vb_read(data: &[u8], start: usize) -> (u64, usize) {
     let mut value = 0u64;

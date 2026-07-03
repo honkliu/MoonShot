@@ -736,6 +736,7 @@ impl IndexContext {
 
     /// Load from raw bytes (WASM path — no file system access needed).
     pub fn LoadFromBytes(&mut self, data: &[u8]) -> Result<()> {
+        let header = IndexFileHeader::parse(data)?;
         let mut store = PostingStore::new();
         let (head_term_entries, leaf_term_blocks, blocks, docdata, pathPrefixSidecar, pathPrefixes, mphfHeader, mphfDisplacements, mphfEntryPages) = IndexSerializer::decode(&mut store, data)?;
         let mut table = IndexBlockTable::new(blocks.len().max(512) + 64);
@@ -752,6 +753,7 @@ impl IndexContext {
         self.m_BlockTable = Arc::new(table);
         self.m_VectorIndex = vector_index;
         self.m_VectorBuilt = false;
+        self.m_IndexFileHeader = header;
         self.m_DocData = docdata;
         self.m_PathPrefixSidecar = pathPrefixSidecar;
         self.m_PathPrefixes = pathPrefixes;

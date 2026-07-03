@@ -7,13 +7,55 @@ Usage:
     python3 serve.py ~/moon.idx         # auto-load idx at startup
     python3 serve.py ~/moon.idx 8080    # custom port
 """
-import sys, os, json, struct, http.server, socketserver, urllib.parse, mimetypes
+import sys, os, json, struct, http.server, socketserver, urllib.parse, mimetypes, socket
 
 idx_path = sys.argv[1] if len(sys.argv) > 1 else ''
 port     = int(sys.argv[2]) if len(sys.argv) > 2 else 8080
 LARGE_INDEX_COPY_LIMIT = 128 * 1024 * 1024
 DOC_REC_SIZE = 256
 DOC_PATH_MAX = 64
+DOC_PATH_OFFSET = 192
+PATH_PREFIX_SIDECAR_BYTES = 10 * 4096
+PATH_PREFIX_SIDECAR_MAGIC = b'MSPATHS\0'
+
+def decode_path_prefix_sidecar(sidecar):
+    if len(sidecar) != PATH_PREFIX_SIDECAR_BYTES or sidecar[:8] != PATH_PREFIX_SIDECAR_MAGIC:
+        return []
+    version, count = struct.unpack_from('<HH', sidecar, 8)
+    if version != 1:
+        return []
+    entry_off = struct.unpack_from('<I', sidecar, 12)[0]
+    string_off = struct.unpack_from('<I', sidecar, 16)[0]
+    string_bytes = struct.unpack_from('<I', sidecar, 20)[0]
+    if entry_off < 32 or string_off > len(sidecar) or string_off + string_bytes > len(sidecar):
+        return []
+    prefixes = []
+    for index in range(count):
+        off = entry_off + index * 8
+        if off + 8 > len(sidecar):
+            break
+        str_off, length, _flags = struct.unpack_from('<IHH', sidecar, off)
+        begin = string_off + str_off
+        end = begin + length
+        if end > string_off + string_bytes or end > len(sidecar):
+            break
+        prefixes.append(sidecar[begin:end].decode('utf-8', errors='replace'))
+    return prefixes
+
+def decode_doc_path(payload, prefixes):
+    if not payload:
+        return ''
+    if len(payload) < 2:
+        return payload.decode('utf-8', errors='replace')
+    prefix_id = struct.unpack_from('<H', payload, 0)[0]
+    filename = payload[2:].decode('utf-8', errors='replace')
+    if prefix_id == 0xffff or prefix_id >= len(prefixes):
+        return filename
+    prefix = prefixes[prefix_id]
+    if not prefix:
+        return filename
+    sep = '\\' if '\\' in prefix else '/'
+    return prefix + filename if prefix.endswith(('/', '\\')) else prefix + sep + filename
 
 # Write a tiny config that index.html reads to auto-load the idx.
 # Path is made relative to the HTTP server root (this script's directory).
@@ -137,6 +179,8 @@ class MoonShotHandler(http.server.SimpleHTTPRequestHandler):
                         return
                     num_docs = struct.unpack_from('<Q', header, 16)[0]
                     docdata_off = struct.unpack_from('<Q', header, 64)[0]
+                    f.seek(136)
+                    prefixes = decode_path_prefix_sidecar(f.read(PATH_PREFIX_SIDECAR_BYTES))
                     first_doc_id = 0
                     if num_docs:
                         f.seek(docdata_off)
@@ -156,7 +200,7 @@ class MoonShotHandler(http.server.SimpleHTTPRequestHandler):
                         if stored_doc_id != doc_id:
                             continue
                         path_len = min(struct.unpack_from('<H', rec, 18)[0], DOC_PATH_MAX)
-                        path = rec[192:192 + path_len].decode('utf-8', errors='replace') if path_len else ''
+                        path = decode_doc_path(rec[DOC_PATH_OFFSET:DOC_PATH_OFFSET + path_len], prefixes) if path_len else ''
                         out[str(doc_id)] = path
             except OSError as exc:
                 self.send_error(500, str(exc))
@@ -200,6 +244,55 @@ class MoonShotHandler(http.server.SimpleHTTPRequestHandler):
             return
 
         return super().do_GET()
+
+    def do_POST(self):
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path != '/embed-bge':
+            self.send_error(404, 'not found')
+            return
+        try:
+            length = int(self.headers.get('Content-Length', '0'))
+            body = self.rfile.read(min(length, 65536 + 1024))
+            request = json.loads(body.decode('utf-8'))
+            host = str(request.get('host') or '127.0.0.1')
+            port = int(request.get('port') or 8765)
+            text = str(request.get('text') or '')
+            if not text:
+                raise ValueError('empty text')
+            if port <= 0 or port > 65535:
+                raise ValueError('invalid port')
+            payload = text.encode('utf-8')[:65536]
+            with socket.create_connection((host, port), timeout=20) as sock:
+                sock.sendall(struct.pack('<I', len(payload)))
+                sock.sendall(payload)
+                dim_bytes = self._recv_exact(sock, 4)
+                dim = struct.unpack('<I', dim_bytes)[0]
+                if dim <= 0 or dim > 4096:
+                    raise ValueError(f'invalid embedding dim {dim}')
+                vector_bytes = self._recv_exact(sock, dim)
+            values = struct.unpack(f'<{dim}b', vector_bytes)
+            response = {'dim': dim, 'vector': [value / 128.0 for value in values]}
+            data = json.dumps(response).encode('utf-8')
+            self.send_response(200)
+        except Exception as exc:
+            data = json.dumps({'error': str(exc)}).encode('utf-8')
+            self.send_response(500)
+        self.send_header('Content-Type', 'application/json; charset=utf-8')
+        self.send_header('Content-Length', str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    @staticmethod
+    def _recv_exact(sock, size):
+        chunks = []
+        remaining = size
+        while remaining:
+            chunk = sock.recv(remaining)
+            if not chunk:
+                raise ConnectionError('embedding service closed connection')
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        return b''.join(chunks)
 
 print(f'MoonShot viewer  →  http://localhost:{port}/index.html')
 if config_val:

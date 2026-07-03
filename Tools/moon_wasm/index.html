@@ -194,6 +194,12 @@ tr:hover td { background:#2a2d2e; cursor:pointer; }
       <div id="srch-panel" class="panel">
         <div class="search-bar">
           <input id="doc-search" class="tool-input" placeholder="Search documents…" onkeydown="if(event.key==='Enter') runDocumentSearch()">
+          <select id="search-mode" class="tool-input" title="Search mode">
+            <option value="text">Text</option>
+            <option value="vector">BGE Vector</option>
+          </select>
+          <input id="bge-host" class="tool-input" value="52.171.138.19" title="BGE host" style="width:135px">
+          <input id="bge-port" class="tool-input" value="30000" title="BGE port" style="width:72px">
           <button type="button" class="btn" onclick="runDocumentSearch()">Search</button>
         </div>
         <div id="srch-out"><p class="srch-hint">Enter a query and press Enter.</p></div>
@@ -223,16 +229,17 @@ const PAGE_SIZE = 4096;
 const DOC_REC_SIZE = 256;
 const LEAF_TERM_DIRECTORY_COUNT = 161;
 const LEAF_TERM_DATA_OFFSET = LEAF_TERM_DIRECTORY_COUNT * 2;
+const PATH_PREFIX_SIDECAR_BYTES = 10 * PAGE_SIZE;
 const HEAD_ROWS_PER_PAGE = 32;
 const DOCDATA_ROWS_PER_PAGE = 32;
 const INDEXBLOCKS_PER_PAGE = 32;
 const POSTING_ROWS_PER_PAGE = 32;
 const SEARCH_RESULTS_PER_PAGE = 20;
-const { default: init, parse_index_summary, parse_index, search_index } = await import(`./pkg/moon_wasm.js?${BUILD_STAMP}`);
+const { default: init, parse_index_summary, parse_index, search_index, vector_search_index } = await import(`./pkg/moon_wasm.js?${BUILD_STAMP}`);
 const wasmBytes = await fetch(`./pkg/moon_wasm_bg.wasm?${BUILD_STAMP}`, { cache: 'no-store' })
   .then(r => r.ok ? r.arrayBuffer() : Promise.reject(r.status));
 await init(wasmBytes);
-window._wasm = { parse_index_summary, parse_index, search_index };
+window._wasm = { parse_index_summary, parse_index, search_index, vector_search_index };
 window.MOONSHOT_VIEWER_BUILD = BUILD_STAMP;
 
 let G = { bytes: null, parsed: null, sc: null };
@@ -466,14 +473,52 @@ function normalizeIndexEntry(e) {
 
 function docImportanceFromU16(value) { return value / 65535; }
 
+function decodePathPrefixSidecar(sidecar) {
+  const magic = textAt(sidecar, 0, 7);
+  if (magic !== 'MSPATHS') return [];
+  const version = u16(sidecar, 8);
+  if (version !== 1) return [];
+  const count = u16(sidecar, 10);
+  const entryOffset = u32(sidecar, 12);
+  const stringOffset = u32(sidecar, 16);
+  const stringBytes = u32(sidecar, 20);
+  if (entryOffset < 32 || stringOffset > sidecar.length || stringOffset + stringBytes > sidecar.length)
+    return [];
+  const prefixes = [];
+  for (let i = 0; i < count; i++) {
+    const off = entryOffset + i * 8;
+    if (off + 8 > sidecar.length) break;
+    const strOff = u32(sidecar, off);
+    const len = u16(sidecar, off + 4);
+    const begin = stringOffset + strOff;
+    const end = begin + len;
+    if (end > stringOffset + stringBytes || end > sidecar.length) break;
+    prefixes.push(textAt(sidecar, begin, len));
+  }
+  return prefixes;
+}
+
+function decodeDocPathPayload(payload, prefixes) {
+  if (!payload.length) return '';
+  if (payload.length < 2) return TEXT_DECODER.decode(payload);
+  const prefixId = new DataView(payload.buffer, payload.byteOffset, payload.byteLength).getUint16(0, true);
+  const filename = TEXT_DECODER.decode(payload.subarray(2));
+  if (prefixId === 0xffff || prefixId >= prefixes.length) return filename;
+  const prefix = prefixes[prefixId] || '';
+  if (!prefix) return filename;
+  const sep = prefix.includes('\\') ? '\\' : '/';
+  return prefix.endsWith('/') || prefix.endsWith('\\') ? prefix + filename : prefix + sep + filename;
+}
+
 function decodeDocRecord(rec, base, byteOffset) {
   const docId = u32(rec, base);
   const pathLen = Math.min(u16(rec, base + 18), 64);
+  const payload = pathLen ? rec.subarray(base + 192, base + 192 + pathLen) : new Uint8Array();
   return {
     doc_id: String(docId),
     importance: docImportanceFromU16(u16(rec, base + 4)),
     doc_len: u32(rec, base + 30),
-    path: pathLen ? textAt(rec, base + 192, pathLen) : '',
+    path: decodeDocPathPayload(payload, G.paged?.pathPrefixes || []),
     byte_offset: byteOffset,
   };
 }
@@ -530,12 +575,15 @@ async function loadPagedHeadDirectory() {
     docIdCache: new Map(),
     docPromiseCache: new Map(),
     docFirstId: 0,
+    pathPrefixes: [],
     blockOwnerCache: new Map(),
     continuationOwnerCache: new Map(),
     ownerScanPage: 0,
     ownerScanDone: false,
   };
   if (h.num_docs > 0) {
+    const sidecar = await rangeRead(136, PATH_PREFIX_SIDECAR_BYTES);
+    G.paged.pathPrefixes = decodePathPrefixSidecar(sidecar);
     const firstDoc = await rangeRead(h.docdata_off, 4);
     G.paged.docFirstId = u32(firstDoc, 0);
   }
@@ -1562,6 +1610,11 @@ window.runDocumentSearch = async function() {
   const input = document.getElementById('doc-search');
   const q = (input?.value || '').trim();
   const out = document.getElementById('srch-out');
+  const mode = document.getElementById('search-mode')?.value || 'text';
+  if (mode === 'vector') {
+    await runVectorDocumentSearch(q, out);
+    return;
+  }
   if (G.summaryOnly) {
     if (!q) {
       out.innerHTML = '<p class="srch-hint">Enter a query and press Enter.</p>';
@@ -1590,9 +1643,47 @@ window.runDocumentSearch = async function() {
     out.innerHTML = `<p class="srch-hint">Search failed: ${esc(e)}</p>`;
     return;
   }
+  if (res && !Array.isArray(res) && res.error) {
+    out.innerHTML = `<p class="srch-hint">Search failed: ${esc(res.error)}</p>`;
+    return;
+  }
 
   renderSearchResults(q, res, false);
 };
+
+async function runVectorDocumentSearch(q, out) {
+  if (!q) {
+    out.innerHTML = '<p class="srch-hint">Enter a query and press Enter.</p>';
+    switchTabByName('srch-panel');
+    return;
+  }
+  if (G.summaryOnly) {
+    out.innerHTML = '<p class="srch-hint">BGE vector search needs full index mode; load a smaller index or use text paged search.</p>';
+    switchTabByName('srch-panel');
+    return;
+  }
+  const host = (document.getElementById('bge-host')?.value || '127.0.0.1').trim();
+  const port = Number(document.getElementById('bge-port')?.value || 8765);
+  out.innerHTML = `<div class="search-summary">Embedding "${esc(q)}" via ${esc(host)}:${esc(String(port))}…</div>`;
+  switchTabByName('srch-panel');
+  try {
+    const embedResponse = await fetch('/embed-bge', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ host, port, text: q })
+    });
+    if (!embedResponse.ok) throw new Error(`embedding proxy returned ${embedResponse.status}`);
+    const embed = await embedResponse.json();
+    if (embed.error) throw new Error(embed.error);
+    if (!Array.isArray(embed.vector)) throw new Error('embedding response missing vector');
+    const raw = window._wasm.vector_search_index(G.bytes, JSON.stringify(embed.vector), 1000, 1000);
+    const res = JSON.parse(raw);
+    if (res && !Array.isArray(res) && res.error) throw new Error(res.error);
+    renderSearchResults(q, res, false);
+  } catch (e) {
+    out.innerHTML = `<p class="srch-hint">BGE vector search failed: ${esc(e)}</p>`;
+  }
+}
 
 function renderSearchResults(q, res, paged) {
   const out = document.getElementById('srch-out');

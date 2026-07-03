@@ -140,6 +140,23 @@ fn add_document_indexes_all_default_streams() {
 }
 
 #[test]
+fn load_from_bytes_supports_text_search_and_paths() {
+    let temp = tempfile::tempdir().unwrap();
+    let index_path = temp.path().join("bytes.idx");
+    let index_path_text = index_path.to_string_lossy().to_string();
+
+    let mut ctx = IndexContext::new();
+    add_doc_via_context(&mut ctx, 0, "alpha", "beta gamma", "dir/alpha.md");
+    ctx.SaveIndex(&index_path_text).unwrap();
+
+    let bytes = std::fs::read(&index_path).unwrap();
+    let mut loaded = IndexContext::new();
+    loaded.LoadFromBytes(&bytes).unwrap();
+    assert_eq!(loaded.GetDocPath(0), "dir/alpha.md");
+    assert!(search_doc_ids(&mut loaded, "alpha").contains(&0));
+}
+
+#[test]
 fn title_score_uses_title_length_instead_of_body_length() {
     let mut ctx = IndexContext::new();
     let short = Document {
