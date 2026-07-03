@@ -12,6 +12,7 @@ use crate::block_table::{
     LeafTermBlock,
     LeafTermEntry,
     DocDataDecodeScore,
+    PathPrefixSidecarEntry,
     PathPrefixSidecarHeader,
     DOC_PATH_MAX,
     DOC_REC_SIZE,
@@ -434,12 +435,13 @@ impl IndexSerializer {
     }
 
     pub fn decode(store: &mut PostingStore, data: &[u8])
-        -> Result<(Vec<HeadTermEntry>, Vec<LeafTermBlock>, Vec<IndexBlock>, Vec<u8>, TermMphfHeader, Vec<i32>, Vec<IndexBlock>)>
+        -> Result<(Vec<HeadTermEntry>, Vec<LeafTermBlock>, Vec<IndexBlock>, Vec<u8>, Vec<u8>, Vec<String>, TermMphfHeader, Vec<i32>, Vec<IndexBlock>)>
     {
         let header = IndexFileHeader::parse(data)?;
 
         if INDEX_FILE_HEADER_SIZE + PATH_PREFIX_SIDECAR_BYTES > data.len() { return Err(RustBladeError::InvalidFormat); }
-        let _prefixes = Self::DecodePathPrefixSidecar(&data[INDEX_FILE_HEADER_SIZE..INDEX_FILE_HEADER_SIZE + PATH_PREFIX_SIDECAR_BYTES])?;
+        let sidecar = data[INDEX_FILE_HEADER_SIZE..INDEX_FILE_HEADER_SIZE + PATH_PREFIX_SIDECAR_BYTES].to_vec();
+        let prefixes = Self::DecodePathPrefixSidecar(&sidecar)?;
 
         let head_offset = header.IFH_HeadTermEntryOffset as usize;
         let head_count = header.IFH_HeadTermEntryCount as usize;
@@ -512,7 +514,7 @@ impl IndexSerializer {
             (mphf_header, mphf_displacements, mphf_entry_pages)
         };
 
-        Ok((head, leaf_blocks, index_blocks, docdata, mphf_header, mphf_displacements, mphf_entry_pages))
+        Ok((head, leaf_blocks, index_blocks, docdata, sidecar, prefixes, mphf_header, mphf_displacements, mphf_entry_pages))
     }
 
     #[allow(non_snake_case)]

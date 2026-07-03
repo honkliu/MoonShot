@@ -13,7 +13,7 @@ find_program(WASM_PACK wasm-pack
     DOC "wasm-pack tool")
 
 if(NOT WASM_PACK)
-    message(STATUS "wasm-pack not found — skipping moon_wasm target")
+    message(FATAL_ERROR "wasm-pack not found. Install it with: cargo install wasm-pack")
 else()
     message(STATUS "wasm-pack found: ${WASM_PACK}")
 

@@ -624,7 +624,7 @@ impl IndexContext {
             }
             Self::encode_doc_path(&mut out[offset..offset + DOC_REC_SIZE], &stats.path, &mut prefix_to_id, &mut prefixes, &mut string_bytes);
         }
-        let sidecar = IndexSerializer::EncodePathPrefixSidecar(&prefixes).unwrap_or_else(|_| vec![0u8; PATH_PREFIX_SIDECAR_BYTES]);
+        let sidecar = IndexSerializer::EncodePathPrefixSidecar(&prefixes);
         (out, sidecar, prefixes)
     }
 
@@ -699,6 +699,7 @@ impl IndexContext {
         self.m_IndexPath = Some(path.to_string());
         let mut store = PostingStore::new();
         let (header, head_term_entries, docdata) = IndexSerializer::load_file_tables(&mut store, path)?;
+        let (pathPrefixSidecar, pathPrefixes) = IndexSerializer::LoadPathPrefixSidecar(path)?;
         let (mphfHeader, mphfDisplacements, mphfEntryPages) = IndexSerializer::LoadTermMphf(path, &header)?;
         let mut table = IndexBlockTable::new(header.IFH_IndexBlockCount as usize);
         table.InitFileBacked(
@@ -724,6 +725,8 @@ impl IndexContext {
         self.m_VectorBuilt = false;
         self.m_IndexFileHeader = header;
         self.m_DocData = docdata;
+        self.m_PathPrefixSidecar = pathPrefixSidecar;
+        self.m_PathPrefixes = pathPrefixes;
         self.m_Built       = true;
         self.m_LoadedFromDisk = true;
         self.LoadDeltaIndex();
@@ -733,7 +736,7 @@ impl IndexContext {
     /// Load from raw bytes (WASM path — no file system access needed).
     pub fn LoadFromBytes(&mut self, data: &[u8]) -> Result<()> {
         let mut store = PostingStore::new();
-        let (head_term_entries, leaf_term_blocks, blocks, docdata, mphfHeader, mphfDisplacements, mphfEntryPages) = IndexSerializer::decode(&mut store, data)?;
+        let (head_term_entries, leaf_term_blocks, blocks, docdata, pathPrefixSidecar, pathPrefixes, mphfHeader, mphfDisplacements, mphfEntryPages) = IndexSerializer::decode(&mut store, data)?;
         let mut table = IndexBlockTable::new(blocks.len().max(512) + 64);
         table.SetIndexBlocks(blocks);
         table.SetHeadLeafTermTable(head_term_entries, leaf_term_blocks);
@@ -749,6 +752,8 @@ impl IndexContext {
         self.m_VectorIndex = vector_index;
         self.m_VectorBuilt = false;
         self.m_DocData = docdata;
+        self.m_PathPrefixSidecar = pathPrefixSidecar;
+        self.m_PathPrefixes = pathPrefixes;
         self.m_Built       = true;
         self.m_LoadedFromDisk = true;
         Ok(())

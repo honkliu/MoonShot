@@ -71,7 +71,7 @@ pub fn parse_index(data: &[u8]) -> String {
 fn parse_index_inner(data: &[u8]) -> Result<String, String> {
     let header = parse_header(data)?;
     let mut store = PostingStore::new();
-    let (head_entries, leaf_blocks, blocks, _, _, _, _) = IndexSerializer::decode(&mut store, data)
+    let (head_entries, leaf_blocks, blocks, _, _, _, _, _, _) = IndexSerializer::decode(&mut store, data)
         .map_err(|error| format!("{error:?}"))?;
 
     let mut block_entry_map: HashMap<u32, Vec<LeafTermEntry>> = HashMap::new();
