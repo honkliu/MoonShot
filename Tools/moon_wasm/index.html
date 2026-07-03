@@ -411,8 +411,8 @@ function normalizeParsedIndex(parsed) {
     const old = parsed.term_header_table;
     parsed.head_leaf_term_table = {
       head: (old.dir || []).map(d => ({
-        hte_first_term: d.hte_first_term ?? d.first_term ?? '',
-        hte_leaf_term_block_id: d.hte_leaf_term_block_id ?? d.term_header_block_id ?? 0,
+          hte_first_term: d.hte_first_term ?? d.HTE_FirstTerm ?? d.first_term ?? '',
+          hte_leaf_term_block_id: d.hte_leaf_term_block_id ?? d.HTE_LeafTermBlockID ?? d.term_header_block_id ?? 0,
         byte_offset: d.byte_offset ?? 0,
         byte_len: d.byte_len ?? 0,
         leaf_term_block_offset: d.leaf_term_block_offset ?? d.header_block_offset ?? 0,
@@ -429,6 +429,14 @@ function normalizeParsedIndex(parsed) {
 
   parsed.head_leaf_term_table = parsed.head_leaf_term_table || { head: [], leaf_blocks: [] };
   parsed.head_leaf_term_table.head = parsed.head_leaf_term_table.head || [];
+  parsed.head_leaf_term_table.head = parsed.head_leaf_term_table.head.map(d => ({
+    hte_first_term: d.hte_first_term ?? d.HTE_FirstTerm ?? d.first_term ?? '',
+    hte_leaf_term_block_id: d.hte_leaf_term_block_id ?? d.HTE_LeafTermBlockID ?? d.term_header_block_id ?? 0,
+    byte_offset: d.byte_offset ?? 0,
+    byte_len: d.byte_len ?? 0,
+    leaf_term_block_offset: d.leaf_term_block_offset ?? d.header_block_offset ?? 0,
+    leaf_term_block_len: d.leaf_term_block_len ?? d.header_block_len ?? 0,
+  }));
   parsed.head_leaf_term_table.leaf_blocks = parsed.head_leaf_term_table.leaf_blocks || [];
   parsed.head_leaf_term_table.leaf_blocks = parsed.head_leaf_term_table.leaf_blocks.map(b => ({
     id: b.id,
@@ -451,14 +459,14 @@ function normalizeParsedIndex(parsed) {
 
 function normalizeLeafTermEntry(e) {
   return {
-    lte_term: e.lte_term ?? e.term ?? '',
-    lte_doc_freq: e.lte_doc_freq ?? e.doc_freq ?? 0,
-    lte_index_block_id: e.lte_index_block_id ?? e.posting_block_id ?? 0,
-    lte_index_offset: e.lte_index_offset ?? e.posting_offset ?? 0,
-    lte_index_length: e.lte_index_length ?? e.posting_length ?? 0,
+     lte_term: e.lte_term ?? e.LTE_Term ?? e.term ?? '',
+     lte_doc_freq: e.lte_doc_freq ?? e.LTE_DocFreq ?? e.doc_freq ?? 0,
+     lte_index_block_id: e.lte_index_block_id ?? e.LTE_IndexBlockID ?? e.posting_block_id ?? 0,
+     lte_index_offset: e.lte_index_offset ?? e.LTE_IndexOffset ?? e.posting_offset ?? 0,
+     lte_index_length: e.lte_index_length ?? e.LTE_IndexLength ?? e.posting_length ?? 0,
     lte_page_skip_offset: e.lte_page_skip_offset ?? e.skip_list_offset ?? 0,
-    lte_continuation_block_count: e.lte_continuation_block_count ?? e.continuation_block_count ?? 0,
-    lte_flags: e.lte_flags ?? e.flags ?? 0,
+     lte_continuation_block_count: e.lte_continuation_block_count ?? e.LTE_ContinuationBlockCount ?? e.continuation_block_count ?? 0,
+     lte_flags: e.lte_flags ?? e.LTE_Flags ?? e.flags ?? 0,
     byte_offset: e.byte_offset ?? 0,
     byte_len: e.byte_len ?? 0,
   };
@@ -576,12 +584,15 @@ async function loadPagedHeadDirectory() {
     docPromiseCache: new Map(),
     docFirstId: 0,
     pathPrefixes: [],
+    pathPrefixes: [],
     blockOwnerCache: new Map(),
     continuationOwnerCache: new Map(),
     ownerScanPage: 0,
     ownerScanDone: false,
   };
   if (h.num_docs > 0) {
+    const sidecar = await rangeRead(136, PATH_PREFIX_SIDECAR_BYTES);
+    G.paged.pathPrefixes = decodePathPrefixSidecar(sidecar);
     const sidecar = await rangeRead(136, PATH_PREFIX_SIDECAR_BYTES);
     G.paged.pathPrefixes = decodePathPrefixSidecar(sidecar);
     const firstDoc = await rangeRead(h.docdata_off, 4);
