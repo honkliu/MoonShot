@@ -584,15 +584,12 @@ async function loadPagedHeadDirectory() {
     docPromiseCache: new Map(),
     docFirstId: 0,
     pathPrefixes: [],
-    pathPrefixes: [],
     blockOwnerCache: new Map(),
     continuationOwnerCache: new Map(),
     ownerScanPage: 0,
     ownerScanDone: false,
   };
   if (h.num_docs > 0) {
-    const sidecar = await rangeRead(136, PATH_PREFIX_SIDECAR_BYTES);
-    G.paged.pathPrefixes = decodePathPrefixSidecar(sidecar);
     const sidecar = await rangeRead(136, PATH_PREFIX_SIDECAR_BYTES);
     G.paged.pathPrefixes = decodePathPrefixSidecar(sidecar);
     const firstDoc = await rangeRead(h.docdata_off, 4);
