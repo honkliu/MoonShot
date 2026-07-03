@@ -42,10 +42,10 @@ inline constexpr QueryCompileModeParameters kWeakAndBigramBoostParameters{
 };
 
 inline constexpr QueryCompileModeParameters kWeakAndBigramBoostForDocParameters{
-    0.15f, 0.5f, 0.25f,
-    0.0f, 0.0f, 0.0f, 0.0f, 1.0f,
-    96.0f,
-    1.5f, 0.75f, 1.25f, 1.0f
+    0.09f, 0.5f, 4.0f,
+    0.25f, 2.0f, 1.0f, 0.1f, 1.0f,
+    128.0f,
+    1.0f, 1.0f, 1.0f, 1.0f
 };
 
 inline const QueryCompileModeParameters& GetQueryCompileModeParameters(QueryCompileMode mode)
