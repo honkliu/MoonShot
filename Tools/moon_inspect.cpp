@@ -337,7 +337,7 @@ static void emit(std::ostream& out, const Index& index, const char* path)
 
     out << "<div class='panel' id='docs'><table><tr><th>DocID</th><th>Importance</th><th>DocLen</th><th>Path</th></tr>";
     for (const auto& doc : index.docs) {
-        out << "<tr><td class='mono num'>" << doc.DDE_DocID << "</td><td class='num'>" << doc.DDE_StaticRank << "</td><td class='num'>" << doc.DDE_DocLength << "</td><td class='path'>" << esc(doc_path(doc)) << "</td></tr>";
+        out << "<tr><td class='mono num'>" << doc.DDE_DocID << "</td><td class='num'>" << DocDataDecodeScore(doc.DDE_StaticRank) << "</td><td class='num'>" << doc.DDE_BodyLength << "</td><td class='path'>" << esc(doc_path(doc)) << "</td></tr>";
     }
     out << "</table></div>";
 
