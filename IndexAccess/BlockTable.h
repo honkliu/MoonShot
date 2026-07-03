@@ -21,6 +21,10 @@
 #include "ElementFilter.h"
 #include "MemOperation.h"
 
+#ifdef _WIN32
+#pragma comment(lib, "Synchronization.lib")
+#endif
+
 static constexpr int PAGE_SIZE  = 4096;
 static constexpr size_t DOC_REC_SIZE = 256;
 static constexpr size_t DOC_VECTOR_DIM = 128;
@@ -308,6 +312,8 @@ class IndexBlockTable
         };
 
     private:
+        static constexpr uint64_t BLOCK_REQUEST_RING_SIZE = 1ull << 16;
+
         enum class BlockRequestType {
             Get,
             Release
@@ -318,8 +324,35 @@ class IndexBlockTable
             uint32_t BlockSeq = 0;
             uint32_t Slot = UINT32_MAX;
             void* Address = nullptr;
+#ifdef _WIN32
+            std::atomic<uint32_t> Done{0};
+
+            void Wait()
+            {
+                uint32_t expected = 0;
+                while (Done.load(std::memory_order_acquire) == 0)
+                    WaitOnAddress(reinterpret_cast<volatile void*>(&Done), &expected, sizeof(expected), INFINITE);
+            }
+
+            void Complete()
+            {
+                Done.store(1, std::memory_order_release);
+                WakeByAddressSingle(reinterpret_cast<void*>(&Done));
+            }
+#else
             std::latch Completion{1};
+
+            void Wait() { Completion.wait(); }
+            void Complete() { Completion.count_down(); }
+#endif
         };
+
+#ifdef _WIN32
+        struct BlockRequestRingSlot {
+            std::atomic<uint64_t> Sequence{0};
+            BlockRequest* Request = nullptr;
+        };
+#endif
 
     public:
         struct BlockCachePool {
@@ -334,10 +367,15 @@ class IndexBlockTable
             std::thread                       BCP_Thread;
             std::mutex                        BCP_StateMutex;
             std::condition_variable           BCP_StateCv;
+#ifdef _WIN32
+            std::unique_ptr<BlockRequestRingSlot[]> BCP_RequestRing;
+            std::atomic<uint64_t>             BCP_RequestTail{0};
+            uint64_t                          BCP_RequestHead = 0;
+#endif
             std::mutex                        BCP_RequestMutex;
             std::condition_variable           BCP_RequestCv;
             std::deque<BlockRequest*>         BCP_Requests;
-            bool                              BCP_ExitThread = false;
+            std::atomic<bool>                 BCP_ExitThread = false;
         };
 
         explicit IndexBlockTable(uint32_t = 0) {}
@@ -503,12 +541,16 @@ class IndexBlockTable
             BlockRequest request;
             request.Type = BlockRequestType::Get;
             request.BlockSeq = block_seq;
+#ifdef _WIN32
+            SubmitBlockRequest(pool, &request);
+#else
             {
                 std::lock_guard<std::mutex> lock(pool.BCP_RequestMutex);
                 pool.BCP_Requests.push_back(&request);
             }
             pool.BCP_RequestCv.notify_one();
-            request.Completion.wait();
+#endif
+            request.Wait();
             *slotOut = request.Slot;
             return request.Address;
         }
@@ -816,6 +858,11 @@ class IndexBlockTable
             dest.BCP_LogicTable = source.BCP_LogicTable;
             dest.BCP_SlotTable = source.BCP_SlotTable;
             dest.BCP_File = source.BCP_File;
+#ifdef _WIN32
+            dest.BCP_RequestRing = std::move(source.BCP_RequestRing);
+            dest.BCP_RequestHead = source.BCP_RequestHead;
+            dest.BCP_RequestTail.store(source.BCP_RequestTail.load(std::memory_order_relaxed), std::memory_order_relaxed);
+#endif
             dest.BCP_Requests.clear();
             dest.BCP_ExitThread = false;
 
@@ -827,6 +874,10 @@ class IndexBlockTable
             source.BCP_LogicTable = nullptr;
             source.BCP_SlotTable = nullptr;
             source.BCP_File = nullptr;
+#ifdef _WIN32
+            source.BCP_RequestHead = 0;
+            source.BCP_RequestTail.store(0, std::memory_order_relaxed);
+#endif
             source.BCP_Requests.clear();
             source.BCP_ExitThread = false;
         }
@@ -837,6 +888,9 @@ class IndexBlockTable
                 return;
             if (pool.BCP_Pages && pool.BCP_SlotCount && !pool.BCP_Thread.joinable()) {
                 pool.BCP_ExitThread = false;
+#ifdef _WIN32
+                ResetRequestRing(pool);
+#endif
                 BlockCachePool* target = &pool;
                 pool.BCP_Thread = std::thread([this, target]() { BlockThreadMain(*target); });
             }
@@ -849,7 +903,12 @@ class IndexBlockTable
                 std::lock_guard<std::mutex> lock(pool.BCP_RequestMutex);
                 pool.BCP_ExitThread = true;
             }
+#ifdef _WIN32
+            pool.BCP_ExitThread = true;
+            WakeByAddressAll(reinterpret_cast<void*>(&pool.BCP_RequestTail));
+#else
             pool.BCP_RequestCv.notify_one();
+#endif
             pool.BCP_Thread.join();
         }
 
@@ -897,10 +956,72 @@ class IndexBlockTable
             return pool.BCP_LogicTable[startBlock] != UINT32_MAX;
         }
 
+#ifdef _WIN32
+        void ResetRequestRing(BlockCachePool& pool)
+        {
+            if (!pool.BCP_RequestRing)
+                pool.BCP_RequestRing = std::make_unique<BlockRequestRingSlot[]>(BLOCK_REQUEST_RING_SIZE);
+            pool.BCP_RequestHead = 0;
+            pool.BCP_RequestTail.store(0, std::memory_order_relaxed);
+            for (uint64_t i = 0; i < BLOCK_REQUEST_RING_SIZE; ++i) {
+                pool.BCP_RequestRing[i].Request = nullptr;
+                pool.BCP_RequestRing[i].Sequence.store(i, std::memory_order_relaxed);
+            }
+        }
+
+        void SubmitBlockRequest(BlockCachePool& pool, BlockRequest* request)
+        {
+            const uint64_t pos = pool.BCP_RequestTail.fetch_add(1, std::memory_order_acq_rel);
+            auto& slot = pool.BCP_RequestRing[pos & (BLOCK_REQUEST_RING_SIZE - 1)];
+            uint32_t spins = 0;
+            while (slot.Sequence.load(std::memory_order_acquire) != pos) {
+                if (++spins < 256)
+                    YieldProcessor();
+                else {
+                    uint64_t expected = slot.Sequence.load(std::memory_order_relaxed);
+                    if (expected != pos)
+                        WaitOnAddress(reinterpret_cast<volatile void*>(&slot.Sequence), &expected, sizeof(expected), 1);
+                }
+            }
+            slot.Request = request;
+            slot.Sequence.store(pos + 1, std::memory_order_release);
+            WakeByAddressSingle(reinterpret_cast<void*>(&pool.BCP_RequestTail));
+        }
+
+        BlockRequest* TryPopBlockRequest(BlockCachePool& pool)
+        {
+            auto& slot = pool.BCP_RequestRing[pool.BCP_RequestHead & (BLOCK_REQUEST_RING_SIZE - 1)];
+            const uint64_t ready = pool.BCP_RequestHead + 1;
+            if (slot.Sequence.load(std::memory_order_acquire) != ready)
+                return nullptr;
+            BlockRequest* request = slot.Request;
+            slot.Request = nullptr;
+            slot.Sequence.store(pool.BCP_RequestHead + BLOCK_REQUEST_RING_SIZE, std::memory_order_release);
+            WakeByAddressAll(reinterpret_cast<void*>(&slot.Sequence));
+            ++pool.BCP_RequestHead;
+            return request;
+        }
+#endif
+
         void BlockThreadMain(BlockCachePool& pool)
         {
             while (true) {
                 BlockRequest* request = nullptr;
+#ifdef _WIN32
+                uint32_t idleSpins = 0;
+                while (!(request = TryPopBlockRequest(pool))) {
+                    if (pool.BCP_ExitThread.load(std::memory_order_acquire)
+                        && pool.BCP_RequestHead == pool.BCP_RequestTail.load(std::memory_order_acquire))
+                        return;
+                    if (++idleSpins < 4096)
+                        YieldProcessor();
+                    else {
+                        uint64_t observedTail = pool.BCP_RequestTail.load(std::memory_order_acquire);
+                        if (pool.BCP_RequestHead == observedTail && !pool.BCP_ExitThread.load(std::memory_order_acquire))
+                            WaitOnAddress(reinterpret_cast<volatile void*>(&pool.BCP_RequestTail), &observedTail, sizeof(observedTail), 1);
+                    }
+                }
+#else
                 {
                     std::unique_lock<std::mutex> lock(pool.BCP_RequestMutex);
                     while (!pool.BCP_ExitThread && pool.BCP_Requests.empty())
@@ -910,13 +1031,14 @@ class IndexBlockTable
                     request = pool.BCP_Requests.front();
                     pool.BCP_Requests.pop_front();
                 }
+#endif
 
                 if (request->Type == BlockRequestType::Get)
                     ProcessGetBlockLocked(pool, *request);
                 else if (request->Type == BlockRequestType::Release)
                     ProcessReleaseBlockLocked(pool, *request);
 
-                request->Completion.count_down();
+                request->Complete();
             }
         }
 
