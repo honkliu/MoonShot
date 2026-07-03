@@ -2355,7 +2355,9 @@ static int RunBeirEval(const std::string& idxPath, const BeirEvalOptions& option
         ctx.SetLeafTermCacheBytes(leafCacheBytes);
     ctx.LoadIndex(idxPath.c_str());
     ctx.SetTermMphfEnabled(!options.noMphf);
-    ctx.SetDirectBlockAccessEnabled(true);
+    const char* blockAccessMode = std::getenv("MOONSHOT_BLOCK_ACCESS");
+    const bool useWorkerBlockAccess = blockAccessMode && std::string(blockAccessMode) == "worker";
+    ctx.SetDirectBlockAccessEnabled(!useWorkerBlockAccess);
     const QueryCompileMode compileMode = BeirCompileMode(options.mode);
     auto parameters = GetQueryCompileModeParameters(compileMode);
     ctx.SetQueryParameters(parameters);
@@ -2490,6 +2492,16 @@ static int RunBeirEval(const std::string& idxPath, const BeirEvalOptions& option
               << " queries=" << evaluated
               << " missing_qrels=" << missingQrels
               << " elapsed_ms=" << elapsedMs << "\n";
+    if (std::getenv("MOONSHOT_BLOCK_STATS")) {
+        const auto stats = ctx.GetBlockAccessStats();
+        std::cout << "BlockAccess direct_gets=" << stats.DirectGets
+                  << " direct_releases=" << stats.DirectReleases
+                  << " worker_gets=" << stats.WorkerGets
+                  << " worker_releases=" << stats.WorkerReleases
+                  << " cache_hits=" << stats.CacheHits
+                  << " cache_misses=" << stats.CacheMisses
+                  << " disk_reads=" << stats.DiskReads << "\n";
+    }
     std::cout << std::fixed << std::setprecision(4);
     for (size_t i = 0; i < options.at.size(); ++i) {
         const double macro = macroRecall[i] / static_cast<double>(evaluated);

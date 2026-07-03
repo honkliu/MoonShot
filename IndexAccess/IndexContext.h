@@ -308,6 +308,11 @@ public:
             m_DeltaContext->SetDirectBlockAccessEnabled(enabled);
     }
 
+    IndexBlockTable::BlockAccessStats GetBlockAccessStats() const
+    {
+        return m_BlockTable.GetBlockAccessStats();
+    }
+
     void SetWeakAndBuildMode(WeakAndBuildMode mode)
     {
         m_WeakAndBuildMode = mode;
