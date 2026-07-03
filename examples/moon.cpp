@@ -357,10 +357,32 @@ static std::string Stem(const std::string& path)
     return name;
 }
 
+struct SearchOptions {
+    bool inverted = false;
+    bool vector = false;
+    bool bge = false;
+    bool bgeSidecar = false;
+    size_t topK = 1000;
+    size_t vectorEf = 1000;
+    std::string bgeHost = "127.0.0.1";
+    uint16_t bgePort = 8765;
+    std::string bgePython;
+    std::string bgeScript;
+    std::string bgeModel = "BAAI/bge-small-en-v1.5";
+};
+
+static constexpr size_t BGE_MAX_TEXT_BYTES = 65536;
+static constexpr const char* BGE_DOCUMENT_MARKER = "__MOONSHOT_BGE_DOCUMENT__\n";
+
+static bool EmbedDocumentWithBge(const std::string& text,
+                                 const SearchOptions& options,
+                                 std::vector<float>& vector);
+
 // ─── index: build one batch delta ─────────────────────────────────────────────
 
 static bool BuildIndexFile(const std::string& savePath,
                            const PathMap& pathMap,
+                           const SearchOptions& embeddingOptions,
                            uint64_t& kept,
                            uint64_t& skipped,
                            std::set<std::string>* reportedSkippedPaths = nullptr)
@@ -385,7 +407,24 @@ static bool BuildIndexFile(const std::string& savePath,
         doc.path = fp;
         doc.title = Stem(fp);
         doc.body = std::move(content);
-        ctx.AddDocument(doc);
+        ctx.AddDocument(doc, !embeddingOptions.bge);
+        if (embeddingOptions.bge) {
+            std::string embeddingText = doc.title;
+            if (!doc.body.empty()) {
+                if (!embeddingText.empty())
+                    embeddingText.push_back('\n');
+                embeddingText += doc.body;
+            }
+            if (embeddingText.size() > BGE_MAX_TEXT_BYTES - std::strlen(BGE_DOCUMENT_MARKER))
+                embeddingText.resize(BGE_MAX_TEXT_BYTES - std::strlen(BGE_DOCUMENT_MARKER));
+
+            std::vector<float> vector;
+            if (EmbedDocumentWithBge(embeddingText, embeddingOptions, vector)) {
+                ctx.GetWriter()->SetDocVector(id, std::move(vector));
+            } else {
+                std::cerr << "  warning: BGE document embedding failed; added without vector: " << fp << "\n";
+            }
+        }
         ++kept;
 
         if (processed == total || processed % 25 == 0) {
@@ -437,20 +476,6 @@ struct SearchHit {
     SearchResult result;
 };
 
-struct SearchOptions {
-    bool inverted = false;
-    bool vector = false;
-    bool bge = false;
-    bool bgeSidecar = false;
-    size_t topK = 1000;
-    size_t vectorEf = 1000;
-    std::string bgeHost = "127.0.0.1";
-    uint16_t bgePort = 8765;
-    std::string bgePython;
-    std::string bgeScript;
-    std::string bgeModel = "BAAI/bge-small-en-v1.5";
-};
-
 static std::string SearchStreamSet(const SearchOptions& options)
 {
     std::string streams;
@@ -496,9 +521,6 @@ static std::string DefaultBgeScript()
     const std::string local = ".\\Tools\\embed_query.py";
     return std::filesystem::is_regular_file(FsPathFromUtf8(local)) ? local : "Tools/embed_query.py";
 }
-
-static constexpr size_t BGE_MAX_TEXT_BYTES = 65536;
-static constexpr const char* BGE_DOCUMENT_MARKER = "__MOONSHOT_BGE_DOCUMENT__\n";
 
 static bool ReadSingleI8Vector(const std::string& path, std::vector<float>& vector)
 {
@@ -1043,6 +1065,7 @@ struct IndexOptions {
     std::vector<std::string> extensions = ParseExtensions("md,txt");
     uint64_t batchSize = 10000;
     bool recursive = false;
+    SearchOptions embedding;
 };
 
 struct SampleMergeOptions {
@@ -1239,6 +1262,27 @@ static bool ParseIndexOptions(const std::vector<std::string>& args,
             if (options.batchSize < 10000) { error = "-b must be at least 10000 for indexing performance"; return false; }
         } else if (arg == "-r") {
             options.recursive = true;
+        } else if (arg == "-bge") {
+            options.embedding.bge = true;
+        } else if (arg == "-bge-sidecar") {
+            options.embedding.bgeSidecar = true;
+        } else if (arg == "-bge-python") {
+            if (i + 1 >= args.size()) { error = "Usage: moon -file <file> -bge -bge-python <python>"; return false; }
+            options.embedding.bgePython = args[++i];
+        } else if (arg == "-bge-script") {
+            if (i + 1 >= args.size()) { error = "Usage: moon -file <file> -bge -bge-script <embed_query.py>"; return false; }
+            options.embedding.bgeScript = args[++i];
+        } else if (arg == "-bge-model") {
+            if (i + 1 >= args.size()) { error = "Usage: moon -file <file> -bge -bge-model <model>"; return false; }
+            options.embedding.bgeModel = args[++i];
+        } else if (arg == "-bge-host") {
+            if (i + 1 >= args.size()) { error = "Usage: moon -file <file> -bge -bge-host <host>"; return false; }
+            options.embedding.bgeHost = args[++i];
+        } else if (arg == "-bge-port") {
+            if (i + 1 >= args.size()) { error = "Usage: moon -file <file> -bge -bge-port <port>"; return false; }
+            uint64_t value = 0;
+            if (!ParseUInt64(args[++i], value) || value == 0 || value > 65535) { error = "-bge-port must be 1..65535"; return false; }
+            options.embedding.bgePort = static_cast<uint16_t>(value);
         } else {
             error = "Unknown option: " + arg;
             return false;
@@ -1251,7 +1295,7 @@ static bool ParseIndexOptions(const std::vector<std::string>& args,
     }
     if (!options.filePath.empty() || !options.dirPath.empty())
         return true;
-    error = "Usage: moon -file <filename> | moon -dir <directory> [-ext md,txt] [-r] [-b 10000]";
+    error = "Usage: moon -file <filename> | moon -dir <directory> [-ext md,txt] [-r] [-b 10000] [-bge [-bge-host host] [-bge-port port]]";
     return false;
 }
 
@@ -1424,12 +1468,13 @@ static void PrintHelp(const std::string& idxPath)
         << "  -idx <index-path>                  Use this index instead of the default\n"
         << "                                     Default: " << idxPath << "\n\n"
         << "Build or update an index:\n"
-        << "  moon [-idx <index>] -file <file>\n"
-        << "      Index one file.\n\n"
-        << "  moon [-idx <index>] -dir <dir> -ext md,txt [-r] [-b 10000]\n"
+        << "  moon [-idx <index>] -file <file> [-bge [-bge-host 127.0.0.1] [-bge-port 8765]]\n"
+        << "      Index one file. With -bge, store document vectors from the configured BGE service.\n\n"
+        << "  moon [-idx <index>] -dir <dir> -ext md,txt [-r] [-b 10000] [-bge [-bge-host 127.0.0.1] [-bge-port 8765]]\n"
         << "      Index files under <dir>. Use -r for recursive traversal.\n"
         << "      -ext is a comma-separated extension list without or with dots.\n"
-        << "      -b controls how many new files are saved per delta batch; minimum 10000.\n\n"
+        << "      -b controls how many new files are saved per delta batch; minimum 10000.\n"
+        << "      With -bge, store document vectors from the configured BGE service.\n\n"
         << "Search an index:\n"
         << "  moon [-idx <index>] -i\n"
         << "      Open an interactive inverted-index search prompt.\n\n"
@@ -2651,7 +2696,7 @@ static int RunIndexCommand(const std::string& idxPath, const IndexOptions& optio
         std::cout << "Batch " << (savedBatches + 1) << ": adding "
                   << batchNewCount << " new file(s), merging "
                   << indexedMap.size() << " total document(s) into " << idxPath << "\n";
-        if (!BuildIndexFile(batchPath, batchMap, kept, skipped, &reportedSkippedPaths)) {
+        if (!BuildIndexFile(batchPath, batchMap, options.embedding, kept, skipped, &reportedSkippedPaths)) {
             std::cerr << "Failed to save batch index: " << batchPath << "\n";
             return 1;
         }
