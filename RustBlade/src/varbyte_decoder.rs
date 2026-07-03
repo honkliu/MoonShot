@@ -56,11 +56,15 @@ impl VarByteDecoder {
             self.m_HasCurrent = false;
             return;
         }
-        let (tf, m) = VbRead(&block.IB_Data, self.m_CurrentPtr);
-        self.m_CurrentPtr += m;
+        if self.m_CurrentPtr >= self.m_BlockEnd {
+            self.m_HasCurrent = false;
+            return;
+        }
+        let tf = block.IB_Data[self.m_CurrentPtr] as u32;
+        self.m_CurrentPtr += 1;
 
         self.m_CurrentDoc  = docID;
-        self.m_CurrentTf   = tf as u32;
+        self.m_CurrentTf   = tf;
         self.m_HasCurrent  = true;
     }
 

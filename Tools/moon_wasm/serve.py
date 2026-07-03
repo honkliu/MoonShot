@@ -12,6 +12,8 @@ import sys, os, json, struct, http.server, socketserver, urllib.parse, mimetypes
 idx_path = sys.argv[1] if len(sys.argv) > 1 else ''
 port     = int(sys.argv[2]) if len(sys.argv) > 2 else 8080
 LARGE_INDEX_COPY_LIMIT = 128 * 1024 * 1024
+DOC_REC_SIZE = 256
+DOC_PATH_MAX = 64
 
 # Write a tiny config that index.html reads to auto-load the idx.
 # Path is made relative to the HTTP server root (this script's directory).
@@ -129,22 +131,32 @@ class MoonShotHandler(http.server.SimpleHTTPRequestHandler):
 
             try:
                 with open(served_idx_abs, 'rb') as f:
-                    header = f.read(96)
-                    if len(header) < 96 or header[:8] != b'MOONSHOT':
+                    header = f.read(136)
+                    if len(header) < 136 or header[:8] != b'MOONSHOT':
                         self.send_error(400, 'invalid idx header')
                         return
                     num_docs = struct.unpack_from('<Q', header, 16)[0]
-                    docdata_off = struct.unpack_from('<Q', header, 56)[0]
+                    docdata_off = struct.unpack_from('<Q', header, 64)[0]
+                    first_doc_id = 0
+                    if num_docs:
+                        f.seek(docdata_off)
+                        first = f.read(DOC_REC_SIZE)
+                        if len(first) == DOC_REC_SIZE:
+                            first_doc_id = struct.unpack_from('<I', first, 0)[0]
                     out = {}
                     for doc_id in ids:
-                        if doc_id < 1 or doc_id > num_docs:
+                        ordinal = doc_id - first_doc_id
+                        if ordinal < 0 or ordinal >= num_docs:
                             continue
-                        f.seek(docdata_off + (doc_id - 1) * 1024)
-                        rec = f.read(1024)
-                        if len(rec) < 1024:
+                        f.seek(docdata_off + ordinal * DOC_REC_SIZE)
+                        rec = f.read(DOC_REC_SIZE)
+                        if len(rec) < DOC_REC_SIZE:
                             continue
-                        path_len = min(struct.unpack_from('<H', rec, 16)[0], 999)
-                        path = rec[24:24 + path_len].decode('utf-8', errors='replace') if path_len else ''
+                        stored_doc_id = struct.unpack_from('<I', rec, 0)[0]
+                        if stored_doc_id != doc_id:
+                            continue
+                        path_len = min(struct.unpack_from('<H', rec, 18)[0], DOC_PATH_MAX)
+                        path = rec[192:192 + path_len].decode('utf-8', errors='replace') if path_len else ''
                         out[str(doc_id)] = path
             except OSError as exc:
                 self.send_error(500, str(exc))

@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use wasm_bindgen::prelude::*;
 
-// Rust/WASM inspection surface for the C++ v14 index format. There is no native
+// Rust/WASM inspection surface for the C++ v19 index format. There is no native
 // C++ peer file; the binary structures below mirror BlockTable.h/IndexSerializer.h.
 
 use crate::block_table::{
@@ -208,13 +208,13 @@ fn decode_block_terms(block: &IndexBlock, entries: &[LeafTermEntry]) -> Vec<Stri
         let len = entry.LTE_IndexLength as usize;
         if start + len > PAGE_SIZE { continue; }
         let postings = decode_postings(&block.IB_Data[start..start + len]);
-        terms.push(format_postings(
-            &entry.LTE_Term,
-            entry.LTE_DocFreq,
-            start,
-            len,
-            entry.LTE_ContinuationBlockCount,
-            postings));
+            terms.push(format_postings(
+                &entry.LTE_Term,
+                entry.LTE_DocFreq,
+                start,
+                len,
+                entry.LTE_ContinuationBlockCount as u32,
+                postings));
     }
 
     terms
@@ -255,9 +255,9 @@ fn decode_postings(data: &[u8]) -> Vec<(u64, u32)> {
         let (doc_id, doc_bytes) = vb_read(data, pos);
         pos += doc_bytes;
         if pos >= data.len() { break; }
-        let (tf, tf_bytes) = vb_read(data, pos);
-        pos += tf_bytes;
-        result.push((doc_id, tf as u32));
+        let tf = data[pos] as u32;
+        pos += 1;
+        result.push((doc_id, tf));
     }
     result
 }

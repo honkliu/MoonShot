@@ -217,10 +217,12 @@ tr:hover td { background:#2a2d2e; cursor:pointer; }
 <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/auto-render.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/mermaid@10.9.1/dist/mermaid.min.js"></script>
 <script type="module">
-const BUILD_STAMP = 'v12-20260619-1';
+const BUILD_STAMP = 'v19-20260703-2';
 const LARGE_INDEX_LIMIT = 128 * 1024 * 1024;
 const PAGE_SIZE = 4096;
-const DOC_REC_SIZE = 1024;
+const DOC_REC_SIZE = 256;
+const LEAF_TERM_DIRECTORY_COUNT = 161;
+const LEAF_TERM_DATA_OFFSET = LEAF_TERM_DIRECTORY_COUNT * 2;
 const HEAD_ROWS_PER_PAGE = 32;
 const DOCDATA_ROWS_PER_PAGE = 32;
 const INDEXBLOCKS_PER_PAGE = 32;
@@ -462,6 +464,28 @@ function normalizeIndexEntry(e) {
   };
 }
 
+function docImportanceFromU16(value) { return value / 65535; }
+
+function decodeDocRecord(rec, base, byteOffset) {
+  const docId = u32(rec, base);
+  const pathLen = Math.min(u16(rec, base + 18), 64);
+  return {
+    doc_id: String(docId),
+    importance: docImportanceFromU16(u16(rec, base + 4)),
+    doc_len: u32(rec, base + 30),
+    path: pathLen ? textAt(rec, base + 192, pathLen) : '',
+    byte_offset: byteOffset,
+  };
+}
+
+function docOrdinalForId(docId) {
+  const id = Number(docId);
+  const first = Number(G.paged?.docFirstId ?? 0);
+  if (!Number.isFinite(id) || id < first) return -1;
+  const ordinal = id - first;
+  return ordinal >= 0 && ordinal < Number(G.parsed.header.num_docs || 0) ? ordinal : -1;
+}
+
 // ── paged large-index helpers ────────────────────────────────────────────────
 async function rangeRead(start, length) {
   const res = await fetch(`/idx-range?start=${start}&length=${length}&_=${BUILD_STAMP}-${Date.now()}`, { cache: 'no-store' });
@@ -479,45 +503,42 @@ function textAt(bytes, off, len) { return TEXT_DECODER.decode(bytes.subarray(off
 async function loadPagedHeadDirectory() {
   if (!G.summaryOnly) return;
   const h = G.parsed.header;
-  const prefix = await rangeRead(h.subindex_off, Math.min(h.subindex_size, 16 * 1024 * 1024));
-  let p = 0;
-  const headCount = u32(prefix, p); p += 4;
+  const headBytes = await rangeRead(h.head_term_off, h.head_term_count * 32);
   const head = [];
-  for (let i = 0; i < headCount; i++) {
-    const entryStart = p;
-    const len = u16(prefix, p); p += 2;
-    const first = textAt(prefix, p, len); p += len;
-    const blockId = u32(prefix, p); p += 4;
+  for (let i = 0; i < h.head_term_count; i++) {
+    const entryStart = i * 32;
+    const blockId = u32(headBytes, entryStart);
+    const len = Math.min(u16(headBytes, entryStart + 4), 26);
+    const first = textAt(headBytes, entryStart + 6, len);
     head.push({
       hte_first_term: first,
       hte_leaf_term_block_id: blockId,
-      byte_offset: h.subindex_off + entryStart,
-      byte_len: 2 + len + 4,
-      leaf_term_block_offset: 0,
+      byte_offset: h.head_term_off + entryStart,
+      byte_len: 32,
+      leaf_term_block_offset: h.leaf_term_off + blockId * PAGE_SIZE,
       leaf_term_block_len: PAGE_SIZE,
     });
-  }
-  const leafCountOffset = h.subindex_off + p;
-  const leafTermBlockCount = p + 4 <= prefix.length ? u32(prefix, p) : 0;
-  p += 4;
-  const leafBase = leafCountOffset + 4;
-  for (const d of head) {
-    d.leaf_term_block_offset = leafBase + d.hte_leaf_term_block_id * PAGE_SIZE;
   }
   G.parsed.head_leaf_term_table.head = head;
   G.parsed.head_leaf_term_table.leaf_blocks = [];
   G.paged = {
-    leafBase,
-    leafTermBlockCount,
+    leafBase: h.leaf_term_off,
+    leafTermBlockCount: h.leaf_term_count,
     leafCache: new Map(),
     blockCache: new Map(),
     docCache: new Map(),
+    docIdCache: new Map(),
     docPromiseCache: new Map(),
+    docFirstId: 0,
     blockOwnerCache: new Map(),
     continuationOwnerCache: new Map(),
     ownerScanPage: 0,
     ownerScanDone: false,
   };
+  if (h.num_docs > 0) {
+    const firstDoc = await rangeRead(h.docdata_off, 4);
+    G.paged.docFirstId = u32(firstDoc, 0);
+  }
 }
 
 async function loadPagedLeafBlock(blockId) {
@@ -526,26 +547,24 @@ async function loadPagedLeafBlock(blockId) {
   const off = G.paged.leafBase + blockId * PAGE_SIZE;
   const page = await rangeRead(off, PAGE_SIZE);
   const entries = [];
-  let p = 0;
-  const count = u32(page, p); p += 4;
-  for (let i = 0; i < count && p + 2 <= page.length; i++) {
-    const entryStart = p;
-    const len = u16(page, p); p += 2;
-    if (p + len + 28 > page.length) break;
-    const term = textAt(page, p, len); p += len;
+  const count = Math.min(u16(page, (LEAF_TERM_DIRECTORY_COUNT - 1) * 2), LEAF_TERM_DIRECTORY_COUNT - 1);
+  for (let i = 0; i < count; i++) {
+    const entryStart = u16(page, i * 2);
+    if (entryStart < LEAF_TERM_DATA_OFFSET || entryStart + 16 > page.length) break;
+    const len = page[entryStart + 15];
+    if (entryStart + 16 + len > page.length) break;
+    const term = textAt(page, entryStart + 16, len);
     const entry = normalizeLeafTermEntry({
       lte_term: term,
-      lte_doc_freq: u32(page, p),
-      lte_index_block_id: u32(page, p + 4),
-      lte_index_offset: u32(page, p + 8),
-      lte_index_length: u32(page, p + 12),
-      lte_page_skip_offset: u32(page, p + 16),
-      lte_continuation_block_count: u32(page, p + 20),
-      lte_flags: u32(page, p + 24),
+      lte_doc_freq: u32(page, entryStart),
+      lte_index_block_id: u32(page, entryStart + 4),
+      lte_index_offset: u16(page, entryStart + 8),
+      lte_index_length: u16(page, entryStart + 10),
+      lte_continuation_block_count: u16(page, entryStart + 12),
+      lte_flags: page[entryStart + 14],
       byte_offset: off + entryStart,
-      byte_len: 2 + len + 28,
+      byte_len: 16 + len,
     });
-    p += 28;
     entries.push(entry);
   }
   const block = { id: blockId, byte_offset: off, byte_len: PAGE_SIZE, entries };
@@ -593,8 +612,8 @@ async function loadPagedIndexBlock(seq) {
     seq,
     byte_off: off,
     has_more: (header & 0x8000000000000000) !== 0,
-    is_continuation: u16(bytes, h.ib_data_off) === 0xffff,
-    continuation_length: u16(bytes, h.ib_data_off) === 0xffff ? u16(bytes, h.ib_data_off + 2) : 0,
+    is_continuation: false,
+    continuation_length: u32(bytes, 8),
     bytes,
     terms: [],
   };
@@ -620,8 +639,8 @@ async function loadPagedIndexBlockPage(startSeq, count) {
       seq,
       byte_off: h.blocks_off + seq * PAGE_SIZE,
       has_more: (header & 0x8000000000000000) !== 0,
-      is_continuation: u16(page, h.ib_data_off) === 0xffff,
-      continuation_length: u16(page, h.ib_data_off) === 0xffff ? u16(page, h.ib_data_off + 2) : 0,
+      is_continuation: false,
+      continuation_length: u32(page, 8),
       bytes: page,
       terms: [],
     };
@@ -638,15 +657,9 @@ async function loadDocRecordByOrdinal(ordinal) {
   if (G.paged?.docPromiseCache?.has(ordinal)) return G.paged.docPromiseCache.get(ordinal);
   const off = h.docdata_off + ordinal * DOC_REC_SIZE;
   const promise = rangeRead(off, DOC_REC_SIZE).then(rec => {
-    const pathLen = Math.min(u16(rec, 16), 999);
-    const doc = {
-      doc_id: String(u64n(rec, 0)),
-      importance: f32(rec, 8),
-      doc_len: u32(rec, 12),
-      path: pathLen ? textAt(rec, 24, pathLen) : '',
-      byte_offset: off,
-    };
+    const doc = decodeDocRecord(rec, 0, off);
     G.paged.docCache.set(ordinal, doc);
+    G.paged.docIdCache?.set(doc.doc_id, doc);
     G.paged.docPromiseCache?.delete(ordinal);
     return doc;
   }).catch(err => {
@@ -665,25 +678,21 @@ async function loadDocPage(startOrdinal, count) {
   const docs = [];
   for (let i = 0; i < count; i++) {
     const base = i * DOC_REC_SIZE;
-    const pathLen = Math.min(u16(bytes, base + 16), 999);
-    const doc = {
-      doc_id: String(u64n(bytes, base)),
-      importance: f32(bytes, base + 8),
-      doc_len: u32(bytes, base + 12),
-      path: pathLen ? textAt(bytes, base + 24, pathLen) : '',
-      byte_offset: off + base,
-    };
+    const doc = decodeDocRecord(bytes, base, off + base);
     docs.push(doc);
     G.paged?.docCache?.set(startOrdinal + i, doc);
+    G.paged?.docIdCache?.set(doc.doc_id, doc);
   }
   return docs;
 }
 
 async function loadDocRecordById(docId) {
   const id = Number(docId);
-  if (!Number.isFinite(id) || id < 1) return null;
-  // Current generated indexes assign dense 1-based doc IDs in docdata order.
-  return loadDocRecordByOrdinal(id - 1);
+  if (!Number.isFinite(id)) return null;
+  const cached = G.paged?.docIdCache?.get(String(id));
+  if (cached) return cached;
+  const ordinal = docOrdinalForId(id);
+  return ordinal >= 0 ? loadDocRecordByOrdinal(ordinal) : null;
 }
 
 async function loadDocPathsByIds(docIds) {
@@ -693,7 +702,7 @@ async function loadDocPathsByIds(docIds) {
   const result = new Map();
   const missing = [];
   for (const id of ids) {
-    const cached = G.paged?.docCache?.get(id - 1);
+    const cached = G.paged?.docIdCache?.get(String(id));
     if (cached) result.set(String(id), cached.path || '');
     else missing.push(id);
   }
@@ -709,9 +718,11 @@ async function loadDocPathsByIds(docIds) {
           importance: 0,
           doc_len: 0,
           path,
-          byte_offset: G.parsed.header.docdata_off + (id - 1) * DOC_REC_SIZE,
+          byte_offset: docOrdinalForId(id) >= 0 ? G.parsed.header.docdata_off + docOrdinalForId(id) * DOC_REC_SIZE : G.parsed.header.docdata_off,
         };
-        G.paged?.docCache?.set(id - 1, doc);
+        const ordinal = docOrdinalForId(id);
+        if (ordinal >= 0) G.paged?.docCache?.set(ordinal, doc);
+        G.paged?.docIdCache?.set(String(id), doc);
         result.set(String(id), path);
       }
       return result;
@@ -856,10 +867,9 @@ async function loadPagedPostings(e) {
 
   for (let i = 0; i < e.lte_continuation_block_count; i++) {
     const cont = await loadPagedIndexBlock(e.lte_index_block_id + 1 + i);
-    const contStart = h.ib_data_off;
-    if (u16(cont.bytes, contStart) !== 0xffff) break;
-    const len = u16(cont.bytes, contStart + 2);
-    chunks.push(cont.bytes.subarray(contStart + 4, contStart + 4 + len));
+    const len = u32(cont.bytes, 8);
+    if (len <= 0 || 12 + len > PAGE_SIZE) break;
+    chunks.push(cont.bytes.subarray(12, 12 + len));
   }
 
   const total = chunks.reduce((sum, c) => sum + c.length, 0);
@@ -876,12 +886,13 @@ async function hydratePostingPaths(postings) {
   const pages = new Set();
   for (const p of postings) {
     const id = Number(p.doc_id);
-    if (Number.isFinite(id) && id > 0) pages.add(Math.floor((id - 1) / DOCDATA_ROWS_PER_PAGE));
+    const ordinal = docOrdinalForId(id);
+    if (ordinal >= 0) pages.add(Math.floor(ordinal / DOCDATA_ROWS_PER_PAGE));
   }
   await Promise.all([...pages].map(page => loadDocPage(page * DOCDATA_ROWS_PER_PAGE, Math.min(DOCDATA_ROWS_PER_PAGE, G.parsed.header.num_docs - page * DOCDATA_ROWS_PER_PAGE))));
   return postings.map(p => {
     const id = Number(p.doc_id);
-    const doc = Number.isFinite(id) && id > 0 ? G.paged.docCache.get(id - 1) : null;
+    const doc = Number.isFinite(id) ? G.paged.docIdCache.get(String(id)) : null;
     return { ...p, path: doc?.path || '' };
   });
 }
@@ -1479,7 +1490,7 @@ function renderDocDataRows(docs, start, total, pageCount) {
     const fp  = d.path || '';
     const link = fp ? `<span class="spath" onclick="openEncodedFile('${encodeURIComponent(fp)}')" title="Open file">${esc(fp)}</span>`
                     : '<span style="color:#555">—</span>';
-    html += `<tr onclick="gotoRange(${off},${off+1024})">` +
+    html += `<tr onclick="gotoRange(${off},${off+DOC_REC_SIZE})">` +
             `<td class="mono num" style="font-size:10px">${d.doc_id}</td>` +
             `<td class="num">${d.importance}</td><td class="num">${d.doc_len}</td>` +
             `<td>${link}</td></tr>`;

@@ -1,4 +1,5 @@
 use crate::bm25::Bm25Scorer;
+use crate::posting_store::PostingStore;
 
 pub const NO_MORE_DOCS: u64 = u64::MAX;
 pub const READER_DOCID_SOURCE_SHIFT: u64 = 59;
@@ -55,7 +56,7 @@ pub trait IndexReader {
     fn IsEnd(&self)            -> bool;
     fn GetDocumentID(&self)   -> u64;
     fn GetTermFreq(&self)     -> u32   { 1 }
-    fn GetScore(&self, _scorer: &Bm25Scorer, _doc_len: u32) -> f32 { 0.0 }
+    fn GetScore(&self, _scorer: &Bm25Scorer, _store: &PostingStore, _doc_id: u64) -> f32 { 0.0 }
     fn GetSourceMask(&self) -> u8 { 0 }
     fn SetDebug(&mut self, _label: &str, _depth: usize) {}
     fn Close(&mut self) {}

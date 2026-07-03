@@ -2,8 +2,9 @@
 """Persistent local BGE embedding service for MoonShot.
 
 Protocol over TCP:
-  request:  uint32 little-endian byte length + UTF-8 query bytes
-  response: uint32 little-endian dim (=512) + int8[512]
+        request:  uint32 little-endian byte length + UTF-8 text bytes
+                            optional prefix "__MOONSHOT_BGE_DOCUMENT__\n" selects document mode
+    response: uint32 little-endian dim (=128 by default) + int8[dim]
 """
 
 import argparse
@@ -13,36 +14,43 @@ import threading
 
 import numpy as np
 
+DOCUMENT_MARKER = "__MOONSHOT_BGE_DOCUMENT__\n"
+
 
 class BgeEmbedder:
-    def __init__(self, model_name: str, max_length: int, prefix: str | None, no_default_prefix: bool):
+    def __init__(self, model_name: str, max_length: int, prefix: str | None, doc_prefix: str | None, no_default_prefix: bool, output_dim: int):
         from sentence_transformers import SentenceTransformer
 
         if prefix is None and not no_default_prefix and "bge" in model_name.lower():
             prefix = "Represent this sentence for searching relevant passages: "
         elif prefix is None:
             prefix = ""
-        self.prefix = prefix
+        if doc_prefix is None:
+            doc_prefix = ""
+        self.query_prefix = prefix
+        self.doc_prefix = doc_prefix
+        self.output_dim = output_dim
         self.lock = threading.Lock()
         self.model = SentenceTransformer(model_name)
         if hasattr(self.model, "max_seq_length"):
             self.model.max_seq_length = max_length
 
-    def embed_i8(self, text: str) -> bytes:
+    def embed_i8(self, text: str, is_document: bool) -> bytes:
+        prefix = self.doc_prefix if is_document else self.query_prefix
         with self.lock:
             vector = self.model.encode(
-                [self.prefix + text],
+                [prefix + text],
                 batch_size=1,
                 normalize_embeddings=True,
                 convert_to_numpy=True,
                 show_progress_bar=False,
             )[0].astype(np.float32)
-        if vector.shape[0] < 512:
-            padded = np.zeros(512, dtype=np.float32)
+        if vector.shape[0] < self.output_dim:
+            padded = np.zeros(self.output_dim, dtype=np.float32)
             padded[: vector.shape[0]] = vector
             vector = padded
-        elif vector.shape[0] > 512:
-            vector = vector[:512]
+        elif vector.shape[0] > self.output_dim:
+            vector = vector[:self.output_dim]
             norm = np.linalg.norm(vector)
             if norm > 0:
                 vector = vector / norm
@@ -59,8 +67,11 @@ class Handler(socketserver.BaseRequestHandler):
             self.request.sendall(struct.pack("<I", 0))
             return
         text = self._read_exact(length).decode("utf-8", errors="replace")
-        vector = self.server.embedder.embed_i8(text)
-        self.request.sendall(struct.pack("<I", 512))
+        is_document = text.startswith(DOCUMENT_MARKER)
+        if is_document:
+            text = text[len(DOCUMENT_MARKER):]
+        vector = self.server.embedder.embed_i8(text, is_document)
+        self.request.sendall(struct.pack("<I", self.server.embedder.output_dim))
         self.request.sendall(vector)
 
     def _read_exact(self, size: int) -> bytes:
@@ -86,13 +97,17 @@ def main():
     parser.add_argument("--model", default="BAAI/bge-small-en-v1.5")
     parser.add_argument("--max-length", type=int, default=512)
     parser.add_argument("--prefix", default=None)
+    parser.add_argument("--doc-prefix", default=None)
     parser.add_argument("--no-default-prefix", action="store_true")
+    parser.add_argument("--output-dim", type=int, default=128)
     args = parser.parse_args()
+    if args.output_dim <= 0:
+        raise SystemExit("--output-dim must be positive")
 
-    embedder = BgeEmbedder(args.model, args.max_length, args.prefix, args.no_default_prefix)
+    embedder = BgeEmbedder(args.model, args.max_length, args.prefix, args.doc_prefix, args.no_default_prefix, args.output_dim)
     with ThreadingServer((args.host, args.port), Handler) as server:
         server.embedder = embedder
-        print(f"BGE embedding service listening on {args.host}:{args.port} model={args.model}", flush=True)
+        print(f"BGE embedding service listening on {args.host}:{args.port} model={args.model} dim={args.output_dim}", flush=True)
         server.serve_forever()
 
 

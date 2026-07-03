@@ -1,5 +1,6 @@
 use crate::index_reader::{IndexReader, NO_MORE_DOCS, READER_SOURCE_VECTOR};
 use crate::bm25::Bm25Scorer;
+use crate::posting_store::PostingStore;
 use crate::vector_index::VectorSearchResult;
 
 /* ------------------------------------------------------------------ */
@@ -80,8 +81,8 @@ impl IndexReader for AndIndexReader {
         self.m_Children.iter().map(|c| c.GetTermFreq()).sum()
     }
 
-    fn GetScore(&self, scorer: &Bm25Scorer, doc_len: u32) -> f32 {
-        self.m_Children.iter().map(|c| c.GetScore(scorer, doc_len)).sum()
+    fn GetScore(&self, scorer: &Bm25Scorer, store: &PostingStore, doc_id: u64) -> f32 {
+        self.m_Children.iter().map(|c| c.GetScore(scorer, store, doc_id)).sum()
     }
 
     fn GetSourceMask(&self) -> u8 {
@@ -161,11 +162,11 @@ impl IndexReader for OrIndexReader {
             .sum()
     }
 
-    fn GetScore(&self, scorer: &Bm25Scorer, doc_len: u32) -> f32 {
+    fn GetScore(&self, scorer: &Bm25Scorer, store: &PostingStore, doc_id: u64) -> f32 {
         let doc = self.GetDocumentID();
         self.m_Children.iter()
             .filter(|child| !child.IsEnd() && child.GetDocumentID() == doc)
-            .map(|child| child.GetScore(scorer, doc_len))
+            .map(|child| child.GetScore(scorer, store, doc_id))
             .sum()
     }
 
@@ -230,8 +231,8 @@ impl IndexReader for NotIndexReader {
     fn GetDocumentID(&self)         -> u64   { self.m_Base.GetDocumentID() }
     fn GetTermFreq(&self)           -> u32   { self.m_Base.GetTermFreq() }
 
-    fn GetScore(&self, scorer: &Bm25Scorer, doc_len: u32) -> f32 {
-        self.m_Base.GetScore(scorer, doc_len)
+    fn GetScore(&self, scorer: &Bm25Scorer, store: &PostingStore, doc_id: u64) -> f32 {
+        self.m_Base.GetScore(scorer, store, doc_id)
     }
 
     fn GetSourceMask(&self) -> u8 { self.m_Base.GetSourceMask() }
@@ -279,7 +280,7 @@ impl IndexReader for VectorIndexReader {
         if self.IsEnd() { NO_MORE_DOCS } else { self.m_Results[self.m_Pos].doc_id }
     }
 
-    fn GetScore(&self, _scorer: &Bm25Scorer, _doc_len: u32) -> f32 {
+    fn GetScore(&self, _scorer: &Bm25Scorer, _store: &PostingStore, _doc_id: u64) -> f32 {
         if self.IsEnd() { 0.0 } else { self.m_Results[self.m_Pos].score }
     }
 

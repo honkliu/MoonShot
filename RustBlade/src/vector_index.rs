@@ -3,9 +3,7 @@ use std::collections::{BinaryHeap, HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
-use crate::block_table::{DOC_REC_SIZE, DOC_VECTOR_DIM};
-
-const DOC_VECTOR_OFFSET: usize = 256;
+use crate::block_table::{DOC_REC_SIZE, DOC_VECTOR_DIM, DOC_VECTOR_OFFSET};
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum VectorMetric {
@@ -51,6 +49,7 @@ pub struct HnswIndex {
     pub dim: usize,
     metric: VectorMetric,
     docdata: Vec<u8>,
+    docdata_first_doc_id: u64,
 }
 
 impl HnswIndex {
@@ -65,16 +64,24 @@ impl HnswIndex {
             dim,
             metric,
             docdata: Vec::new(),
+            docdata_first_doc_id: 0,
         }
     }
 
     #[allow(non_snake_case)]
     pub fn SetDocData(&mut self, docdata: Vec<u8>) {
+        self.SetDocDataWithFirstDocId(docdata, 0);
+    }
+
+    #[allow(non_snake_case)]
+    pub fn SetDocDataWithFirstDocId(&mut self, docdata: Vec<u8>, first_doc_id: u64) {
         self.docdata = docdata;
+        self.docdata_first_doc_id = first_doc_id;
     }
 
     #[allow(non_snake_case)]
     pub fn Add(&mut self, doc_id: u64) -> bool {
+        if !self.has_doc_vector(doc_id) { return false; }
         self.add_node(doc_id)
     }
 
@@ -159,8 +166,23 @@ impl HnswIndex {
     }
 
     fn get_doc_vector(&self, doc_id: u64) -> &[u8] {
-        let offset = doc_id as usize * DOC_REC_SIZE + DOC_VECTOR_OFFSET;
+        let offset = self.doc_slot_offset(doc_id) + DOC_VECTOR_OFFSET;
         &self.docdata[offset..offset + DOC_VECTOR_DIM]
+    }
+
+    fn doc_slot_offset(&self, doc_id: u64) -> usize {
+        let slot = doc_id.checked_sub(self.docdata_first_doc_id).unwrap_or(u64::MAX) as usize;
+        slot * DOC_REC_SIZE
+    }
+
+    fn has_doc_vector(&self, doc_id: u64) -> bool {
+        if doc_id < self.docdata_first_doc_id { return false; }
+        let offset = self.doc_slot_offset(doc_id);
+        if offset + DOC_REC_SIZE > self.docdata.len() { return false; }
+        let stored_doc_id = u32::from_le_bytes(self.docdata[offset..offset + 4].try_into().unwrap()) as u64;
+        let vector_dim = u16::from_le_bytes(self.docdata[offset + 54..offset + 56].try_into().unwrap()) as usize;
+        let vector_format = u16::from_le_bytes(self.docdata[offset + 56..offset + 58].try_into().unwrap());
+        stored_doc_id == doc_id && vector_dim == DOC_VECTOR_DIM && vector_format != 0
     }
 
     fn get_node_vector(&self, node_id: usize) -> &[u8] {
@@ -344,6 +366,13 @@ impl VectorIndex {
     }
 
     #[allow(non_snake_case)]
+    pub fn SetDocDataWithFirstDocId(&mut self, docdata: Vec<u8>, first_doc_id: u64) {
+        match self {
+            VectorIndex::Hnsw(h) => h.SetDocDataWithFirstDocId(docdata, first_doc_id),
+        }
+    }
+
+    #[allow(non_snake_case)]
     pub fn Add(&mut self, doc_id: u64) -> bool {
         match self {
             VectorIndex::Hnsw(h) => h.Add(doc_id),
@@ -406,15 +435,15 @@ fn fnv_slot(token: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::block_table::{DOC_REC_SIZE, DOC_VECTOR_DIM};
+    use crate::block_table::{DOC_REC_SIZE, DOC_VECTOR_DIM, DOC_VECTOR_OFFSET};
 
     fn docdata(vectors: &[[i8; DOC_VECTOR_DIM]]) -> Vec<u8> {
         let mut bytes = vec![0u8; vectors.len() * DOC_REC_SIZE];
         for (doc_id, vector) in vectors.iter().enumerate() {
             let offset = doc_id * DOC_REC_SIZE;
-            bytes[offset..offset + 8].copy_from_slice(&(doc_id as u64).to_le_bytes());
-            bytes[offset + 144..offset + 146].copy_from_slice(&(DOC_VECTOR_DIM as u16).to_le_bytes());
-            bytes[offset + 146..offset + 148].copy_from_slice(&1u16.to_le_bytes());
+            bytes[offset..offset + 4].copy_from_slice(&(doc_id as u32).to_le_bytes());
+            bytes[offset + 54..offset + 56].copy_from_slice(&(DOC_VECTOR_DIM as u16).to_le_bytes());
+            bytes[offset + 56..offset + 58].copy_from_slice(&1u16.to_le_bytes());
             for i in 0..DOC_VECTOR_DIM {
                 bytes[offset + DOC_VECTOR_OFFSET + i] = vector[i] as u8;
             }

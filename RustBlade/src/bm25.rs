@@ -44,4 +44,12 @@ impl Bm25Scorer {
     pub fn score(&self, tf: u32, doc_len: u32, doc_freq: u32) -> f32 {
         self.Idf(doc_freq) * self.TfNorm(tf, doc_len)
     }
+
+    pub fn score_with_avg(&self, tf: u32, doc_len: u32, doc_freq: u32, avg_doc_len: f32) -> f32 {
+        let f = tf as f32;
+        let dl = doc_len.max(1) as f32;
+        let avg = avg_doc_len.max(1.0);
+        let tf_norm = f * (self.m_K1 + 1.0) / (f + self.m_K1 * (1.0 - self.m_B + self.m_B * dl / avg));
+        self.Idf(doc_freq) * tf_norm
+    }
 }

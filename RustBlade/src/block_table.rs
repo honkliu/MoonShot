@@ -7,20 +7,23 @@ use std::sync::Arc;
 use crate::pinned_memory::PinnedMemory;
 
 pub const PAGE_SIZE: usize = 4096;
-pub const DOC_REC_SIZE: usize = 1024;
-pub const DOC_VECTOR_DIM: usize = 512;
+pub const DOC_REC_SIZE: usize = 256;
+pub const DOC_VECTOR_DIM: usize = 128;
 pub const DOC_VECTOR_STORAGE_MAX_DIM: usize = DOC_VECTOR_DIM;
-pub const DOC_PATH_MAX: usize = 256;
+pub const DOC_PATH_MAX: usize = 64;
 pub const HEAD_TERM_KEY_MAX: usize = 26;
-pub const LEAF_TERM_DIRECTORY_COUNT: usize = 96;
+pub const LEAF_TERM_DIRECTORY_COUNT: usize = 161;
 pub const LEAF_TERM_DATA_OFFSET: usize = LEAF_TERM_DIRECTORY_COUNT * std::mem::size_of::<u16>();
 pub const INDEX_FILE_HEADER_SIZE: usize = 136;
-pub const INDEX_FORMAT_VERSION: u32 = 14;
+pub const INDEX_FORMAT_VERSION: u32 = 19;
 pub const INDEX_BLOCK_CONTINUATION_HEADER_SIZE: usize = 12;
 pub const TERM_MPHF_MAGIC: u64 = 0x4850464d4d524554u64;
 pub const TERM_MPHF_HEADER_SIZE: usize = 48;
+pub const LEAF_TERM_ENTRY_SIZE: usize = 16;
 pub const TERM_MPHF_ENTRY_SIZE: usize = 32;
 pub const TERM_MPHF_ENTRIES_PER_PAGE: usize = PAGE_SIZE / TERM_MPHF_ENTRY_SIZE;
+pub const DOC_VECTOR_OFFSET: usize = 64;
+pub const DOC_PATH_OFFSET: usize = 192;
 
 #[allow(non_snake_case)]
 pub fn TermMphfHash(term: &[u8], seed: u64) -> u64 {
@@ -86,6 +89,7 @@ impl TermMphfHeader {
     }
 }
 
+#[repr(C)]
 #[derive(Clone, Copy)]
 #[allow(non_snake_case)]
 pub struct IndexBlock {
@@ -96,12 +100,16 @@ impl Default for IndexBlock {
     fn default() -> Self { Self { IB_Data: [0; PAGE_SIZE] } }
 }
 
+#[repr(C)]
 #[derive(Clone, Copy)]
 #[allow(non_snake_case)]
 pub struct LeafTermBlock {
     pub LTB_Directory: [u16; LEAF_TERM_DIRECTORY_COUNT],
     pub LTB_Data: [u8; PAGE_SIZE - LEAF_TERM_DATA_OFFSET],
 }
+
+const _: [(); PAGE_SIZE] = [(); std::mem::size_of::<IndexBlock>()];
+const _: [(); PAGE_SIZE] = [(); std::mem::size_of::<LeafTermBlock>()];
 
 impl Default for LeafTermBlock {
     fn default() -> Self {
@@ -186,15 +194,14 @@ pub struct LeafTermEntry {
     pub LTE_Term: String,
     pub LTE_DocFreq: u32,
     pub LTE_IndexBlockID: u32,
-    pub LTE_IndexOffset: u32,
-    pub LTE_IndexLength: u32,
-    pub LTE_ContinuationBlockCount: u32,
-    pub LTE_Flags: u32,
-    pub LTE_Fingerprint: u64,
+    pub LTE_IndexOffset: u16,
+    pub LTE_IndexLength: u16,
+    pub LTE_ContinuationBlockCount: u16,
+    pub LTE_Flags: u8,
 }
 
 impl LeafTermEntry {
-    pub fn byte_len(&self) -> usize { TERM_MPHF_ENTRY_SIZE + self.LTE_Term.len() }
+    pub fn byte_len(&self) -> usize { LEAF_TERM_ENTRY_SIZE + self.LTE_Term.len() }
 }
 
 #[allow(non_snake_case)]
@@ -208,21 +215,20 @@ impl LeafTermBlock {
         let block_offset = self.LTB_Directory[index] as usize;
         if block_offset < LEAF_TERM_DATA_OFFSET { return None; }
         let offset = block_offset - LEAF_TERM_DATA_OFFSET;
-        if offset + TERM_MPHF_ENTRY_SIZE > self.LTB_Data.len() { return None; }
+        if offset + LEAF_TERM_ENTRY_SIZE > self.LTB_Data.len() { return None; }
 
         let data = &self.LTB_Data[offset..];
-        let term_len = data[31] as usize;
-        if offset + TERM_MPHF_ENTRY_SIZE + term_len > self.LTB_Data.len() { return None; }
-        let lteTerm = std::str::from_utf8(&data[32..32 + term_len]).ok()?.to_string();
+        let term_len = data[15] as usize;
+        if offset + LEAF_TERM_ENTRY_SIZE + term_len > self.LTB_Data.len() { return None; }
+        let lteTerm = std::str::from_utf8(&data[16..16 + term_len]).ok()?.to_string();
 
         Some(LeafTermEntry {
             LTE_DocFreq: u32::from_le_bytes(data[0..4].try_into().ok()?),
             LTE_IndexBlockID: u32::from_le_bytes(data[4..8].try_into().ok()?),
-            LTE_IndexOffset: u32::from_le_bytes(data[8..12].try_into().ok()?),
-            LTE_IndexLength: u32::from_le_bytes(data[12..16].try_into().ok()?),
-            LTE_ContinuationBlockCount: u32::from_le_bytes(data[16..20].try_into().ok()?),
-            LTE_Flags: u32::from_le_bytes(data[20..24].try_into().ok()?),
-            LTE_Fingerprint: u64::from_le_bytes(data[24..32].try_into().ok()?),
+            LTE_IndexOffset: u16::from_le_bytes(data[8..10].try_into().ok()?),
+            LTE_IndexLength: u16::from_le_bytes(data[10..12].try_into().ok()?),
+            LTE_ContinuationBlockCount: u16::from_le_bytes(data[12..14].try_into().ok()?),
+            LTE_Flags: data[14],
             LTE_Term: lteTerm,
         })
     }
@@ -256,6 +262,18 @@ impl LeafTermBlock {
 pub struct BloomFilter;
 impl BloomFilter {
     pub fn can_term_exist(&self, _term: &str) -> bool { true }
+}
+
+#[allow(non_snake_case)]
+pub fn DocDataEncodeScore(value: f32) -> u16 {
+    if value <= 0.0 { return 0; }
+    if value >= 1.0 { return u16::MAX; }
+    (value * 65535.0 + 0.5) as u16
+}
+
+#[allow(non_snake_case)]
+pub fn DocDataDecodeScore(value: u16) -> f32 {
+    value as f32 / 65535.0
 }
 
 #[derive(Clone, Copy)]
@@ -579,7 +597,7 @@ impl IndexBlockTable {
             index_offset: entry.LTE_IndexOffset as usize,
             index_length: entry.LTE_IndexLength as usize,
             doc_freq: entry.LTE_DocFreq,
-            continuation_block_count: entry.LTE_ContinuationBlockCount,
+            continuation_block_count: entry.LTE_ContinuationBlockCount as u32,
         }, index_block))
     }
 
@@ -645,7 +663,7 @@ impl IndexBlockTable {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&first.IB_Data[begin..end]);
 
-        for i in 0..entry.LTE_ContinuationBlockCount {
+        for i in 0..entry.LTE_ContinuationBlockCount as u32 {
             let block = self.GetBlockBySeq(entry.LTE_IndexBlockID + 1 + i)?;
             let header = IndexBlockContinuationHeader::from_bytes(&block.IB_Data)?;
             let data_begin = INDEX_BLOCK_CONTINUATION_HEADER_SIZE;

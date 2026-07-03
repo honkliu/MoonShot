@@ -66,6 +66,7 @@ impl IndexWriter for AdvancedIndexWriter {
                 *term_tf.entry(tok.clone()).or_insert(0) += 1;
             }
         }
+        let unique_unigram_count = term_tf.len() as u32;
 
         /* bigrams: "race_car" etc. */
         for i in 0..tokens.len().saturating_sub(1) {
@@ -80,6 +81,7 @@ impl IndexWriter for AdvancedIndexWriter {
         }
 
         store.AddDocTokens(doc_id, tokens.len() as u32);
+        store.AddStreamStats(doc_id, abbrev.chars().next().unwrap_or('B'), tokens.len() as u32, unique_unigram_count);
     }
 
     fn SetDocImportance(&mut self, doc_id: u64, score: f32) {

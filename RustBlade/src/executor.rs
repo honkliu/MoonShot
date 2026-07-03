@@ -24,9 +24,9 @@ impl<'a> IndexSearchExecutor<'a> {
 
         while !reader.IsEnd() {
             let doc_id  = reader.GetDocumentID();
-            let doc_len = self.store.GetDocLen(ReaderDocumentIDValue(doc_id));
-            let score   = reader.GetScore(&scorer, doc_len)
-                        + self.store.GetDocImportance(ReaderDocumentIDValue(doc_id));
+            let doc_id_value = ReaderDocumentIDValue(doc_id);
+            let score   = reader.GetScore(&scorer, self.store, doc_id_value)
+                        + self.store.GetDocImportance(doc_id_value);
             results.push(SearchResult { doc_id, score });
             reader.GoNext();
         }
@@ -60,8 +60,7 @@ fn collect_results(r: &mut dyn IndexReader, s: &Bm25Scorer, store: &PostingStore
     while !r.IsEnd() {
         let doc_id  = r.GetDocumentID();
         let doc_id_value = ReaderDocumentIDValue(doc_id);
-        let doc_len = store.GetDocLen(doc_id_value);
-        let score   = r.GetScore(s, doc_len) + store.GetDocImportance(doc_id_value);
+        let score   = r.GetScore(s, store, doc_id_value) + store.GetDocImportance(doc_id_value);
         out.push(SearchResult { doc_id, score });
         r.GoNext();
     }

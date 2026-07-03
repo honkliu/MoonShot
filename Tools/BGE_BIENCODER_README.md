@@ -1,6 +1,6 @@
 # MoonShot BEIR Bi-Encoder Workflow
 
-MoonShot stores document vectors directly in `DocDataEntry::DDE_VectorData` as a fixed 512-byte int8 payload. The production path is:
+MoonShot stores document vectors directly in `DocDataEntry::DDE_VectorData` as a fixed 128-byte int8 payload. The production path is:
 
 1. Generate normalized document/query embeddings with a real bi-encoder.
 2. Build a MoonShot index with `-doc-vectors` so vectors are stored in DocData.
@@ -10,9 +10,9 @@ Recommended starting model:
 
 - `BAAI/bge-small-en-v1.5`
 - Good quality/latency tradeoff, open model, 384 dimensions.
-- The generator pads to MoonShot's 512-dimensional slot.
+- The generator truncates and renormalizes to MoonShot's 128-dimensional slot by default.
 
-Larger models such as `BAAI/bge-base-en-v1.5`, `BAAI/bge-large-en-v1.5`, or E5 can be used too, but dimensions above 512 are truncated unless the index format is expanded.
+Larger models such as `BAAI/bge-base-en-v1.5`, `BAAI/bge-large-en-v1.5`, or E5 can be used too, but dimensions above 128 are truncated unless the index format is expanded.
 
 ## Environment
 

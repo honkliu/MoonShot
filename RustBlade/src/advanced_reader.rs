@@ -9,6 +9,7 @@ use crate::block_table::{
 };
 use crate::bm25::Bm25Scorer;
 use crate::index_reader::{IndexReader, NO_MORE_DOCS, ReaderSourceMaskForStream};
+use crate::posting_store::PostingStore;
 use crate::varbyte_decoder::VarByteDecoder;
 
 #[allow(non_snake_case)]
@@ -17,6 +18,7 @@ pub struct AdvancedIndexReader {
     m_Word: String,
     m_BlockTable: Arc<IndexBlockTable>,
     m_DocFreq: u32,
+    m_Stream: char,
     m_SourceMask: u8,
     m_BlockSeqNumber: u32,
     m_RemainingContinuationBlocks: u32,
@@ -30,6 +32,7 @@ impl AdvancedIndexReader {
             m_Word: stream_key.to_string(),
             m_BlockTable: block_table,
             m_DocFreq: doc_freq,
+            m_Stream: stream_key.chars().last().unwrap_or('B'),
             m_SourceMask: stream_key.chars().last().map(ReaderSourceMaskForStream).unwrap_or(0),
             m_BlockSeqNumber: 0,
             m_RemainingContinuationBlocks: 0,
@@ -111,8 +114,10 @@ impl IndexReader for AdvancedIndexReader {
         if self.m_Decoder.IsEnd() { 0 } else { self.m_Decoder.GetTermFrequency() }
     }
 
-    fn GetScore(&self, scorer: &Bm25Scorer, doc_len: u32) -> f32 {
-        scorer.score(self.GetTermFreq(), doc_len, self.m_DocFreq)
+    fn GetScore(&self, scorer: &Bm25Scorer, store: &PostingStore, doc_id: u64) -> f32 {
+        let doc_len = store.GetStreamLen(doc_id, self.m_Stream);
+        let avg_len = store.AvgStreamLen(self.m_Stream);
+        scorer.score_with_avg(self.GetTermFreq(), doc_len, self.m_DocFreq, avg_len)
     }
 
     fn GetSourceMask(&self) -> u8 { self.m_SourceMask }

@@ -1,6 +1,6 @@
 use rustblade::executor::IndexSearchExecutor;
 use rustblade::index_writer::IndexWriter;
-use rustblade::block_table::{INDEX_FILE_HEADER_SIZE, PAGE_SIZE, TERM_MPHF_ENTRY_SIZE, TERM_MPHF_MAGIC, TermMphfHash, TermMphfSlotSeed};
+use rustblade::block_table::INDEX_FILE_HEADER_SIZE;
 use rustblade::posting_store::PostingStore;
 use rustblade::serializer::{IndexFileHeader, IndexSerializer};
 use rustblade::tokenizer::Tokenizer;
@@ -62,7 +62,7 @@ fn read_header(path: &std::path::Path) -> IndexFileHeader {
 }
 
 #[test]
-fn term_mphf_handles_same_bucket_same_base_terms() {
+fn build_blocks_does_not_emit_term_mphf_for_v19_indexes() {
     let mut store = PostingStore::new();
     let mut terms = vec!["t28".to_string(), "t66".to_string()];
     let mut suffix = 0;
@@ -77,32 +77,9 @@ fn term_mphf_handles_same_bucket_same_base_terms() {
 
     let built = IndexSerializer::BuildBlocks(&store);
     assert_eq!(built.BBR_TotalTerms, terms.len() as u64);
-    assert_eq!(built.BBR_TermMphfHeader.TMH_Magic, TERM_MPHF_MAGIC);
-    assert_eq!(built.BBR_TermMphfHeader.TMH_SlotCount, terms.len() as u32);
-    assert!(!built.BBR_TermMphfDisplacements.is_empty());
-    assert!(!built.BBR_TermMphfEntryPages.is_empty());
-
-    let mut used = vec![false; terms.len()];
-    for term in &terms {
-        let header = built.BBR_TermMphfHeader;
-        let bucket = (TermMphfHash(term.as_bytes(), header.TMH_BucketSeed) % header.TMH_BucketCount as u64) as usize;
-        let displacement = built.BBR_TermMphfDisplacements[bucket];
-        let slot = if displacement < 0 {
-            (-(displacement as i64) - 1) as usize
-        } else {
-            (TermMphfHash(term.as_bytes(), TermMphfSlotSeed(header.TMH_SlotSeed, displacement as u32)) % header.TMH_SlotCount as u64) as usize
-        };
-        assert!(!used[slot]);
-        used[slot] = true;
-
-        let byte_offset = slot * TERM_MPHF_ENTRY_SIZE;
-        let page = byte_offset / PAGE_SIZE;
-        let offset = byte_offset % PAGE_SIZE;
-        let entry = &built.BBR_TermMphfEntryPages[page].IB_Data[offset..offset + TERM_MPHF_ENTRY_SIZE];
-        let mut fingerprint = TermMphfHash(term.as_bytes(), header.TMH_FingerprintSeed);
-        if fingerprint == 0 { fingerprint = 1; }
-        assert_eq!(u64::from_le_bytes(entry[24..32].try_into().unwrap()), fingerprint);
-    }
+    assert_eq!(built.BBR_TermMphfHeader.TMH_Magic, 0);
+    assert!(built.BBR_TermMphfDisplacements.is_empty());
+    assert!(built.BBR_TermMphfEntryPages.is_empty());
 }
 
 #[test]
@@ -163,6 +140,39 @@ fn add_document_indexes_all_default_streams() {
 }
 
 #[test]
+fn title_score_uses_title_length_instead_of_body_length() {
+    let mut ctx = IndexContext::new();
+    let short = Document {
+        doc_id: 0,
+        title: "needle".to_string(),
+        body: "short".to_string(),
+        importance: 0.0,
+        ..Document::default()
+    };
+    let long = Document {
+        doc_id: 1,
+        title: "needle".to_string(),
+        body: std::iter::repeat("filler").take(200).collect::<Vec<_>>().join(" "),
+        importance: 0.0,
+        ..Document::default()
+    };
+    ctx.AddDocument(&short, true);
+    ctx.AddDocument(&long, true);
+    ctx.Build();
+
+    let token = ctx.GetTokenizer().Tokenize("needle").into_iter().next().unwrap();
+    let stream_key = format!("{token}T");
+    let mut reader = ctx.GetStreamReader(&stream_key);
+    let store = ctx.GetStore();
+    let store = store.lock().unwrap();
+    let executor = IndexSearchExecutor::new(&store);
+    let results = executor.Execute(reader.as_mut(), 0);
+    let short_score = results.iter().find(|result| result.doc_id == 0).unwrap().score;
+    let long_score = results.iter().find(|result| result.doc_id == 1).unwrap().score;
+    assert!((short_score - long_score).abs() < 1e-6, "short_score={short_score}, long_score={long_score}");
+}
+
+#[test]
 fn load_index_discovers_delta_context() {
     let temp = tempfile::tempdir().unwrap();
     let base_path = temp.path().join("delta-load.idx");
@@ -184,9 +194,29 @@ fn load_index_discovers_delta_context() {
 }
 
 #[test]
-fn merge_sparse_delta_preserves_docdata_slots_and_header_average() {
+fn sparse_standalone_index_uses_compact_docdata_first_doc_id() {
     let temp = tempfile::tempdir().unwrap();
-    let base_path = temp.path().join("sparse.idx");
+    let index_path = temp.path().join("sparse.idx");
+    let index_path_text = index_path.to_string_lossy().to_string();
+
+    let mut ctx = IndexContext::new();
+    add_doc(&mut ctx, 3, "gamma", "three four five", "delta3.txt");
+    ctx.SaveIndex(&index_path_text).unwrap();
+
+    let header = read_header(&index_path);
+    assert_eq!(header.IFH_NumDocuments, 1);
+    assert_eq!(header.IFH_AvgDocLength, 4.0);
+
+    let mut loaded = IndexContext::with_path(Some(index_path_text));
+    assert_eq!(loaded.DocumentCount(), 1);
+    assert_eq!(loaded.GetDocPath(3), "delta3.txt");
+    assert!(search_doc_ids(&mut loaded, "gamma").contains(&3));
+}
+
+#[test]
+fn merge_base_and_contiguous_delta_preserves_header_average() {
+    let temp = tempfile::tempdir().unwrap();
+    let base_path = temp.path().join("contiguous.idx");
     let delta_path = delta_index_path(&base_path);
     let base_path_text = base_path.to_string_lossy().to_string();
 
@@ -195,24 +225,22 @@ fn merge_sparse_delta_preserves_docdata_slots_and_header_average() {
     base.SaveIndex(&base_path_text).unwrap();
 
     let mut delta = IndexContext::new();
-    add_doc(&mut delta, 3, "gamma", "three four five", "delta3.txt");
+    add_doc(&mut delta, 1, "gamma", "three four five", "delta1.txt");
     delta.SaveIndex(&delta_path).unwrap();
 
     let mut merge = IndexContext::with_path(Some(base_path_text.clone()));
     merge.Merge(&base_path_text).unwrap();
 
     let header = read_header(&base_path);
-    assert_eq!(header.IFH_NumDocuments, 4);
-    assert_eq!(header.IFH_AvgDocLength, 1.75);
+    assert_eq!(header.IFH_NumDocuments, 2);
+    assert_eq!(header.IFH_AvgDocLength, 3.5);
 
     let mut merged = IndexContext::with_path(Some(base_path_text));
-    assert_eq!(merged.DocumentCount(), 4);
-    assert_eq!(merged.AvgDocLen(), 1.75);
+    assert_eq!(merged.DocumentCount(), 2);
+    assert_eq!(merged.AvgDocLen(), 3.5);
     assert_eq!(merged.GetDocPath(0), "base.txt");
-    assert_eq!(merged.GetDocPath(1), "");
-    assert_eq!(merged.GetDocPath(2), "");
-    assert_eq!(merged.GetDocPath(3), "delta3.txt");
-    assert!(search_doc_ids(&mut merged, "gamma").contains(&3));
+    assert_eq!(merged.GetDocPath(1), "delta1.txt");
+    assert!(search_doc_ids(&mut merged, "gamma").contains(&1));
 }
 
 #[test]
