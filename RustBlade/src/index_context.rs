@@ -501,9 +501,9 @@ impl IndexContext {
         self.LoadIndex(output_path)
     }
 
-    fn BuildIndexData(store: &PostingStore, buildVectorIndex: bool) -> (IndexFileHeader, IndexBlockTable, HnswIndex, Vec<u8>) {
+    fn BuildIndexData(store: &PostingStore, buildVectorIndex: bool) -> (IndexFileHeader, IndexBlockTable, HnswIndex, Vec<u8>, Vec<u8>, Vec<String>) {
         let blocks = IndexSerializer::BuildBlocks(store);
-        let docData = Self::EncodeDocData(store);
+        let (docData, pathPrefixSidecar, pathPrefixes) = Self::EncodeDocData(store);
         let firstDocId = Self::StoreFirstDocId(store);
         let documentCount = Self::StoreDocDataRecordCount(store);
 
@@ -553,7 +553,7 @@ impl IndexContext {
             }
         }
 
-        (header, blockTable, vectorIndex, docData)
+        (header, blockTable, vectorIndex, docData, pathPrefixSidecar, pathPrefixes)
     }
 
     fn BuildVectorRuntime(&mut self) {
@@ -573,10 +573,13 @@ impl IndexContext {
         self.m_VectorBuilt = true;
     }
 
-    fn EncodeDocData(store: &PostingStore) -> Vec<u8> {
+    fn EncodeDocData(store: &PostingStore) -> (Vec<u8>, Vec<u8>, Vec<String>) {
         let firstDocId = Self::StoreFirstDocId(store);
         let documentCount = Self::StoreDocDataRecordCount(store);
         let mut out = vec![0u8; documentCount as usize * DOC_REC_SIZE];
+        let mut prefix_to_id = HashMap::new();
+        let mut prefixes = Vec::new();
+        let mut string_bytes = 0usize;
         for slot in 0..documentCount as usize {
             let offset = slot * DOC_REC_SIZE;
             out[offset..offset + 4].copy_from_slice(&u32::MAX.to_le_bytes());
@@ -617,11 +620,10 @@ impl IndexContext {
                     out[offset + DOC_VECTOR_OFFSET + i] = vector[i] as u8;
                 }
             }
-            let pathLen = stats.path.len().min(DOC_PATH_MAX);
-            out[offset + 18..offset + 20].copy_from_slice(&(pathLen as u16).to_le_bytes());
-            out[offset + DOC_PATH_OFFSET..offset + DOC_PATH_OFFSET + pathLen].copy_from_slice(&stats.path.as_bytes()[..pathLen]);
+            Self::encode_doc_path(&mut out[offset..offset + DOC_REC_SIZE], &stats.path, &mut prefix_to_id, &mut prefixes, &mut string_bytes);
         }
-        out
+        let sidecar = IndexSerializer::EncodePathPrefixSidecar(&prefixes).unwrap_or_else(|_| vec![0u8; PATH_PREFIX_SIDECAR_BYTES]);
+        (out, sidecar, prefixes)
     }
 
     fn StoreFirstDocId(store: &PostingStore) -> u64 {
