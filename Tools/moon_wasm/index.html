@@ -112,6 +112,28 @@ tr:hover td { background:#2a2d2e; cursor:pointer; }
 .tree-cell { display:flex; align-items:center; gap:4px; }
 .tree-kind { color:#888; font-size:11px; }
 .tree-field { color:#888; font-size:11px; margin-right:4px; }
+.tree-meta { display:flex; align-items:center; gap:6px; flex-wrap:wrap; color:#999; }
+.tree-chip { display:inline-block; padding:1px 5px; border:1px solid #3e3e42; border-radius:3px; background:#252526; color:#b5cea8; font-size:10px; }
+.tree-target { color:#9cdcfe; font-family:'Cascadia Code','Consolas',monospace; font-size:11px; }
+.tree-table { table-layout:fixed; width:100%; }
+.tree-table th,.tree-table td { overflow:hidden; }
+.tree-table td:nth-child(2),.tree-table td:nth-child(3),.tree-table td:nth-child(4),.tree-table td:nth-child(5) { white-space:nowrap; text-overflow:ellipsis; }
+.tree-table .tree-meta { min-width:0; overflow:hidden; white-space:nowrap; }
+.tree-table .key,.tree-table .tree-target { overflow:hidden; text-overflow:ellipsis; }
+.tree-detail-cell { padding:0 !important; }
+.posting-panel { margin:0; padding:6px 10px; border-top:1px solid #2a2a2a; background:#181818; color:#aaa; overflow:hidden; }
+.posting-panel table { width:100%; border-collapse:collapse; table-layout:fixed; }
+.posting-panel th,.posting-panel td { border:0; padding:3px 6px; background:transparent !important; }
+.posting-panel th { color:#777; font-size:10px; text-transform:uppercase; letter-spacing:.03em; }
+.posting-panel th:nth-child(1),.posting-panel td:nth-child(1) { width:90px; }
+.posting-panel th:nth-child(2),.posting-panel td:nth-child(2) { width:60px; }
+.posting-panel .path { display:block; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.doc-row { cursor:pointer; }
+.doc-row:hover td { background:#2a2d2e; }
+.doc-open { color:#9cdcfe; text-decoration:underline; cursor:pointer; }
+.leaf-row td { background:#202020; }
+.posting-row td { background:#181818; color:#aaa; }
+.posting-header td { color:#777; font-size:10px; text-transform:uppercase; letter-spacing:.03em; }
 .term-jump { color:#9cdcfe; text-decoration:underline; cursor:pointer; }
 .term-empty { padding:12px; color:#777; font-size:12px; }
 .posting   { color:#4ec9b0; font-size:11px; padding:1px 4px; }
@@ -447,11 +469,11 @@ function normalizeParsedIndex(parsed) {
 
   for (const block of parsed.blocks) {
     block.terms = (block.terms || []).map(t => ({
-      lte_term: t.lte_term ?? t.key ?? '',
-      lte_doc_freq: t.lte_doc_freq ?? t.freq ?? 0,
-      lte_index_length: t.lte_index_length ?? t.data_len ?? 0,
-      lte_index_offset: t.lte_index_offset ?? t.data_off ?? 0,
-      lte_continuation_block_count: t.lte_continuation_block_count ?? t.continuation_block_count ?? 0,
+      lte_term: t.lte_term ?? t.LTE_Term ?? t.key ?? '',
+      lte_doc_freq: t.lte_doc_freq ?? t.LTE_DocFreq ?? t.freq ?? 0,
+      lte_index_length: t.lte_index_length ?? t.LTE_IndexLength ?? t.data_len ?? 0,
+      lte_index_offset: t.lte_index_offset ?? t.LTE_IndexOffset ?? t.data_off ?? 0,
+      lte_continuation_block_count: t.lte_continuation_block_count ?? t.LTE_ContinuationBlockCount ?? t.continuation_block_count ?? 0,
       index_entries: (t.index_entries || t.postings || []).map(normalizeIndexEntry),
     }));
   }
@@ -1272,7 +1294,7 @@ function renderHeadLeafTerms() {
   html += `<div class="term-toolbar">`
       + `Head/Leaf term table @ 0x${h.subindex_off.toString(16)} (${h.subindex_size} bytes). `
        + `Use + to expand physical layout nodes; click any row to highlight its on-disk bytes.</div>`;
-  html += '<table><tr><th></th><th>Object</th><th>Disk bytes</th><th>Target / fields</th><th>IndexEntry</th></tr>';
+  html += '<table class="tree-table"><colgroup><col style="width:72px"><col style="width:32%"><col style="width:145px"><col style="width:260px"><col></colgroup><tr><th></th><th>Object</th><th>Disk bytes</th><th>Target / fields</th><th>IndexEntry</th></tr>';
   html += renderHeadTermRows(si);
   html += '</table></div>';
   document.getElementById('si-panel').innerHTML = html;
@@ -1317,11 +1339,11 @@ function renderHeadTermEntry(d) {
       + `<td>LeafTermBlock[${d.hte_leaf_term_block_id}] @ 0x${d.leaf_term_block_offset.toString(16)}</td>`
        + `<td></td></tr>`;
 
-  if (expanded) html += renderLeafTermBlock(d.hte_leaf_term_block_id, 1);
+  if (expanded) html += renderLeafTermBlock(d.hte_leaf_term_block_id, 1, true);
   return html;
 }
 
-function renderLeafTermBlock(block_idx, depth) {
+function renderLeafTermBlock(block_idx, depth, forceExpanded = false) {
   const block = G.leafTermBlocksById?.get(block_idx);
   if (!block && G.summaryOnly) {
     const indent = '<span class="indent"></span>'.repeat(depth);
@@ -1331,7 +1353,7 @@ function renderLeafTermBlock(block_idx, depth) {
   if (!block) return '';
   const node = `ltb:${block_idx}`;
   const filtering = !!G_TermFilter;
-  const expanded = filtering || G_ExpandedTree.has(node);
+  const expanded = forceExpanded || filtering || G_ExpandedTree.has(node);
   const active = G_SelectedTreeNode === node ? ' active' : '';
   const indent = '<span class="indent"></span>'.repeat(depth);
   let html = `<tr class="tree-row${active}" onclick="selectTreeNode('${node}',${block.byte_offset},${block.byte_offset + block.byte_len})">`
@@ -1367,35 +1389,38 @@ function renderLeafTermEntry(block_idx, entry_idx, e, depth) {
   const indexStart = h.blocks_off + e.lte_index_block_id * 4096 + h.ib_data_off + e.lte_index_offset;
   const indexEnd = indexStart + e.lte_index_length;
   const indent = '<span class="indent"></span>'.repeat(depth);
-  return `<tr class="tree-row${active}" onclick="selectTreeNode('${node}',${e.byte_offset},${e.byte_offset + e.byte_len})">`
+    const chips = `<span class="tree-chip">df ${e.lte_doc_freq}</span>`
+      + (e.lte_continuation_block_count ? `<span class="tree-chip">cont ${e.lte_continuation_block_count}</span>` : '')
+      + (e.lte_flags ? `<span class="tree-chip">flags ${e.lte_flags}</span>` : '');
+    return `<tr class="tree-row leaf-row${active}" onclick="selectTreeNode('${node}',${e.byte_offset},${e.byte_offset + e.byte_len})">`
        + `<td>${indent}<button type="button" class="icon-btn" title="Toggle posting detail" onclick="event.stopPropagation();toggleTreeNode('${node}')">${G_ExpandedTree.has(node) ? '-' : '+'}</button></td>`
       + `<td><span class="tree-kind">LeafTermEntry</span> <span class="key mono">${esc(e.lte_term)}</span></td>`
        + `<td class="num">0x${e.byte_offset.toString(16)} +${e.byte_len}</td>`
-      + `<td>df=<span class="num">${e.lte_doc_freq}</span> skip=<span class="num">${e.lte_page_skip_offset}</span> cont=<span class="num">${e.lte_continuation_block_count}</span> flags=<span class="num">${e.lte_flags}</span></td>`
-      + `<td>IndexBlock[${e.lte_index_block_id}] 0x${indexStart.toString(16)} +${e.lte_index_length}</td></tr>`
+      + `<td><div class="tree-meta">${chips}</div></td>`
+      + `<td><span class="tree-target">IB[${e.lte_index_block_id}] +${e.lte_index_offset}/${e.lte_index_length}</span></td></tr>`
       + (G_ExpandedTree.has(node) ? renderIndexEntriesInline(node, e, depth + 1, indexStart, indexEnd) : '');
 }
 
 function renderIndexEntriesInline(node, e, depth, indexStart, indexEnd) {
-  const indent = '<span class="indent"></span>'.repeat(depth);
+  const indent = '<span class="indent"></span>'.repeat(Math.max(0, depth - 1));
   if (G.summaryOnly) {
     loadPagedPostings(e).then(hydratePostingPaths).then(postings => {
       const row = document.getElementById(`posting-rows-${cssId(node)}`);
-      if (row) row.outerHTML = renderPostingRowsForLeaf(node, postings, depth + 1);
+      if (row) row.outerHTML = renderPostingRowsForLeaf(node, postings, depth);
     }).catch(err => {
       const row = document.getElementById(`posting-rows-${cssId(node)}`);
-      if (row) row.outerHTML = `<tr class="tree-row"><td>${'<span class="indent"></span>'.repeat(depth + 1)}</td><td colspan="4"><div class="posting" style="color:#f66">Failed to decode postings: ${esc(err)}</div></td></tr>`;
+      if (row) row.outerHTML = `<tr class="tree-row"><td>${indent}</td><td colspan="4" class="tree-detail-cell"><div class="posting-panel" style="color:#f66">Failed to decode postings: ${esc(err)}</div></td></tr>`;
     });
-    return `<tr class="tree-row${G_SelectedTreeNode === node + ':index' ? ' active' : ''}" onclick="selectTreeNode('${node}:index',${indexStart},${indexEnd})">`
+    return `<tr class="tree-row posting-row${G_SelectedTreeNode === node + ':index' ? ' active' : ''}" onclick="selectTreeNode('${node}:index',${indexStart},${indexEnd})">`
        + `<td>${indent}</td>`
       + `<td><span class="tree-kind">IndexEntry</span> <span class="key mono">${esc(e.lte_term)}</span></td>`
       + `<td class="num">0x${indexStart.toString(16)} +${e.lte_index_length}</td>`
       + `<td>IndexBlock[${e.lte_index_block_id}] offset=<span class="num">${e.lte_index_offset}</span> length=<span class="num">${e.lte_index_length}</span> cont=<span class="num">${e.lte_continuation_block_count}</span></td>`
        + `<td></td></tr>`
-       + `<tr class="tree-row" id="posting-rows-${cssId(node)}"><td>${'<span class="indent"></span>'.repeat(depth + 1)}</td><td colspan="4"><div class="posting" style="color:#888">Loading posting list…</div></td></tr>`;
+        + `<tr class="tree-row" id="posting-rows-${cssId(node)}"><td>${indent}</td><td colspan="4" class="tree-detail-cell"><div class="posting-panel" style="color:#888">Loading posting list…</div></td></tr>`;
   }
-  const block = (G.parsed.blocks || []).find(b => b.seq === e.lte_index_block_id);
-  const term = block ? (block.terms || []).find(t => t.lte_term === e.lte_term && t.lte_index_offset === e.lte_index_offset) : null;
+      const block = (G.parsed.blocks || []).find(b => Number(b.seq) === Number(e.lte_index_block_id));
+      const term = block ? (block.terms || []).find(t => t.lte_term === e.lte_term && Number(t.lte_index_offset) === Number(e.lte_index_offset)) : null;
   let posts = '';
   if (term && term.index_entries && term.index_entries.length) {
     const postings = term.index_entries.map(p => ({
@@ -1403,11 +1428,11 @@ function renderIndexEntriesInline(node, e, depth, indexStart, indexEnd) {
       tf: p.ie_term_frequency,
       path: G.pathOf(p.ie_doc_id),
     }));
-    posts = renderPostingRowsForLeaf(node, postings, depth + 1);
+    posts = renderPostingRowsForLeaf(node, postings, depth);
   } else {
-    posts = `<tr class="tree-row"><td>${'<span class="indent"></span>'.repeat(depth + 1)}</td><td colspan="4"><div class="posting" style="color:#888">No decoded sample IndexEntry rows in parser output.</div></td></tr>`;
+    posts = `<tr class="tree-row"><td>${indent}</td><td colspan="4" class="tree-detail-cell"><div class="posting-panel" style="color:#888">No decoded sample IndexEntry rows in parser output.</div></td></tr>`;
   }
-    return `<tr class="tree-row${G_SelectedTreeNode === node + ':index' ? ' active' : ''}" onclick="selectTreeNode('${node}:index',${indexStart},${indexEnd})">`
+    return `<tr class="tree-row posting-row${G_SelectedTreeNode === node + ':index' ? ' active' : ''}" onclick="selectTreeNode('${node}:index',${indexStart},${indexEnd})">`
        + `<td>${indent}</td>`
       + `<td><span class="tree-kind">IndexEntry</span> <span class="key mono">${esc(e.lte_term)}</span></td>`
       + `<td class="num">0x${indexStart.toString(16)} +${e.lte_index_length}</td>`
@@ -1421,21 +1446,20 @@ function renderPostingListForLeaf(node, postings) {
 }
 
 function renderPostingRowsForLeaf(node, postings, depth) {
-  const indent = '<span class="indent"></span>'.repeat(depth);
+  const indent = '';
   if (!postings.length) {
-    return `<tr class="tree-row"><td>${indent}</td><td colspan="4"><div class="posting" style="color:#888">No decoded postings.</div></td></tr>`;
+    return `<tr class="tree-row"><td>${indent}</td><td colspan="4" class="tree-detail-cell"><div class="posting-panel" style="color:#888">No decoded postings.</div></td></tr>`;
   }
-  let html = `<tr class="tree-row"><td>${indent}</td><td><span class="tree-field">IE_DocID</span></td><td><span class="tree-field">TF</span></td><td><span class="tree-field">path</span></td><td></td></tr>`;
+  let html = `<tr class="tree-row posting-row"><td>${indent}</td><td colspan="4" class="tree-detail-cell"><div class="posting-panel"><table><tr><th>DocID</th><th>TF</th><th>Path</th></tr>`;
   for (let i = 0; i < postings.length; i++) {
     const p = postings[i];
-    html += `<tr class="tree-row" onclick="event.stopPropagation()">`
-      + `<td>${indent}</td>`
+    html += `<tr onclick="event.stopPropagation()">`
       + `<td class="mono num">${p.doc_id}</td>`
       + `<td class="num">${p.tf}</td>`
       + `<td class="path">${p.path ? esc(p.path) : ''}</td>`
-      + `<td></td>`
       + `</tr>`;
   }
+  html += `</table></div></td></tr>`;
   return html;
 }
 
@@ -1533,23 +1557,25 @@ async function renderDocData() {
 
 function renderDocDataRows(docs, start, total, pageCount) {
   const h = G.parsed.header;
-  let html = '<table><tr><th>id</th><th>importance</th><th>doc_len</th><th>path</th></tr>';
+  let html = '<table><tr><th>id</th><th>importance</th><th>doc_len</th><th>path</th><th>hex</th></tr>';
     html += `<tr><td colspan="4"><div class="pager">`
       + `<button type="button" class="icon-btn" title="Previous page" onclick="setDocPage(${G_DocPage - 1})" ${G_DocPage <= 0 ? 'disabled' : ''}>‹</button>`
       + `<button type="button" class="icon-btn" title="Next page" onclick="setDocPage(${G_DocPage + 1})" ${G_DocPage >= pageCount - 1 ? 'disabled' : ''}>›</button>`
       + `<span class="num">${start + 1}-${start + docs.length}</span><span>of ${total} DocData rows</span>`
       + `<span>page</span><input class="tool-input" type="number" min="1" max="${pageCount}" value="${G_DocPage + 1}" onchange="setDocPage(Number(this.value)-1)" title="DocData page"><span>/ ${pageCount}</span>`
-      + `</div></td></tr>`;
+      + `</div></td><td></td></tr>`;
   for (let i = 0; i < docs.length; i++) {
     const d = docs[i];
     const off = h.docdata_off + (start + i)*DOC_REC_SIZE;
     const fp  = d.path || '';
-    const link = fp ? `<span class="spath" onclick="openEncodedFile('${encodeURIComponent(fp)}')" title="Open file">${esc(fp)}</span>`
+        const encodedPath = encodeURIComponent(fp);
+        const link = fp ? `<span class="spath doc-open" title="Open file">${esc(fp)}</span>`
                     : '<span style="color:#555">—</span>';
-    html += `<tr onclick="gotoRange(${off},${off+DOC_REC_SIZE})">` +
+        html += `<tr class="doc-row" onclick="${fp ? `openEncodedFile('${encodedPath}')` : `gotoRange(${off},${off+DOC_REC_SIZE})`}">` +
             `<td class="mono num" style="font-size:10px">${d.doc_id}</td>` +
             `<td class="num">${d.importance}</td><td class="num">${d.doc_len}</td>` +
-            `<td>${link}</td></tr>`;
+          `<td>${link}</td>` +
+          `<td><button type="button" class="icon-btn" title="Show DocData bytes" onclick="event.stopPropagation();gotoRange(${off},${off+DOC_REC_SIZE})">↦</button></td></tr>`;
   }
   document.getElementById('dd-panel').innerHTML = html+'</table>';
 }
