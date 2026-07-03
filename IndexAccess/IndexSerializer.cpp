@@ -329,7 +329,7 @@ BuildBlocksResult IndexSerializer::BuildBlocks(const PostingStore& store)
     uint32_t leafEntryCount = 0;
     char firstLeafTerm[HEAD_TERM_KEY_MAX] = {};
     uint16_t firstLeafTermLength = 0;
-    const bool buildMphf = terms.size() <= 500000;
+    const bool buildMphf = false;
     std::vector<TermMphfBuildTerm> mphfTerms;
     if (buildMphf)
         mphfTerms.reserve(terms.size());
@@ -373,11 +373,14 @@ BuildBlocksResult IndexSerializer::BuildBlocks(const PostingStore& store)
         LeafTermEntry* entry = reinterpret_cast<LeafTermEntry*>(leafBlock.LTB_Data + leafWriteOffset);
         entry->LTE_DocFreq = docFreq;
         entry->LTE_IndexBlockID = indexBlockID;
-        entry->LTE_IndexOffset = indexOffset;
-        entry->LTE_IndexLength = indexLength;
-        entry->LTE_ContinuationBlockCount = continuationBlockCount;
-        entry->LTE_Flags = flags;
-        std::memset(entry->LTE_Reserved, 0, sizeof(entry->LTE_Reserved));
+        assert(indexOffset <= UINT16_MAX);
+        assert(indexLength <= UINT16_MAX);
+        assert(continuationBlockCount <= UINT16_MAX);
+        assert(flags <= UINT8_MAX);
+        entry->LTE_IndexOffset = static_cast<uint16_t>(indexOffset);
+        entry->LTE_IndexLength = static_cast<uint16_t>(indexLength);
+        entry->LTE_ContinuationBlockCount = static_cast<uint16_t>(continuationBlockCount);
+        entry->LTE_Flags = static_cast<uint8_t>(flags);
         entry->LTE_TermLength = termLength;
         std::memcpy(entry->LTE_Term, term.data(), termLength);
         leafWriteOffset += entryBytes;

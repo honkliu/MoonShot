@@ -338,9 +338,16 @@ public:
 
     static uint32_t GetStreamLength(const DocDataEntry& entry, char stream)
     {
-        const uint32_t docLength = std::max<uint32_t>(1, entry.DDE_DocLength);
+        const uint32_t docLength = std::max<uint32_t>(1, entry.DDE_BodyLength);
         auto featureLength = [&](size_t index) {
-            return static_cast<uint32_t>(std::max(0.0f, entry.DDE_FeatureScore[index]));
+            switch (index) {
+            case 0: return entry.DDE_TitleLength;
+            case 1: return entry.DDE_BodyLength;
+            case 4: return entry.DDE_UrlLength;
+            case 5: return entry.DDE_AnchorLength;
+            case 6: return entry.DDE_MetaLength;
+            default: return 0u;
+            }
         };
         uint32_t streamLength = 0;
         switch (stream) {
@@ -683,22 +690,6 @@ public:
 
             BuildBlocksResult mphfResult;
             if (headEntryCount > UINT32_MAX) { cleanupTempFiles(); return false; }
-            std::vector<LeafTermBlock> mergedLeafBlocks(static_cast<size_t>(headEntryCount));
-            if (headEntryCount > 0) {
-                FileAccess leafInput(leafTempPath.c_str());
-                const uint64_t leafBytes = headEntryCount * sizeof(LeafTermBlock);
-                if (!leafInput.Init()
-                    || leafBytes > static_cast<uint64_t>(std::numeric_limits<int>::max())
-                    || leafInput.GetData(mergedLeafBlocks.data(), static_cast<int>(leafBytes)) != static_cast<int>(leafBytes)) {
-                    cleanupTempFiles();
-                    return false;
-                }
-                IndexSerializer::BuildTermMphfFromLeafBlocks(mergedLeafBlocks.data(), static_cast<uint32_t>(headEntryCount), mphfResult);
-                if (totalTerms > 0 && (mphfResult.BBR_TermMphfDisplacements.empty() || mphfResult.BBR_TermMphfEntryPages.empty())) {
-                    cleanupTempFiles();
-                    return false;
-                }
-            }
 
             std::memcpy(header.IFH_Magic, INDEX_FILE_MAGIC, sizeof(INDEX_FILE_MAGIC));
             header.IFH_Version = INDEX_FORMAT_VERSION;
@@ -1075,7 +1066,7 @@ private:
             for (uint64_t slot = 0; slot < m_IndexFileHeader.IFH_NumDocuments; ++slot) {
                 const uint64_t docId = firstDocId + slot;
                 const auto* entry = reinterpret_cast<const DocDataEntry*>(m_DocData + slot * DOC_REC_SIZE);
-                if (entry->DDE_DocID == docId && entry->DDE_VectorFlags != 0)
+                if (entry->DDE_DocID == docId && entry->DDE_VectorDim == DOC_VECTOR_DIM && entry->DDE_VectorFormat != 0)
                     ++vectorDocCount;
             }
             if (vectorDocCount < std::numeric_limits<uint32_t>::max())
@@ -1084,7 +1075,7 @@ private:
             for (uint64_t slot = 0; slot < m_IndexFileHeader.IFH_NumDocuments; ++slot) {
                 const uint64_t docId = firstDocId + slot;
                 const auto* entry = reinterpret_cast<const DocDataEntry*>(m_DocData + slot * DOC_REC_SIZE);
-                if (entry->DDE_DocID == docId && entry->DDE_VectorFlags != 0)
+                if (entry->DDE_DocID == docId && entry->DDE_VectorDim == DOC_VECTOR_DIM && entry->DDE_VectorFormat != 0)
                     m_VectorIndex.Add(docId);
                 if (showProgress && docId > 0 && docId % 100000 == 0)
                     std::cout << "  vector runtime: added through doc " << docId << "\n";
@@ -1136,11 +1127,11 @@ private:
                     ++count;
                 }
             };
-            addLength(entry->DDE_FeatureScore[0], titleTotal, titleDocs);
-            addLength(entry->DDE_FeatureScore[1], bodyTotal, bodyDocs);
-            addLength(entry->DDE_FeatureScore[4], urlTotal, urlDocs);
-            addLength(entry->DDE_FeatureScore[5], anchorTotal, anchorDocs);
-            addLength(entry->DDE_FeatureScore[6], metaTotal, metaDocs);
+            addLength(static_cast<float>(entry->DDE_TitleLength), titleTotal, titleDocs);
+            addLength(static_cast<float>(entry->DDE_BodyLength), bodyTotal, bodyDocs);
+            addLength(static_cast<float>(entry->DDE_UrlLength), urlTotal, urlDocs);
+            addLength(static_cast<float>(entry->DDE_AnchorLength), anchorTotal, anchorDocs);
+            addLength(static_cast<float>(entry->DDE_MetaLength), metaTotal, metaDocs);
         }
 
         if (titleDocs > 0) m_AvgTitleLength = static_cast<float>(titleTotal / static_cast<double>(titleDocs));
@@ -1217,37 +1208,36 @@ private:
         }
         std::memset(docData, 0, static_cast<size_t>(docDataRecordCount * DOC_REC_SIZE));
         for (uint64_t slot = 0; slot < docDataRecordCount; ++slot)
-            reinterpret_cast<DocDataEntry*>(docData + slot * DOC_REC_SIZE)->DDE_DocID = UINT64_MAX;
+            reinterpret_cast<DocDataEntry*>(docData + slot * DOC_REC_SIZE)->DDE_DocID = UINT32_MAX;
 
         uint64_t totalLen = 0;
         for (const auto& [docId, stats] : m_Store->AllDocStats()) {
             auto* entry = reinterpret_cast<DocDataEntry*>(docData + (docId - docDataFirstDocId) * DOC_REC_SIZE);
-            entry->DDE_DocID = docId;
-            entry->DDE_StaticRank = stats.importance;
-            entry->DDE_DocLength = stats.doc_len;
+            assert(docId <= UINT32_MAX);
+            entry->DDE_DocID = static_cast<uint32_t>(docId);
+            entry->DDE_StaticRank = DocDataEncodeScore(stats.importance);
             const float docLength = static_cast<float>(std::max<uint32_t>(1, stats.doc_len));
             const float diversity = std::min(1.0f, static_cast<float>(stats.unique_terms) / docLength);
             const float logLength = std::log2(docLength);
             const float lengthQuality = std::max(0.0f, 1.0f - std::abs(logLength - 6.0f) / 4.0f);
-            entry->DDE_QualityScore = 0.6f * lengthQuality + 0.4f * diversity;
-            entry->DDE_AuthorityScore = stats.title_len > 0
+            entry->DDE_QualityScore = DocDataEncodeScore(0.6f * lengthQuality + 0.4f * diversity);
+            entry->DDE_AuthorityScore = DocDataEncodeScore(stats.title_len > 0
                 ? std::min(1.0f, std::log2(1.0f + static_cast<float>(stats.title_len)) / 5.0f)
-                : 0.0f;
+                : 0.0f);
             const float repetitionPenalty = std::max(0.0f, 0.35f - diversity) / 0.35f;
             const float overlongPenalty = std::max(0.0f, (logLength - 10.0f) / 4.0f);
-            entry->DDE_SpamScore = std::min(1.0f, repetitionPenalty + overlongPenalty);
-            entry->DDE_FeatureScore[0] = static_cast<float>(stats.title_len);
-            entry->DDE_FeatureScore[1] = static_cast<float>(stats.body_len);
-            entry->DDE_FeatureScore[2] = diversity;
-            entry->DDE_FeatureScore[3] = lengthQuality;
-            entry->DDE_FeatureScore[4] = static_cast<float>(stats.url_len);
-            entry->DDE_FeatureScore[5] = static_cast<float>(stats.anchor_len);
-            entry->DDE_FeatureScore[6] = static_cast<float>(stats.meta_len);
+            entry->DDE_SpamScore = DocDataEncodeScore(std::min(1.0f, repetitionPenalty + overlongPenalty));
+            entry->DDE_TitleLength = stats.title_len;
+            entry->DDE_BodyLength = stats.body_len;
+            entry->DDE_UrlLength = stats.url_len;
+            entry->DDE_AnchorLength = stats.anchor_len;
+            entry->DDE_MetaLength = stats.meta_len;
+            entry->DDE_DiversityScore = diversity;
+            entry->DDE_LengthQualityScore = lengthQuality;
             if (m_Store->HasDocVector(docId)) {
-                entry->DDE_VectorFlags = 1;
                 entry->DDE_VectorDim = static_cast<uint16_t>(DOC_VECTOR_DIM);
                 entry->DDE_VectorFormat = 1;
-                std::memcpy(entry->DDE_VectorData, m_Store->GetDocVector(docId), DOC_VECTOR_DIM);
+                std::memcpy(entry->DDE_VectorData, m_Store->GetDocVector(docId), DOC_VECTOR_STORAGE_MAX_DIM);
             }
             entry->DDE_PathLength = static_cast<uint16_t>(std::min(stats.path.size(), DOC_PATH_MAX));
             if (entry->DDE_PathLength > 0)
@@ -1262,9 +1252,6 @@ private:
         header.IFH_AvgDocLength = totalDocs ? static_cast<float>(totalLen) / static_cast<float>(totalDocs) : 1.0f;
 
         auto br = IndexSerializer::BuildBlocks(*m_Store);
-        if (br.BBR_TotalTerms > 0 && (br.BBR_TermMphfDisplacements.empty() || br.BBR_TermMphfEntryPages.empty())) {
-            std::cerr << "TermMPHF unavailable; falling back to Head/Leaf lookup\n";
-        }
         if (br.BBR_IndexBlocks.size() > UINT32_MAX
             || br.BBR_LeafTermBlocks.size() > UINT32_MAX
             || br.BBR_HeadTermEntries.size() > UINT32_MAX
@@ -1416,9 +1403,12 @@ private:
             std::memcpy(entry, source, entryBytes);
             entry->LTE_DocFreq = m_DocFreq;
             entry->LTE_IndexBlockID = m_IndexBlockBase + m_PostingIndexBlockID;
-            entry->LTE_IndexOffset = m_PostingIndexOffset;
-            entry->LTE_IndexLength = m_PostingIndexLength;
-            entry->LTE_ContinuationBlockCount = m_PostingContinuationBlockCount;
+            assert(m_PostingIndexOffset <= UINT16_MAX);
+            assert(m_PostingIndexLength <= UINT16_MAX);
+            assert(m_PostingContinuationBlockCount <= UINT16_MAX);
+            entry->LTE_IndexOffset = static_cast<uint16_t>(m_PostingIndexOffset);
+            entry->LTE_IndexLength = static_cast<uint16_t>(m_PostingIndexLength);
+            entry->LTE_ContinuationBlockCount = static_cast<uint16_t>(m_PostingContinuationBlockCount);
             m_LeafWriteOffset += entryBytes;
             ++m_LeafEntryCount;
             leaf->LTB_Directory[LEAF_TERM_DIRECTORY_COUNT - 1] = static_cast<uint16_t>(m_LeafEntryCount);

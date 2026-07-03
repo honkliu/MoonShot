@@ -1122,16 +1122,16 @@ static bool ParseUInt64(const std::string& text, uint64_t& value)
 
 static float MoonDocDataPrior(const DocDataEntry& entry)
 {
-    const float docLength = static_cast<float>(std::max<uint32_t>(1, entry.DDE_DocLength));
+    const float docLength = static_cast<float>(std::max<uint32_t>(1, entry.DDE_BodyLength));
     static constexpr float TargetLogLength = 6.0f;
     static constexpr float Width = 4.0f;
     static constexpr float Weight = 0.15f;
     const float distance = std::abs(std::log2(docLength) - TargetLogLength);
     const float lengthQuality = std::max(0.0f, 1.0f - distance / Width);
     return Weight * lengthQuality
-        + 0.10f * entry.DDE_QualityScore
-        + 0.05f * entry.DDE_AuthorityScore
-        - 0.10f * entry.DDE_SpamScore;
+        + 0.10f * DocDataDecodeScore(entry.DDE_QualityScore)
+        + 0.05f * DocDataDecodeScore(entry.DDE_AuthorityScore)
+        - 0.10f * DocDataDecodeScore(entry.DDE_SpamScore);
 }
 
 static bool ParseAtList(const std::string& text, std::vector<int>& values)
@@ -1914,7 +1914,7 @@ struct BeirCandidateFeature {
 
 static float RawBranchScore(const SearchResult& result, const DocDataEntry& entry)
 {
-    return result.score - entry.DDE_StaticRank - MoonDocDataPrior(entry);
+    return result.score - DocDataDecodeScore(entry.DDE_StaticRank) - MoonDocDataPrior(entry);
 }
 
 static void AddFeatureRows(IndexContext& ctx,
@@ -2034,16 +2034,16 @@ static void WriteFeatureRows(std::ofstream& output,
                << (row.bigramScore != 0.0f ? 1 : 0) << '\t'
                << static_cast<uint32_t>(row.weakSourceMask) << '\t'
                << static_cast<uint32_t>(row.bigramSourceMask) << '\t'
-               << row.entry->DDE_StaticRank << '\t'
+               << DocDataDecodeScore(row.entry->DDE_StaticRank) << '\t'
                << prior << '\t'
-               << row.entry->DDE_DocLength << '\t'
-               << row.entry->DDE_QualityScore << '\t'
-               << row.entry->DDE_AuthorityScore << '\t'
-               << row.entry->DDE_SpamScore << '\t'
-               << row.entry->DDE_FeatureScore[0] << '\t'
-               << row.entry->DDE_FeatureScore[1] << '\t'
-               << row.entry->DDE_FeatureScore[2] << '\t'
-               << row.entry->DDE_FeatureScore[3] << '\n';
+               << row.entry->DDE_BodyLength << '\t'
+               << DocDataDecodeScore(row.entry->DDE_QualityScore) << '\t'
+               << DocDataDecodeScore(row.entry->DDE_AuthorityScore) << '\t'
+               << DocDataDecodeScore(row.entry->DDE_SpamScore) << '\t'
+               << row.entry->DDE_TitleLength << '\t'
+               << row.entry->DDE_BodyLength << '\t'
+               << row.entry->DDE_DiversityScore << '\t'
+               << row.entry->DDE_LengthQualityScore << '\n';
     }
 }
 
@@ -2219,16 +2219,12 @@ static int RunBeirPatchVectors(const std::string& idxPath, const BeirPatchVector
         }
 
         const uint64_t entryOffset = header.IFH_DocDataOffset + docId * DOC_REC_SIZE;
-        const uint64_t flagsOffset = entryOffset + offsetof(DocDataEntry, DDE_VectorFlags);
         const uint64_t dimOffset = entryOffset + offsetof(DocDataEntry, DDE_VectorDim);
         const uint64_t formatOffset = entryOffset + offsetof(DocDataEntry, DDE_VectorFormat);
         const uint64_t dataOffset = entryOffset + offsetof(DocDataEntry, DDE_VectorData);
 
-        const uint32_t flags = 1;
         const uint16_t dim = static_cast<uint16_t>(DOC_VECTOR_DIM);
         const uint16_t format = 1;
-        output.seekp(flagsOffset);
-        output.write(reinterpret_cast<const char*>(&flags), sizeof(flags));
         output.seekp(dimOffset);
         output.write(reinterpret_cast<const char*>(&dim), sizeof(dim));
         output.seekp(formatOffset);
@@ -2240,7 +2236,7 @@ static int RunBeirPatchVectors(const std::string& idxPath, const BeirPatchVector
             quantized[i] = static_cast<int8_t>(std::round(clipped));
         }
         output.seekp(dataOffset);
-        output.write(reinterpret_cast<const char*>(quantized.data()), quantized.size());
+        output.write(reinterpret_cast<const char*>(quantized.data()), DOC_VECTOR_STORAGE_MAX_DIM);
         if (!output) {
             std::cerr << "Failed while patching docId " << docId << "\n";
             return 1;

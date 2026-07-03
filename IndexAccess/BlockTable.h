@@ -22,15 +22,15 @@
 #include "MemOperation.h"
 
 static constexpr int PAGE_SIZE  = 4096;
-static constexpr size_t DOC_REC_SIZE = 1024;
-static constexpr size_t DOC_VECTOR_DIM = 512;
-static constexpr size_t DOC_VECTOR_STORAGE_MAX_DIM = DOC_VECTOR_DIM;  // fixed int8[512]
-static constexpr size_t DOC_PATH_MAX = 256;
+static constexpr size_t DOC_REC_SIZE = 256;
+static constexpr size_t DOC_VECTOR_DIM = 128;
+static constexpr size_t DOC_VECTOR_STORAGE_MAX_DIM = DOC_VECTOR_DIM;  // fixed int8[128]
+static constexpr size_t DOC_PATH_MAX = 64;
 static constexpr size_t HEAD_TERM_KEY_MAX = 26;
-static constexpr size_t LEAF_TERM_DIRECTORY_COUNT = 96;
+static constexpr size_t LEAF_TERM_DIRECTORY_COUNT = 161;
 static constexpr size_t LEAF_TERM_DATA_OFFSET = LEAF_TERM_DIRECTORY_COUNT * sizeof(uint16_t);
 static constexpr uint8_t  INDEX_FILE_MAGIC[8] = {'M','O','O','N','S','H','O','T'};
-static constexpr uint32_t INDEX_FORMAT_VERSION = 16;
+static constexpr uint32_t INDEX_FORMAT_VERSION = 19;
 
 static constexpr uint64_t INDEX_BLOCK_CACHE_BYTES = 100ull * 1024ull * 1024ull;
 static constexpr uint64_t LEAF_TERM_CACHE_BYTES = 100ull * 1024ull * 1024ull;
@@ -105,36 +105,48 @@ struct TermMphfHeader {
 
 #pragma pack(push,1)
 struct DocDataEntry {
-    uint64_t DDE_DocID;
-    uint64_t DDE_SourceFlags;
-    uint64_t DDE_LastModifiedEpochSeconds;
-    uint64_t DDE_CreatedEpochSeconds;
+    uint32_t DDE_DocID;
 
-    uint32_t DDE_DocLength;
-    uint32_t DDE_PolicyFlags;
-    uint32_t DDE_VectorFlags;
-
-    float    DDE_StaticRank;
-    float    DDE_QualityScore;
-    float    DDE_FreshnessScore;
-    float    DDE_ClickScore;
-    float    DDE_EngagementScore;
-    float    DDE_AuthorityScore;
-    float    DDE_SpamScore;
+    uint16_t DDE_StaticRank;
+    uint16_t DDE_QualityScore;
+    uint16_t DDE_FreshnessScore;
+    uint16_t DDE_ClickScore;
+    uint16_t DDE_EngagementScore;
+    uint16_t DDE_AuthorityScore;
+    uint16_t DDE_SpamScore;
 
     uint16_t DDE_PathLength;
     uint16_t DDE_Language;
     uint16_t DDE_Locale;
     uint16_t DDE_ContentType;
 
-    float    DDE_FeatureScore[16];
+    uint32_t DDE_TitleLength;
+    uint32_t DDE_BodyLength;
+    uint32_t DDE_UrlLength;
+    uint32_t DDE_AnchorLength;
+    uint32_t DDE_MetaLength;
+    float    DDE_DiversityScore;
+    float    DDE_LengthQualityScore;
     uint16_t DDE_VectorDim;
     uint16_t DDE_VectorFormat;
-    uint8_t  DDE_Reserved[108];
+    uint8_t  DDE_Reserved[6];
     int8_t   DDE_VectorData[DOC_VECTOR_STORAGE_MAX_DIM];
     uint8_t  DDE_Path[DOC_PATH_MAX];
 };
 #pragma pack(pop)
+static_assert(sizeof(DocDataEntry) == DOC_REC_SIZE);
+
+inline uint16_t DocDataEncodeScore(float value)
+{
+    if (!(value > 0.0f)) return 0;
+    if (value >= 1.0f) return UINT16_MAX;
+    return static_cast<uint16_t>(value * 65535.0f + 0.5f);
+}
+
+inline float DocDataDecodeScore(uint16_t value)
+{
+    return static_cast<float>(value) / 65535.0f;
+}
 
 #pragma pack(push,1)
 struct IndexBlockContinuationHeader {
@@ -152,25 +164,30 @@ static_assert(sizeof(IndexBlock) == PAGE_SIZE);
 struct LeafTermEntry {
     uint32_t    LTE_DocFreq                 = 0;
     uint32_t    LTE_IndexBlockID            = 0;
-    uint32_t    LTE_IndexOffset             = 0;
-    uint32_t    LTE_IndexLength             = 0;
-    uint32_t    LTE_ContinuationBlockCount  = 0;
-    uint32_t    LTE_Flags                   = 0;
-
-    union {
-        uint64_t LTE_Fingerprint;
-        struct {
-            uint8_t LTE_Reserved[7];
-            uint8_t LTE_TermLength;
-        };
-    };
+    uint16_t    LTE_IndexOffset             = 0;
+    uint16_t    LTE_IndexLength             = 0;
+    uint16_t    LTE_ContinuationBlockCount  = 0;
+    uint8_t     LTE_Flags                   = 0;
+    uint8_t     LTE_TermLength              = 0;
 
     char        LTE_Term[0];
 };
 #pragma pack(pop)
 
-using TermMphfEntry = LeafTermEntry;
-static_assert(sizeof(LeafTermEntry) == 32);
+/* Kept only for reading legacy MPHF pages; new indexes do not build MPHF. */
+#pragma pack(push,1)
+struct TermMphfEntry {
+    uint32_t    LTE_DocFreq                 = 0;
+    uint32_t    LTE_IndexBlockID            = 0;
+    uint32_t    LTE_IndexOffset             = 0;
+    uint32_t    LTE_IndexLength             = 0;
+    uint32_t    LTE_ContinuationBlockCount  = 0;
+    uint32_t    LTE_Flags                   = 0;
+    uint64_t    LTE_Fingerprint             = 0;
+};
+#pragma pack(pop)
+
+static_assert(sizeof(LeafTermEntry) == 16);
 static_assert(sizeof(TermMphfEntry) == 32);
 static_assert(PAGE_SIZE % sizeof(TermMphfEntry) == 0);
 
@@ -182,8 +199,8 @@ struct alignas(16) HeadTermEntry {
 
 /*
 * LeafTermBlock is one 4096-byte page.
-* LTB_Directory[0..94] stores LeafTermEntry offsets from the block base.
-* LTB_Directory[95] stores the number of entries in this block.
+* LTB_Directory[0..159] stores LeafTermEntry offsets from the block base.
+* LTB_Directory[160] stores the number of entries in this block.
 * LTB_Data stores packed LeafTermEntry records followed by their term bytes.
 */
 struct LeafTermBlock {

@@ -215,7 +215,7 @@ public:
         if (!HasDoc(doc_id))
             m_DocStats[doc_id];
         DocVectorBytes payload{};
-        std::memcpy(payload.data(), vector, DOC_VECTOR_DIM);
+        std::memcpy(payload.data(), vector, DOC_VECTOR_STORAGE_MAX_DIM);
         m_DocVectors[doc_id] = std::move(payload);
         return true;
     }
@@ -236,7 +236,7 @@ private:
     static DocVectorBytes QuantizeVector(const std::vector<float>& vector)
     {
         DocVectorBytes out{};
-        for (size_t i = 0; i < DOC_VECTOR_DIM; ++i) {
+        for (size_t i = 0; i < DOC_VECTOR_STORAGE_MAX_DIM; ++i) {
             const float clipped = std::max(-128.0f, std::min(127.0f, vector[i] * 128.0f));
             out[i] = static_cast<int8_t>(std::round(clipped));
         }
