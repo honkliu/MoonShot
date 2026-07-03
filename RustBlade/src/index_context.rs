@@ -290,7 +290,7 @@ impl IndexContext {
         if !savingDeltaIndex {
             self.m_IndexPath = Some(path.to_string());
         }
-        let (header, blockTable, vectorIndex, docData) = {
+        let (header, blockTable, vectorIndex, docData, pathPrefixSidecar, pathPrefixes) = {
             let store = self.m_Store.lock().unwrap();
             Self::BuildIndexData(&store, false)
         };
@@ -299,8 +299,10 @@ impl IndexContext {
         self.m_WriteBlockTable = blockTable;
         self.m_WriteVectorIndex = vectorIndex;
         self.m_WriteDocData = docData;
+        self.m_WritePathPrefixSidecar = pathPrefixSidecar;
+        self.m_WritePathPrefixes = pathPrefixes;
 
-        IndexSerializer::Save(&self.m_WriteIndexFileHeader, &self.m_WriteBlockTable, &self.m_WriteDocData, path)?;
+        IndexSerializer::Save(&self.m_WriteIndexFileHeader, &self.m_WriteBlockTable, &self.m_WriteDocData, &self.m_WritePathPrefixSidecar, path)?;
         if savingDeltaIndex {
             let mut delta = IndexContext::with_path_and_load_delta(None, false);
             delta.m_IndexPath = Some(path.to_string());
@@ -308,6 +310,8 @@ impl IndexContext {
             delta.m_VectorIndex = std::mem::replace(&mut self.m_WriteVectorIndex, HnswIndex::new(DOC_VECTOR_DIM, 32, 200, VectorMetric::Cosine));
             delta.m_IndexFileHeader = self.m_WriteIndexFileHeader;
             delta.m_DocData = std::mem::take(&mut self.m_WriteDocData);
+            delta.m_PathPrefixSidecar = std::mem::take(&mut self.m_WritePathPrefixSidecar);
+            delta.m_PathPrefixes = std::mem::take(&mut self.m_WritePathPrefixes);
             delta.m_Built = true;
             delta.m_LoadedFromDisk = true;
             delta.m_VectorBuilt = false;

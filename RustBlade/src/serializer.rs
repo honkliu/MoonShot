@@ -12,7 +12,6 @@ use crate::block_table::{
     LeafTermBlock,
     LeafTermEntry,
     DocDataDecodeScore,
-    PathPrefixSidecarEntry,
     PathPrefixSidecarHeader,
     DOC_PATH_MAX,
     DOC_REC_SIZE,
@@ -552,10 +551,10 @@ impl IndexSerializer {
         };
         if &header.PPSH_Magic != PATH_PREFIX_SIDECAR_MAGIC
             || header.PPSH_Version != PATH_PREFIX_SIDECAR_VERSION
-            || header.PPSH_EntryOffset as usize  < 32
-            || header.PPSH_StringOffset as usize > PATH_PREFIX_SIDECAR_BYTES
-            || header.PPSH_StringOffset as usize + header.PPSH_StringBytes as usize > PATH_PREFIX_SIDECAR_BYTES
-            || header.PPSH_EntryOffset as usize + header.PPSH_PrefixCount as usize * 8 > PATH_PREFIX_SIDECAR_BYTES
+            || (header.PPSH_EntryOffset as usize) < 32
+            || (header.PPSH_StringOffset as usize) > PATH_PREFIX_SIDECAR_BYTES
+            || (header.PPSH_StringOffset as usize) + (header.PPSH_StringBytes as usize) > PATH_PREFIX_SIDECAR_BYTES
+            || (header.PPSH_EntryOffset as usize) + (header.PPSH_PrefixCount as usize) * 8 > PATH_PREFIX_SIDECAR_BYTES
         {
             return Err(RustBladeError::InvalidFormat);
         }
