@@ -12,11 +12,16 @@ use crate::block_table::{
     LeafTermBlock,
     LeafTermEntry,
     DocDataDecodeScore,
+    PathPrefixSidecarEntry,
+    PathPrefixSidecarHeader,
     DOC_PATH_MAX,
     DOC_REC_SIZE,
     DOC_VECTOR_DIM,
     DOC_VECTOR_OFFSET,
     DOC_PATH_OFFSET,
+    PATH_PREFIX_SIDECAR_BYTES,
+    PATH_PREFIX_SIDECAR_MAGIC,
+    PATH_PREFIX_SIDECAR_VERSION,
     HEAD_TERM_KEY_MAX,
     INDEX_BLOCK_CONTINUATION_HEADER_SIZE,
     INDEX_FILE_HEADER_SIZE,
@@ -281,9 +286,11 @@ fn BuildTermMphf(terms: &[TermMphfBuildTerm]) -> (TermMphfHeader, Vec<i32>, Vec<
 
 impl IndexSerializer {
     #[allow(non_snake_case)]
-    pub fn Save(header: &IndexFileHeader, blockTable: &IndexBlockTable, docData: &[u8], path: &str) -> Result<()> {
+    pub fn Save(header: &IndexFileHeader, blockTable: &IndexBlockTable, docData: &[u8], pathPrefixSidecar: &[u8], path: &str) -> Result<()> {
         let mut file = File::create(path)?;
         file.write_all(&header.to_bytes())?;
+        if pathPrefixSidecar.len() != PATH_PREFIX_SIDECAR_BYTES { return Err(RustBladeError::InvalidFormat); }
+        file.write_all(pathPrefixSidecar)?;
 
         if header.IFH_HeadTermEntryCount > 0 {
             let mut bytes = Vec::with_capacity(header.IFH_HeadTermEntryCount as usize * 32);
@@ -358,6 +365,16 @@ impl IndexSerializer {
     }
 
     #[allow(non_snake_case)]
+    pub fn LoadPathPrefixSidecar(path: &str) -> Result<(Vec<u8>, Vec<String>)> {
+        let mut file = File::open(path)?;
+        file.seek(std::io::SeekFrom::Start(INDEX_FILE_HEADER_SIZE as u64))?;
+        let mut sidecar = vec![0u8; PATH_PREFIX_SIDECAR_BYTES];
+        file.read_exact(&mut sidecar)?;
+        let prefixes = Self::DecodePathPrefixSidecar(&sidecar)?;
+        Ok((sidecar, prefixes))
+    }
+
+    #[allow(non_snake_case)]
     pub fn LoadTermMphf(path: &str, header: &IndexFileHeader) -> Result<(TermMphfHeader, Vec<i32>, Vec<IndexBlock>)> {
         if header.IFH_TermMphfHeaderCount == 0 {
             return Ok((TermMphfHeader::default(), Vec::new(), Vec::new()));
@@ -421,6 +438,9 @@ impl IndexSerializer {
         -> Result<(Vec<HeadTermEntry>, Vec<LeafTermBlock>, Vec<IndexBlock>, Vec<u8>, TermMphfHeader, Vec<i32>, Vec<IndexBlock>)>
     {
         let header = IndexFileHeader::parse(data)?;
+
+        if INDEX_FILE_HEADER_SIZE + PATH_PREFIX_SIDECAR_BYTES > data.len() { return Err(RustBladeError::InvalidFormat); }
+        let _prefixes = Self::DecodePathPrefixSidecar(&data[INDEX_FILE_HEADER_SIZE..INDEX_FILE_HEADER_SIZE + PATH_PREFIX_SIDECAR_BYTES])?;
 
         let head_offset = header.IFH_HeadTermEntryOffset as usize;
         let head_count = header.IFH_HeadTermEntryCount as usize;
@@ -516,6 +536,69 @@ impl IndexSerializer {
         } else {
             0
         }
+    }
+
+    #[allow(non_snake_case)]
+    pub fn DecodePathPrefixSidecar(sidecar: &[u8]) -> Result<Vec<String>> {
+        if sidecar.len() != PATH_PREFIX_SIDECAR_BYTES { return Err(RustBladeError::InvalidFormat); }
+        let header = PathPrefixSidecarHeader {
+            PPSH_Magic: sidecar[0..8].try_into().map_err(|_| RustBladeError::InvalidFormat)?,
+            PPSH_Version: u16_at(sidecar, 8),
+            PPSH_PrefixCount: u16_at(sidecar, 10),
+            PPSH_EntryOffset: u32_at(sidecar, 12),
+            PPSH_StringOffset: u32_at(sidecar, 16),
+            PPSH_StringBytes: u32_at(sidecar, 20),
+            PPSH_Reserved: sidecar[24..32].try_into().map_err(|_| RustBladeError::InvalidFormat)?,
+        };
+        if &header.PPSH_Magic != PATH_PREFIX_SIDECAR_MAGIC
+            || header.PPSH_Version != PATH_PREFIX_SIDECAR_VERSION
+            || header.PPSH_EntryOffset as usize  < 32
+            || header.PPSH_StringOffset as usize > PATH_PREFIX_SIDECAR_BYTES
+            || header.PPSH_StringOffset as usize + header.PPSH_StringBytes as usize > PATH_PREFIX_SIDECAR_BYTES
+            || header.PPSH_EntryOffset as usize + header.PPSH_PrefixCount as usize * 8 > PATH_PREFIX_SIDECAR_BYTES
+        {
+            return Err(RustBladeError::InvalidFormat);
+        }
+
+        let mut prefixes = Vec::with_capacity(header.PPSH_PrefixCount as usize);
+        for index in 0..header.PPSH_PrefixCount as usize {
+            let offset = header.PPSH_EntryOffset as usize + index * 8;
+            let entry = PathPrefixSidecarEntry {
+                PPSE_Offset: u32_at(sidecar, offset),
+                PPSE_Length: u16_at(sidecar, offset + 4),
+                PPSE_Flags: u16_at(sidecar, offset + 6),
+            };
+            let begin = header.PPSH_StringOffset as usize + entry.PPSE_Offset as usize;
+            let end = begin + entry.PPSE_Length as usize;
+            if end > header.PPSH_StringOffset as usize + header.PPSH_StringBytes as usize { return Err(RustBladeError::InvalidFormat); }
+            prefixes.push(std::str::from_utf8(&sidecar[begin..end]).map_err(|_| RustBladeError::InvalidFormat)?.to_string());
+        }
+        Ok(prefixes)
+    }
+
+    #[allow(non_snake_case)]
+    pub fn EncodePathPrefixSidecar(prefixes: &[String]) -> Vec<u8> {
+        let mut sidecar = vec![0u8; PATH_PREFIX_SIDECAR_BYTES];
+        sidecar[0..8].copy_from_slice(PATH_PREFIX_SIDECAR_MAGIC);
+        sidecar[8..10].copy_from_slice(&PATH_PREFIX_SIDECAR_VERSION.to_le_bytes());
+        let count = prefixes.len().min(u16::MAX as usize) as u16;
+        sidecar[10..12].copy_from_slice(&count.to_le_bytes());
+        let entry_offset = 32u32;
+        let string_offset = entry_offset + count as u32 * 8;
+        sidecar[12..16].copy_from_slice(&entry_offset.to_le_bytes());
+        sidecar[16..20].copy_from_slice(&string_offset.to_le_bytes());
+
+        let mut cursor = 0u32;
+        for (index, prefix) in prefixes.iter().take(count as usize).enumerate() {
+            let entry_offset = entry_offset as usize + index * 8;
+            sidecar[entry_offset..entry_offset + 4].copy_from_slice(&cursor.to_le_bytes());
+            sidecar[entry_offset + 4..entry_offset + 6].copy_from_slice(&(prefix.len() as u16).to_le_bytes());
+            let string_begin = string_offset as usize + cursor as usize;
+            sidecar[string_begin..string_begin + prefix.len()].copy_from_slice(prefix.as_bytes());
+            cursor += prefix.len() as u32;
+        }
+        sidecar[20..24].copy_from_slice(&cursor.to_le_bytes());
+        sidecar
     }
 
     #[allow(non_snake_case)]

@@ -1,5 +1,6 @@
 use std::fs;
 use std::fs::File;
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
 use crate::posting_store::PostingStore;
@@ -14,7 +15,7 @@ use crate::compiler::IndexSearchCompiler;
 use crate::tokenizer::{SmartTokenizer, Tokenizer};
 use crate::serializer::{IndexSerializer, IndexFileHeader};
 use crate::error::{Result, RustBladeError};
-use crate::block_table::{DOC_PATH_MAX, DOC_REC_SIZE, DOC_VECTOR_DIM, DOC_VECTOR_OFFSET, DOC_PATH_OFFSET, INDEX_FILE_HEADER_SIZE, PAGE_SIZE, HEAD_TERM_KEY_MAX, INDEX_BLOCK_CONTINUATION_HEADER_SIZE, LEAF_TERM_DATA_OFFSET, LEAF_TERM_DIRECTORY_COUNT, TERM_MPHF_HEADER_SIZE, HeadTermEntry, IndexBlock, IndexBlockContinuationHeader, LeafTermEntry, LeafTermBlock, PinnedBlock, TermMphfHeader, DocDataEncodeScore};
+use crate::block_table::{DOC_PATH_MAX, DOC_PATH_PREFIX_ID_BYTES, DOC_PATH_FILENAME_MAX, DOC_PATH_PREFIX_INVALID, DOC_REC_SIZE, DOC_VECTOR_DIM, DOC_VECTOR_OFFSET, DOC_PATH_OFFSET, PATH_PREFIX_SIDECAR_BYTES, INDEX_FILE_HEADER_SIZE, PAGE_SIZE, HEAD_TERM_KEY_MAX, INDEX_BLOCK_CONTINUATION_HEADER_SIZE, LEAF_TERM_DATA_OFFSET, LEAF_TERM_DIRECTORY_COUNT, TERM_MPHF_HEADER_SIZE, HeadTermEntry, IndexBlock, IndexBlockContinuationHeader, LeafTermEntry, LeafTermBlock, PinnedBlock, TermMphfHeader, DocDataEncodeScore};
 use crate::vector_index::{HnswIndex, VectorMetric, VectorSearchResult};
 use crate::vector_index::build_hashed_embedding;
 
@@ -60,11 +61,15 @@ pub struct IndexContext {
     m_LoadDelta: bool,
     m_IndexFileHeader: IndexFileHeader,
     m_DocData: Vec<u8>,
+    m_PathPrefixSidecar: Vec<u8>,
+    m_PathPrefixes: Vec<String>,
     m_DeltaContext: Option<Box<IndexContext>>,
     m_WriteBlockTable: IndexBlockTable,
     m_WriteVectorIndex: HnswIndex,
     m_WriteIndexFileHeader: IndexFileHeader,
     m_WriteDocData: Vec<u8>,
+    m_WritePathPrefixSidecar: Vec<u8>,
+    m_WritePathPrefixes: Vec<String>,
 }
 
 #[allow(non_snake_case)]
@@ -90,11 +95,15 @@ impl IndexContext {
             m_LoadDelta: load_delta,
             m_IndexFileHeader: IndexFileHeader::default(),
             m_DocData: Vec::new(),
+            m_PathPrefixSidecar: vec![0u8; PATH_PREFIX_SIDECAR_BYTES],
+            m_PathPrefixes: Vec::new(),
             m_DeltaContext: None,
             m_WriteBlockTable: IndexBlockTable::new(512),
             m_WriteVectorIndex: HnswIndex::new(DOC_VECTOR_DIM, 32, 200, VectorMetric::Cosine),
             m_WriteIndexFileHeader: IndexFileHeader::default(),
             m_WriteDocData: Vec::new(),
+            m_WritePathPrefixSidecar: vec![0u8; PATH_PREFIX_SIDECAR_BYTES],
+            m_WritePathPrefixes: Vec::new(),
         };
         if let Some(ref path) = index_path {
             let _ = ctx.LoadIndex(path);
@@ -173,9 +182,7 @@ impl IndexContext {
             {
                 let path_len = u16::from_le_bytes(self.m_DocData[offset + 18..offset + 20].try_into().unwrap()) as usize;
                 if path_len > 0 && path_len <= DOC_PATH_MAX {
-                    if let Ok(path) = std::str::from_utf8(&self.m_DocData[offset + DOC_PATH_OFFSET..offset + DOC_PATH_OFFSET + path_len]) {
-                        return path.to_string();
-                    }
+                    return Self::DecodeDocPath(&self.m_DocData[offset + DOC_PATH_OFFSET..offset + DOC_PATH_OFFSET + path_len], &self.m_PathPrefixes);
                 }
             }
         }
@@ -621,6 +628,59 @@ impl IndexContext {
         let Some(min_doc_id) = store.AllDocStats().keys().copied().min() else { return 0; };
         let max_doc_id = store.AllDocStats().keys().copied().max().unwrap_or(min_doc_id);
         max_doc_id - min_doc_id + 1
+    }
+
+    fn split_path_for_sidecar(full_path: &str) -> (String, String) {
+        match full_path.rfind(['/', '\\']) {
+            Some(index) => (full_path[..index].to_string(), full_path[index + 1..].to_string()),
+            None => (String::new(), full_path.to_string()),
+        }
+    }
+
+    fn path_prefix_sidecar_can_hold(prefix_count: usize, string_bytes: usize) -> bool {
+        32 + prefix_count * 8 + string_bytes <= PATH_PREFIX_SIDECAR_BYTES
+    }
+
+    fn intern_path_prefix(prefix: &str, prefix_to_id: &mut HashMap<String, u16>, prefixes: &mut Vec<String>, string_bytes: &mut usize) -> u16 {
+        if let Some(id) = prefix_to_id.get(prefix) { return *id; }
+        if prefixes.len() >= DOC_PATH_PREFIX_INVALID as usize { return DOC_PATH_PREFIX_INVALID; }
+        let next_string_bytes = *string_bytes + prefix.len();
+        if !Self::path_prefix_sidecar_can_hold(prefixes.len() + 1, next_string_bytes) { return DOC_PATH_PREFIX_INVALID; }
+        let id = prefixes.len() as u16;
+        prefixes.push(prefix.to_string());
+        prefix_to_id.insert(prefix.to_string(), id);
+        *string_bytes = next_string_bytes;
+        id
+    }
+
+    fn encode_doc_path(record: &mut [u8], full_path: &str, prefix_to_id: &mut HashMap<String, u16>, prefixes: &mut Vec<String>, string_bytes: &mut usize) {
+        record[18..20].copy_from_slice(&0u16.to_le_bytes());
+        record[DOC_PATH_OFFSET..DOC_PATH_OFFSET + DOC_PATH_MAX].fill(0);
+        if full_path.is_empty() { return; }
+        let (prefix, filename) = Self::split_path_for_sidecar(full_path);
+        let prefix_id = Self::intern_path_prefix(&prefix, prefix_to_id, prefixes, string_bytes);
+        let filename_len = filename.len().min(DOC_PATH_FILENAME_MAX);
+        let path_len = (DOC_PATH_PREFIX_ID_BYTES + filename_len) as u16;
+        record[18..20].copy_from_slice(&path_len.to_le_bytes());
+        record[DOC_PATH_OFFSET..DOC_PATH_OFFSET + 2].copy_from_slice(&prefix_id.to_le_bytes());
+        record[DOC_PATH_OFFSET + 2..DOC_PATH_OFFSET + 2 + filename_len].copy_from_slice(&filename.as_bytes()[..filename_len]);
+    }
+
+    fn DecodeDocPath(payload: &[u8], prefixes: &[String]) -> String {
+        if payload.is_empty() { return String::new(); }
+        if payload.len() < DOC_PATH_PREFIX_ID_BYTES {
+            return std::str::from_utf8(payload).unwrap_or("").to_string();
+        }
+        let prefix_id = u16::from_le_bytes(payload[0..2].try_into().unwrap());
+        let filename = std::str::from_utf8(&payload[2..]).unwrap_or("");
+        if prefix_id == DOC_PATH_PREFIX_INVALID || prefix_id as usize >= prefixes.len() {
+            return filename.to_string();
+        }
+        let prefix = &prefixes[prefix_id as usize];
+        if prefix.is_empty() { return filename.to_string(); }
+        let separator = if prefix.contains('\\') { '\\' } else { '/' };
+        if prefix.ends_with(['/', '\\']) { format!("{prefix}{filename}") }
+        else { format!("{prefix}{separator}{filename}") }
     }
 
     fn DocDataFirstDocId(docdata: &[u8], header: &IndexFileHeader) -> u64 {

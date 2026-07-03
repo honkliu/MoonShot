@@ -11,11 +11,18 @@ pub const DOC_REC_SIZE: usize = 256;
 pub const DOC_VECTOR_DIM: usize = 128;
 pub const DOC_VECTOR_STORAGE_MAX_DIM: usize = DOC_VECTOR_DIM;
 pub const DOC_PATH_MAX: usize = 64;
+pub const DOC_PATH_PREFIX_ID_BYTES: usize = 2;
+pub const DOC_PATH_FILENAME_MAX: usize = DOC_PATH_MAX - DOC_PATH_PREFIX_ID_BYTES;
+pub const DOC_PATH_PREFIX_INVALID: u16 = u16::MAX;
 pub const HEAD_TERM_KEY_MAX: usize = 26;
 pub const LEAF_TERM_DIRECTORY_COUNT: usize = 161;
 pub const LEAF_TERM_DATA_OFFSET: usize = LEAF_TERM_DIRECTORY_COUNT * std::mem::size_of::<u16>();
+pub const PATH_PREFIX_SIDECAR_PAGE_COUNT: usize = 10;
+pub const PATH_PREFIX_SIDECAR_BYTES: usize = PATH_PREFIX_SIDECAR_PAGE_COUNT * PAGE_SIZE;
+pub const PATH_PREFIX_SIDECAR_MAGIC: &[u8; 8] = b"MSPATHS\0";
+pub const PATH_PREFIX_SIDECAR_VERSION: u16 = 1;
 pub const INDEX_FILE_HEADER_SIZE: usize = 136;
-pub const INDEX_FORMAT_VERSION: u32 = 19;
+pub const INDEX_FORMAT_VERSION: u32 = 20;
 pub const INDEX_BLOCK_CONTINUATION_HEADER_SIZE: usize = 12;
 pub const TERM_MPHF_MAGIC: u64 = 0x4850464d4d524554u64;
 pub const TERM_MPHF_HEADER_SIZE: usize = 48;
@@ -59,6 +66,26 @@ pub struct TermMphfHeader {
     pub TMH_BucketSeed: u64,
     pub TMH_SlotSeed: u64,
     pub TMH_FingerprintSeed: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+#[allow(non_snake_case)]
+pub struct PathPrefixSidecarHeader {
+    pub PPSH_Magic: [u8; 8],
+    pub PPSH_Version: u16,
+    pub PPSH_PrefixCount: u16,
+    pub PPSH_EntryOffset: u32,
+    pub PPSH_StringOffset: u32,
+    pub PPSH_StringBytes: u32,
+    pub PPSH_Reserved: [u8; 8],
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+#[allow(non_snake_case)]
+pub struct PathPrefixSidecarEntry {
+    pub PPSE_Offset: u32,
+    pub PPSE_Length: u16,
+    pub PPSE_Flags: u16,
 }
 
 #[allow(non_snake_case)]
