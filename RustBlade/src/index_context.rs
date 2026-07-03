@@ -433,7 +433,7 @@ impl IndexContext {
                 &mut headEntryCount, &mut totalTerms, &mut indexBlockCount)?;
         }
 
-        let headOffset = INDEX_FILE_HEADER_SIZE;
+        let headOffset = INDEX_FILE_HEADER_SIZE + PATH_PREFIX_SIDECAR_BYTES;
         let leafOffset = headOffset + headEntryCount as usize * 32;
         let docDataOffset = leafOffset + headEntryCount as usize * PAGE_SIZE;
         let indexOffset = docDataOffset + mergedDocData.len();
@@ -480,6 +480,7 @@ impl IndexContext {
         {
             let mut output = File::create(&tempPath)?;
             output.write_all(&header.to_bytes())?;
+            output.write_all(&IndexSerializer::EncodePathPrefixSidecar(&[]))?;
             Self::AppendFile(&mut output, &headTempPath)?;
             Self::AppendFile(&mut output, &leafTempPath)?;
             Self::AppendFile(&mut output, &docDataTempPath)?;
@@ -509,7 +510,7 @@ impl IndexContext {
         let firstDocId = Self::StoreFirstDocId(store);
         let documentCount = Self::StoreDocDataRecordCount(store);
 
-        let headOffset = INDEX_FILE_HEADER_SIZE;
+        let headOffset = INDEX_FILE_HEADER_SIZE + PATH_PREFIX_SIDECAR_BYTES;
         let leafOffset = headOffset + blocks.BBR_HeadTermEntries.len() * 32;
         let docDataOffset = leafOffset + blocks.BBR_LeafTermBlocks.len() * PAGE_SIZE;
         let indexOffset = docDataOffset + docData.len();

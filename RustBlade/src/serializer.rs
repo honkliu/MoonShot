@@ -14,11 +14,9 @@ use crate::block_table::{
     DocDataDecodeScore,
     PathPrefixSidecarEntry,
     PathPrefixSidecarHeader,
-    DOC_PATH_MAX,
     DOC_REC_SIZE,
     DOC_VECTOR_DIM,
     DOC_VECTOR_OFFSET,
-    DOC_PATH_OFFSET,
     PATH_PREFIX_SIDECAR_BYTES,
     PATH_PREFIX_SIDECAR_MAGIC,
     PATH_PREFIX_SIDECAR_VERSION,
@@ -607,7 +605,6 @@ impl IndexSerializer {
         let doc_id = u32_at(record, 0) as u64;
         if doc_id != index { return Ok(()); }
         let importance = DocDataDecodeScore(u16_at(record, 4));
-        let path_len = u16_at(record, 18) as usize;
         let title_len = u32_at(record, 26);
         let body_len = u32_at(record, 30);
         let url_len = u32_at(record, 34);
@@ -619,11 +616,6 @@ impl IndexSerializer {
         store.SetDocImportance(doc_id, importance);
         if vector_dim == DOC_VECTOR_DIM && vector_format != 0 {
             store.SetDocVectorBytes(doc_id, &record[DOC_VECTOR_OFFSET..DOC_VECTOR_OFFSET + DOC_VECTOR_DIM]);
-        }
-        if path_len > 0 && path_len <= DOC_PATH_MAX {
-            if let Ok(path) = std::str::from_utf8(&record[DOC_PATH_OFFSET..DOC_PATH_OFFSET + path_len]) {
-                store.SetDocPath(doc_id, path.to_string());
-            }
         }
         Ok(())
     }
