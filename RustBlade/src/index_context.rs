@@ -212,12 +212,14 @@ impl IndexContext {
         let table = Arc::get_mut(&mut self.m_BlockTable)
             .expect("BlockTable must have no other refs during build");
 
-        let (header, newTable, vectorIndex, docData) = Self::BuildIndexData(&store, true);
+        let (header, newTable, vectorIndex, docData, pathPrefixSidecar, pathPrefixes) = Self::BuildIndexData(&store, true);
         *table = newTable;
         self.m_VectorIndex = vectorIndex;
         self.m_VectorBuilt = true;
         self.m_IndexFileHeader = header;
         self.m_DocData = docData;
+        self.m_PathPrefixSidecar = pathPrefixSidecar;
+        self.m_PathPrefixes = pathPrefixes;
         self.m_Built = true;
     }
 
