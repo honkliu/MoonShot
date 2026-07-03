@@ -98,7 +98,7 @@ tr:hover td { background:#2a2d2e; cursor:pointer; }
 .bcard     { border-bottom:1px solid #2a2a2a; }
 .bcard-hdr { padding:5px 10px; background:#252526; display:flex; align-items:center;
              gap:6px; cursor:pointer; font-size:12px; }
-.term-explorer { height:calc(100vh - 94px); overflow:auto; min-height:0; }
+.term-explorer { height:calc(100vh - 94px); overflow:auto; min-height:0; scrollbar-gutter:stable; }
 .term-toolbar { padding:5px 8px; font-size:11px; color:#888; background:#252526; border-bottom:1px solid #3e3e42; }
 .pager { display:flex; align-items:center; gap:6px; padding:2px 0; color:#888; font-size:11px; }
 .pager .icon-btn { width:24px; }
@@ -108,23 +108,27 @@ tr:hover td { background:#2a2d2e; cursor:pointer; }
 .icon-btn:hover { background:#094771; color:#fff; border-color:#007acc; }
 .icon-btn:disabled { opacity:.35; cursor:default; background:#2d2d30; color:#777; border-color:#444; }
 .tree-row.active td { background:#094771; }
-.tree-row .indent { display:inline-block; width:18px; }
+.tree-row td { height:28px; vertical-align:middle; line-height:18px; }
+.tree-row .indent { display:inline-block; width:14px; }
 .tree-cell { display:flex; align-items:center; gap:4px; }
+.tree-label { display:flex; align-items:center; gap:5px; min-width:0; white-space:nowrap; overflow:hidden; }
+.tree-label .key,.tree-label .num { min-width:0; overflow:hidden; text-overflow:ellipsis; }
+.tree-level { display:inline-block; flex:0 0 auto; color:#555; font-family:'Cascadia Code','Consolas',monospace; }
 .tree-kind { color:#888; font-size:11px; }
 .tree-field { color:#888; font-size:11px; margin-right:4px; }
 .tree-meta { display:flex; align-items:center; gap:6px; flex-wrap:wrap; color:#999; }
-.tree-chip { display:inline-block; padding:1px 5px; border:1px solid #3e3e42; border-radius:3px; background:#252526; color:#b5cea8; font-size:10px; }
+.tree-chip { display:inline-block; margin-right:5px; padding:1px 5px; border:1px solid #3e3e42; border-radius:3px; background:#252526; color:#b5cea8; font-size:10px; }
 .tree-target { color:#9cdcfe; font-family:'Cascadia Code','Consolas',monospace; font-size:11px; }
 .tree-table { table-layout:fixed; width:100%; }
-.tree-table th,.tree-table td { overflow:hidden; }
+.tree-table th,.tree-table td { overflow:hidden; white-space:nowrap; }
 .tree-table td:nth-child(2),.tree-table td:nth-child(3),.tree-table td:nth-child(4),.tree-table td:nth-child(5) { white-space:nowrap; text-overflow:ellipsis; }
 .tree-table .tree-meta { min-width:0; overflow:hidden; white-space:nowrap; }
 .tree-table .key,.tree-table .tree-target { overflow:hidden; text-overflow:ellipsis; }
-.tree-detail-cell { padding:0 !important; }
+.tree-detail-cell { padding:0 !important; white-space:normal !important; }
 .posting-panel { margin:0; padding:6px 10px; border-top:1px solid #2a2a2a; background:#181818; color:#aaa; overflow:hidden; }
 .posting-panel table { width:100%; border-collapse:collapse; table-layout:fixed; }
 .posting-panel th,.posting-panel td { border:0; padding:3px 6px; background:transparent !important; }
-.posting-panel th { color:#777; font-size:10px; text-transform:uppercase; letter-spacing:.03em; }
+.posting-panel th { color:#777; font-size:10px; text-transform:uppercase; letter-spacing:.03em; position:static; z-index:auto; }
 .posting-panel th:nth-child(1),.posting-panel td:nth-child(1) { width:90px; }
 .posting-panel th:nth-child(2),.posting-panel td:nth-child(2) { width:60px; }
 .posting-panel .path { display:block; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
@@ -132,6 +136,8 @@ tr:hover td { background:#2a2d2e; cursor:pointer; }
 .doc-row:hover td { background:#2a2d2e; }
 .doc-open { color:#9cdcfe; text-decoration:underline; cursor:pointer; }
 .leaf-row td { background:#202020; }
+.block-row td { background:#1b2428; }
+.block-row td:first-child { box-shadow:inset 3px 0 #4ec9b0; }
 .posting-row td { background:#181818; color:#aaa; }
 .posting-header td { color:#777; font-size:10px; text-transform:uppercase; letter-spacing:.03em; }
 .term-jump { color:#9cdcfe; text-decoration:underline; cursor:pointer; }
@@ -1294,7 +1300,7 @@ function renderHeadLeafTerms() {
   html += `<div class="term-toolbar">`
       + `Head/Leaf term table @ 0x${h.subindex_off.toString(16)} (${h.subindex_size} bytes). `
        + `Use + to expand physical layout nodes; click any row to highlight its on-disk bytes.</div>`;
-  html += '<table class="tree-table"><colgroup><col style="width:72px"><col style="width:32%"><col style="width:145px"><col style="width:260px"><col></colgroup><tr><th></th><th>Object</th><th>Disk bytes</th><th>Target / fields</th><th>IndexEntry</th></tr>';
+  html += '<table class="tree-table"><colgroup><col style="width:64px"><col style="width:33%"><col style="width:138px"><col style="width:28%"><col style="width:22%"></colgroup><tr><th></th><th>Object</th><th>Disk bytes</th><th>Target / fields</th><th>IndexEntry</th></tr>';
   html += renderHeadTermRows(si);
   html += '</table></div>';
   document.getElementById('si-panel').innerHTML = html;
@@ -1332,14 +1338,33 @@ function renderHeadTermEntry(d) {
   const filtering = !!G_TermFilter;
   const expanded = filtering || G_ExpandedTree.has(node);
   const active = G_SelectedTreeNode === node ? ' active' : '';
-  let html = `<tr class="tree-row${active}" onclick="selectTreeNode('${node}',${d.byte_offset},${d.byte_offset + d.byte_len})">`
+  const leafBlock = G.leafTermBlocksById?.get(d.hte_leaf_term_block_id);
+  const leafCount = leafBlock ? leafBlock.entries.length : null;
+  let html = `<tr class="tree-row${active}" data-node="${cssId(node)}" onclick="selectTreeNode('${node}',${d.byte_offset},${d.byte_offset + d.byte_len})">`
       + `<td><div class="tree-cell"><button type="button" class="icon-btn" onclick="event.stopPropagation();toggleTreeNode('${node}')">${expanded ? '-' : '+'}</button></div></td>`
-      + `<td><span class="tree-kind">HeadTermEntry</span> <span class="key mono">${esc(d.hte_first_term)}</span></td>`
+      + `<td><div class="tree-label"><span class="tree-kind">HeadTermEntry</span><span class="key mono">${esc(d.hte_first_term)}</span></div></td>`
        + `<td class="num">0x${d.byte_offset.toString(16)} +${d.byte_len}</td>`
-      + `<td>LeafTermBlock[${d.hte_leaf_term_block_id}] @ 0x${d.leaf_term_block_offset.toString(16)}</td>`
+      + `<td><span class="tree-chip">${leafCount ?? '?'} leaves</span><span class="tree-target">leaf page ${d.hte_leaf_term_block_id} @ 0x${d.leaf_term_block_offset.toString(16)}</span></td>`
        + `<td></td></tr>`;
 
-  if (expanded) html += renderLeafTermBlock(d.hte_leaf_term_block_id, 1, true);
+  if (expanded) html += renderLeafTermsForHead(d.hte_leaf_term_block_id, 1);
+  return html;
+}
+
+function renderLeafTermsForHead(block_idx, depth) {
+  const block = G.leafTermBlocksById?.get(block_idx);
+  if (!block && G.summaryOnly) {
+    const indent = '<span class="indent"></span>'.repeat(depth);
+    return `<tr class="tree-row"><td><div class="tree-cell">${indent}</div></td><td><span class="tree-kind">LeafTermEntry</span></td>`
+      + `<td class="num">paged</td><td><button type="button" class="icon-btn" title="Load leaf terms" onclick="loadLeafBlockAndRender(${block_idx})">↧</button> Load leaf terms</td><td></td></tr>`;
+  }
+  if (!block) return '';
+  const filtering = !!G_TermFilter;
+  let html = '';
+  for (let i = 0; i < block.entries.length; i++) {
+    if (!filtering || leafTermEntryMatchesFilter(block.entries[i]))
+      html += renderLeafTermEntry(block_idx, i, block.entries[i], depth);
+  }
   return html;
 }
 
@@ -1356,9 +1381,9 @@ function renderLeafTermBlock(block_idx, depth, forceExpanded = false) {
   const expanded = forceExpanded || filtering || G_ExpandedTree.has(node);
   const active = G_SelectedTreeNode === node ? ' active' : '';
   const indent = '<span class="indent"></span>'.repeat(depth);
-  let html = `<tr class="tree-row${active}" onclick="selectTreeNode('${node}',${block.byte_offset},${block.byte_offset + block.byte_len})">`
+  let html = `<tr class="tree-row${active}" data-node="${cssId(node)}" onclick="selectTreeNode('${node}',${block.byte_offset},${block.byte_offset + block.byte_len})">`
       + `<td><div class="tree-cell">${indent}<button type="button" class="icon-btn" onclick="event.stopPropagation();toggleTreeNode('${node}')">${expanded ? '-' : '+'}</button></div></td>`
-      + `<td><span class="tree-kind">LeafTermBlock</span> <span class="num">${block_idx}</span></td>`
+      + `<td><div class="tree-label"><span class="tree-level">↳</span><span class="tree-kind">LeafTermBlock</span><span class="num">${block_idx}</span></div></td>`
       + `<td class="num">0x${block.byte_offset.toString(16)}</td>`
       + `<td>${block.entries.length} LeafTermEntry records</td>`
        + `<td></td></tr>`;
@@ -1392,13 +1417,70 @@ function renderLeafTermEntry(block_idx, entry_idx, e, depth) {
     const chips = `<span class="tree-chip">df ${e.lte_doc_freq}</span>`
       + (e.lte_continuation_block_count ? `<span class="tree-chip">cont ${e.lte_continuation_block_count}</span>` : '')
       + (e.lte_flags ? `<span class="tree-chip">flags ${e.lte_flags}</span>` : '');
-    return `<tr class="tree-row leaf-row${active}" onclick="selectTreeNode('${node}',${e.byte_offset},${e.byte_offset + e.byte_len})">`
+    return `<tr class="tree-row leaf-row${active}" data-node="${cssId(node)}" onclick="selectTreeNode('${node}',${e.byte_offset},${e.byte_offset + e.byte_len})">`
        + `<td>${indent}<button type="button" class="icon-btn" title="Toggle posting detail" onclick="event.stopPropagation();toggleTreeNode('${node}')">${G_ExpandedTree.has(node) ? '-' : '+'}</button></td>`
-      + `<td><span class="tree-kind">LeafTermEntry</span> <span class="key mono">${esc(e.lte_term)}</span></td>`
+      + `<td><div class="tree-label"><span class="tree-level">↳</span><span class="tree-kind">LeafTermEntry</span><span class="key mono">${esc(e.lte_term)}</span></div></td>`
        + `<td class="num">0x${e.byte_offset.toString(16)} +${e.byte_len}</td>`
       + `<td><div class="tree-meta">${chips}</div></td>`
       + `<td><span class="tree-target">IB[${e.lte_index_block_id}] +${e.lte_index_offset}/${e.lte_index_length}</span></td></tr>`
-      + (G_ExpandedTree.has(node) ? renderIndexEntriesInline(node, e, depth + 1, indexStart, indexEnd) : '');
+      + (G_ExpandedTree.has(node) ? renderIndexBlockRowsForLeaf(node, e, depth + 1, indexStart, indexEnd) : '');
+}
+
+function renderIndexBlockRowsForLeaf(node, e, depth, indexStart, indexEnd) {
+  const h = G.parsed.header;
+  const indent = '<span class="indent"></span>'.repeat(depth);
+  const rows = [];
+  const baseSeq = Number(e.lte_index_block_id);
+  rows.push({ seq: baseSeq, role: 'base', start: indexStart, length: Number(e.lte_index_length || 0), offset: Number(e.lte_index_offset || 0) });
+  for (let i = 0; i < Number(e.lte_continuation_block_count || 0); i++) {
+    const seq = baseSeq + 1 + i;
+    const blockStart = h.blocks_off + seq * PAGE_SIZE;
+    const length = G.bytes && blockStart + 12 <= G.bytes.length ? u32(G.bytes, blockStart + 8) : 0;
+    rows.push({ seq, role: 'cont', start: blockStart + 12, length, offset: 12 });
+  }
+
+  let html = '';
+  for (const row of rows) {
+    const blockNode = `${node}:block:${row.seq}`;
+    const active = G_SelectedTreeNode === blockNode ? ' active' : '';
+    const blockStart = h.blocks_off + row.seq * PAGE_SIZE;
+    const blockEnd = blockStart + PAGE_SIZE;
+    html += `<tr class="tree-row block-row${active}" data-node="${cssId(blockNode)}" onclick="selectTreeNode('${blockNode}',${blockStart},${blockEnd})">`
+       + `<td>${indent}<button type="button" class="icon-btn" title="Toggle block postings" onclick="event.stopPropagation();toggleTreeNode('${blockNode}')">${G_ExpandedTree.has(blockNode) ? '-' : '+'}</button></td>`
+       + `<td><div class="tree-label"><span class="tree-level">↳ ↳</span><span class="tree-kind">IndexBlock</span><span class="num">${row.seq}</span></div></td>`
+       + `<td class="num">0x${blockStart.toString(16)} +${PAGE_SIZE}</td>`
+      + `<td><span class="tree-chip">${row.role}</span><span class="tree-chip">+${row.offset}/${row.length}</span></td>`
+       + `<td><span class="tree-target">${esc(e.lte_term)}</span></td></tr>`;
+    if (G_ExpandedTree.has(blockNode))
+      html += renderPostingRowsForBlock(blockNode, e, row, depth + 1);
+  }
+  return html;
+}
+
+function renderPostingRowsForBlock(blockNode, e, row, depth) {
+  if (G.summaryOnly) {
+    loadPostingsForBlockRow(row).then(hydratePostingPaths).then(postings => {
+      const target = document.getElementById(`posting-rows-${cssId(blockNode)}`);
+      if (target) target.outerHTML = renderPostingRowsForLeaf(blockNode, postings, depth);
+    }).catch(err => {
+      const target = document.getElementById(`posting-rows-${cssId(blockNode)}`);
+      if (target) target.outerHTML = `<tr class="tree-row"><td></td><td colspan="4" class="tree-detail-cell"><div class="posting-panel" style="color:#f66">Failed to decode postings: ${esc(err)}</div></td></tr>`;
+    });
+    return `<tr class="tree-row" id="posting-rows-${cssId(blockNode)}"><td></td><td colspan="4" class="tree-detail-cell"><div class="posting-panel" style="color:#888">Loading postings…</div></td></tr>`;
+  }
+  const postings = decodePostingsForBlockRow(row).map(p => ({ ...p, path: G.pathOf(p.doc_id) }));
+  return renderPostingRowsForLeaf(blockNode, postings, depth);
+}
+
+function decodePostingsForBlockRow(row) {
+  if (!G.bytes || !row.length || row.start < 0 || row.start + row.length > G.bytes.length) return [];
+  return decodePostings(G.bytes, row.start, row.length);
+}
+
+async function loadPostingsForBlockRow(row) {
+  const block = await loadPagedIndexBlock(row.seq);
+  if (!block || !row.length) return [];
+  return decodePostings(block.bytes, row.offset, row.length);
 }
 
 function renderIndexEntriesInline(node, e, depth, indexStart, indexEnd) {
@@ -1411,7 +1493,7 @@ function renderIndexEntriesInline(node, e, depth, indexStart, indexEnd) {
       const row = document.getElementById(`posting-rows-${cssId(node)}`);
       if (row) row.outerHTML = `<tr class="tree-row"><td>${indent}</td><td colspan="4" class="tree-detail-cell"><div class="posting-panel" style="color:#f66">Failed to decode postings: ${esc(err)}</div></td></tr>`;
     });
-    return `<tr class="tree-row posting-row${G_SelectedTreeNode === node + ':index' ? ' active' : ''}" onclick="selectTreeNode('${node}:index',${indexStart},${indexEnd})">`
+    return `<tr class="tree-row posting-row${G_SelectedTreeNode === node + ':index' ? ' active' : ''}" data-node="${cssId(node + ':index')}" onclick="selectTreeNode('${node}:index',${indexStart},${indexEnd})">`
        + `<td>${indent}</td>`
       + `<td><span class="tree-kind">IndexEntry</span> <span class="key mono">${esc(e.lte_term)}</span></td>`
       + `<td class="num">0x${indexStart.toString(16)} +${e.lte_index_length}</td>`
@@ -1432,7 +1514,7 @@ function renderIndexEntriesInline(node, e, depth, indexStart, indexEnd) {
   } else {
     posts = `<tr class="tree-row"><td>${indent}</td><td colspan="4" class="tree-detail-cell"><div class="posting-panel" style="color:#888">No decoded sample IndexEntry rows in parser output.</div></td></tr>`;
   }
-    return `<tr class="tree-row posting-row${G_SelectedTreeNode === node + ':index' ? ' active' : ''}" onclick="selectTreeNode('${node}:index',${indexStart},${indexEnd})">`
+    return `<tr class="tree-row posting-row${G_SelectedTreeNode === node + ':index' ? ' active' : ''}" data-node="${cssId(node + ':index')}" onclick="selectTreeNode('${node}:index',${indexStart},${indexEnd})">`
        + `<td>${indent}</td>`
       + `<td><span class="tree-kind">IndexEntry</span> <span class="key mono">${esc(e.lte_term)}</span></td>`
       + `<td class="num">0x${indexStart.toString(16)} +${e.lte_index_length}</td>`
@@ -1450,7 +1532,7 @@ function renderPostingRowsForLeaf(node, postings, depth) {
   if (!postings.length) {
     return `<tr class="tree-row"><td>${indent}</td><td colspan="4" class="tree-detail-cell"><div class="posting-panel" style="color:#888">No decoded postings.</div></td></tr>`;
   }
-  let html = `<tr class="tree-row posting-row"><td>${indent}</td><td colspan="4" class="tree-detail-cell"><div class="posting-panel"><table><tr><th>DocID</th><th>TF</th><th>Path</th></tr>`;
+  let html = `<tr class="tree-row posting-row"><td>${indent}</td><td colspan="4" class="tree-detail-cell"><div class="posting-panel"><table>`;
   for (let i = 0; i < postings.length; i++) {
     const p = postings[i];
     html += `<tr onclick="event.stopPropagation()">`
@@ -1471,19 +1553,16 @@ function selectTreeNode(node, start, end) {
   G_SelectedTreeNode = node;
   gotoRange(start, end);
   document.querySelectorAll('.tree-row').forEach(r => r.classList.remove('active'));
-  renderHeadLeafTermsPreserveScroll();
+  renderHeadLeafTermsPreserveAnchor(node);
 }
 
 function toggleTreeNode(node) {
-  const panel = document.getElementById('si-panel');
-  const scrollTop = panel ? panel.scrollTop : 0;
   if (G_ExpandedTree.has(node)) {
     collapseTreeSubtree(node);
   } else {
     G_ExpandedTree.add(node);
   }
-  renderHeadLeafTerms();
-  if (panel) panel.scrollTop = scrollTop;
+  renderHeadLeafTermsPreserveAnchor(node);
 }
 
 function collapseTreeSubtree(node) {
@@ -1528,10 +1607,35 @@ function headTermEntryMatchesFilter(d) {
 
 function renderHeadLeafTermsPreserveScroll() {
   const panel = document.getElementById('si-panel');
-  const scrollTop = panel ? panel.scrollTop : 0;
+  const scroller = panel ? panel.querySelector('.term-explorer') : null;
+  const scrollTop = scroller ? scroller.scrollTop : 0;
   renderHeadLeafTerms();
-  const next = document.getElementById('si-panel');
-  if (next) next.scrollTop = scrollTop;
+  const nextScroller = document.getElementById('si-panel')?.querySelector('.term-explorer');
+  if (nextScroller) nextScroller.scrollTop = scrollTop;
+}
+
+function renderHeadLeafTermsPreserveAnchor(node) {
+  const panel = document.getElementById('si-panel');
+  const scroller = panel ? panel.querySelector('.term-explorer') : null;
+  const beforeRow = scroller ? findTreeRowByNode(node) : null;
+  const beforeTop = beforeRow ? beforeRow.getBoundingClientRect().top : null;
+  const fallbackTop = scroller ? scroller.scrollTop : 0;
+
+  renderHeadLeafTerms();
+
+  const nextScroller = document.getElementById('si-panel')?.querySelector('.term-explorer');
+  if (!nextScroller) return;
+  const afterRow = findTreeRowByNode(node);
+  if (beforeTop !== null && afterRow) {
+    const afterTop = afterRow.getBoundingClientRect().top;
+    nextScroller.scrollTop += afterTop - beforeTop;
+  } else {
+    nextScroller.scrollTop = fallbackTop;
+  }
+}
+
+function findTreeRowByNode(node) {
+  return document.querySelector(`#si-panel .tree-row[data-node="${cssId(node)}"]`);
 }
 
 async function renderDocData() {
@@ -1558,12 +1662,12 @@ async function renderDocData() {
 function renderDocDataRows(docs, start, total, pageCount) {
   const h = G.parsed.header;
   let html = '<table><tr><th>id</th><th>importance</th><th>doc_len</th><th>path</th><th>hex</th></tr>';
-    html += `<tr><td colspan="4"><div class="pager">`
+    html += `<tr><td colspan="5"><div class="pager">`
       + `<button type="button" class="icon-btn" title="Previous page" onclick="setDocPage(${G_DocPage - 1})" ${G_DocPage <= 0 ? 'disabled' : ''}>‹</button>`
       + `<button type="button" class="icon-btn" title="Next page" onclick="setDocPage(${G_DocPage + 1})" ${G_DocPage >= pageCount - 1 ? 'disabled' : ''}>›</button>`
       + `<span class="num">${start + 1}-${start + docs.length}</span><span>of ${total} DocData rows</span>`
       + `<span>page</span><input class="tool-input" type="number" min="1" max="${pageCount}" value="${G_DocPage + 1}" onchange="setDocPage(Number(this.value)-1)" title="DocData page"><span>/ ${pageCount}</span>`
-      + `</div></td><td></td></tr>`;
+      + `</div></td></tr>`;
   for (let i = 0; i < docs.length; i++) {
     const d = docs[i];
     const off = h.docdata_off + (start + i)*DOC_REC_SIZE;
