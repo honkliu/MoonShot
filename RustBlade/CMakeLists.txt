@@ -14,7 +14,7 @@ else()
     set(CARGO_SUBDIR  "release")
 endif()
 
-set(CARGO_TARGET_DIR "${CMAKE_BINARY_DIR}/x64/$<CONFIG>/rust")
+set(CARGO_TARGET_DIR "${MOONSHOT_CONFIG_OUTPUT_DIR}/rust")
 set(RUST_BIN_DIR "${CARGO_TARGET_DIR}/${CARGO_SUBDIR}")
 
 add_custom_target(rustblade ALL
@@ -27,13 +27,13 @@ add_custom_target(rustblade ALL
 )
 
 add_custom_command(TARGET rustblade POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/$<CONFIG>"
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${MOONSHOT_CONFIG_OUTPUT_DIR}"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "${RUST_BIN_DIR}/moon_rs${CMAKE_EXECUTABLE_SUFFIX}"
-            "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/$<CONFIG>/moon_rs${CMAKE_EXECUTABLE_SUFFIX}"
+        "${MOONSHOT_CONFIG_OUTPUT_DIR}/moon_rs${CMAKE_EXECUTABLE_SUFFIX}"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "${RUST_BIN_DIR}/shennong_rs${CMAKE_EXECUTABLE_SUFFIX}"
-            "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/$<CONFIG>/shennong_rs${CMAKE_EXECUTABLE_SUFFIX}"
+        "${MOONSHOT_CONFIG_OUTPUT_DIR}/shennong_rs${CMAKE_EXECUTABLE_SUFFIX}"
     VERBATIM
 )
 
@@ -48,9 +48,9 @@ add_custom_target(rustblade_demo ALL
 )
 
 add_custom_command(TARGET rustblade_demo POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/$<CONFIG>"
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${MOONSHOT_CONFIG_OUTPUT_DIR}"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "${RUST_BIN_DIR}/examples/demo${CMAKE_EXECUTABLE_SUFFIX}"
-            "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/$<CONFIG>/rustblade_demo${CMAKE_EXECUTABLE_SUFFIX}"
+            "${MOONSHOT_CONFIG_OUTPUT_DIR}/rustblade_demo${CMAKE_EXECUTABLE_SUFFIX}"
     VERBATIM
 )

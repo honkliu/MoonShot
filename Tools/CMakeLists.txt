@@ -33,21 +33,21 @@ else()
 
     add_custom_target(moon_wasm ALL
         COMMAND ${CMAKE_COMMAND} -E make_directory
-            "${MOONSHOT_OUTPUT_ROOT}/$<CONFIG>/moon_wasm/pkg"
+            "${MOONSHOT_CONFIG_OUTPUT_DIR}/moon_wasm/pkg"
         COMMAND ${WASM_PACK_COMMAND}
                 build
                 --target web
                 --release
-            --out-dir "${MOONSHOT_OUTPUT_ROOT}/$<CONFIG>/moon_wasm/pkg"
+            --out-dir "${MOONSHOT_CONFIG_OUTPUT_DIR}/moon_wasm/pkg"
                 .
                 --
-            --target-dir "${MOONSHOT_OUTPUT_ROOT}/$<CONFIG>/rust"
+            --target-dir "${MOONSHOT_CONFIG_OUTPUT_DIR}/rust"
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
                 "${CMAKE_CURRENT_SOURCE_DIR}/moon_wasm/index.html"
-            "${MOONSHOT_OUTPUT_ROOT}/$<CONFIG>/moon_wasm/index.html"
+            "${MOONSHOT_CONFIG_OUTPUT_DIR}/moon_wasm/index.html"
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
                 "${CMAKE_CURRENT_SOURCE_DIR}/moon_wasm/serve.py"
-            "${MOONSHOT_OUTPUT_ROOT}/$<CONFIG>/moon_wasm/serve.py"
+            "${MOONSHOT_CONFIG_OUTPUT_DIR}/moon_wasm/serve.py"
         WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/moon_wasm"
         COMMENT "Building moon_wasm (Rust → WASM viewer)"
         VERBATIM
