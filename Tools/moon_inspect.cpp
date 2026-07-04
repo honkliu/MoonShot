@@ -54,6 +54,24 @@ static FilePtr open_file(const char* path, const char* mode)
     return FilePtr(std::fopen(path, mode));
 }
 
+static bool seek_file(FILE* file, int64_t offset, int origin)
+{
+#if defined(_WIN32)
+    return _fseeki64(file, offset, origin) == 0;
+#else
+    return std::fseek(file, static_cast<long>(offset), origin) == 0;
+#endif
+}
+
+static int64_t file_offset(FILE* file)
+{
+#if defined(_WIN32)
+    return _ftelli64(file);
+#else
+    return std::ftell(file);
+#endif
+}
+
 static std::string esc(const std::string& s)
 {
     std::string out;
