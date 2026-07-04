@@ -2554,6 +2554,13 @@ static int RunBeirEval(const std::string& idxPath, const BeirEvalOptions& option
                       << " cache_hits=" << stats.CacheHits
                       << " cache_misses=" << stats.CacheMisses
                       << " disk_reads=" << stats.DiskReads << "\n";
+            const auto ioStats = FileAccess::GetIoStats();
+            if (ioStats.IoUringReads || ioStats.PreadFallbackReads || ioStats.IoUringSetupOk || ioStats.IoUringSetupFailed) {
+                std::cout << "FileAccess io_uring_reads=" << ioStats.IoUringReads
+                          << " pread_fallback_reads=" << ioStats.PreadFallbackReads
+                          << " io_uring_setup_ok=" << ioStats.IoUringSetupOk
+                          << " io_uring_setup_failed=" << ioStats.IoUringSetupFailed << "\n";
+            }
         }
         std::cout << std::fixed << std::setprecision(4);
         for (size_t i = 0; i < options.at.size(); ++i) {
@@ -2686,6 +2693,13 @@ static int RunBeirEval(const std::string& idxPath, const BeirEvalOptions& option
                   << " cache_hits=" << stats.CacheHits
                   << " cache_misses=" << stats.CacheMisses
                   << " disk_reads=" << stats.DiskReads << "\n";
+        const auto ioStats = FileAccess::GetIoStats();
+        if (ioStats.IoUringReads || ioStats.PreadFallbackReads || ioStats.IoUringSetupOk || ioStats.IoUringSetupFailed) {
+            std::cout << "FileAccess io_uring_reads=" << ioStats.IoUringReads
+                      << " pread_fallback_reads=" << ioStats.PreadFallbackReads
+                      << " io_uring_setup_ok=" << ioStats.IoUringSetupOk
+                      << " io_uring_setup_failed=" << ioStats.IoUringSetupFailed << "\n";
+        }
     }
     std::cout << std::fixed << std::setprecision(4);
     for (size_t i = 0; i < options.at.size(); ++i) {

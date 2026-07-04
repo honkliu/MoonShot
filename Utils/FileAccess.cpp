@@ -11,6 +11,27 @@
 #include <mutex>
 
 #if defined(__linux__)
+static std::atomic<uint64_t> g_IoUringReads{0};
+static std::atomic<uint64_t> g_PreadFallbackReads{0};
+static std::atomic<uint64_t> g_IoUringSetupOk{0};
+static std::atomic<uint64_t> g_IoUringSetupFailed{0};
+#endif
+
+FileAccess::IoStats FileAccess::GetIoStats()
+{
+#if defined(__linux__)
+    return IoStats{
+        g_IoUringReads.load(std::memory_order_relaxed),
+        g_PreadFallbackReads.load(std::memory_order_relaxed),
+        g_IoUringSetupOk.load(std::memory_order_relaxed),
+        g_IoUringSetupFailed.load(std::memory_order_relaxed),
+    };
+#else
+    return {};
+#endif
+}
+
+#if defined(__linux__)
 #include <linux/io_uring.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
@@ -209,8 +230,11 @@ bool FileAccess::Init()
         return false;
     m_IoUring = new FileAccessIoUring();
     if (!m_IoUring->Init()) {
+        ++g_IoUringSetupFailed;
         delete m_IoUring;
         m_IoUring = nullptr;
+    } else {
+        ++g_IoUringSetupOk;
     }
     return true;
 #endif
@@ -334,9 +358,12 @@ bool FileAccess::ReadBlock(uint32_t block_seq, void* buffer, size_t block_size,
     off_t position = static_cast<off_t>(base_byte_offset)
                    + static_cast<off_t>(block_seq) * static_cast<off_t>(block_size);
 
-    if (m_IoUring && m_IoUring->Read(m_FileHandle, buffer, block_size, static_cast<uint64_t>(position)))
+    if (m_IoUring && m_IoUring->Read(m_FileHandle, buffer, block_size, static_cast<uint64_t>(position))) {
+        ++g_IoUringReads;
         return true;
+    }
 
+    ++g_PreadFallbackReads;
     ssize_t bytesRead = pread(m_FileHandle, buffer, block_size, position);
     return bytesRead == static_cast<ssize_t>(block_size);
 #endif

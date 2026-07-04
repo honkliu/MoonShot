@@ -27,9 +27,17 @@ struct FileAccessIoUring;
 
 class FileAccess {
 	public:
+		struct IoStats {
+			uint64_t IoUringReads = 0;
+			uint64_t PreadFallbackReads = 0;
+			uint64_t IoUringSetupOk = 0;
+			uint64_t IoUringSetupFailed = 0;
+		};
+
 		FileAccess() = default;
 		FileAccess(const char * fileName);
 		~FileAccess();
+		static IoStats GetIoStats();
 		bool Init();
 		bool InitWrite(bool truncate = true);
 		int GetData(void * buffer, int numBytes);
