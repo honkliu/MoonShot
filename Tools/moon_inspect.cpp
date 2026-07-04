@@ -40,29 +40,18 @@ struct Index {
     std::string error;
 };
 
-using FilePtr = std::unique_ptr<FILE, decltype(&std::fclose)>;
+struct FileCloser {
+    void operator()(FILE* file) const
+    {
+        if (file) std::fclose(file);
+    }
+};
+
+using FilePtr = std::unique_ptr<FILE, FileCloser>;
 
 static FilePtr open_file(const char* path, const char* mode)
 {
-    return FilePtr(std::fopen(path, mode), &std::fclose);
-}
-
-static bool seek_file(FILE* file, int64_t offset, int origin)
-{
-#if defined(_WIN32)
-    return _fseeki64(file, offset, origin) == 0;
-#else
-    return std::fseek(file, static_cast<long>(offset), origin) == 0;
-#endif
-}
-
-static int64_t file_offset(FILE* file)
-{
-#if defined(_WIN32)
-    return _ftelli64(file);
-#else
-    return std::ftell(file);
-#endif
+    return FilePtr(std::fopen(path, mode));
 }
 
 static std::string esc(const std::string& s)
@@ -76,24 +65,6 @@ static std::string esc(const std::string& s)
         else out += ch;
     }
     return out;
-}
-
-static uint16_t read_u16(const uint8_t*& ptr, const uint8_t* end)
-{
-    if (ptr + 2 > end) return 0;
-    uint16_t value = 0;
-    std::memcpy(&value, ptr, 2);
-    ptr += 2;
-    return value;
-}
-
-static uint32_t read_u32(const uint8_t*& ptr, const uint8_t* end)
-{
-    if (ptr + 4 > end) return 0;
-    uint32_t value = 0;
-    std::memcpy(&value, ptr, 4);
-    ptr += 4;
-    return value;
 }
 
 static bool section_fits(size_t file_size, uint64_t offset, uint64_t count, size_t entry_size, size_t& byte_count)
@@ -211,9 +182,10 @@ static Index parse_index(const char* path)
             page.reserve(entry_count);
             for (uint32_t i = 0; i < entry_count; ++i) {
                 const uint16_t entry_offset = directory_value(i);
+                const size_t remaining = PAGE_SIZE - static_cast<size_t>(entry_offset);
                 if (entry_offset < LEAF_TERM_DATA_OFFSET
                     || entry_offset > PAGE_SIZE
-                    || PAGE_SIZE - entry_offset < sizeof(LeafTermEntry))
+                    || remaining < sizeof(LeafTermEntry))
                 {
                     index.error = "Corrupt leaf term page: missing entry header";
                     return index;

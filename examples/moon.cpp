@@ -159,23 +159,6 @@ struct FileItem {
 
 static std::filesystem::path FsPathFromUtf8(const std::string& path);
 
-static PathMap LoadPathMapFromIndex(const std::string& idxPath, uint64_t& nextId)
-{
-    PathMap m;
-    if (!IndexSerializer::IsValidIndex(idxPath.c_str()))
-        return m;
-
-    IndexContext ctx("", idxPath.c_str(), false);
-    for (uint64_t id = 0; id < ctx.AllocateDocumentID(); ++id) {
-        const std::string path = ctx.GetDocPath(id);
-        if (!path.empty()) {
-            m[path] = id;
-            nextId = std::max(nextId, id + 1);
-        }
-    }
-    return m;
-}
-
 // ─── file helpers ─────────────────────────────────────────────────────────────
 
 static std::string ReadFile(const std::string& path)
@@ -1963,36 +1946,6 @@ struct BeirCandidateFeature {
     uint8_t weakSourceMask = 0;
     uint8_t bigramSourceMask = 0;
 };
-
-static float RawBranchScore(const SearchResult& result, const DocDataEntry& entry)
-{
-    return result.score - DocDataDecodeScore(entry.DDE_StaticRank) - MoonDocDataPrior(entry);
-}
-
-static void AddFeatureRows(IndexContext& ctx,
-                           std::unordered_map<uint64_t, BeirCandidateFeature>& rows,
-                           const std::vector<SearchResult>& results,
-                           bool isBigramBranch)
-{
-    for (const auto& result : results) {
-        const uint64_t docId = ReaderDocumentIDValue(result.doc_id);
-        const auto* entry = ctx.GetDocDataEntry(docId);
-        if (!entry)
-            continue;
-        auto& row = rows[docId];
-        row.entry = entry;
-        if (row.docIdText.empty())
-            row.docIdText = ctx.GetDocPath(docId);
-        const float rawScore = RawBranchScore(result, *entry);
-        if (isBigramBranch) {
-            row.bigramScore = std::max(row.bigramScore, rawScore);
-            row.bigramSourceMask |= ReaderDocumentIDSourceMask(result.doc_id);
-        } else {
-            row.weakScore = std::max(row.weakScore, rawScore);
-            row.weakSourceMask |= ReaderDocumentIDSourceMask(result.doc_id);
-        }
-    }
-}
 
 static void AddFeatureRowsFromReader(IndexContext& ctx,
                                      std::unordered_map<uint64_t, BeirCandidateFeature>& rows,

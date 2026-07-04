@@ -273,10 +273,11 @@ void IndexSerializer::BuildTermMphfFromLeafBlocks(const LeafTermBlock* leafBlock
         const auto* blockBase = reinterpret_cast<const uint8_t*>(&block);
         for (uint32_t entryIndex = 0; entryIndex < entryCount; ++entryIndex) {
             const uint16_t offset = block.LTB_Directory[entryIndex];
-            if (offset < LEAF_TERM_DATA_OFFSET || PAGE_SIZE - offset < sizeof(LeafTermEntry))
+            const size_t remaining = PAGE_SIZE - static_cast<size_t>(offset);
+            if (offset < LEAF_TERM_DATA_OFFSET || remaining < sizeof(LeafTermEntry))
                 continue;
             const auto* entry = reinterpret_cast<const LeafTermEntry*>(blockBase + offset);
-            if (PAGE_SIZE - offset < sizeof(LeafTermEntry) + entry->LTE_TermLength)
+            if (remaining < sizeof(LeafTermEntry) + entry->LTE_TermLength)
                 continue;
 
             TermMphfBuildTerm term{};

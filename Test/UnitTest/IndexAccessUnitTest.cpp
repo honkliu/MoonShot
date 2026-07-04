@@ -108,15 +108,16 @@ void TestBuildIndex()
     assert(store->GetPostingList("vietnamT") != nullptr);
     assert(store->GetPostingList("vietnamB") != nullptr);
 
-    auto* postingList = store->GetPostingList("vietnamT");
-    assert(postingList != nullptr);
-    assert(postingList->doc_freq() >= 1);
+    auto* vietnamTitlePostings = store->GetPostingList("vietnamT");
+    if (!vietnamTitlePostings || vietnamTitlePostings->doc_freq() < 1)
+        throw std::runtime_error("vietnamT postings missing");
 
-    postingList = store->GetPostingList("goodT");
-    assert(postingList->doc_freq() >= 2);
+    auto* goodTitlePostings = store->GetPostingList("goodT");
+    if (!goodTitlePostings || goodTitlePostings->doc_freq() < 2)
+        throw std::runtime_error("goodT postings missing");
 
-    std::cout << "  'vietnamT' doc_freq = " << store->GetPostingList("vietnamT")->doc_freq() << "\n";
-    std::cout << "  'goodT'    doc_freq = " << store->GetPostingList("goodT")->doc_freq()    << "\n";
+    std::cout << "  'vietnamT' doc_freq = " << vietnamTitlePostings->doc_freq() << "\n";
+    std::cout << "  'goodT'    doc_freq = " << goodTitlePostings->doc_freq()    << "\n";
     std::cout << "  avg_doc_len         = " << store->AvgDocLen()                             << "\n";
 }
 
@@ -265,7 +266,8 @@ void TestFieldConstraint()
             if (postingList)
                 for (auto& entry : postingList->entries)
                     if (entry.IE_DocID == ReaderDocumentIDValue(result.doc_id)) { inTitle = true; break; }
-            assert(inTitle && "title:vietnam matched a doc not in vietnamT");
+            if (!inTitle)
+                throw std::runtime_error("title:vietnam matched a doc not in vietnamT");
         }
         delete compiler; delete tree;
     }
@@ -303,9 +305,10 @@ void TestEvalTree()
         assert(tree && !tree->IsEmpty());
         assert(tree->root->GetType() == NodeType::Or);
         auto* orNode = static_cast<OrNode*>(tree->root.get());
-        assert(orNode->children.size() == 2);
-        assert(orNode->children[0]->GetType() == NodeType::Term);
-        assert(orNode->children[1]->GetType() == NodeType::And);
+        if (orNode->children.size() != 2
+            || orNode->children[0]->GetType() != NodeType::Term
+            || orNode->children[1]->GetType() != NodeType::And)
+            throw std::runtime_error("fox quick tree shape mismatch");
         std::cout << "  Compile('fox quick','T') → OrNode(bigram, unigram AND)\n";
         delete tree;
     }
@@ -437,7 +440,8 @@ void TestEndToEnd()
     doc2.title = "Morning Fox 2021";
     doc2.body = "The lazy fox slept all morning";
     uint64_t doc2Id = index_context->AddDocument(doc2);
-    assert(doc2Id == 1);
+    if (doc2Id != 1)
+        throw std::runtime_error("expected second document id to be 1");
     index_context->Build();
 
     {
@@ -518,8 +522,8 @@ void TestDiskPersistence()
         std::cout << "  Written " << engine.GetStore()->TotalDocs()
                   << " docs to memory\n";
 
-        bool saved = engine.SaveIndex();
-        assert(saved && "SaveIndex() must return true");
+        if (!engine.SaveIndex())
+            throw std::runtime_error("SaveIndex() must return true");
         std::cout << "  Saved to " << INDEX_FILE << "\n";
 
         /*
@@ -545,7 +549,8 @@ void TestDiskPersistence()
          bool foundVectorDoc0 = false;
          for (const auto& result : vectorResults)
              if (ReaderDocumentIDValue(result.doc_id) == 0) foundVectorDoc0 = true;
-         assert(foundVectorDoc0 && "DocDataEntry vectors must rebuild IndexContext vector index");
+         if (!foundVectorDoc0)
+             throw std::runtime_error("DocDataEntry vectors must rebuild IndexContext vector index");
 
         /*
         * Run the same queries as the other tests to confirm results match.
@@ -647,9 +652,8 @@ void TestDeltaRuntimeHandoff()
         assert(engine.HasDelta());
 
         auto* delta = engine.GetDeltaContext();
-        assert(delta != nullptr);
-        assert(delta->DocumentCount() == 2);
-        assert(delta->GetDocPath(deltaDocId) == "delta.txt");
+        if (!delta || delta->DocumentCount() != 2 || delta->GetDocPath(deltaDocId) != "delta.txt")
+            throw std::runtime_error("delta runtime handoff failed");
 
         std::unique_ptr<EvalTree> tree(engine.Compile("banana", "AUTB"));
         std::unique_ptr<IndexSearchExecutor> exec(engine.GetExecutor());
@@ -1085,7 +1089,8 @@ void TestTermMphfSameBaseCollision()
         const auto* entry = reinterpret_cast<const TermMphfEntry*>(reinterpret_cast<const uint8_t*>(built.BBR_TermMphfEntryPages.data()) + byteOffset);
         uint64_t fingerprint = TermMphfHash(term.data(), term.size(), header.TMH_FingerprintSeed);
         if (fingerprint == 0) fingerprint = 1;
-        assert(entry->LTE_Fingerprint == fingerprint);
+        if (entry->LTE_Fingerprint != fingerprint)
+            throw std::runtime_error("MPHF fingerprint mismatch");
     }
 
     std::cout << "  MPHF same-base collision regression passed\n";
