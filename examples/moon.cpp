@@ -1089,6 +1089,7 @@ struct BeirEvalOptions {
     bool noMphf = false;
     uint64_t leafCacheMb = 0;
     bool leafCacheMatchMphf = false;
+    bool useEnqueue = false;
 };
 
 static QueryCompileMode BeirCompileMode(const std::string& mode)
@@ -1423,6 +1424,8 @@ static bool ParseBeirEvalOptions(const std::vector<std::string>& args,
         } else if (arg == "-query-threads") {
             if (i + 1 >= args.size()) { error = "Usage: moon -beir-eval -query-threads N"; return false; }
             if (!ParseUInt64(args[++i], options.queryThreads) || options.queryThreads == 0) { error = "-query-threads must be a positive integer"; return false; }
+        } else if (arg == "-enqueue") {
+            options.useEnqueue = true;
         } else {
             error = "Unknown BEIR eval option: " + arg;
             return false;
@@ -2348,6 +2351,114 @@ static int RunBeirEval(const std::string& idxPath, const BeirEvalOptions& option
         std::string query;
         const std::unordered_set<std::string>* relevant = nullptr;
     };
+
+    if (options.queryThreads > 1 && options.useEnqueue && !dumpFeatures) {
+        if (evalPath == BeirEvalPath::Bow || evalPath == BeirEvalPath::FeatureDump) {
+            std::cerr << "-enqueue is supported for weakand/vector/hybrid BEIR modes only\n";
+            return 1;
+        }
+
+        std::vector<BeirEvalTask> tasks;
+        std::string taskLine;
+        while (std::getline(queries, taskLine)) {
+            std::string qid;
+            std::string query;
+            if (!ExtractJsonString(taskLine, "_id", qid) || !ExtractJsonString(taskLine, "text", query))
+                continue;
+            auto qrelIt = qrels.find(qid);
+            if (qrelIt == qrels.end() || qrelIt->second.empty()) {
+                ++missingQrels;
+                continue;
+            }
+            if (options.limit > 0 && tasks.size() >= options.limit) break;
+            tasks.push_back({std::move(qid), std::move(query), &qrelIt->second});
+        }
+
+        const auto elapsedStart = std::chrono::steady_clock::now();
+        std::vector<SearchTask> searchTasks;
+        searchTasks.reserve(tasks.size());
+        for (const auto& task : tasks) {
+            std::vector<float> queryVector;
+            if (evalPath == BeirEvalPath::VectorOrHybrid) {
+                auto vectorIt = queryVectors.find(task.qid);
+                if (vectorIt != queryVectors.end()) {
+                    queryVector = ToVector(vectorIt->second);
+                } else if (!hasExternalQueryVectors) {
+                    queryVector = ctx.CompileToVector(task.query.c_str());
+                }
+            }
+
+            const char* queryText = (evalPath == BeirEvalPath::VectorOrHybrid && !isHybridEval) ? "" : task.query.c_str();
+            searchTasks.push_back(ctx.Enqueue(queryText,
+                                             std::move(queryVector),
+                                             options.streams.c_str(),
+                                             maxK,
+                                             compileMode));
+        }
+
+        for (size_t i = 0; i < searchTasks.size(); ++i) {
+            auto results = searchTasks[i].Wait();
+            if (results.size() > static_cast<size_t>(maxK))
+                results.resize(static_cast<size_t>(maxK));
+            const auto& task = tasks[i];
+            if (runWriter)
+                WriteBeirRun(runWriter, ctx, task.qid, results, runTag);
+            AddBeirRecallForResults(ctx, results, *task.relevant, options.at, macroRecall, microHits, microRelevant);
+            ++evaluated;
+            if (evaluated % 100 == 0)
+                std::cout << "  BEIR evaluated " << evaluated << " queries\n";
+        }
+
+        if (evaluated == 0 || microRelevant == 0) {
+            std::cerr << "No BEIR queries with qrels were evaluated\n";
+            return 1;
+        }
+
+        const auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - elapsedStart).count();
+        std::cout << "BEIR eval index=" << idxPath
+                  << " data=" << options.dataPath
+                  << " qrels=" << qrelsPath
+                  << " streams=" << options.streams
+                  << " mode=" << options.mode
+                  << " weakand_shape=" << options.weakAndShape
+                  << " bigram_weight=" << parameters.QMP_BigramWeight
+                  << " mphf=" << (options.noMphf ? "off" : "on")
+                  << " leaf_cache_mb=" << (leafCacheBytes ? (leafCacheBytes / (1024ull * 1024ull)) : (LEAF_TERM_CACHE_BYTES / (1024ull * 1024ull)))
+                  << " query_threads=4"
+                  << " enqueue=on"
+                  << " queries=" << evaluated
+                  << " missing_qrels=" << missingQrels
+                  << " elapsed_ms=" << elapsedMs << "\n";
+        if (std::getenv("MOONSHOT_BLOCK_STATS")) {
+            const auto stats = ctx.GetBlockAccessStats();
+            std::cout << "BlockAccess direct_gets=" << stats.DirectGets
+                      << " direct_releases=" << stats.DirectReleases
+                      << " worker_gets=" << stats.WorkerGets
+                      << " worker_releases=" << stats.WorkerReleases
+                      << " cache_hits=" << stats.CacheHits
+                      << " cache_misses=" << stats.CacheMisses
+                      << " disk_reads=" << stats.DiskReads << "\n";
+            const auto ioStats = FileAccess::GetIoStats();
+            if (ioStats.IoUringReads || ioStats.PreadFallbackReads || ioStats.IoUringSetupOk || ioStats.IoUringSetupFailed) {
+                std::cout << "FileAccess io_uring_reads=" << ioStats.IoUringReads
+                          << " pread_fallback_reads=" << ioStats.PreadFallbackReads
+                          << " io_uring_setup_ok=" << ioStats.IoUringSetupOk
+                          << " io_uring_setup_failed=" << ioStats.IoUringSetupFailed << "\n";
+            }
+        }
+        std::cout << std::fixed << std::setprecision(4);
+        for (size_t i = 0; i < options.at.size(); ++i) {
+            const double macro = macroRecall[i] / static_cast<double>(evaluated);
+            const double micro = static_cast<double>(microHits[i]) / static_cast<double>(microRelevant);
+            std::cout << "Recall@" << options.at[i]
+                      << " macro=" << macro
+                      << " micro=" << micro
+                      << " hits=" << microHits[i]
+                      << "/" << microRelevant << "\n";
+        }
+        return 0;
+    }
 
     if (options.queryThreads > 1 && !dumpFeatures) {
         std::vector<BeirEvalTask> tasks;

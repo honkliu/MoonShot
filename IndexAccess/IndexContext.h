@@ -21,15 +21,20 @@
 #include <string_view>
 #include <algorithm>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <cmath>
+#include <deque>
 #include <filesystem>
+#include <future>
 #include <iostream>
 #include <limits>
+#include <mutex>
 #include <utility>
 #include <unordered_map>
+#include <thread>
 #include <vector>
 
 using std::shared_ptr;
@@ -46,6 +51,43 @@ struct Document
     std::string anchor;
     std::string meta;
     float       importance = 0.0f;
+};
+
+class SearchTask
+{
+public:
+    SearchTask() = default;
+
+    std::vector<SearchResult> Wait()
+    {
+        return m_State ? m_State->Future.get() : std::vector<SearchResult>{};
+    }
+
+    bool Valid() const
+    {
+        return m_State && m_State->Future.valid();
+    }
+
+private:
+    friend class IndexContext;
+
+    struct State
+    {
+        std::string Query;
+        std::vector<float> Vector;
+        std::string Streams = "AUTB";
+        int TopK = 1000;
+        QueryCompileMode Mode = QueryCompileMode::WeakAndBigramBoostForDoc;
+        size_t VectorEfSearch = 1000;
+        std::promise<std::vector<SearchResult>> Promise;
+        std::shared_future<std::vector<SearchResult>> Future;
+    };
+
+    explicit SearchTask(std::shared_ptr<State> state)
+        : m_State(std::move(state))
+    {}
+
+    std::shared_ptr<State> m_State;
 };
 
 /*
@@ -87,6 +129,7 @@ public:
 
     ~IndexContext()
     {
+        StopSearchWorkers();
         ClearPinnedIndexData();
         ClearWritePinnedIndexData();
     }
@@ -239,6 +282,30 @@ public:
         auto reader = make_shared<AdvancedIndexReader>();
         reader->Open(streamKey, &m_BlockTable, this);
         return reader;
+    }
+
+    SearchTask Enqueue(const char* query,
+                       std::vector<float> vector = {},
+                       const char* streams = "AUTB",
+                       int topK = 1000,
+                       QueryCompileMode mode = QueryCompileMode::WeakAndBigramBoostForDoc)
+    {
+        auto state = std::make_shared<SearchTask::State>();
+        state->Query = query ? query : "";
+        state->Vector = std::move(vector);
+        state->Streams = streams && *streams ? streams : "AUTB";
+        state->TopK = topK;
+        state->Mode = mode;
+        state->Future = state->Promise.get_future().share();
+
+        EnsureSearchWorkersStarted();
+
+        {
+            std::lock_guard<std::mutex> lock(m_SearchQueueMutex);
+            m_SearchQueue.push_back(state);
+        }
+        m_SearchQueueCv.notify_one();
+        return SearchTask(state);
     }
 
     PostingStore* GetStore() { return m_Store.get(); }
@@ -1033,6 +1100,13 @@ private:
     uint64_t                     m_LeafTermCacheBytes = LEAF_TERM_CACHE_BYTES;
     WeakAndBuildMode             m_WeakAndBuildMode = WeakAndBuildMode::FlatPruned;
     QueryCompileModeParameters   m_QueryParameters = kWeakAndBigramParameters;
+    std::mutex                   m_SearchWorkerMutex;
+    std::mutex                   m_SearchQueueMutex;
+    std::condition_variable      m_SearchQueueCv;
+    std::deque<std::shared_ptr<SearchTask::State>> m_SearchQueue;
+    std::vector<std::thread>     m_SearchWorkers;
+    bool                         m_StopSearchWorkers = false;
+    std::mutex                   m_VectorRuntimeMutex;
     mutable const uint8_t*        m_StreamLengthStatsDocData = nullptr;
     mutable uint64_t              m_StreamLengthStatsDocCount = 0;
     mutable float                 m_AvgTitleLength = 1.0f;
@@ -1045,6 +1119,100 @@ private:
         static_cast<uint32_t>(INDEX_BLOCK_CACHE_BYTES / sizeof(IndexBlock));
     static constexpr uint32_t LEAF_TERM_BLOCK_CACHE_SLOT_COUNT =
         static_cast<uint32_t>(LEAF_TERM_CACHE_BYTES / sizeof(LeafTermBlock));
+
+    void EnsureSearchWorkersStarted(uint32_t workerCount = 4)
+    {
+        std::lock_guard<std::mutex> lock(m_SearchWorkerMutex);
+        if (!m_SearchWorkers.empty())
+            return;
+
+        SetDirectBlockAccessEnabled(false);
+        EnsureStreamLengthStats();
+        m_StopSearchWorkers = false;
+        workerCount = std::max<uint32_t>(1, workerCount);
+        m_SearchWorkers.reserve(workerCount);
+        for (uint32_t i = 0; i < workerCount; ++i)
+            m_SearchWorkers.emplace_back([this] { SearchWorkerLoop(); });
+    }
+
+    void StopSearchWorkers()
+    {
+        std::vector<std::thread> workers;
+        {
+            std::lock_guard<std::mutex> lock(m_SearchWorkerMutex);
+            if (m_SearchWorkers.empty())
+                return;
+            {
+                std::lock_guard<std::mutex> queueLock(m_SearchQueueMutex);
+                m_StopSearchWorkers = true;
+            }
+            m_SearchQueueCv.notify_all();
+            workers.swap(m_SearchWorkers);
+        }
+
+        for (auto& worker : workers)
+            if (worker.joinable()) worker.join();
+    }
+
+    void SearchWorkerLoop()
+    {
+        SmartTokenizer tokenizer;
+        IndexSearchCompiler compiler(&tokenizer);
+        IndexSearchExecutor executor(this);
+
+        while (true) {
+            std::shared_ptr<SearchTask::State> task;
+            {
+                std::unique_lock<std::mutex> lock(m_SearchQueueMutex);
+                m_SearchQueueCv.wait(lock, [this] {
+                    return m_StopSearchWorkers || !m_SearchQueue.empty();
+                });
+                if (m_StopSearchWorkers && m_SearchQueue.empty())
+                    return;
+                task = std::move(m_SearchQueue.front());
+                m_SearchQueue.pop_front();
+            }
+
+            try {
+                task->Promise.set_value(ExecuteSearchTask(*task, compiler, executor));
+            } catch (...) {
+                task->Promise.set_exception(std::current_exception());
+            }
+        }
+    }
+
+    std::vector<SearchResult> ExecuteSearchTask(SearchTask::State& task,
+                                                IndexSearchCompiler& compiler,
+                                                IndexSearchExecutor& executor)
+    {
+        std::unique_ptr<EvalTree> tree;
+        if (task.Query.empty() && !task.Vector.empty()) {
+            tree = std::make_unique<EvalTree>();
+        } else {
+            tree.reset(compiler.Compile(task.Query.c_str(), task.Streams.c_str(), nullptr, task.Mode));
+        }
+
+        if (!tree)
+            return {};
+        if (!task.Vector.empty())
+            tree->vector_query = task.Vector;
+        tree->vector_ef_search = task.VectorEfSearch;
+        if (tree->IsEmpty())
+            return {};
+
+        std::shared_ptr<IndexReader> reader;
+        if (!tree->HasTextQuery() && tree->HasVectorQuery()) {
+            std::lock_guard<std::mutex> lock(m_VectorRuntimeMutex);
+            reader = GetReader(tree.get());
+        } else {
+            reader = GetReader(tree.get());
+        }
+
+        const std::vector<float>* vectorQuery = tree->HasTextQuery() && tree->HasVectorQuery()
+            ? &tree->vector_query
+            : nullptr;
+        return executor.Execute(reader, task.TopK, vectorQuery);
+    }
 
     static uint64_t DocDataFirstDocId(const uint8_t* docData, const IndexFileHeader& header)
     {

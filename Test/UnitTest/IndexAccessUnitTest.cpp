@@ -488,6 +488,60 @@ void TestEndToEnd()
     delete tokenizer;
 }
 
+void TestEnqueueSearchTask()
+{
+    auto* index_context = new IndexContext();
+
+    Document doc0;
+    doc0.title = "Quick Fox";
+    doc0.body = "The quick brown fox jumps over the lazy dog";
+    index_context->AddDocument(doc0);
+
+    Document doc1;
+    doc1.title = "Rust Search";
+    doc1.body = "Rust systems programming and fast search";
+    index_context->AddDocument(doc1);
+
+    Document doc2;
+    doc2.title = "Lazy Dog";
+    doc2.body = "The lazy dog sleeps while the fox runs";
+    index_context->AddDocument(doc2);
+
+    index_context->Build();
+
+    std::unique_ptr<EvalTree> tree(index_context->Compile("fox lazy", "AUTB", QueryCompileMode::WeakAndBigramBoostForDoc));
+    std::unique_ptr<IndexSearchExecutor> exec(index_context->GetExecutor());
+    auto syncResults = exec->Execute(index_context->GetReader(tree.get()), 10);
+    auto asyncResults = index_context->Enqueue("fox lazy", {}, "AUTB", 10).Wait();
+
+    if (syncResults.empty())
+        throw std::runtime_error("sync search returned no results");
+    if (syncResults.size() != asyncResults.size())
+        throw std::runtime_error("queued search result count mismatch");
+    for (size_t i = 0; i < syncResults.size(); ++i) {
+        if (ReaderDocumentIDValue(syncResults[i].doc_id) != ReaderDocumentIDValue(asyncResults[i].doc_id))
+            throw std::runtime_error("queued search result order mismatch");
+    }
+
+    std::vector<SearchTask> tasks;
+    for (int i = 0; i < 32; ++i) {
+        const char* query = (i % 2) == 0 ? "fox lazy" : "rust search";
+        tasks.push_back(index_context->Enqueue(query, {}, "AUTB", 10));
+    }
+
+    for (int i = 0; i < 32; ++i) {
+        auto results = tasks[static_cast<size_t>(i)].Wait();
+        if (results.empty())
+            throw std::runtime_error("queued concurrent search returned no results");
+        if ((i % 2) == 0)
+            AssertContains(results, 0, "queued fox lazy");
+        else
+            AssertContains(results, 1, "queued rust search");
+    }
+
+    delete index_context;
+}
+
 } // namespace IndexAccessTests
 
 // ============================================================
@@ -636,7 +690,8 @@ void TestDeltaRuntimeHandoff()
         doc.title = "base apple";
         doc.body = "base document only";
         base.AddDocument(doc);
-        assert(base.SaveIndex(INDEX_FILE));
+        if (!base.SaveIndex(INDEX_FILE))
+            throw std::runtime_error("failed to save delta base index");
     }
 
     {
@@ -648,7 +703,8 @@ void TestDeltaRuntimeHandoff()
         const uint64_t deltaDocId = engine.AddDocument(doc);
         assert(deltaDocId == 1);
 
-        assert(engine.SaveIndex(DELTA_FILE));
+        if (!engine.SaveIndex(DELTA_FILE))
+            throw std::runtime_error("failed to save delta index");
         assert(engine.HasDelta());
 
         auto* delta = engine.GetDeltaContext();
@@ -1133,6 +1189,7 @@ std::map<std::string, std::function<void()>> testRegistry = {
     {"TestMultiPhase",       IndexAccessTests::TestMultiPhase},
     {"TestDocImportance",    IndexAccessTests::TestDocImportance},
     {"TestEndToEnd",         IndexAccessTests::TestEndToEnd},
+    {"TestEnqueueSearchTask", IndexAccessTests::TestEnqueueSearchTask},
     {"TestDiskPersistence",  IndexAccessTests::TestDiskPersistence},
     {"TestDeltaRuntimeHandoff", IndexAccessTests::TestDeltaRuntimeHandoff},
     {"TestIndexContextMerge", IndexAccessTests::TestIndexContextMerge},
