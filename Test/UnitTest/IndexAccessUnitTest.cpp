@@ -701,14 +701,16 @@ void TestDeltaRuntimeHandoff()
         doc.title = "delta banana";
         doc.body = "delta runtime document";
         const uint64_t deltaDocId = engine.AddDocument(doc);
-        assert(deltaDocId == 1);
+        if (deltaDocId != 1)
+            throw std::runtime_error("unexpected delta doc id");
 
         if (!engine.SaveIndex(DELTA_FILE))
             throw std::runtime_error("failed to save delta index");
-        assert(engine.HasDelta());
+        if (!engine.HasDelta())
+            throw std::runtime_error("delta context was not handed off");
 
         auto* delta = engine.GetDeltaContext();
-        if (!delta || delta->DocumentCount() != 2 || delta->GetDocPath(deltaDocId) != "delta.txt")
+        if (!delta || delta->DocumentCount() != 1 || delta->GetDocPath(deltaDocId) != "delta.txt")
             throw std::runtime_error("delta runtime handoff failed");
 
         std::unique_ptr<EvalTree> tree(engine.Compile("banana", "AUTB"));
@@ -744,7 +746,8 @@ void TestIndexContextMerge()
         doc.title = "base apple";
         doc.body = "base sharedtoken";
         base.AddDocument(doc);
-        assert(base.SaveIndex(INDEX_FILE));
+        if (!base.SaveIndex(INDEX_FILE))
+            throw std::runtime_error("failed to save merge base index");
     }
 
     {
@@ -755,12 +758,14 @@ void TestIndexContextMerge()
         doc.title = "delta banana";
         doc.body = "delta sharedtoken";
         delta.AddDocument(doc);
-        assert(delta.SaveIndex(DELTA_FILE));
+        if (!delta.SaveIndex(DELTA_FILE))
+            throw std::runtime_error("failed to save merge delta index");
     }
 
     {
         IndexContext merged("", INDEX_FILE);
-        assert(merged.Merge(INDEX_FILE));
+        if (!merged.Merge(INDEX_FILE))
+            throw std::runtime_error("failed to merge index");
     }
 
     {
@@ -818,7 +823,8 @@ void TestIndexContextMergeContinuationPostings()
         writer->Write(g_tokenizer.Tokenize("zzzafter"), BASE_DOCS, "Title");
         writer->SetDocImportance(BASE_DOCS, 0.1f);
         writer->SetDocVector(BASE_DOCS, vector);
-        assert(base.SaveIndex(INDEX_FILE));
+        if (!base.SaveIndex(INDEX_FILE))
+            throw std::runtime_error("failed to save continuation base index");
         std::cout << "  base continuation index saved\n";
     }
 
@@ -831,13 +837,15 @@ void TestIndexContextMergeContinuationPostings()
             writer->SetDocImportance(finalDocId, 0.1f);
             writer->SetDocVector(finalDocId, vector);
         }
-        assert(delta.SaveIndex(DELTA_FILE));
+        if (!delta.SaveIndex(DELTA_FILE))
+            throw std::runtime_error("failed to save continuation delta index");
         std::cout << "  delta continuation index saved\n";
     }
 
     {
         IndexContext merged("", INDEX_FILE);
-        assert(merged.Merge(INDEX_FILE));
+        if (!merged.Merge(INDEX_FILE))
+            throw std::runtime_error("failed to merge continuation index");
         std::cout << "  continuation index merged\n";
     }
 

@@ -275,9 +275,17 @@ int FileAccess::GetData(void * buffer, int numBytes)
         return static_cast<int>(bytesRead);
     }
     const DWORD error = GetLastError();
-    if (error == ERROR_IO_PENDING && GetOverlappedResult(m_FileHandle, &overlapped, &bytesRead, TRUE)) {
-        m_Position.store(position + bytesRead, std::memory_order_relaxed);
-        return static_cast<int>(bytesRead);
+    if (error == ERROR_HANDLE_EOF) {
+        return 0;
+    }
+    if (error == ERROR_IO_PENDING) {
+        if (GetOverlappedResult(m_FileHandle, &overlapped, &bytesRead, TRUE)) {
+            m_Position.store(position + bytesRead, std::memory_order_relaxed);
+            return static_cast<int>(bytesRead);
+        }
+        if (GetLastError() == ERROR_HANDLE_EOF) {
+            return 0;
+        }
     }
     return -1;
 #else
