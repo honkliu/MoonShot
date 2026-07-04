@@ -19,6 +19,11 @@
 
 #include <stdio.h>
 #include <stdint.h>
+#include <atomic>
+
+#if defined(__linux__)
+struct FileAccessIoUring;
+#endif
 
 class FileAccess {
 	public:
@@ -40,7 +45,9 @@ class FileAccess {
 		HANDLE m_FileHandle = INVALID_HANDLE_VALUE;
 #else
 		int m_FileHandle = -1;
+		FileAccessIoUring* m_IoUring = nullptr;
 #endif
+		std::atomic<uint64_t> m_Position{0};
 		char * m_FileName = nullptr;
 };
 

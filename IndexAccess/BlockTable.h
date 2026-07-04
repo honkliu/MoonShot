@@ -17,12 +17,77 @@
 #include <deque>
 #include <latch>
 #include <mutex>
+#if defined(__linux__)
+#include <linux/futex.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#if defined(__x86_64__) || defined(__i386__)
+#include <immintrin.h>
+#endif
+#endif
 #include "../Utils/FileAccess.h"
 #include "ElementFilter.h"
 #include "MemOperation.h"
 
 #ifdef _WIN32
 #pragma comment(lib, "Synchronization.lib")
+#endif
+
+#if defined(_WIN32) || defined(__linux__)
+#define MOONSHOT_BLOCK_REQUEST_RING 1
+#endif
+
+inline void MoonshotCpuRelax()
+{
+#ifdef _WIN32
+    YieldProcessor();
+#elif defined(__x86_64__) || defined(__i386__)
+    _mm_pause();
+#else
+    std::this_thread::yield();
+#endif
+}
+
+#if defined(__linux__)
+inline void MoonshotWakeAddress32(std::atomic<uint32_t>* address)
+{
+    syscall(SYS_futex, reinterpret_cast<uint32_t*>(address), FUTEX_WAKE_PRIVATE, 1, nullptr, nullptr, 0);
+}
+
+inline void MoonshotWakeAddress64(std::atomic<uint64_t>* address)
+{
+    syscall(SYS_futex, reinterpret_cast<uint32_t*>(address), FUTEX_WAKE_PRIVATE, 1, nullptr, nullptr, 0);
+}
+
+inline void MoonshotWakeAddress64All(std::atomic<uint64_t>* address)
+{
+    syscall(SYS_futex, reinterpret_cast<uint32_t*>(address), FUTEX_WAKE_PRIVATE, INT32_MAX, nullptr, nullptr, 0);
+}
+
+inline void MoonshotWaitAddress32(std::atomic<uint32_t>* address, uint32_t expected, uint32_t timeoutMs = 0)
+{
+    timespec timeout{};
+    timespec* timeoutPtr = nullptr;
+    if (timeoutMs != 0) {
+        timeout.tv_sec = timeoutMs / 1000;
+        timeout.tv_nsec = static_cast<long>(timeoutMs % 1000) * 1000000L;
+        timeoutPtr = &timeout;
+    }
+    syscall(SYS_futex, reinterpret_cast<uint32_t*>(address), FUTEX_WAIT_PRIVATE, expected, timeoutPtr, nullptr, 0);
+}
+
+inline void MoonshotWaitAddress64(std::atomic<uint64_t>* address, uint64_t expected, uint32_t timeoutMs = 0)
+{
+    timespec timeout{};
+    timespec* timeoutPtr = nullptr;
+    if (timeoutMs != 0) {
+        timeout.tv_sec = timeoutMs / 1000;
+        timeout.tv_nsec = static_cast<long>(timeoutMs % 1000) * 1000000L;
+        timeoutPtr = &timeout;
+    }
+    uint32_t expectedLow = static_cast<uint32_t>(expected);
+    syscall(SYS_futex, reinterpret_cast<uint32_t*>(address), FUTEX_WAIT_PRIVATE, expectedLow, timeoutPtr, nullptr, 0);
+}
 #endif
 
 static constexpr int PAGE_SIZE  = 4096;
@@ -324,20 +389,29 @@ class IndexBlockTable
             uint32_t BlockSeq = 0;
             uint32_t Slot = UINT32_MAX;
             void* Address = nullptr;
-#ifdef _WIN32
+#if defined(MOONSHOT_BLOCK_REQUEST_RING)
             std::atomic<uint32_t> Done{0};
 
             void Wait()
             {
                 uint32_t expected = 0;
-                while (Done.load(std::memory_order_acquire) == 0)
+                while (Done.load(std::memory_order_acquire) == 0) {
+#ifdef _WIN32
                     WaitOnAddress(reinterpret_cast<volatile void*>(&Done), &expected, sizeof(expected), INFINITE);
+#else
+                    MoonshotWaitAddress32(&Done, expected);
+#endif
+                }
             }
 
             void Complete()
             {
                 Done.store(1, std::memory_order_release);
+#ifdef _WIN32
                 WakeByAddressSingle(reinterpret_cast<void*>(&Done));
+#else
+                MoonshotWakeAddress32(&Done);
+#endif
             }
 #else
             std::latch Completion{1};
@@ -347,7 +421,7 @@ class IndexBlockTable
 #endif
         };
 
-#ifdef _WIN32
+#if defined(MOONSHOT_BLOCK_REQUEST_RING)
         struct BlockRequestRingSlot {
             std::atomic<uint64_t> Sequence{0};
             BlockRequest* Request = nullptr;
@@ -367,7 +441,7 @@ class IndexBlockTable
             std::thread                       BCP_Thread;
             std::mutex                        BCP_StateMutex;
             std::condition_variable           BCP_StateCv;
-#ifdef _WIN32
+#if defined(MOONSHOT_BLOCK_REQUEST_RING)
             std::unique_ptr<BlockRequestRingSlot[]> BCP_RequestRing;
             std::atomic<uint64_t>             BCP_RequestTail{0};
             uint64_t                          BCP_RequestHead = 0;
@@ -541,7 +615,7 @@ class IndexBlockTable
             BlockRequest request;
             request.Type = BlockRequestType::Get;
             request.BlockSeq = block_seq;
-#ifdef _WIN32
+#if defined(MOONSHOT_BLOCK_REQUEST_RING)
             SubmitBlockRequest(pool, &request);
 #else
             {
@@ -858,7 +932,7 @@ class IndexBlockTable
             dest.BCP_LogicTable = source.BCP_LogicTable;
             dest.BCP_SlotTable = source.BCP_SlotTable;
             dest.BCP_File = source.BCP_File;
-#ifdef _WIN32
+#if defined(MOONSHOT_BLOCK_REQUEST_RING)
             dest.BCP_RequestRing = std::move(source.BCP_RequestRing);
             dest.BCP_RequestHead = source.BCP_RequestHead;
             dest.BCP_RequestTail.store(source.BCP_RequestTail.load(std::memory_order_relaxed), std::memory_order_relaxed);
@@ -874,7 +948,7 @@ class IndexBlockTable
             source.BCP_LogicTable = nullptr;
             source.BCP_SlotTable = nullptr;
             source.BCP_File = nullptr;
-#ifdef _WIN32
+#if defined(MOONSHOT_BLOCK_REQUEST_RING)
             source.BCP_RequestHead = 0;
             source.BCP_RequestTail.store(0, std::memory_order_relaxed);
 #endif
@@ -888,7 +962,7 @@ class IndexBlockTable
                 return;
             if (pool.BCP_Pages && pool.BCP_SlotCount && !pool.BCP_Thread.joinable()) {
                 pool.BCP_ExitThread = false;
-#ifdef _WIN32
+#if defined(MOONSHOT_BLOCK_REQUEST_RING)
                 ResetRequestRing(pool);
 #endif
                 BlockCachePool* target = &pool;
@@ -903,9 +977,13 @@ class IndexBlockTable
                 std::lock_guard<std::mutex> lock(pool.BCP_RequestMutex);
                 pool.BCP_ExitThread = true;
             }
-#ifdef _WIN32
+#if defined(MOONSHOT_BLOCK_REQUEST_RING)
             pool.BCP_ExitThread = true;
+#ifdef _WIN32
             WakeByAddressAll(reinterpret_cast<void*>(&pool.BCP_RequestTail));
+#else
+            MoonshotWakeAddress64All(&pool.BCP_RequestTail);
+#endif
 #else
             pool.BCP_RequestCv.notify_one();
 #endif
@@ -956,7 +1034,7 @@ class IndexBlockTable
             return pool.BCP_LogicTable[startBlock] != UINT32_MAX;
         }
 
-#ifdef _WIN32
+#if defined(MOONSHOT_BLOCK_REQUEST_RING)
         void ResetRequestRing(BlockCachePool& pool)
         {
             if (!pool.BCP_RequestRing)
@@ -976,16 +1054,25 @@ class IndexBlockTable
             uint32_t spins = 0;
             while (slot.Sequence.load(std::memory_order_acquire) != pos) {
                 if (++spins < 256)
-                    YieldProcessor();
+                    MoonshotCpuRelax();
                 else {
                     uint64_t expected = slot.Sequence.load(std::memory_order_relaxed);
-                    if (expected != pos)
+                    if (expected != pos) {
+#ifdef _WIN32
                         WaitOnAddress(reinterpret_cast<volatile void*>(&slot.Sequence), &expected, sizeof(expected), 1);
+#else
+                        MoonshotWaitAddress64(&slot.Sequence, expected, 1);
+#endif
+                    }
                 }
             }
             slot.Request = request;
             slot.Sequence.store(pos + 1, std::memory_order_release);
+#ifdef _WIN32
             WakeByAddressSingle(reinterpret_cast<void*>(&pool.BCP_RequestTail));
+#else
+            MoonshotWakeAddress64(&pool.BCP_RequestTail);
+#endif
         }
 
         BlockRequest* TryPopBlockRequest(BlockCachePool& pool)
@@ -997,7 +1084,11 @@ class IndexBlockTable
             BlockRequest* request = slot.Request;
             slot.Request = nullptr;
             slot.Sequence.store(pool.BCP_RequestHead + BLOCK_REQUEST_RING_SIZE, std::memory_order_release);
+#ifdef _WIN32
             WakeByAddressAll(reinterpret_cast<void*>(&slot.Sequence));
+#else
+            MoonshotWakeAddress64All(&slot.Sequence);
+#endif
             ++pool.BCP_RequestHead;
             return request;
         }
@@ -1007,18 +1098,23 @@ class IndexBlockTable
         {
             while (true) {
                 BlockRequest* request = nullptr;
-#ifdef _WIN32
+#if defined(MOONSHOT_BLOCK_REQUEST_RING)
                 uint32_t idleSpins = 0;
                 while (!(request = TryPopBlockRequest(pool))) {
                     if (pool.BCP_ExitThread.load(std::memory_order_acquire)
                         && pool.BCP_RequestHead == pool.BCP_RequestTail.load(std::memory_order_acquire))
                         return;
                     if (++idleSpins < 4096)
-                        YieldProcessor();
+                        MoonshotCpuRelax();
                     else {
                         uint64_t observedTail = pool.BCP_RequestTail.load(std::memory_order_acquire);
-                        if (pool.BCP_RequestHead == observedTail && !pool.BCP_ExitThread.load(std::memory_order_acquire))
+                        if (pool.BCP_RequestHead == observedTail && !pool.BCP_ExitThread.load(std::memory_order_acquire)) {
+#ifdef _WIN32
                             WaitOnAddress(reinterpret_cast<volatile void*>(&pool.BCP_RequestTail), &observedTail, sizeof(observedTail), 1);
+#else
+                            MoonshotWaitAddress64(&pool.BCP_RequestTail, observedTail, 1);
+#endif
+                        }
                     }
                 }
 #else
