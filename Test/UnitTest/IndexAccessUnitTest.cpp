@@ -1131,33 +1131,15 @@ void TestTermMphfSameBaseCollision()
         store.AddPosting(term, docId++, 1);
 
     auto built = IndexSerializer::BuildBlocks(store);
-    assert(built.BBR_TotalTerms == terms.size());
-    assert(built.BBR_TermMphfHeader.TMH_Magic == TERM_MPHF_MAGIC);
-    assert(built.BBR_TermMphfHeader.TMH_SlotCount == terms.size());
-    assert(!built.BBR_TermMphfDisplacements.empty());
-    assert(!built.BBR_TermMphfEntryPages.empty());
+    if (built.BBR_TotalTerms != terms.size())
+        throw std::runtime_error("unexpected term count in compact term dictionary build");
+    if (built.BBR_TermMphfHeader.TMH_TermCount != 0
+        || built.BBR_TermMphfHeader.TMH_SlotCount != 0
+        || !built.BBR_TermMphfDisplacements.empty()
+        || !built.BBR_TermMphfEntryPages.empty())
+        throw std::runtime_error("MPHF output should be disabled for current compact index format");
 
-    std::vector<uint8_t> used(terms.size(), 0);
-    for (const auto& term : terms) {
-        const auto& header = built.BBR_TermMphfHeader;
-        const uint64_t bucket = TermMphfHash(term.data(), term.size(), header.TMH_BucketSeed) % header.TMH_BucketCount;
-        const int32_t displacement = built.BBR_TermMphfDisplacements[static_cast<size_t>(bucket)];
-        const uint64_t slot = displacement < 0
-            ? static_cast<uint64_t>(-static_cast<int64_t>(displacement) - 1)
-            : TermMphfHash(term.data(), term.size(), TermMphfSlotSeed(header.TMH_SlotSeed, static_cast<uint32_t>(displacement))) % header.TMH_SlotCount;
-        assert(slot < used.size());
-        assert(!used[static_cast<size_t>(slot)]);
-        used[static_cast<size_t>(slot)] = 1;
-
-        const uint64_t byteOffset = slot * sizeof(TermMphfEntry);
-        const auto* entry = reinterpret_cast<const TermMphfEntry*>(reinterpret_cast<const uint8_t*>(built.BBR_TermMphfEntryPages.data()) + byteOffset);
-        uint64_t fingerprint = TermMphfHash(term.data(), term.size(), header.TMH_FingerprintSeed);
-        if (fingerprint == 0) fingerprint = 1;
-        if (entry->LTE_Fingerprint != fingerprint)
-            throw std::runtime_error("MPHF fingerprint mismatch");
-    }
-
-    std::cout << "  MPHF same-base collision regression passed\n";
+    std::cout << "  MPHF disabled for compact term dictionary regression passed\n";
 }
 
 void TestTokenizerSnowballStemming()

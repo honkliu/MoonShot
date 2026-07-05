@@ -9,6 +9,7 @@
 #include "IndexContext.h"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <climits>
 #include <cctype>
@@ -21,6 +22,7 @@
 #include <mutex>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -41,7 +43,11 @@ namespace {
 struct Options {
     uint16_t port = 9000;
     std::string index_path;
+    std::string gbe_host = "127.0.0.1";
+    uint16_t gbe_port = 8765;
 };
+
+static constexpr size_t GBE_MAX_TEXT_BYTES = 65536;
 
 struct ParsedRequest {
     std::string method;
@@ -97,8 +103,14 @@ static Options parse_args(int argc, char** argv)
             }
         } else if (arg == "--index" && i + 1 < argc) {
             options.index_path = expand_user_path(argv[++i]);
+        } else if ((arg == "--gbe-host" || arg == "--bge-host") && i + 1 < argc) {
+            options.gbe_host = argv[++i];
+        } else if ((arg == "--gbe-port" || arg == "--bge-port") && i + 1 < argc) {
+            if (!parse_port(argv[++i], options.gbe_port)) {
+                throw std::runtime_error("invalid " + arg + " value");
+            }
         } else if (arg == "--help" || arg == "-h") {
-            std::cout << "usage: shennong [--port 9000] [--index ~/moon.idx]\n";
+            std::cout << "usage: shennong [--port 9000] [--index ~/moon.idx] [--gbe-host 127.0.0.1] [--gbe-port 8765]\n";
             std::exit(0);
         } else {
             throw std::runtime_error("unknown or incomplete argument: " + arg);
@@ -251,6 +263,89 @@ static bool send_all(socket_t fd, const std::string& data)
     return true;
 }
 
+static bool send_all_bytes(socket_t fd, const char* data, size_t bytes)
+{
+    const char* ptr = data;
+    size_t remaining = bytes;
+    while (remaining > 0) {
+#ifdef _WIN32
+        int sent = send(fd, ptr, static_cast<int>(std::min<size_t>(remaining, 64 * 1024)), 0);
+#else
+        ssize_t sent = send(fd, ptr, remaining, 0);
+#endif
+        if (sent <= 0) return false;
+        ptr += sent;
+        remaining -= static_cast<size_t>(sent);
+    }
+    return true;
+}
+
+static bool recv_all_bytes(socket_t fd, char* data, size_t bytes)
+{
+    char* ptr = data;
+    size_t remaining = bytes;
+    while (remaining > 0) {
+#ifdef _WIN32
+        int got = recv(fd, ptr, static_cast<int>(std::min<size_t>(remaining, 64 * 1024)), 0);
+#else
+        ssize_t got = recv(fd, ptr, remaining, 0);
+#endif
+        if (got <= 0) return false;
+        ptr += got;
+        remaining -= static_cast<size_t>(got);
+    }
+    return true;
+}
+
+static bool embed_text_with_gbe_service(const std::string& text,
+                                        const std::string& host,
+                                        uint16_t port,
+                                        std::vector<float>& vector)
+{
+    if (text.empty()) return false;
+
+    addrinfo hints{};
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    addrinfo* resolved = nullptr;
+    const std::string portText = std::to_string(port);
+    if (getaddrinfo(host.c_str(), portText.c_str(), &hints, &resolved) != 0 || !resolved)
+        return false;
+
+    socket_t fd = INVALID_SOCKET_FD;
+    for (addrinfo* cur = resolved; cur; cur = cur->ai_next) {
+        socket_t candidate = socket(cur->ai_family, cur->ai_socktype, cur->ai_protocol);
+        if (candidate == INVALID_SOCKET_FD) continue;
+        if (connect(candidate, cur->ai_addr, static_cast<int>(cur->ai_addrlen)) == 0) {
+            fd = candidate;
+            break;
+        }
+        close_socket(candidate);
+    }
+    freeaddrinfo(resolved);
+    if (fd == INVALID_SOCKET_FD) return false;
+
+    std::string payload = text;
+    if (payload.size() > GBE_MAX_TEXT_BYTES)
+        payload.resize(GBE_MAX_TEXT_BYTES);
+
+    const uint32_t length = static_cast<uint32_t>(payload.size());
+    uint32_t dim = 0;
+    std::array<int8_t, DOC_VECTOR_DIM> response{};
+    const bool ok = send_all_bytes(fd, reinterpret_cast<const char*>(&length), sizeof(length))
+        && send_all_bytes(fd, payload.data(), payload.size())
+        && recv_all_bytes(fd, reinterpret_cast<char*>(&dim), sizeof(dim))
+        && dim == DOC_VECTOR_DIM
+        && recv_all_bytes(fd, reinterpret_cast<char*>(response.data()), response.size());
+    close_socket(fd);
+    if (!ok) return false;
+
+    vector.assign(DOC_VECTOR_DIM, 0.0f);
+    for (size_t i = 0; i < DOC_VECTOR_DIM; ++i)
+        vector[i] = static_cast<float>(response[i]) / 128.0f;
+    return true;
+}
+
 static std::string http_response(int status, const std::string& status_text,
                                  const std::string& body,
                                  const std::string& content_type = "application/json; charset=utf-8")
@@ -269,8 +364,11 @@ static std::string http_response(int status, const std::string& status_text,
 
 class SearchService {
 public:
-    explicit SearchService(std::string index_path)
-        : m_IndexPath(std::move(index_path)), m_Context("", m_IndexPath.c_str())
+    explicit SearchService(std::string index_path, std::string gbe_host, uint16_t gbe_port)
+        : m_IndexPath(std::move(index_path))
+        , m_GbeHost(std::move(gbe_host))
+        , m_GbePort(gbe_port)
+        , m_Context("", m_IndexPath.c_str())
     {
         if (m_Context.DocumentCount() == 0) {
             throw std::runtime_error("index loaded with zero docs or failed to load: " + m_IndexPath);
@@ -282,6 +380,8 @@ public:
         std::ostringstream out;
         const IndexFileHeader& header = m_Context.GetIndexFileHeader();
         out << "{\"status\":\"ok\",\"index\":\"" << json_escape(m_IndexPath) << "\""
+            << ",\"gbe_host\":\"" << json_escape(m_GbeHost) << "\""
+            << ",\"gbe_port\":" << m_GbePort
             << ",\"documents\":" << header.IFH_NumDocuments
             << ",\"avg_doc_len\":" << header.IFH_AvgDocLength
             << ",\"vector_count\":" << m_Context.VectorCount()
@@ -308,18 +408,10 @@ public:
 
         const auto started = std::chrono::steady_clock::now();
 
-        std::vector<SearchResult> results;
-        {
-            std::lock_guard<std::mutex> lock(m_QueryMutex);
-            auto tree = std::unique_ptr<EvalTree>(m_Context.Compile(query.c_str(), streams.c_str()));
-            if (tree && !tree->IsEmpty()) {
-                tree->vector_ef_search = static_cast<size_t>(efSearch);
-                const std::vector<float>* vectorQuery = tree->HasTextQuery() && tree->HasVectorQuery() ? &tree->vector_query : nullptr;
-                auto reader = m_Context.GetReader(tree.get());
-                auto executor = std::unique_ptr<IndexSearchExecutor>(m_Context.GetExecutor());
-                results = executor->Execute(reader, 0, vectorQuery);
-            }
-        }
+        std::vector<float> vector;
+        const bool vectorReady = embed_text_with_gbe_service(query, m_GbeHost, m_GbePort, vector);
+        auto task = m_Context.Enqueue(query.c_str(), vectorReady ? std::move(vector) : std::vector<float>{}, streams.c_str(), 0);
+        std::vector<SearchResult> results = task.Wait();
 
         const auto finished = std::chrono::steady_clock::now();
         const double elapsed_ms = std::chrono::duration<double, std::milli>(finished - started).count();
@@ -334,6 +426,7 @@ public:
             << ",\"offset\":" << begin
             << ",\"limit\":" << limit
             << ",\"elapsed_ms\":" << elapsed_ms
+            << ",\"vector_ready\":" << (vectorReady ? "true" : "false")
             << ",\"results\":[";
 
         for (int i = begin; i < end; ++i) {
@@ -373,13 +466,9 @@ public:
         tree->vector_ef_search = static_cast<size_t>(efSearch);
 
         const auto started = std::chrono::steady_clock::now();
-        std::vector<SearchResult> results;
-        {
-            std::lock_guard<std::mutex> lock(m_QueryMutex);
-            auto reader = m_Context.GetReader(tree.get());
-            auto executor = std::unique_ptr<IndexSearchExecutor>(m_Context.GetExecutor());
-            results = executor->Execute(reader, 0);
-        }
+        const size_t vectorDim = tree->vector_query.size();
+        auto task = m_Context.Enqueue("", std::move(tree->vector_query), "AUTB", 0);
+        std::vector<SearchResult> results = task.Wait();
         const auto finished = std::chrono::steady_clock::now();
         const double elapsed_ms = std::chrono::duration<double, std::milli>(finished - started).count();
         const int total = static_cast<int>(std::min<size_t>(results.size(), static_cast<size_t>(INT32_MAX)));
@@ -388,7 +477,7 @@ public:
 
         std::ostringstream out;
         out << "{\"query\":\"" << json_escape(queryText) << "\""
-            << ",\"vector_dim\":" << tree->vector_query.size()
+            << ",\"vector_dim\":" << vectorDim
             << ",\"vector_count\":" << m_Context.VectorCount()
             << ",\"efSearch\":" << efSearch
             << ",\"total\":" << total
@@ -411,8 +500,9 @@ public:
 
 private:
     std::string m_IndexPath;
+    std::string m_GbeHost;
+    uint16_t m_GbePort = 8765;
     IndexContext m_Context;
-    std::mutex m_QueryMutex;
 };
 
 static std::string handle_request(SearchService& service, const ParsedRequest& request)
@@ -474,6 +564,30 @@ static socket_t create_listen_socket(uint16_t port)
     return fd;
 }
 
+static void serve_one_client(socket_t client, SearchService& service)
+{
+    std::string request;
+    char buffer[4096];
+    while (request.find("\r\n\r\n") == std::string::npos && request.size() < 64 * 1024) {
+#ifdef _WIN32
+        int n = recv(client, buffer, sizeof(buffer), 0);
+#else
+        ssize_t n = recv(client, buffer, sizeof(buffer), 0);
+#endif
+        if (n <= 0) break;
+        request.append(buffer, buffer + n);
+    }
+
+    try {
+        auto response = handle_request(service, parse_http_request(request));
+        send_all(client, response);
+    } catch (const std::exception& ex) {
+        send_all(client, http_response(500, "Internal Server Error", std::string("{\"error\":\"") + json_escape(ex.what()) + "\"}"));
+    }
+
+    close_socket(client);
+}
+
 static void serve_forever(SearchService& service, uint16_t port)
 {
     socket_t server = create_listen_socket(port);
@@ -488,27 +602,7 @@ static void serve_forever(SearchService& service, uint16_t port)
 #endif
         socket_t client = accept(server, reinterpret_cast<sockaddr*>(&client_addr), &len);
         if (client == INVALID_SOCKET_FD) continue;
-
-        std::string request;
-        char buffer[4096];
-        while (request.find("\r\n\r\n") == std::string::npos && request.size() < 64 * 1024) {
-#ifdef _WIN32
-            int n = recv(client, buffer, sizeof(buffer), 0);
-#else
-            ssize_t n = recv(client, buffer, sizeof(buffer), 0);
-#endif
-            if (n <= 0) break;
-            request.append(buffer, buffer + n);
-        }
-
-        try {
-            auto response = handle_request(service, parse_http_request(request));
-            send_all(client, response);
-        } catch (const std::exception& ex) {
-            send_all(client, http_response(500, "Internal Server Error", std::string("{\"error\":\"") + json_escape(ex.what()) + "\"}"));
-        }
-
-        close_socket(client);
+        std::thread([client, &service] { serve_one_client(client, service); }).detach();
     }
 }
 
@@ -527,7 +621,7 @@ int main(int argc, char** argv)
                   << "Index: " << options.index_path << "\n"
                   << "Listen: 0.0.0.0:" << options.port << "\n";
 
-        SearchService service(options.index_path);
+        SearchService service(options.index_path, options.gbe_host, options.gbe_port);
         std::cout << "Index loaded: " << service.health_json() << "\n";
         serve_forever(service, options.port);
     } catch (const std::exception& ex) {

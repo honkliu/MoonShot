@@ -35,10 +35,12 @@ impl Ord for F32 {
     }
 }
 
+#[derive(Clone)]
 struct HnswNode {
     neighbors: Vec<Vec<usize>>,
 }
 
+#[derive(Clone)]
 pub struct HnswIndex {
     nodes: Vec<HnswNode>,
     doc_ids: Vec<u64>,

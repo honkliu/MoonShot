@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
 use crate::posting_store::PostingStore;
 use crate::eval_tree::BIGRAM_SEP;
 
@@ -26,12 +26,12 @@ pub trait IndexWriter {
 */
 #[allow(non_snake_case)]
 pub struct AdvancedIndexWriter {
-    m_Store: Arc<Mutex<PostingStore>>,
+    m_Store: Arc<RwLock<PostingStore>>,
 }
 
 #[allow(non_snake_case)]
 impl AdvancedIndexWriter {
-    pub fn new(store: Arc<Mutex<PostingStore>>) -> Self {
+    pub fn new(store: Arc<RwLock<PostingStore>>) -> Self {
         Self { m_Store: store }
     }
 
@@ -58,7 +58,7 @@ impl IndexWriter for AdvancedIndexWriter {
     fn Write(&mut self, tokens: Vec<String>, doc_id: u64, stream: &str) {
         if tokens.is_empty() { return; }
         let abbrev = Self::StreamAbbrev(stream);
-        let mut store = self.m_Store.lock().unwrap();
+        let mut store = self.m_Store.write().unwrap();
 
         let mut term_tf: HashMap<String, u32> = HashMap::new();
         for tok in &tokens {
@@ -85,14 +85,14 @@ impl IndexWriter for AdvancedIndexWriter {
     }
 
     fn SetDocImportance(&mut self, doc_id: u64, score: f32) {
-        self.m_Store.lock().unwrap().SetDocImportance(doc_id, score);
+        self.m_Store.write().unwrap().SetDocImportance(doc_id, score);
     }
 
     fn SetDocPath(&mut self, doc_id: u64, path: String) {
-        self.m_Store.lock().unwrap().SetDocPath(doc_id, path);
+        self.m_Store.write().unwrap().SetDocPath(doc_id, path);
     }
 
     fn SetDocVector(&mut self, doc_id: u64, vector: Vec<f32>) {
-        self.m_Store.lock().unwrap().SetDocVector(doc_id, vector);
+        self.m_Store.write().unwrap().SetDocVector(doc_id, vector);
     }
 }

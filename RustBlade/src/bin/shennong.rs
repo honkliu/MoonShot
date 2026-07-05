@@ -2,11 +2,11 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::Instant;
 
 use rustblade::IndexContext;
-use rustblade::executor::IndexSearchExecutor;
 
 struct Options {
     port: u16,
@@ -146,13 +146,11 @@ impl SearchService {
         let limit = query_int(params, "limit", 20, 1, 1000);
         let started = Instant::now();
 
-        let mut context = self.context.lock().unwrap();
-        let tree = context.Compile(&query, &streams);
-        let mut reader = context.GetReader(tree);
-        let store = context.GetStore();
-        let store = store.lock().unwrap();
-        let executor = IndexSearchExecutor::new(&store);
-        let results = executor.Execute(reader.as_mut(), 0);
+        let task = {
+            let mut context = self.context.lock().unwrap();
+            context.Enqueue(&query, Vec::new(), &streams, 0)
+        };
+        let results = task.Wait();
         let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
         let total = results.len();
         let begin = offset.min(total);
@@ -163,7 +161,7 @@ impl SearchService {
             json_escape(&query), json_escape(&streams), total, begin, limit, elapsed_ms);
         for (rank, result) in results[begin..end].iter().enumerate() {
             if rank > 0 { body.push(','); }
-            let path = context.GetDocPath(result.doc_id);
+            let path = self.context.lock().unwrap().GetDocPath(result.doc_id);
             body.push_str(&format!(
                 "{{\"rank\":{},\"doc_id\":{},\"score\":{},\"path\":\"{}\"}}",
                 begin + rank + 1, result.doc_id, result.score, json_escape(&path)));
@@ -233,7 +231,7 @@ fn handle_request(service: &SearchService, request: &str) -> String {
     }
 }
 
-fn serve_client(mut stream: TcpStream, service: &SearchService) {
+fn serve_client(mut stream: TcpStream, service: Arc<SearchService>) {
     let mut buffer = [0u8; 8192];
     let mut request = Vec::new();
     while request.windows(4).all(|window| window != b"\r\n\r\n") && request.len() < 64 * 1024 {
@@ -242,7 +240,7 @@ fn serve_client(mut stream: TcpStream, service: &SearchService) {
         request.extend_from_slice(&buffer[..read]);
     }
     let request = String::from_utf8_lossy(&request);
-    let response = handle_request(service, &request);
+    let response = handle_request(&service, &request);
     let _ = stream.write_all(response.as_bytes());
 }
 
@@ -263,10 +261,12 @@ fn main() {
         Err(error) => { eprintln!("shennong_rs: {error}"); std::process::exit(1); }
     };
     println!("Index loaded: {}", service.health_json());
+    let service = Arc::new(service);
 
     let listener = TcpListener::bind(("0.0.0.0", options.port)).expect("bind failed");
     println!("Ready: http://localhost:{}/search?q=usage&offset=0&limit=20", options.port);
     for stream in listener.incoming().flatten() {
-        serve_client(stream, &service);
+        let service = Arc::clone(&service);
+        thread::spawn(move || serve_client(stream, service));
     }
 }

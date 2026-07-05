@@ -304,6 +304,7 @@ int FileAccess::GetData(void * buffer, int numBytes)
 bool FileAccess::PutData(const void * buffer, uint64_t numBytes)
 {
     const auto* cursor = static_cast<const uint8_t*>(buffer);
+    uint64_t writtenTotal = 0;
     while (numBytes > 0) {
         const int chunk = static_cast<int>(std::min<uint64_t>(numBytes, static_cast<uint64_t>(std::numeric_limits<int>::max())));
 #ifdef _WIN32
@@ -328,7 +329,9 @@ bool FileAccess::PutData(const void * buffer, uint64_t numBytes)
 #endif
         cursor += chunk;
         numBytes -= static_cast<uint64_t>(chunk);
+        writtenTotal += static_cast<uint64_t>(chunk);
     }
+    m_Position.fetch_add(writtenTotal, std::memory_order_relaxed);
     return true;
 }
 
@@ -422,12 +425,14 @@ bool FileAccess::SetPosition(uint64_t position)
     if (m_FileHandle == INVALID_HANDLE_VALUE) {
         return false;
     }
-    return true;
+    LARGE_INTEGER liPosition;
+    liPosition.QuadPart = static_cast<LONGLONG>(position);
+    return SetFilePointerEx(m_FileHandle, liPosition, NULL, FILE_BEGIN) != 0;
 #else
     if (m_FileHandle == -1) {
         return false;
     }
-    return true;
+    return lseek(m_FileHandle, static_cast<off_t>(position), SEEK_SET) != -1;
 #endif
 }
 

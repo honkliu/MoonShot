@@ -292,7 +292,7 @@ pub fn search_index(data: &[u8], query: &str, streams: &str) -> String {
     let mut reader = context.GetReader(tree);
     let results = {
         let store = context.GetStore();
-        let store = store.lock().unwrap();
+        let store = store.read().unwrap();
         let executor = IndexSearchExecutor::new(&store);
         executor.Execute(reader.as_mut(), 0)
     };

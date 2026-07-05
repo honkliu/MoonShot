@@ -1,8 +1,8 @@
-use std::cell::RefCell;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::ops::Deref;
-use std::sync::Arc;
+use std::sync::{mpsc, Arc, Mutex};
+use std::thread::{self, JoinHandle};
 
 use crate::pinned_memory::PinnedMemory;
 
@@ -333,6 +333,56 @@ struct BlockCachePool<T: Default + Copy> {
     slot_table: Option<PinnedMemory<IndexSlotEntry>>,
 }
 
+enum BlockWorkerRequest<T: Default + Copy + Send + Sync + 'static> {
+    Get {
+        block_seq: u32,
+        reply: mpsc::Sender<Option<(u32, PinnedBlock<T>)>>,
+    },
+    Stop,
+}
+
+struct BlockCacheWorker<T: Default + Copy + Send + Sync + 'static> {
+    sender: mpsc::Sender<BlockWorkerRequest<T>>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl<T: Default + Copy + Send + Sync + 'static> BlockCacheWorker<T> {
+    fn start(pool: Arc<Mutex<BlockCachePool<T>>>) -> Self {
+        let (sender, receiver) = mpsc::channel::<BlockWorkerRequest<T>>();
+        let handle = thread::spawn(move || {
+            while let Ok(request) = receiver.recv() {
+                match request {
+                    BlockWorkerRequest::Get { block_seq, reply } => {
+                        let result = pool.lock().ok().and_then(|mut pool| pool.read_miss(block_seq));
+                        let _ = reply.send(result);
+                    }
+                    BlockWorkerRequest::Stop => break,
+                }
+            }
+        });
+        Self { sender, handle: Some(handle) }
+    }
+
+    fn get(&self, block_seq: u32) -> Option<(u32, PinnedBlock<T>)> {
+        let (reply, receiver) = mpsc::channel();
+        self.sender.send(BlockWorkerRequest::Get { block_seq, reply }).ok()?;
+        receiver.recv().ok().flatten()
+    }
+
+    fn stop(&mut self) {
+        let _ = self.sender.send(BlockWorkerRequest::Stop);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl<T: Default + Copy + Send + Sync + 'static> Drop for BlockCacheWorker<T> {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
 #[allow(non_snake_case)]
 impl<T: Default + Copy> BlockCachePool<T> {
     fn new() -> Self {
@@ -438,10 +488,6 @@ impl<T: Default + Copy> BlockCachePool<T> {
         Some((found, PinnedBlock { page }))
     }
 
-    fn get_or_read(&mut self, block_seq: u32) -> Option<(u32, PinnedBlock<T>)> {
-        if let Some(hit) = self.get(block_seq) { return Some(hit); }
-        self.read_miss(block_seq)
-    }
 }
 
 pub struct IndexLocation {
@@ -453,8 +499,10 @@ pub struct IndexLocation {
 }
 
 pub struct IndexBlockTable {
-    index_pool: RefCell<BlockCachePool<IndexBlock>>,
-    leaf_term_pool: RefCell<BlockCachePool<LeafTermBlock>>,
+    index_pool: Arc<Mutex<BlockCachePool<IndexBlock>>>,
+    leaf_term_pool: Arc<Mutex<BlockCachePool<LeafTermBlock>>>,
+    index_worker: Mutex<Option<BlockCacheWorker<IndexBlock>>>,
+    leaf_term_worker: Mutex<Option<BlockCacheWorker<LeafTermBlock>>>,
     head_term_entries: Vec<HeadTermEntry>,
     term_mphf_header: TermMphfHeader,
     term_mphf_displacements: Vec<i32>,
@@ -466,8 +514,10 @@ pub struct IndexBlockTable {
 impl IndexBlockTable {
     pub fn new(_capacity: usize) -> Self {
         Self {
-            index_pool: RefCell::new(BlockCachePool::new()),
-            leaf_term_pool: RefCell::new(BlockCachePool::new()),
+            index_pool: Arc::new(Mutex::new(BlockCachePool::new())),
+            leaf_term_pool: Arc::new(Mutex::new(BlockCachePool::new())),
+            index_worker: Mutex::new(None),
+            leaf_term_worker: Mutex::new(None),
             head_term_entries: Vec::new(),
             term_mphf_header: TermMphfHeader::default(),
             term_mphf_displacements: Vec::new(),
@@ -477,11 +527,13 @@ impl IndexBlockTable {
     }
 
     pub fn SetIndexBlocks(&mut self, blocks: Vec<IndexBlock>) {
-        self.index_pool.borrow_mut().set_pages(blocks);
+        self.StopWorkers();
+        self.index_pool.lock().unwrap().set_pages(blocks);
     }
 
     pub fn SetLeafTermBlocks(&mut self, blocks: Vec<LeafTermBlock>) {
-        self.leaf_term_pool.borrow_mut().set_pages(blocks);
+        self.StopWorkers();
+        self.leaf_term_pool.lock().unwrap().set_pages(blocks);
     }
 
     pub fn InitFileBacked(&mut self,
@@ -492,16 +544,18 @@ impl IndexBlockTable {
                             leaf_base_offset: u64,
                             leaf_block_count: u32,
                             leaf_slot_count: u32) -> std::io::Result<()> {
-        self.index_pool.borrow_mut().InitFileBacked(
+        self.StopWorkers();
+        self.index_pool.lock().unwrap().InitFileBacked(
             path.to_string(), index_base_offset, index_block_count, index_slot_count)?;
-        self.leaf_term_pool.borrow_mut().InitFileBacked(
+        self.leaf_term_pool.lock().unwrap().InitFileBacked(
             path.to_string(), leaf_base_offset, leaf_block_count, leaf_slot_count)?;
+        self.StartWorkers();
         Ok(())
     }
 
     pub fn InsertBlock(&mut self, seq: u32, block: IndexBlock) {
         let mut pages: Vec<IndexBlock> = self.index_pool
-            .borrow()
+            .lock().unwrap()
             .pages
             .as_ref()
             .map(|pages| pages.as_slice().to_vec())
@@ -526,8 +580,10 @@ impl IndexBlockTable {
 
     pub fn HandOverBlockTable(&mut self, source: &mut IndexBlockTable) {
         if std::ptr::eq(self, source) { return; }
-        self.index_pool = std::mem::replace(&mut source.index_pool, RefCell::new(BlockCachePool::new()));
-        self.leaf_term_pool = std::mem::replace(&mut source.leaf_term_pool, RefCell::new(BlockCachePool::new()));
+        self.StopWorkers();
+        source.StopWorkers();
+        self.index_pool = std::mem::replace(&mut source.index_pool, Arc::new(Mutex::new(BlockCachePool::new())));
+        self.leaf_term_pool = std::mem::replace(&mut source.leaf_term_pool, Arc::new(Mutex::new(BlockCachePool::new())));
         self.head_term_entries = std::mem::take(&mut source.head_term_entries);
         self.term_mphf_header = source.term_mphf_header;
         self.term_mphf_displacements = std::mem::take(&mut source.term_mphf_displacements);
@@ -564,13 +620,59 @@ impl IndexBlockTable {
     pub fn TermMphfDisplacements(&self) -> &[i32] { &self.term_mphf_displacements }
     pub fn TermMphfEntryPages(&self) -> &[IndexBlock] { &self.term_mphf_entry_pages }
 
+    fn StartWorkers(&self) {
+        let mut index_worker = self.index_worker.lock().unwrap();
+        if index_worker.is_none() {
+            *index_worker = Some(BlockCacheWorker::start(Arc::clone(&self.index_pool)));
+        }
+        drop(index_worker);
+
+        let mut leaf_worker = self.leaf_term_worker.lock().unwrap();
+        if leaf_worker.is_none() {
+            *leaf_worker = Some(BlockCacheWorker::start(Arc::clone(&self.leaf_term_pool)));
+        }
+    }
+
+    fn StopWorkers(&self) {
+        if let Ok(mut worker) = self.index_worker.lock() {
+            if let Some(mut worker) = worker.take() {
+                worker.stop();
+            }
+        }
+        if let Ok(mut worker) = self.leaf_term_worker.lock() {
+            if let Some(mut worker) = worker.take() {
+                worker.stop();
+            }
+        }
+    }
+
+    fn GetIndexBlock(&self, seq: u32) -> Option<(u32, PinnedBlock<IndexBlock>)> {
+        if let Some(hit) = self.index_pool.lock().ok()?.get(seq) {
+            return Some(hit);
+        }
+        if let Some(worker) = self.index_worker.lock().ok()?.as_ref() {
+            return worker.get(seq);
+        }
+        self.index_pool.lock().ok()?.read_miss(seq)
+    }
+
+    fn GetLeafTermBlock(&self, seq: u32) -> Option<(u32, PinnedBlock<LeafTermBlock>)> {
+        if let Some(hit) = self.leaf_term_pool.lock().ok()?.get(seq) {
+            return Some(hit);
+        }
+        if let Some(worker) = self.leaf_term_worker.lock().ok()?.as_ref() {
+            return worker.get(seq);
+        }
+        self.leaf_term_pool.lock().ok()?.read_miss(seq)
+    }
+
     pub fn HeadTermEntries(&self) -> &[HeadTermEntry] {
         &self.head_term_entries
     }
 
     pub fn IndexBlocks(&self) -> Vec<IndexBlock> {
         self.index_pool
-            .borrow()
+            .lock().unwrap()
             .pages
             .as_ref()
             .map(|pages| pages.as_slice().to_vec())
@@ -579,7 +681,7 @@ impl IndexBlockTable {
 
     pub fn LeafTermBlocks(&self) -> Vec<LeafTermBlock> {
         self.leaf_term_pool
-            .borrow()
+            .lock().unwrap()
             .pages
             .as_ref()
             .map(|pages| pages.as_slice().to_vec())
@@ -602,7 +704,7 @@ impl IndexBlockTable {
         let pos = self.head_term_entries.partition_point(|entry| entry.first_term() <= term);
         if pos == 0 { return None; }
         let leaf_block_id = self.head_term_entries[pos - 1].HTE_LeafTermBlockID;
-        let (_leaf_slot, leaf_block) = self.leaf_term_pool.borrow_mut().get_or_read(leaf_block_id)?;
+        let (_leaf_slot, leaf_block) = self.GetLeafTermBlock(leaf_block_id)?;
 
         let entry_count = leaf_block.entry_count();
         let mut left = 0usize;
@@ -618,7 +720,7 @@ impl IndexBlockTable {
         let entry = leaf_block.entry(left)?;
         if entry.LTE_Term != term { return None; }
 
-        let (_index_slot, index_block) = self.index_pool.borrow_mut().get_or_read(entry.LTE_IndexBlockID)?;
+        let (_index_slot, index_block) = self.GetIndexBlock(entry.LTE_IndexBlockID)?;
         Some((IndexLocation {
             index_block_id: entry.LTE_IndexBlockID,
             index_offset: entry.LTE_IndexOffset as usize,
@@ -659,7 +761,7 @@ impl IndexBlockTable {
         if u64::from_le_bytes(data[24..32].try_into().ok()?) != fingerprint { return None; }
 
         let index_block_id = u32::from_le_bytes(data[4..8].try_into().ok()?);
-        let index_block = self.index_pool.borrow_mut().get_or_read(index_block_id)?.1;
+        let index_block = self.GetIndexBlock(index_block_id)?.1;
         Some((IndexLocation {
             doc_freq: u32::from_le_bytes(data[0..4].try_into().ok()?),
             index_block_id,
@@ -670,15 +772,15 @@ impl IndexBlockTable {
     }
 
     pub fn GetBlockBySeq(&self, seq: u32) -> Option<PinnedBlock<IndexBlock>> {
-        self.index_pool.borrow_mut().get_or_read(seq).map(|(_, block)| block)
+        self.GetIndexBlock(seq).map(|(_, block)| block)
     }
 
     pub fn GetLeafBlockBySeq(&self, seq: u32) -> Option<PinnedBlock<LeafTermBlock>> {
-        self.leaf_term_pool.borrow_mut().get_or_read(seq).map(|(_, block)| block)
+        self.GetLeafTermBlock(seq).map(|(_, block)| block)
     }
 
     pub fn LeafTermBlockCount(&self) -> u32 {
-        self.leaf_term_pool.borrow().total_block_count
+        self.leaf_term_pool.lock().unwrap().total_block_count
     }
 
     pub fn PostingBytes(&self, entry: &LeafTermEntry) -> Option<Vec<u8>> {

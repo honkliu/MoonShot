@@ -98,7 +98,7 @@ fn interactive() -> io::Result<()> {
         let tree = context.Compile(query, "AUTB");
         let mut reader = context.GetReader(tree);
         let store = context.GetStore();
-        let store = store.lock().unwrap();
+        let store = store.read().unwrap();
         let executor = IndexSearchExecutor::new(&store);
         let results = executor.Execute(reader.as_mut(), 0);
         if results.is_empty() {

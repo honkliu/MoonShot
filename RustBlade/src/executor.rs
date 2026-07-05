@@ -1,6 +1,7 @@
 use crate::index_reader::IndexReader;
 use crate::index_reader::ReaderDocumentIDValue;
 use crate::bm25::Bm25Scorer;
+use crate::block_table::{DOC_REC_SIZE, DOC_VECTOR_DIM, DOC_VECTOR_OFFSET};
 use crate::posting_store::PostingStore;
 
 #[derive(Debug, Clone)]
@@ -18,6 +19,17 @@ impl<'a> IndexSearchExecutor<'a> {
     pub fn new(store: &'a PostingStore) -> Self { Self { store } }
 
     pub fn Execute(&self, reader: &mut dyn IndexReader, top_k: usize) -> Vec<SearchResult> {
+        self.ExecuteWithVector(reader, top_k, &[], 0, None)
+    }
+
+    pub fn ExecuteWithVector(
+        &self,
+        reader: &mut dyn IndexReader,
+        top_k: usize,
+        docdata: &[u8],
+        docdata_first_doc_id: u64,
+        vector_query: Option<&[f32]>,
+    ) -> Vec<SearchResult> {
         if reader.IsEnd() { return vec![]; }
         let scorer  = Bm25Scorer::new(self.store.TotalDocs(), self.store.AvgDocLen());
         let mut results = Vec::new();
@@ -26,7 +38,8 @@ impl<'a> IndexSearchExecutor<'a> {
             let doc_id  = reader.GetDocumentID();
             let doc_id_value = ReaderDocumentIDValue(doc_id);
             let score   = reader.GetScore(&scorer, self.store, doc_id_value)
-                        + self.store.GetDocImportance(doc_id_value);
+                        + self.store.GetDocImportance(doc_id_value)
+                        + vector_score_feature(docdata, docdata_first_doc_id, doc_id_value, vector_query);
             results.push(SearchResult { doc_id, score });
             reader.GoNext();
         }
@@ -53,6 +66,31 @@ impl<'a> IndexSearchExecutor<'a> {
         sort_and_truncate(&mut results, top_k);
         results
     }
+}
+
+fn vector_score_feature(docdata: &[u8], first_doc_id: u64, doc_id: u64, query: Option<&[f32]>) -> f32 {
+    let Some(query) = query else { return 0.0; };
+    if query.len() != DOC_VECTOR_DIM || doc_id < first_doc_id { return 0.0; }
+    let slot = (doc_id - first_doc_id) as usize;
+    let offset = slot.saturating_mul(DOC_REC_SIZE);
+    if offset + DOC_REC_SIZE > docdata.len() { return 0.0; }
+    let stored_doc_id = u32::from_le_bytes(docdata[offset..offset + 4].try_into().unwrap()) as u64;
+    let vector_dim = u16::from_le_bytes(docdata[offset + 54..offset + 56].try_into().unwrap()) as usize;
+    let vector_format = u16::from_le_bytes(docdata[offset + 56..offset + 58].try_into().unwrap());
+    if stored_doc_id != doc_id || vector_dim != DOC_VECTOR_DIM || vector_format == 0 { return 0.0; }
+
+    let mut dot = 0.0f32;
+    let mut nq = 0.0f32;
+    let mut nd = 0.0f32;
+    for i in 0..DOC_VECTOR_DIM {
+        let q = query[i];
+        let d = docdata[offset + DOC_VECTOR_OFFSET + i] as i8 as f32 / 128.0;
+        dot += q * d;
+        nq += q * q;
+        nd += d * d;
+    }
+    if nq <= 0.0 || nd <= 0.0 { return 0.0; }
+    128.0 * dot / (nq.sqrt() * nd.sqrt())
 }
 
 fn collect_results(r: &mut dyn IndexReader, s: &Bm25Scorer, store: &PostingStore) -> Vec<SearchResult> {

@@ -1,8 +1,10 @@
 use std::fs;
 use std::fs::File;
+use std::collections::VecDeque;
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Condvar, Mutex, RwLock};
+use std::thread::{self, JoinHandle};
 use crate::posting_store::PostingStore;
 use crate::block_table::IndexBlockTable;
 use crate::index_writer::AdvancedIndexWriter;
@@ -18,6 +20,7 @@ use crate::error::{Result, RustBladeError};
 use crate::block_table::{DOC_PATH_MAX, DOC_PATH_PREFIX_ID_BYTES, DOC_PATH_FILENAME_MAX, DOC_PATH_PREFIX_INVALID, DOC_REC_SIZE, DOC_VECTOR_DIM, DOC_VECTOR_OFFSET, DOC_PATH_OFFSET, PATH_PREFIX_SIDECAR_BYTES, INDEX_FILE_HEADER_SIZE, PAGE_SIZE, HEAD_TERM_KEY_MAX, INDEX_BLOCK_CONTINUATION_HEADER_SIZE, LEAF_TERM_DATA_OFFSET, LEAF_TERM_DIRECTORY_COUNT, TERM_MPHF_HEADER_SIZE, HeadTermEntry, IndexBlock, IndexBlockContinuationHeader, LeafTermEntry, LeafTermBlock, PinnedBlock, TermMphfHeader, DocDataEncodeScore};
 use crate::vector_index::{HnswIndex, VectorMetric, VectorSearchResult};
 use crate::vector_index::build_hashed_embedding;
+use crate::executor::{IndexSearchExecutor, SearchResult};
 
 pub struct Document {
     pub doc_id: u64,
@@ -45,11 +48,111 @@ impl Default for Document {
     }
 }
 
+struct SearchTaskState {
+    query: String,
+    vector: Vec<f32>,
+    streams: String,
+    top_k: usize,
+    reply: mpsc::Sender<Vec<SearchResult>>,
+}
+
+struct SearchQueueState {
+    queue: VecDeque<SearchTaskState>,
+    stop: bool,
+}
+
+struct SearchRuntime {
+    store: Arc<RwLock<PostingStore>>,
+    block_table: Arc<IndexBlockTable>,
+    vector_index: Arc<HnswIndex>,
+    docdata: Arc<Vec<u8>>,
+    header: IndexFileHeader,
+    delta: Option<Arc<SearchRuntime>>,
+}
+
+impl SearchRuntime {
+    fn from_context(ctx: &IndexContext) -> Arc<Self> {
+        Arc::new(Self {
+            store: Arc::clone(&ctx.m_Store),
+            block_table: Arc::clone(&ctx.m_BlockTable),
+            vector_index: Arc::new(ctx.m_VectorIndex.clone()),
+            docdata: Arc::new(ctx.m_DocData.clone()),
+            header: ctx.m_IndexFileHeader,
+            delta: ctx.m_DeltaContext.as_ref().map(|delta| Self::from_context(delta)),
+        })
+    }
+
+    fn get_reader(&self, tree: EvalTree) -> Box<dyn IndexReader> {
+        let base = self.build_local_reader(tree.clone());
+        if let Some(delta) = self.delta.as_ref() {
+            return Box::new(OrIndexReader::new(vec![base, delta.build_local_reader(tree)]));
+        }
+        base
+    }
+
+    fn build_local_reader(&self, tree: EvalTree) -> Box<dyn IndexReader> {
+        if tree.HasTextQuery() && tree.HasVectorQuery() {
+            return self.build_index_reader(tree.root);
+        }
+        if tree.HasVectorQuery() {
+            return Box::new(VectorIndexReader::new(self.vector_index.Search(&tree.vector_query, 0, tree.vector_ef_search)));
+        }
+        self.build_index_reader(tree.root)
+    }
+
+    fn build_index_reader(&self, node: Option<EvalNode>) -> Box<dyn IndexReader> {
+        match node {
+            None => Box::new(AdvancedIndexReader::open("", Arc::clone(&self.block_table), 0)),
+            Some(EvalNode::Term(tn)) => {
+                let doc_freq = self.store.read().unwrap().DocFreq(&tn.stream_key);
+                Box::new(AdvancedIndexReader::open(&tn.stream_key, Arc::clone(&self.block_table), doc_freq))
+            }
+            Some(EvalNode::And(an)) => {
+                let children: Vec<Box<dyn IndexReader>> = an.children.into_iter()
+                    .map(|c| self.build_index_reader(Some(c))).collect();
+                if children.iter().any(|c| c.IsEnd()) {
+                    return Box::new(AdvancedIndexReader::open("", Arc::clone(&self.block_table), 0));
+                }
+                let mut children = children;
+                if children.len() == 1 { return children.remove(0); }
+                Box::new(AndIndexReader::new(children))
+            }
+            Some(EvalNode::Or(on)) => {
+                let children: Vec<Box<dyn IndexReader>> = on.children.into_iter()
+                    .map(|c| self.build_index_reader(Some(c)))
+                    .filter(|r| !r.IsEnd()).collect();
+                if children.is_empty() {
+                    return Box::new(AdvancedIndexReader::open("", Arc::clone(&self.block_table), 0));
+                }
+                let mut children = children;
+                if children.len() == 1 { return children.remove(0); }
+                Box::new(OrIndexReader::new(children))
+            }
+            Some(EvalNode::Not(nn)) => {
+                let base = self.build_index_reader(Some(*nn.base));
+                let exclude = self.build_index_reader(Some(*nn.exclude));
+                Box::new(NotIndexReader::new(base, exclude))
+            }
+        }
+    }
+}
+
+pub struct SearchTask {
+    receiver: mpsc::Receiver<Vec<SearchResult>>,
+}
+
+#[allow(non_snake_case)]
+impl SearchTask {
+    pub fn Wait(self) -> Vec<SearchResult> {
+        self.receiver.recv().unwrap_or_default()
+    }
+}
+
 /// Central factory — owns PostingStore, BlockTable and all search components.
 /// Mirrors MoonShot's IndexContext.h.
 #[allow(non_snake_case)]
 pub struct IndexContext {
-    m_Store:       Arc<Mutex<PostingStore>>,
+    m_Store:       Arc<RwLock<PostingStore>>,
     m_BlockTable: Arc<IndexBlockTable>,
     m_Tokenizer:   SmartTokenizer,
     m_Compiler:    IndexSearchCompiler,
@@ -70,6 +173,9 @@ pub struct IndexContext {
     m_WriteDocData: Vec<u8>,
     m_WritePathPrefixSidecar: Vec<u8>,
     m_WritePathPrefixes: Vec<String>,
+    m_SearchQueue: Arc<(Mutex<SearchQueueState>, Condvar)>,
+    m_SearchWorkers: Vec<JoinHandle<()>>,
+    m_SearchRuntime: Option<Arc<SearchRuntime>>,
 }
 
 #[allow(non_snake_case)]
@@ -81,7 +187,7 @@ impl IndexContext {
     }
 
     pub fn with_path_and_load_delta(index_path: Option<String>, load_delta: bool) -> Self {
-        let store = Arc::new(Mutex::new(PostingStore::new()));
+        let store = Arc::new(RwLock::new(PostingStore::new()));
         let mut ctx = Self {
             m_Store:       Arc::clone(&store),
             m_BlockTable: Arc::new(IndexBlockTable::new(512)),
@@ -104,6 +210,9 @@ impl IndexContext {
             m_WriteDocData: Vec::new(),
             m_WritePathPrefixSidecar: vec![0u8; PATH_PREFIX_SIDECAR_BYTES],
             m_WritePathPrefixes: Vec::new(),
+            m_SearchQueue: Arc::new((Mutex::new(SearchQueueState { queue: VecDeque::new(), stop: false }), Condvar::new())),
+            m_SearchWorkers: Vec::new(),
+            m_SearchRuntime: None,
         };
         if let Some(ref path) = index_path {
             let _ = ctx.LoadIndex(path);
@@ -120,13 +229,14 @@ impl IndexContext {
         if let Some(delta) = self.m_DeltaContext.as_ref() {
             nextId = nextId.max(Self::DocDataFirstDocId(&delta.m_DocData, &delta.m_IndexFileHeader) + delta.m_IndexFileHeader.IFH_NumDocuments);
         }
-        for docId in self.m_Store.lock().unwrap().AllDocStats().keys().copied() {
+        for docId in self.m_Store.read().unwrap().AllDocStats().keys().copied() {
             nextId = nextId.max(docId + 1);
         }
         nextId
     }
 
     pub fn AddDocument(&mut self, doc: &Document, buildVector: bool) -> u64 {
+        self.StopSearchWorkers();
         let docId = if doc.doc_id == u64::MAX { self.AllocateDocumentID() } else { doc.doc_id };
         let mut writer = self.GetWriter();
 
@@ -166,12 +276,12 @@ impl IndexContext {
 
     pub fn GetTokenizer(&self) -> &SmartTokenizer { &self.m_Tokenizer }
     pub fn GetCompiler(&self)  -> &IndexSearchCompiler { &self.m_Compiler }
-    pub fn GetStore(&self) -> Arc<Mutex<PostingStore>> { Arc::clone(&self.m_Store) }
+    pub fn GetStore(&self) -> Arc<RwLock<PostingStore>> { Arc::clone(&self.m_Store) }
     pub fn DocumentCount(&self) -> u64 { self.m_IndexFileHeader.IFH_NumDocuments }
     pub fn AvgDocLen(&self) -> f32 { self.m_IndexFileHeader.IFH_AvgDocLength }
     pub fn GetDocPath(&self, doc_id: u64) -> String {
         let docId = ReaderDocumentIDValue(doc_id);
-        let path = self.m_Store.lock().unwrap().GetDocPath(docId).to_string();
+        let path = self.m_Store.read().unwrap().GetDocPath(docId).to_string();
         if !path.is_empty() { return path; }
         let first_doc_id = Self::DocDataFirstDocId(&self.m_DocData, &self.m_IndexFileHeader);
         if docId >= first_doc_id {
@@ -202,12 +312,13 @@ impl IndexContext {
     /// Pack PostingStore entries into multi-term IndexBlocks (sorted alphabetically)
     /// and populate the Head/Leaf term table. Called lazily on first search.
     pub fn Build(&mut self) {
+        self.StopSearchWorkers();
         if self.m_Built {
             self.BuildVectorRuntime();
             return;
         }
 
-        let store = self.m_Store.lock().unwrap();
+        let store = self.m_Store.read().unwrap();
 
         let table = Arc::get_mut(&mut self.m_BlockTable)
             .expect("BlockTable must have no other refs during build");
@@ -229,28 +340,24 @@ impl IndexContext {
         self.m_Compiler.Compile(query, stream_set)
     }
 
-    pub fn GetReaderForQuery(&mut self, query: &str, stream_set: &str)
+    pub fn GetReaderForQuery(&self, query: &str, stream_set: &str)
         -> Box<dyn IndexReader>
     {
         let tree = self.Compile(query, stream_set);
         self.GetReader(tree)
     }
 
-    pub fn GetReader(&mut self, tree: EvalTree) -> Box<dyn IndexReader> {
+    pub fn GetReader(&self, tree: EvalTree) -> Box<dyn IndexReader> {
         let baseReader = self.BuildLocalReader(tree.clone());
-        if let Some(delta) = self.m_DeltaContext.as_mut() {
+        if let Some(delta) = self.m_DeltaContext.as_ref() {
             return Box::new(OrIndexReader::new(vec![baseReader, delta.BuildLocalReader(tree)]));
         }
         baseReader
     }
 
-    fn BuildLocalReader(&mut self, tree: EvalTree) -> Box<dyn IndexReader> {
+    fn BuildLocalReader(&self, tree: EvalTree) -> Box<dyn IndexReader> {
         if tree.HasTextQuery() && tree.HasVectorQuery() {
-            let children = vec![
-                self.BuildIndexReader(tree.root),
-                self.BuildVectorIndexReader(&tree.vector_query, tree.vector_ef_search),
-            ];
-            return Box::new(OrIndexReader::new(children));
+            return self.BuildIndexReader(tree.root);
         }
         if tree.HasVectorQuery() {
             return self.BuildVectorIndexReader(&tree.vector_query, tree.vector_ef_search);
@@ -258,16 +365,16 @@ impl IndexContext {
         self.BuildIndexReader(tree.root)
     }
 
-    pub fn GetStreamReader(&mut self, stream_key: &str) -> Box<dyn IndexReader> {
+    pub fn GetStreamReader(&self, stream_key: &str) -> Box<dyn IndexReader> {
         let baseReader = self.BuildLocalStreamReader(stream_key);
-        if let Some(delta) = self.m_DeltaContext.as_mut() {
+        if let Some(delta) = self.m_DeltaContext.as_ref() {
             return Box::new(OrIndexReader::new(vec![baseReader, delta.BuildLocalStreamReader(stream_key)]));
         }
         baseReader
     }
 
-    fn BuildLocalStreamReader(&mut self, stream_key: &str) -> Box<dyn IndexReader> {
-        let docFreq = self.m_Store.lock().unwrap().DocFreq(stream_key);
+    fn BuildLocalStreamReader(&self, stream_key: &str) -> Box<dyn IndexReader> {
+        let docFreq = self.m_Store.read().unwrap().DocFreq(stream_key);
         Box::new(AdvancedIndexReader::open(
             stream_key, Arc::clone(&self.m_BlockTable), docFreq))
     }
@@ -283,9 +390,99 @@ impl IndexContext {
     pub fn VectorCount(&self) -> usize { self.m_VectorIndex.Size() }
     pub fn VectorDimension(&self) -> usize { self.m_VectorIndex.Dimension() }
 
+    pub fn Enqueue(&mut self, query: &str, vector: Vec<f32>, streams: &str, top_k: usize) -> SearchTask {
+        self.EnsureSearchWorkersStarted(4);
+        let (sender, receiver) = mpsc::channel();
+        let state = SearchTaskState {
+            query: query.to_string(),
+            vector,
+            streams: if streams.is_empty() { "AUTB".to_string() } else { streams.to_string() },
+            top_k,
+            reply: sender,
+        };
+        let (lock, cv) = &*self.m_SearchQueue;
+        lock.lock().unwrap().queue.push_back(state);
+        cv.notify_one();
+        SearchTask { receiver }
+    }
+
+    fn EnsureSearchWorkersStarted(&mut self, worker_count: usize) {
+        if !self.m_SearchWorkers.is_empty() { return; }
+        self.m_SearchRuntime = Some(SearchRuntime::from_context(self));
+        let runtime = Arc::clone(self.m_SearchRuntime.as_ref().unwrap());
+        let (lock, _) = &*self.m_SearchQueue;
+        lock.lock().unwrap().stop = false;
+        for _ in 0..worker_count.max(1) {
+            let queue = Arc::clone(&self.m_SearchQueue);
+            let runtime = Arc::clone(&runtime);
+            self.m_SearchWorkers.push(thread::spawn(move || {
+                IndexContext::SearchWorkerLoop(runtime, queue);
+            }));
+        }
+    }
+
+    fn StopSearchWorkers(&mut self) {
+        if self.m_SearchWorkers.is_empty() { return; }
+        let (lock, cv) = &*self.m_SearchQueue;
+        lock.lock().unwrap().stop = true;
+        cv.notify_all();
+        for worker in self.m_SearchWorkers.drain(..) {
+            let _ = worker.join();
+        }
+        self.m_SearchRuntime = None;
+    }
+
+    fn SearchWorkerLoop(runtime: Arc<SearchRuntime>, queue: Arc<(Mutex<SearchQueueState>, Condvar)>) {
+        let compiler = IndexSearchCompiler::new(SmartTokenizer::new());
+        loop {
+            let task = {
+                let (lock, cv) = &*queue;
+                let mut guard = lock.lock().unwrap();
+                while guard.queue.is_empty() && !guard.stop {
+                    guard = cv.wait(guard).unwrap();
+                }
+                if guard.stop && guard.queue.is_empty() { return; }
+                guard.queue.pop_front()
+            };
+
+            if let Some(task) = task {
+                let results = Self::ExecuteSearchTask(&runtime, &compiler, &task);
+                let _ = task.reply.send(results);
+            }
+        }
+    }
+
+    fn ExecuteSearchTask(runtime: &SearchRuntime, compiler: &IndexSearchCompiler, task: &SearchTaskState) -> Vec<SearchResult> {
+        let mut tree = if task.query.is_empty() && !task.vector.is_empty() {
+            EvalTree::new(None)
+        } else {
+            compiler.Compile(&task.query, &task.streams)
+        };
+        if !task.vector.is_empty() {
+            tree.vector_query = task.vector.clone();
+        }
+        if tree.IsEmpty() { return Vec::new(); }
+
+        let vector_query = if tree.HasTextQuery() && tree.HasVectorQuery() {
+            Some(tree.vector_query.clone())
+        } else {
+            None
+        };
+        let mut reader = runtime.get_reader(tree);
+        let store = runtime.store.read().unwrap();
+        let executor = IndexSearchExecutor::new(&store);
+        executor.ExecuteWithVector(
+            reader.as_mut(),
+            task.top_k,
+            runtime.docdata.as_slice(),
+            Self::DocDataFirstDocId(runtime.docdata.as_slice(), &runtime.header),
+                vector_query.as_deref())
+    }
+
     // ── Persistence ─────────────────────────────────────────────────────────
 
     pub fn SaveIndex(&mut self, path: &str) -> Result<()> {
+        self.StopSearchWorkers();
         let savingDeltaIndex = self.m_IndexPath.as_ref()
             .map(|index_path| path == Self::DeltaIndexPath(index_path))
             .unwrap_or(false);
@@ -293,7 +490,7 @@ impl IndexContext {
             self.m_IndexPath = Some(path.to_string());
         }
         let (header, blockTable, vectorIndex, docData, pathPrefixSidecar, pathPrefixes) = {
-            let store = self.m_Store.lock().unwrap();
+            let store = self.m_Store.read().unwrap();
             Self::BuildIndexData(&store, false)
         };
 
@@ -697,6 +894,7 @@ impl IndexContext {
     }
 
     pub fn LoadIndex(&mut self, path: &str) -> Result<()> {
+        self.StopSearchWorkers();
         self.m_IndexPath = Some(path.to_string());
         let mut store = PostingStore::new();
         let (header, head_term_entries, docdata) = IndexSerializer::load_file_tables(&mut store, path)?;
@@ -720,7 +918,7 @@ impl IndexContext {
         let mut vector_index = HnswIndex::new(DOC_VECTOR_DIM, 32, 200, VectorMetric::Cosine);
         vector_index.SetDocDataWithFirstDocId(docdata.clone(), Self::DocDataFirstDocId(&docdata, &header));
 
-        self.m_Store       = Arc::new(Mutex::new(store));
+        self.m_Store       = Arc::new(RwLock::new(store));
         self.m_BlockTable = Arc::new(table);
         self.m_VectorIndex = vector_index;
         self.m_VectorBuilt = false;
@@ -749,7 +947,7 @@ impl IndexContext {
         let mut vector_index = HnswIndex::new(DOC_VECTOR_DIM, 32, 200, VectorMetric::Cosine);
         vector_index.SetDocDataWithFirstDocId(docdata.clone(), Self::DocDataFirstDocId(&docdata, &IndexFileHeader { IFH_NumDocuments: (docdata.len() / DOC_REC_SIZE) as u64, ..IndexFileHeader::default() }));
 
-        self.m_Store       = Arc::new(Mutex::new(store));
+        self.m_Store       = Arc::new(RwLock::new(store));
         self.m_BlockTable = Arc::new(table);
         self.m_VectorIndex = vector_index;
         self.m_VectorBuilt = false;
@@ -840,7 +1038,7 @@ impl IndexContext {
             None => Box::new(AdvancedIndexReader::open("", Arc::clone(&self.m_BlockTable), 0)),
 
             Some(EvalNode::Term(tn)) => {
-                let docFreq = self.m_Store.lock().unwrap().DocFreq(&tn.stream_key);
+                let docFreq = self.m_Store.read().unwrap().DocFreq(&tn.stream_key);
                 Box::new(AdvancedIndexReader::open(&tn.stream_key, Arc::clone(&self.m_BlockTable), docFreq))
             }
 
@@ -875,9 +1073,15 @@ impl IndexContext {
         }
     }
 
-    fn BuildVectorIndexReader(&mut self, query: &[f32], efSearch: usize) -> Box<dyn IndexReader> {
-        let results = self.VectorSearch(query, 0, efSearch);
+    fn BuildVectorIndexReader(&self, query: &[f32], efSearch: usize) -> Box<dyn IndexReader> {
+        let results = self.m_VectorIndex.Search(query, 0, efSearch);
         Box::new(VectorIndexReader::new(results))
+    }
+}
+
+impl Drop for IndexContext {
+    fn drop(&mut self) {
+        self.StopSearchWorkers();
     }
 }
 

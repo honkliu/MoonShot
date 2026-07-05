@@ -49,7 +49,7 @@ fn add_doc_via_context(ctx: &mut IndexContext, doc_id: u64, title: &str, body: &
 fn search_doc_ids(ctx: &mut IndexContext, query: &str) -> Vec<u64> {
     let mut reader = ctx.GetReaderForQuery(query, "AUTB");
     let store = ctx.GetStore();
-    let store = store.lock().unwrap();
+    let store = store.read().unwrap();
     let executor = IndexSearchExecutor::new(&store);
     executor.Execute(reader.as_mut(), 0).into_iter().map(|result| result.doc_id).collect()
 }
@@ -181,7 +181,7 @@ fn title_score_uses_title_length_instead_of_body_length() {
     let stream_key = format!("{token}T");
     let mut reader = ctx.GetStreamReader(&stream_key);
     let store = ctx.GetStore();
-    let store = store.lock().unwrap();
+    let store = store.read().unwrap();
     let executor = IndexSearchExecutor::new(&store);
     let results = executor.Execute(reader.as_mut(), 0);
     let short_score = results.iter().find(|result| result.doc_id == 0).unwrap().score;

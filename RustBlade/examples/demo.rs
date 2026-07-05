@@ -99,7 +99,7 @@ fn search_index() {
         let tree    = compiler.Compile(q, "AUTB");
         let mut reader = ctx.GetReader(tree);
         let store = ctx.GetStore();
-        let store = store.lock().unwrap();
+        let store = store.read().unwrap();
         let exec = IndexSearchExecutor::new(&store);
         let hits = exec.Execute(reader.as_mut(), 10);
         println!("\n[{}]", q);
@@ -122,7 +122,7 @@ fn search_index() {
         reader.SetDebug("race car toy", 0);
 
         let store = ctx.GetStore();
-        let store = store.lock().unwrap();
+        let store = store.read().unwrap();
         let exec = IndexSearchExecutor::new(&store);
         let hits = exec.Execute(reader.as_mut(), 10);
 
