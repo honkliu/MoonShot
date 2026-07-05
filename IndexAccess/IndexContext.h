@@ -288,7 +288,8 @@ public:
                        std::vector<float> vector = {},
                        const char* streams = "AUTB",
                        int topK = 1000,
-                       QueryCompileMode mode = QueryCompileMode::WeakAndBigramBoostForDoc)
+                       QueryCompileMode mode = QueryCompileMode::WeakAndBigramBoostForDoc,
+                       size_t vectorEfSearch = 1000)
     {
         auto state = std::make_shared<SearchTask::State>();
         state->Query = query ? query : "";
@@ -296,6 +297,7 @@ public:
         state->Streams = streams && *streams ? streams : "AUTB";
         state->TopK = topK;
         state->Mode = mode;
+        state->VectorEfSearch = vectorEfSearch;
         state->Future = state->Promise.get_future().share();
 
         EnsureSearchWorkersStarted();

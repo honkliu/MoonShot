@@ -31,6 +31,7 @@ using socket_t = SOCKET;
 static constexpr socket_t INVALID_SOCKET_FD = INVALID_SOCKET;
 #else
 #  include <arpa/inet.h>
+#  include <netdb.h>
 #  include <netinet/in.h>
 #  include <sys/socket.h>
 #  include <unistd.h>
@@ -410,7 +411,12 @@ public:
 
         std::vector<float> vector;
         const bool vectorReady = embed_text_with_gbe_service(query, m_GbeHost, m_GbePort, vector);
-        auto task = m_Context.Enqueue(query.c_str(), vectorReady ? std::move(vector) : std::vector<float>{}, streams.c_str(), 0);
+        auto task = m_Context.Enqueue(query.c_str(),
+                          vectorReady ? std::move(vector) : std::vector<float>{},
+                          streams.c_str(),
+                          0,
+                          QueryCompileMode::WeakAndBigramBoostForDoc,
+                          static_cast<size_t>(efSearch));
         std::vector<SearchResult> results = task.Wait();
 
         const auto finished = std::chrono::steady_clock::now();
@@ -467,7 +473,12 @@ public:
 
         const auto started = std::chrono::steady_clock::now();
         const size_t vectorDim = tree->vector_query.size();
-        auto task = m_Context.Enqueue("", std::move(tree->vector_query), "AUTB", 0);
+        auto task = m_Context.Enqueue("",
+                          std::move(tree->vector_query),
+                          "AUTB",
+                          0,
+                          QueryCompileMode::WeakAndBigramBoostForDoc,
+                          static_cast<size_t>(efSearch));
         std::vector<SearchResult> results = task.Wait();
         const auto finished = std::chrono::steady_clock::now();
         const double elapsed_ms = std::chrono::duration<double, std::milli>(finished - started).count();

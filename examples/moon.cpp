@@ -2393,7 +2393,8 @@ static int RunBeirEval(const std::string& idxPath, const BeirEvalOptions& option
                                              std::move(queryVector),
                                              options.streams.c_str(),
                                              maxK,
-                                             compileMode));
+                                             compileMode,
+                                             static_cast<size_t>(options.vectorEf)));
         }
 
         for (size_t i = 0; i < searchTasks.size(); ++i) {

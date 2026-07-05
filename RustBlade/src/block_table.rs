@@ -4,6 +4,12 @@ use std::ops::Deref;
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
+#[cfg(target_os = "linux")]
+use std::os::fd::AsRawFd;
+
+#[cfg(target_os = "linux")]
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use crate::pinned_memory::PinnedMemory;
 
 pub const PAGE_SIZE: usize = 4096;
