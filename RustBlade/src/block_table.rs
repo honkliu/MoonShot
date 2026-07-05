@@ -12,6 +12,257 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::pinned_memory::PinnedMemory;
 
+#[cfg(target_os = "linux")]
+static IO_URING_READS: AtomicU64 = AtomicU64::new(0);
+#[cfg(target_os = "linux")]
+static PREAD_FALLBACK_READS: AtomicU64 = AtomicU64::new(0);
+#[cfg(target_os = "linux")]
+static IO_URING_SETUP_OK: AtomicU64 = AtomicU64::new(0);
+#[cfg(target_os = "linux")]
+static IO_URING_SETUP_FAILED: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(target_os = "linux")]
+const IORING_OFF_SQ_RING: libc::off_t = 0;
+#[cfg(target_os = "linux")]
+const IORING_OFF_CQ_RING: libc::off_t = 0x8000000;
+#[cfg(target_os = "linux")]
+const IORING_OFF_SQES: libc::off_t = 0x10000000;
+#[cfg(target_os = "linux")]
+const IORING_FEAT_SINGLE_MMAP: u32 = 1;
+#[cfg(target_os = "linux")]
+const IORING_ENTER_GETEVENTS: u32 = 1;
+#[cfg(target_os = "linux")]
+const IORING_OP_READ: u8 = 22;
+
+#[cfg(target_os = "linux")]
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+#[allow(dead_code)]
+struct IoSqringOffsets {
+    head: u32,
+    tail: u32,
+    ring_mask: u32,
+    ring_entries: u32,
+    flags: u32,
+    dropped: u32,
+    array: u32,
+    resv1: u32,
+    user_addr: u64,
+}
+
+#[cfg(target_os = "linux")]
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+#[allow(dead_code)]
+struct IoCqringOffsets {
+    head: u32,
+    tail: u32,
+    ring_mask: u32,
+    ring_entries: u32,
+    overflow: u32,
+    cqes: u32,
+    flags: u32,
+    resv1: u32,
+    user_addr: u64,
+}
+
+#[cfg(target_os = "linux")]
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+#[allow(dead_code)]
+struct IoUringParams {
+    sq_entries: u32,
+    cq_entries: u32,
+    flags: u32,
+    sq_thread_cpu: u32,
+    sq_thread_idle: u32,
+    features: u32,
+    wq_fd: u32,
+    resv: [u32; 3],
+    sq_off: IoSqringOffsets,
+    cq_off: IoCqringOffsets,
+}
+
+#[cfg(target_os = "linux")]
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+#[allow(dead_code)]
+struct IoUringSqe {
+    opcode: u8,
+    flags: u8,
+    ioprio: u16,
+    fd: i32,
+    off: u64,
+    addr: u64,
+    len: u32,
+    rw_flags: u32,
+    user_data: u64,
+    buf_index: u16,
+    personality: u16,
+    splice_fd_in: i32,
+    pad2: [u64; 2],
+}
+
+#[cfg(target_os = "linux")]
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+#[allow(dead_code)]
+struct IoUringCqe {
+    user_data: u64,
+    res: i32,
+    flags: u32,
+}
+
+#[cfg(target_os = "linux")]
+struct LinuxIoUring {
+    ring_fd: i32,
+    sq_ring_ptr: *mut libc::c_void,
+    cq_ring_ptr: *mut libc::c_void,
+    sqes_ptr: *mut libc::c_void,
+    sq_ring_size: usize,
+    cq_ring_size: usize,
+    sqes_size: usize,
+    sq_head: *mut u32,
+    sq_tail: *mut u32,
+    sq_ring_mask: *mut u32,
+    sq_ring_entries: *mut u32,
+    sq_array: *mut u32,
+    sqes: *mut IoUringSqe,
+    cq_head: *mut u32,
+    cq_tail: *mut u32,
+    cq_ring_mask: *mut u32,
+    cqes: *mut IoUringCqe,
+}
+
+#[cfg(target_os = "linux")]
+unsafe impl Send for LinuxIoUring {}
+
+#[cfg(target_os = "linux")]
+impl LinuxIoUring {
+    fn init(entries: u32) -> Option<Self> {
+        let mut params = IoUringParams::default();
+        let ring_fd = unsafe { libc::syscall(libc::SYS_io_uring_setup, entries, &mut params) as i32 };
+        if ring_fd < 0 {
+            IO_URING_SETUP_FAILED.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+
+        let mut sq_ring_size = params.sq_off.array as usize + params.sq_entries as usize * std::mem::size_of::<u32>();
+        let mut cq_ring_size = params.cq_off.cqes as usize + params.cq_entries as usize * std::mem::size_of::<IoUringCqe>();
+        if params.features & IORING_FEAT_SINGLE_MMAP != 0 {
+            sq_ring_size = sq_ring_size.max(cq_ring_size);
+            cq_ring_size = sq_ring_size;
+        }
+
+        let sq_ring_ptr = unsafe { libc::mmap(std::ptr::null_mut(), sq_ring_size, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_SHARED | libc::MAP_POPULATE, ring_fd, IORING_OFF_SQ_RING) };
+        if sq_ring_ptr == libc::MAP_FAILED {
+            unsafe { libc::close(ring_fd); }
+            IO_URING_SETUP_FAILED.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+
+        let cq_ring_ptr = if params.features & IORING_FEAT_SINGLE_MMAP != 0 {
+            sq_ring_ptr
+        } else {
+            let ptr = unsafe { libc::mmap(std::ptr::null_mut(), cq_ring_size, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_SHARED | libc::MAP_POPULATE, ring_fd, IORING_OFF_CQ_RING) };
+            if ptr == libc::MAP_FAILED {
+                unsafe { libc::munmap(sq_ring_ptr, sq_ring_size); libc::close(ring_fd); }
+                IO_URING_SETUP_FAILED.fetch_add(1, Ordering::Relaxed);
+                return None;
+            }
+            ptr
+        };
+
+        let sqes_size = params.sq_entries as usize * std::mem::size_of::<IoUringSqe>();
+        let sqes_ptr = unsafe { libc::mmap(std::ptr::null_mut(), sqes_size, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_SHARED | libc::MAP_POPULATE, ring_fd, IORING_OFF_SQES) };
+        if sqes_ptr == libc::MAP_FAILED {
+            unsafe {
+                if cq_ring_ptr != sq_ring_ptr { libc::munmap(cq_ring_ptr, cq_ring_size); }
+                libc::munmap(sq_ring_ptr, sq_ring_size);
+                libc::close(ring_fd);
+            }
+            IO_URING_SETUP_FAILED.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+
+        let sq = sq_ring_ptr as *mut u8;
+        let cq = cq_ring_ptr as *mut u8;
+        IO_URING_SETUP_OK.fetch_add(1, Ordering::Relaxed);
+        Some(Self {
+            ring_fd,
+            sq_ring_ptr,
+            cq_ring_ptr,
+            sqes_ptr,
+            sq_ring_size,
+            cq_ring_size,
+            sqes_size,
+            sq_head: unsafe { sq.add(params.sq_off.head as usize) as *mut u32 },
+            sq_tail: unsafe { sq.add(params.sq_off.tail as usize) as *mut u32 },
+            sq_ring_mask: unsafe { sq.add(params.sq_off.ring_mask as usize) as *mut u32 },
+            sq_ring_entries: unsafe { sq.add(params.sq_off.ring_entries as usize) as *mut u32 },
+            sq_array: unsafe { sq.add(params.sq_off.array as usize) as *mut u32 },
+            sqes: sqes_ptr as *mut IoUringSqe,
+            cq_head: unsafe { cq.add(params.cq_off.head as usize) as *mut u32 },
+            cq_tail: unsafe { cq.add(params.cq_off.tail as usize) as *mut u32 },
+            cq_ring_mask: unsafe { cq.add(params.cq_off.ring_mask as usize) as *mut u32 },
+            cqes: unsafe { cq.add(params.cq_off.cqes as usize) as *mut IoUringCqe },
+        })
+    }
+
+    fn read(&mut self, fd: i32, buffer: &mut [u8], offset: u64) -> bool {
+        if self.ring_fd < 0 || buffer.is_empty() { return false; }
+        unsafe {
+            let head = std::ptr::read_volatile(self.sq_head);
+            let tail = std::ptr::read_volatile(self.sq_tail);
+            if tail.wrapping_sub(head) >= std::ptr::read_volatile(self.sq_ring_entries) { return false; }
+
+            let index = tail & std::ptr::read_volatile(self.sq_ring_mask);
+            let sqe = self.sqes.add(index as usize);
+            std::ptr::write_bytes(sqe, 0, 1);
+            (*sqe).opcode = IORING_OP_READ;
+            (*sqe).fd = fd;
+            (*sqe).addr = buffer.as_mut_ptr() as u64;
+            (*sqe).len = buffer.len() as u32;
+            (*sqe).off = offset;
+            (*sqe).user_data = 1;
+            *self.sq_array.add(index as usize) = index;
+            std::sync::atomic::fence(Ordering::Release);
+            std::ptr::write_volatile(self.sq_tail, tail.wrapping_add(1));
+
+            if libc::syscall(libc::SYS_io_uring_enter, self.ring_fd, 1u32, 1u32, IORING_ENTER_GETEVENTS, std::ptr::null::<libc::c_void>(), 0usize) < 0 {
+                return false;
+            }
+
+            loop {
+                let cq_head = std::ptr::read_volatile(self.cq_head);
+                let cq_tail = std::ptr::read_volatile(self.cq_tail);
+                if cq_head != cq_tail {
+                    let cqe = self.cqes.add((cq_head & std::ptr::read_volatile(self.cq_ring_mask)) as usize);
+                    let result = (*cqe).res;
+                    std::sync::atomic::fence(Ordering::Release);
+                    std::ptr::write_volatile(self.cq_head, cq_head.wrapping_add(1));
+                    return result == buffer.len() as i32;
+                }
+                if libc::syscall(libc::SYS_io_uring_enter, self.ring_fd, 0u32, 1u32, IORING_ENTER_GETEVENTS, std::ptr::null::<libc::c_void>(), 0usize) < 0 {
+                    return false;
+                }
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for LinuxIoUring {
+    fn drop(&mut self) {
+        unsafe {
+            if self.sqes_ptr != libc::MAP_FAILED { libc::munmap(self.sqes_ptr, self.sqes_size); }
+            if self.cq_ring_ptr != libc::MAP_FAILED && self.cq_ring_ptr != self.sq_ring_ptr { libc::munmap(self.cq_ring_ptr, self.cq_ring_size); }
+            if self.sq_ring_ptr != libc::MAP_FAILED { libc::munmap(self.sq_ring_ptr, self.sq_ring_size); }
+            if self.ring_fd >= 0 { libc::close(self.ring_fd); }
+        }
+    }
+}
+
 pub const PAGE_SIZE: usize = 4096;
 pub const DOC_REC_SIZE: usize = 256;
 pub const DOC_VECTOR_DIM: usize = 128;
@@ -337,6 +588,8 @@ struct BlockCachePool<T: Default + Copy> {
     evict_slot: u32,
     logic_table: Option<PinnedMemory<u32>>,
     slot_table: Option<PinnedMemory<IndexSlotEntry>>,
+    #[cfg(target_os = "linux")]
+    io_uring: Option<LinuxIoUring>,
 }
 
 enum BlockWorkerRequest<T: Default + Copy + Send + Sync + 'static> {
@@ -401,6 +654,8 @@ impl<T: Default + Copy> BlockCachePool<T> {
             evict_slot: 0,
             logic_table: None,
             slot_table: None,
+            #[cfg(target_os = "linux")]
+            io_uring: None,
         }
     }
 
@@ -415,6 +670,10 @@ impl<T: Default + Copy> BlockCachePool<T> {
     fn set_pages(&mut self, pages: Vec<T>) {
         self.path = None;
         self.base_offset = 0;
+        #[cfg(target_os = "linux")]
+        {
+            self.io_uring = None;
+        }
         self.reset_tables(pages.len() as u32, pages.len() as u32);
         self.pages = Some(Arc::new(PinnedMemory::from_slice(&pages)));
 
@@ -433,6 +692,10 @@ impl<T: Default + Copy> BlockCachePool<T> {
         self.path = Some(path.clone());
         self.base_offset = base_offset;
         self.reset_tables(total_block_count, slot_count);
+        #[cfg(target_os = "linux")]
+        {
+            self.io_uring = LinuxIoUring::init(64);
+        }
         let mut pages = PinnedMemory::<T>::new_zeroed(self.slot_count as usize);
 
         let mut file = File::open(path)?;
@@ -478,20 +741,40 @@ impl<T: Default + Copy> BlockCachePool<T> {
             self.logic_table.as_mut()?.as_mut_slice()[old_block as usize] = u32::MAX;
         }
 
-        let mut file = File::open(path).ok()?;
-        file.seek(SeekFrom::Start(self.base_offset + block_seq as u64 * PAGE_SIZE as u64)).ok()?;
+        let mut raw_page = [0u8; PAGE_SIZE];
+        self.read_block_bytes(&path, block_seq, &mut raw_page)?;
         let pages = Arc::get_mut(self.pages.as_mut()?)?;
         let page = &mut pages.as_mut_slice()[found as usize];
-        let bytes = unsafe {
-            std::slice::from_raw_parts_mut(page as *mut T as *mut u8, PAGE_SIZE)
-        };
-        file.read_exact(bytes).ok()?;
+        unsafe {
+            std::ptr::copy_nonoverlapping(raw_page.as_ptr(), page as *mut T as *mut u8, PAGE_SIZE);
+        }
 
         self.slot_table.as_mut()?.as_mut_slice()[found as usize].block_id = block_seq;
         self.slot_table.as_mut()?.as_mut_slice()[found as usize].ref_count = 0;
         self.logic_table.as_mut()?.as_mut_slice()[block_seq as usize] = found;
         let page = self.pages.as_ref()?.as_slice()[found as usize];
         Some((found, PinnedBlock { page }))
+    }
+
+    fn read_block_bytes(&mut self, path: &str, block_seq: u32, bytes: &mut [u8]) -> Option<()> {
+        let offset = self.base_offset + block_seq as u64 * PAGE_SIZE as u64;
+        #[cfg(target_os = "linux")]
+        {
+            if let Some(ring) = self.io_uring.as_mut() {
+                if let Ok(file) = File::open(path) {
+                    if ring.read(file.as_raw_fd(), bytes, offset) {
+                        IO_URING_READS.fetch_add(1, Ordering::Relaxed);
+                        return Some(());
+                    }
+                }
+            }
+            PREAD_FALLBACK_READS.fetch_add(1, Ordering::Relaxed);
+        }
+
+        let mut file = File::open(path).ok()?;
+        file.seek(SeekFrom::Start(offset)).ok()?;
+        file.read_exact(bytes).ok()?;
+        Some(())
     }
 
 }
