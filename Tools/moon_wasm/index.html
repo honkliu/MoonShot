@@ -34,12 +34,14 @@ body { font:13px 'Segoe UI',sans-serif; background:#1e1e1e; color:#d4d4d4;
 #main  { display:none; flex:1; overflow:hidden; }
 #left  { width:min(480px,44%); flex-shrink:0; border-right:1px solid #3e3e42;
           display:flex; flex-direction:row; overflow:hidden; transition:width .2s; }
-#left.collapsed { width:6px !important; }
+#left.collapsed { width:26px !important; }
 #left.collapsed #left-inner { display:none; }
 #left-inner { flex:1; display:flex; flex-direction:column; overflow:hidden; min-width:0; }
-#hex-toggle { width:6px; flex-shrink:0; background:#3e3e42; border:none; cursor:col-resize;
-               color:transparent; font-size:1px; border-left:1px solid #555;
-               border-right:1px solid #555; transition:background .15s; }
+#hex-toggle { width:26px; flex-shrink:0; background:#3e3e42; border:none; cursor:col-resize;
+               color:#ccc; font:11px 'Cascadia Code','Consolas',monospace; padding:0;
+               display:flex; align-items:center; justify-content:center; -webkit-user-select:none; user-select:none;
+               border-left:1px solid #555; border-right:1px solid #555; transition:background .15s; }
+#left.collapsed #hex-toggle { cursor:pointer; }
 #hex-toggle:hover { background:#007acc; }
 #right { flex:1; display:flex; flex-direction:column; overflow:hidden; }
 
@@ -204,7 +206,7 @@ tr:hover td { background:#2a2d2e; cursor:pointer; }
       </div>
       <div id="hex-body"></div>
     </div>
-    <button type="button" id="hex-toggle" title="Drag to resize · Click to collapse" onclick="void 0"></button>
+    <button type="button" id="hex-toggle" title="Drag to resize · Click to collapse" aria-label="Collapse hex display">&lt;&lt;</button>
   </div>
   <div id="right">
     <div id="dec-tabs">
@@ -251,8 +253,11 @@ tr:hover td { background:#2a2d2e; cursor:pointer; }
 <script async src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/auto-render.min.js" onerror="void 0"></script>
 <script async src="https://cdn.jsdelivr.net/npm/mermaid@10.9.1/dist/mermaid.min.js" onerror="void 0"></script>
 <script type="module">
-const BUILD_STAMP = 'v19-20260703-3';
+const BUILD_STAMP = 'v20-20260707-paged';
 const LARGE_INDEX_LIMIT = 128 * 1024 * 1024;
+const INDEX_HEADER_BYTES = 136;
+const FULL_PARSE_TERM_LIMIT = 250000;
+const FULL_PARSE_INDEX_BLOCK_LIMIT = 8192;
 const PAGE_SIZE = 4096;
 const DOC_REC_SIZE = 256;
 const LEAF_TERM_DIRECTORY_COUNT = 161;
@@ -270,7 +275,7 @@ await init(wasmBytes);
 window._wasm = { parse_index_summary, parse_index, search_index, vector_search_index };
 window.MOONSHOT_VIEWER_BUILD = BUILD_STAMP;
 
-let G = { bytes: null, parsed: null, sc: null };
+let G = { bytes: null, parsed: null, sc: null, localFile: null };
 const TEXT_DECODER = new TextDecoder('utf-8');
 
 // ── Drag-to-resize + click-to-collapse for hex pane divider ──────────────────
@@ -278,6 +283,14 @@ const TEXT_DECODER = new TextDecoder('utf-8');
   const left   = document.getElementById('left');
   const toggle = document.getElementById('hex-toggle');
   let dragging = false, startX = 0, startW = 0, savedW = 480;
+  let suppressClick = false;
+
+  function updateToggleButton() {
+    const collapsed = left.classList.contains('collapsed');
+    toggle.textContent = collapsed ? '>>' : '<<';
+    toggle.title = collapsed ? 'Click to show hex display' : 'Drag to resize · Click to collapse';
+    toggle.setAttribute('aria-label', collapsed ? 'Show hex display' : 'Collapse hex display');
+  }
 
   toggle.addEventListener('mousedown', e => {
     if (left.classList.contains('collapsed')) return;
@@ -302,13 +315,25 @@ const TEXT_DECODER = new TextDecoder('utf-8');
     dragging = false;
     document.body.style.cursor     = '';
     document.body.style.userSelect = '';
-    if (moved < 4) toggleHex();
+    suppressClick = moved >= 4;
+  });
+
+  toggle.addEventListener('click', e => {
+    if (suppressClick) {
+      suppressClick = false;
+      return;
+    }
+    toggleHex();
+    e.preventDefault();
   });
 
   window.toggleHex = function() {
     const col = left.classList.toggle('collapsed');
     left.style.width = col ? '' : savedW + 'px';
+    updateToggleButton();
   };
+
+  updateToggleButton();
 })();
 
 // ── Auto-load: from serve.py config OR ?idx=URL param ────────────────────────
@@ -327,28 +352,70 @@ function withCacheBuster(url) {
   return `${url}${sep}_=${BUILD_STAMP}-${Date.now()}`;
 }
 
+function parseHeaderNumbers(headerBytes) {
+  if (!headerBytes || headerBytes.length < INDEX_HEADER_BYTES || textAt(headerBytes, 0, 8) !== 'MOONSHOT') return null;
+  return {
+    version: u32(headerBytes, 8),
+    numDocs: u64n(headerBytes, 16),
+    numTerms: u64n(headerBytes, 24),
+    indexBlockCount: u64n(headerBytes, 80),
+  };
+}
+
+function shouldUseSummaryMode(headerBytes, fileSize) {
+  if (fileSize > LARGE_INDEX_LIMIT) return true;
+  const header = parseHeaderNumbers(headerBytes);
+  if (!header) return false;
+  return header.numTerms > FULL_PARSE_TERM_LIMIT || header.indexBlockCount > FULL_PARSE_INDEX_BLOCK_LIMIT;
+}
+
+function summaryReason(headerBytes, fileSize, source) {
+  if (fileSize > LARGE_INDEX_LIMIT) return `Large ${source} index: paged mode`;
+  const header = parseHeaderNumbers(headerBytes);
+  if (header && header.numTerms > FULL_PARSE_TERM_LIMIT) return `High-cardinality ${source} index: paged mode`;
+  return `${source} index: paged mode`;
+}
+
+function parseWasmJson(raw, context) {
+  if (typeof raw !== 'string' || raw.length === 0) {
+    throw new Error(`${context} returned empty JSON; use paged mode for this index`);
+  }
+  return JSON.parse(raw);
+}
+
 // ── loading ───────────────────────────────────────────────────────────────────
-function loadFile(file) {
-  if (file.size > LARGE_INDEX_LIMIT) {
-    setStatus('Loading header only for large local file ' + file.name + '…');
-    file.slice(0, 96).arrayBuffer()
-      .then(buf => loadSummaryData(new Uint8Array(buf), file.name, file.size, 'Large local file: summary mode'))
-      .catch(e => setStatus('Cannot read ' + file.name + ': ' + e));
+async function loadFile(file) {
+  G.localFile = null;
+  let headerBytes;
+  try {
+    headerBytes = new Uint8Array(await file.slice(0, INDEX_HEADER_BYTES).arrayBuffer());
+  } catch (e) {
+    setStatus('Cannot read ' + file.name + ': ' + e);
+    return;
+  }
+  if (shouldUseSummaryMode(headerBytes, file.size)) {
+    G.localFile = file;
+    setStatus('Loading header only for ' + file.name + '…');
+    loadSummaryData(headerBytes, file.name, file.size, summaryReason(headerBytes, file.size, 'local'));
     return;
   }
   const r = new FileReader();
-  r.onload = e => { loadData(new Uint8Array(e.target.result), file.name); };
+  r.onload = e => { G.localFile = null; loadData(new Uint8Array(e.target.result), file.name); };
   r.readAsArrayBuffer(file);
 }
 
 async function loadRemoteIndex(url, size) {
-  if (size > LARGE_INDEX_LIMIT) {
-    const res = await fetch(`/idx-range?start=0&length=96&_=${BUILD_STAMP}-${Date.now()}`, { cache: 'no-store' });
+  G.localFile = null;
+  if (size > 0) {
+    const res = await fetch(`/idx-range?start=0&length=${INDEX_HEADER_BYTES}&_=${BUILD_STAMP}-${Date.now()}`, { cache: 'no-store' });
     if (!res.ok) throw res.status;
     const fileSize = Number(res.headers.get('X-File-Size') || size || 0);
     const buf = await res.arrayBuffer();
-    loadSummaryData(new Uint8Array(buf), url.split('/').pop(), fileSize, 'Large served index: summary mode');
-    return;
+    const headerBytes = new Uint8Array(buf);
+    if (shouldUseSummaryMode(headerBytes, fileSize)) {
+      loadSummaryData(headerBytes, url.split('/').pop(), fileSize, summaryReason(headerBytes, fileSize, 'served'));
+      return;
+    }
   }
   const res = await fetch(withCacheBuster(url));
   if (!res.ok) throw res.status;
@@ -360,7 +427,7 @@ function loadSummaryData(headerBytes, name, fileSize, reason) {
   G.bytes = headerBytes;
   setStatus('Parsing header for ' + (name||'file') + '…');
   try {
-    G.parsed = JSON.parse(window._wasm.parse_index_summary(G.bytes, fileSize || G.bytes.length));
+    G.parsed = parseWasmJson(window._wasm.parse_index_summary(G.bytes, fileSize || G.bytes.length), 'parse_index_summary');
     if (G.parsed.error) { setStatus('Error: '+G.parsed.error+' · viewer '+BUILD_STAMP); return; }
     normalizeParsedIndex(G.parsed);
     G.summaryOnly = true;
@@ -394,9 +461,10 @@ function loadSummaryData(headerBytes, name, fileSize, reason) {
 
 function loadData(bytes, name) {
   G.bytes = bytes;
+  G.localFile = null;
   setStatus('Parsing ' + (name||'file') + '…');
   try {
-    G.parsed = JSON.parse(window._wasm.parse_index(G.bytes));
+    G.parsed = parseWasmJson(window._wasm.parse_index(G.bytes), 'parse_index');
     if (G.parsed.error) { setStatus('Error: '+G.parsed.error+' · viewer '+BUILD_STAMP); return; }
     normalizeParsedIndex(G.parsed);
     G.summaryOnly = false;
@@ -569,6 +637,11 @@ function docOrdinalForId(docId) {
 
 // ── paged large-index helpers ────────────────────────────────────────────────
 async function rangeRead(start, length) {
+  if (G.localFile) {
+    const begin = Math.max(0, Math.min(Number(start), G.localFile.size));
+    const end = Math.max(begin, Math.min(begin + Math.max(0, Number(length)), G.localFile.size));
+    return new Uint8Array(await G.localFile.slice(begin, end).arrayBuffer());
+  }
   const res = await fetch(`/idx-range?start=${start}&length=${length}&_=${BUILD_STAMP}-${Date.now()}`, { cache: 'no-store' });
   if (!res.ok) throw new Error('range read failed: ' + res.status);
   return new Uint8Array(await res.arrayBuffer());
@@ -1893,7 +1966,7 @@ window.switchTabByName=switchTabByName;
 function syncHexForPanel(id) {
   if (!G.parsed) return;
   const h = G.parsed.header;
-  if (id === 'hdr-panel') gotoRange(0, 96);
+  if (id === 'hdr-panel') gotoRange(0, INDEX_HEADER_BYTES);
   else if (id === 'si-panel') {
     const range = currentHeadPageRange();
     if (range) gotoRangeObject(range);
