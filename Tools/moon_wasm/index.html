@@ -152,14 +152,24 @@ tr:hover td { background:#2a2d2e; cursor:pointer; }
 .sres-score { color:#888; font-size:11px; margin-top:3px; }
 .search-bar { padding:10px 12px; border-bottom:1px solid #3e3e42; display:flex; gap:8px; align-items:center; background:#252526; }
 .search-summary { padding:6px 12px; color:#888; font-size:11px; border-bottom:1px solid #2a2a2a; }
-#file-viewer { position:fixed; top:40px; right:20px; bottom:20px; width:50%;
-                background:#1a1a1a; border:1px solid #555; border-radius:6px;
+#file-viewer { position:fixed; top:40px; right:20px; width:min(920px,72vw,calc(100vw - 40px));
+                height:min(760px,calc(100vh - 60px)); min-width:min(360px,calc(100vw - 40px)); min-height:min(240px,calc(100vh - 60px));
+                max-width:calc(100vw - 40px); max-height:calc(100vh - 60px);
+                overflow:hidden; background:#1a1a1a; border:1px solid #555; border-radius:6px;
                 display:none; flex-direction:column; z-index:100; box-shadow:0 4px 24px #000a; }
 #file-viewer-hdr { background:#2d2d30; padding:6px 10px; display:flex;
                     align-items:center; gap:8px; border-radius:6px 6px 0 0; }
 #file-viewer-title { flex:1; color:#9cdcfe; font-size:12px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 #file-viewer-close { background:none; border:none; color:#888; font-size:16px; cursor:pointer; padding:0 4px; }
 #file-viewer-close:hover { color:#fff; }
+#file-viewer-resize-edge { position:absolute; left:0; top:28px; bottom:22px; width:6px; cursor:ew-resize;
+                           background:#2d2d30; border-right:1px solid #444; z-index:2; }
+#file-viewer-resize-corner { position:absolute; left:0; bottom:0; width:22px; height:22px; cursor:nesw-resize;
+                             border-top:1px solid #555; border-right:1px solid #555;
+                             background:linear-gradient(135deg, transparent 46%, #777 47%, #777 53%, transparent 54%),
+                                        linear-gradient(135deg, transparent 62%, #777 63%, #777 69%, transparent 70%), #252526;
+                             opacity:.9; z-index:3; }
+#file-viewer-resize-edge:hover,#file-viewer-resize-corner:hover { background:#094771; }
 #file-viewer-body { flex:1; overflow:auto; padding:8px;
                      font:12px/1.6 'Cascadia Code','Consolas',monospace; white-space:pre-wrap; color:#d4d4d4; }
 #file-viewer-body.markdown { padding:18px 24px; font:14px/1.65 'Segoe UI',sans-serif; white-space:normal; color:#d8d8d8; }
@@ -244,6 +254,8 @@ tr:hover td { background:#2a2d2e; cursor:pointer; }
     <span id="file-viewer-title"></span>
     <button type="button" id="file-viewer-close" onclick="closeFileViewer()">✕</button>
   </div>
+  <div id="file-viewer-resize-edge" title="Drag left to widen, right to narrow" aria-hidden="true"></div>
+  <div id="file-viewer-resize-corner" title="Drag to resize preview" aria-hidden="true"></div>
   <div id="file-viewer-body"></div>
 </div>
 
@@ -258,8 +270,10 @@ const LARGE_INDEX_LIMIT = 128 * 1024 * 1024;
 const INDEX_HEADER_BYTES = 136;
 const FULL_PARSE_TERM_LIMIT = 250000;
 const FULL_PARSE_INDEX_BLOCK_LIMIT = 8192;
+const VECTOR_FULL_INDEX_LIMIT = LARGE_INDEX_LIMIT;
 const PAGE_SIZE = 4096;
 const DOC_REC_SIZE = 256;
+const DOC_VECTOR_DIM = 128;
 const LEAF_TERM_DIRECTORY_COUNT = 161;
 const LEAF_TERM_DATA_OFFSET = LEAF_TERM_DIRECTORY_COUNT * 2;
 const PATH_PREFIX_SIDECAR_BYTES = 10 * PAGE_SIZE;
@@ -275,7 +289,7 @@ await init(wasmBytes);
 window._wasm = { parse_index_summary, parse_index, search_index, vector_search_index };
 window.MOONSHOT_VIEWER_BUILD = BUILD_STAMP;
 
-let G = { bytes: null, parsed: null, sc: null, localFile: null };
+let G = { bytes: null, parsed: null, sc: null, localFile: null, fullIndexBytes: null, indexUrl: '', indexSize: 0 };
 const TEXT_DECODER = new TextDecoder('utf-8');
 
 // ── Drag-to-resize + click-to-collapse for hex pane divider ──────────────────
@@ -386,6 +400,9 @@ function parseWasmJson(raw, context) {
 // ── loading ───────────────────────────────────────────────────────────────────
 async function loadFile(file) {
   G.localFile = null;
+  G.fullIndexBytes = null;
+  G.indexUrl = '';
+  G.indexSize = file.size;
   let headerBytes;
   try {
     headerBytes = new Uint8Array(await file.slice(0, INDEX_HEADER_BYTES).arrayBuffer());
@@ -406,6 +423,9 @@ async function loadFile(file) {
 
 async function loadRemoteIndex(url, size) {
   G.localFile = null;
+  G.fullIndexBytes = null;
+  G.indexUrl = url;
+  G.indexSize = size || 0;
   if (size > 0) {
     const res = await fetch(`/idx-range?start=0&length=${INDEX_HEADER_BYTES}&_=${BUILD_STAMP}-${Date.now()}`, { cache: 'no-store' });
     if (!res.ok) throw res.status;
@@ -462,6 +482,8 @@ function loadSummaryData(headerBytes, name, fileSize, reason) {
 function loadData(bytes, name) {
   G.bytes = bytes;
   G.localFile = null;
+  G.fullIndexBytes = bytes;
+  G.indexSize = bytes.length;
   setStatus('Parsing ' + (name||'file') + '…');
   try {
     G.parsed = parseWasmJson(window._wasm.parse_index(G.bytes), 'parse_index');
@@ -1868,11 +1890,6 @@ async function runVectorDocumentSearch(q, out) {
     switchTabByName('srch-panel');
     return;
   }
-  if (G.summaryOnly) {
-    out.innerHTML = '<p class="srch-hint">BGE vector search needs full index mode; load a smaller index or use text paged search.</p>';
-    switchTabByName('srch-panel');
-    return;
-  }
   const host = (document.getElementById('bge-host')?.value || '127.0.0.1').trim();
   const port = Number(document.getElementById('bge-port')?.value || 8765);
   out.innerHTML = `<div class="search-summary">Embedding "${esc(q)}" via ${esc(host)}:${esc(String(port))}…</div>`;
@@ -1887,13 +1904,41 @@ async function runVectorDocumentSearch(q, out) {
     const embed = await embedResponse.json();
     if (embed.error) throw new Error(embed.error);
     if (!Array.isArray(embed.vector)) throw new Error('embedding response missing vector');
-    const raw = window._wasm.vector_search_index(G.bytes, JSON.stringify(embed.vector), 1000, 1000);
-    const res = JSON.parse(raw);
+    const vector = adaptVectorForIndex(embed.vector);
+    const indexBytes = await ensureFullIndexBytesForVector(out, q);
+    const raw = window._wasm.vector_search_index(indexBytes, JSON.stringify(vector), 1000, 1000);
+    const res = parseWasmJson(raw, 'vector_search_index');
     if (res && !Array.isArray(res) && res.error) throw new Error(res.error);
     renderSearchResults(q, res, false);
   } catch (e) {
     out.innerHTML = `<p class="srch-hint">BGE vector search failed: ${esc(e)}</p>`;
   }
+}
+
+function adaptVectorForIndex(vector) {
+  if (vector.length === DOC_VECTOR_DIM) return vector;
+  const out = new Array(DOC_VECTOR_DIM).fill(0);
+  for (let i = 0; i < Math.min(vector.length, DOC_VECTOR_DIM); i++) out[i] = Number(vector[i]) || 0;
+  return out;
+}
+
+async function ensureFullIndexBytesForVector(out, q) {
+  if (G.fullIndexBytes) return G.fullIndexBytes;
+  const size = Number(G.parsed?.header?.file_size || G.indexSize || 0);
+  if (size > VECTOR_FULL_INDEX_LIMIT) {
+    throw new Error(`paged vector search needs to load the raw index into browser memory; ${formatBytes(size)} exceeds the ${formatBytes(VECTOR_FULL_INDEX_LIMIT)} safety limit`);
+  }
+  out.innerHTML = `<div class="search-summary">Loading raw index bytes for BGE vector search on "${esc(q)}"…</div>`;
+  if (G.localFile) {
+    G.fullIndexBytes = new Uint8Array(await G.localFile.arrayBuffer());
+    return G.fullIndexBytes;
+  }
+  const url = G.indexUrl || (typeof window.MOONSHOT_IDX === 'string' ? window.MOONSHOT_IDX : '');
+  if (!url) throw new Error('no configured index URL is available for vector search');
+  const response = await fetch(withCacheBuster(url), { cache: 'no-store' });
+  if (!response.ok) throw new Error(`raw index fetch failed: ${response.status}`);
+  G.fullIndexBytes = new Uint8Array(await response.arrayBuffer());
+  return G.fullIndexBytes;
 }
 
 function renderSearchResults(q, res, paged) {
@@ -1912,6 +1957,11 @@ function renderSearchResults(q, res, paged) {
   switchTabByName('srch-panel');
 }
 
+function needsSearchPathHydration(result) {
+  const path = String(result?.path || '');
+  return !path || (!path.includes('\\') && !path.includes('/'));
+}
+
 async function renderSearchPage() {
   const out = document.getElementById('srch-out');
   const res = G_SearchResults;
@@ -1919,9 +1969,9 @@ async function renderSearchPage() {
   G_SearchPage = Math.min(Math.max(0, G_SearchPage), pageCount - 1);
   const start = G_SearchPage * SEARCH_RESULTS_PER_PAGE;
   const shown = res.slice(start, start + SEARCH_RESULTS_PER_PAGE);
-  if (G_SearchPaged) {
-    const paths = await loadDocPathsByIds(shown.filter(r => !r.path).map(r => r.doc_id));
-    for (const r of shown) if (!r.path) r.path = paths.get(String(r.doc_id)) || '';
+  if (G.summaryOnly) {
+    const paths = await loadDocPathsByIds(shown.filter(needsSearchPathHydration).map(r => r.doc_id));
+    for (const r of shown) if (needsSearchPathHydration(r)) r.path = paths.get(String(r.doc_id)) || r.path || '';
   }
   let html = `<div class="search-summary">${res.length} result(s) for "${esc(G_SearchQuery)}"${G_SearchPaged ? ' · paged range search' : ''}`
       + ` · showing ${start + 1}-${start + shown.length} of ${res.length}`
@@ -2008,6 +2058,57 @@ window.openEncodedFile = function(encodedPath) {
 window.closeFileViewer = function() {
   document.getElementById('file-viewer').style.display = 'none';
 };
+
+(function() {
+  const viewer = document.getElementById('file-viewer');
+  const edge = document.getElementById('file-viewer-resize-edge');
+  const corner = document.getElementById('file-viewer-resize-corner');
+  let active = null;
+
+  function clamp(value, min, max) {
+    return Math.max(min, Math.min(max, value));
+  }
+
+  function resizeBounds() {
+    const maxWidth = Math.max(240, window.innerWidth - 40);
+    const maxHeight = Math.max(180, window.innerHeight - 60);
+    return {
+      minWidth: Math.min(360, maxWidth),
+      minHeight: Math.min(240, maxHeight),
+      maxWidth,
+      maxHeight,
+    };
+  }
+
+  function beginResize(event, mode) {
+    const rect = viewer.getBoundingClientRect();
+    active = { mode, startX: event.clientX, startY: event.clientY, width: rect.width, height: rect.height };
+    document.body.style.cursor = mode === 'edge' ? 'ew-resize' : 'nesw-resize';
+    document.body.style.userSelect = 'none';
+    event.preventDefault();
+  }
+
+  edge.addEventListener('mousedown', event => beginResize(event, 'edge'));
+  corner.addEventListener('mousedown', event => beginResize(event, 'corner'));
+
+  document.addEventListener('mousemove', event => {
+    if (!active) return;
+    const bounds = resizeBounds();
+    const width = clamp(active.width + active.startX - event.clientX, bounds.minWidth, bounds.maxWidth);
+    viewer.style.width = width + 'px';
+    if (active.mode === 'corner') {
+      const height = clamp(active.height + event.clientY - active.startY, bounds.minHeight, bounds.maxHeight);
+      viewer.style.height = height + 'px';
+    }
+  });
+
+  document.addEventListener('mouseup', () => {
+    if (!active) return;
+    active = null;
+    document.body.style.cursor = '';
+    document.body.style.userSelect = '';
+  });
+})();
 function renderFileContent(path, text) {
   const body = document.getElementById('file-viewer-body');
   if (/\.(md|markdown)$/i.test(path)) {

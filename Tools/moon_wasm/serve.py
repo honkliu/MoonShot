@@ -17,6 +17,8 @@ DOC_PATH_MAX = 64
 DOC_PATH_OFFSET = 192
 PATH_PREFIX_SIDECAR_BYTES = 10 * 4096
 PATH_PREFIX_SIDECAR_MAGIC = b'MSPATHS\0'
+resolved_doc_path_cache = {}
+served_prefix_cache = None
 
 def decode_path_prefix_sidecar(sidecar):
     if len(sidecar) != PATH_PREFIX_SIDECAR_BYTES or sidecar[:8] != PATH_PREFIX_SIDECAR_MAGIC:
@@ -56,6 +58,76 @@ def decode_doc_path(payload, prefixes):
         return filename
     sep = '\\' if '\\' in prefix else '/'
     return prefix + filename if prefix.endswith(('/', '\\')) else prefix + sep + filename
+
+def load_served_prefixes():
+    global served_prefix_cache
+    if served_prefix_cache is not None:
+        return served_prefix_cache
+    if not served_idx_abs or not os.path.isfile(served_idx_abs):
+        served_prefix_cache = []
+        return served_prefix_cache
+    try:
+        with open(served_idx_abs, 'rb') as f:
+            f.seek(136)
+            served_prefix_cache = decode_path_prefix_sidecar(f.read(PATH_PREFIX_SIDECAR_BYTES))
+    except OSError:
+        served_prefix_cache = []
+    return served_prefix_cache
+
+def indexed_search_roots(prefixes):
+    roots = []
+    seen = set()
+    for prefix in prefixes:
+        if not prefix:
+            continue
+        norm = os.path.normpath(prefix)
+        drive, tail = os.path.splitdrive(norm)
+        parts = [part for part in tail.replace('/', os.sep).split(os.sep) if part]
+        if drive and parts:
+            root = os.path.join(drive + os.sep, parts[0])
+        elif os.path.isabs(norm) and parts:
+            root = os.path.join(os.sep, parts[0])
+        else:
+            continue
+        key = os.path.normcase(root)
+        if key not in seen and os.path.isdir(root):
+            seen.add(key)
+            roots.append(root)
+    return roots
+
+def resolve_existing_doc_path(path, prefixes):
+    if not path:
+        return path
+    if os.path.isabs(path) and os.path.isfile(path):
+        return path
+    cache_key = os.path.normcase(path)
+    if cache_key in resolved_doc_path_cache:
+        return resolved_doc_path_cache[cache_key] or path
+
+    for prefix in prefixes:
+        if not prefix:
+            continue
+        candidate = os.path.join(prefix, path)
+        if os.path.isfile(candidate):
+            resolved_doc_path_cache[cache_key] = candidate
+            return candidate
+
+    basename = os.path.basename(path)
+    if basename:
+        suffix = os.path.normcase(os.path.normpath(path))
+        has_dir = os.path.dirname(path) not in ('', '.')
+        for root in indexed_search_roots(prefixes):
+            for current_root, _dirs, files in os.walk(root):
+                if basename not in files:
+                    continue
+                candidate = os.path.join(current_root, basename)
+                if has_dir and not os.path.normcase(candidate).endswith(suffix):
+                    continue
+                resolved_doc_path_cache[cache_key] = candidate
+                return candidate
+
+    resolved_doc_path_cache[cache_key] = ''
+    return path
 
 # Write a tiny config that index.html reads to auto-load the idx.
 # Path is made relative to the HTTP server root (this script's directory).
@@ -201,6 +273,7 @@ class MoonShotHandler(http.server.SimpleHTTPRequestHandler):
                             continue
                         path_len = min(struct.unpack_from('<H', rec, 18)[0], DOC_PATH_MAX)
                         path = decode_doc_path(rec[DOC_PATH_OFFSET:DOC_PATH_OFFSET + path_len], prefixes) if path_len else ''
+                        path = resolve_existing_doc_path(path, prefixes)
                         out[str(doc_id)] = path
             except OSError as exc:
                 self.send_error(500, str(exc))
@@ -222,6 +295,8 @@ class MoonShotHandler(http.server.SimpleHTTPRequestHandler):
                 return
 
             file_path = os.path.abspath(os.path.expanduser(raw_path))
+            if not os.path.isfile(file_path):
+                file_path = resolve_existing_doc_path(raw_path, load_served_prefixes())
             if not os.path.isfile(file_path):
                 self.send_error(404, 'file not found')
                 return

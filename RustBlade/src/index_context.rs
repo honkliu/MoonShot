@@ -384,6 +384,7 @@ impl IndexContext {
     }
 
     pub fn VectorSearch(&mut self, query: &[f32], top_k: usize, ef_search: usize) -> Vec<VectorSearchResult> {
+        self.BuildVectorRuntime();
         self.m_VectorIndex.Search(query, top_k, ef_search)
     }
 
