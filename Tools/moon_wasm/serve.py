@@ -273,7 +273,6 @@ class MoonShotHandler(http.server.SimpleHTTPRequestHandler):
                             continue
                         path_len = min(struct.unpack_from('<H', rec, 18)[0], DOC_PATH_MAX)
                         path = decode_doc_path(rec[DOC_PATH_OFFSET:DOC_PATH_OFFSET + path_len], prefixes) if path_len else ''
-                        path = resolve_existing_doc_path(path, prefixes)
                         out[str(doc_id)] = path
             except OSError as exc:
                 self.send_error(500, str(exc))

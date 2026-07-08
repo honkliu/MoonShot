@@ -961,6 +961,62 @@ impl IndexContext {
         Ok(())
     }
 
+    /// Load only the data needed for vector search (WASM viewer path).
+    pub fn LoadVectorFromBytes(&mut self, data: &[u8]) -> Result<()> {
+        let header = IndexFileHeader::parse(data)?;
+        let sidecar_begin = INDEX_FILE_HEADER_SIZE;
+        let sidecar_end = sidecar_begin + PATH_PREFIX_SIDECAR_BYTES;
+        if sidecar_end > data.len() { return Err(RustBladeError::InvalidFormat); }
+        let pathPrefixSidecar = data[sidecar_begin..sidecar_end].to_vec();
+        let pathPrefixes = IndexSerializer::DecodePathPrefixSidecar(&pathPrefixSidecar)?;
+
+        let docdata_begin = usize::try_from(header.IFH_DocDataOffset).map_err(|_| RustBladeError::InvalidFormat)?;
+        let docdata_bytes = (header.IFH_NumDocuments as usize).checked_mul(DOC_REC_SIZE).ok_or(RustBladeError::InvalidFormat)?;
+        let docdata_end = docdata_begin.checked_add(docdata_bytes).ok_or(RustBladeError::InvalidFormat)?;
+        if docdata_end > data.len() { return Err(RustBladeError::InvalidFormat); }
+        let docdata = data[docdata_begin..docdata_end].to_vec();
+
+        let mut vector_index = HnswIndex::new(DOC_VECTOR_DIM, 32, 200, VectorMetric::Cosine);
+        vector_index.SetDocDataWithFirstDocId(docdata.clone(), Self::DocDataFirstDocId(&docdata, &header));
+
+        self.m_Store = Arc::new(RwLock::new(PostingStore::new()));
+        self.m_BlockTable = Arc::new(IndexBlockTable::new(512));
+        self.m_VectorIndex = vector_index;
+        self.m_VectorBuilt = false;
+        self.m_IndexFileHeader = header;
+        self.m_DocData = docdata;
+        self.m_PathPrefixSidecar = pathPrefixSidecar;
+        self.m_PathPrefixes = pathPrefixes;
+        self.m_Built = true;
+        self.m_LoadedFromDisk = true;
+        Ok(())
+    }
+
+    pub fn LoadVectorTables(&mut self, docdata: &[u8], pathPrefixSidecar: &[u8]) -> Result<()> {
+        if docdata.len() % DOC_REC_SIZE != 0 || pathPrefixSidecar.len() != PATH_PREFIX_SIDECAR_BYTES {
+            return Err(RustBladeError::InvalidFormat);
+        }
+        let pathPrefixes = IndexSerializer::DecodePathPrefixSidecar(pathPrefixSidecar)?;
+        let mut header = IndexFileHeader::default();
+        header.IFH_NumDocuments = (docdata.len() / DOC_REC_SIZE) as u64;
+
+        let docdata = docdata.to_vec();
+        let mut vector_index = HnswIndex::new(DOC_VECTOR_DIM, 32, 200, VectorMetric::Cosine);
+        vector_index.SetDocDataWithFirstDocId(docdata.clone(), Self::DocDataFirstDocId(&docdata, &header));
+
+        self.m_Store = Arc::new(RwLock::new(PostingStore::new()));
+        self.m_BlockTable = Arc::new(IndexBlockTable::new(512));
+        self.m_VectorIndex = vector_index;
+        self.m_VectorBuilt = false;
+        self.m_IndexFileHeader = header;
+        self.m_DocData = docdata;
+        self.m_PathPrefixSidecar = pathPrefixSidecar.to_vec();
+        self.m_PathPrefixes = pathPrefixes;
+        self.m_Built = true;
+        self.m_LoadedFromDisk = true;
+        Ok(())
+    }
+
     fn DeltaIndexPath(path: &str) -> String {
         let slash = path.rfind(['/', '\\']);
         let dot = path.rfind('.');

@@ -236,7 +236,7 @@ tr:hover td { background:#2a2d2e; cursor:pointer; }
           <input id="doc-search" class="tool-input" placeholder="Search documents…" onkeydown="if(event.key==='Enter') runDocumentSearch()">
           <select id="search-mode" class="tool-input" title="Search mode">
             <option value="text">Text</option>
-            <option value="vector">BGE Vector</option>
+            <option value="vector">BGE Hybrid</option>
           </select>
           <input id="bge-host" class="tool-input" value="52.171.138.19" title="BGE host" style="width:135px">
           <input id="bge-port" class="tool-input" value="30000" title="BGE port" style="width:72px">
@@ -270,10 +270,11 @@ const LARGE_INDEX_LIMIT = 128 * 1024 * 1024;
 const INDEX_HEADER_BYTES = 136;
 const FULL_PARSE_TERM_LIMIT = 250000;
 const FULL_PARSE_INDEX_BLOCK_LIMIT = 8192;
-const VECTOR_FULL_INDEX_LIMIT = LARGE_INDEX_LIMIT;
 const PAGE_SIZE = 4096;
 const DOC_REC_SIZE = 256;
 const DOC_VECTOR_DIM = 128;
+const DOC_VECTOR_OFFSET = 64;
+const BGE_COSINE_WEIGHT = 16;
 const LEAF_TERM_DIRECTORY_COUNT = 161;
 const LEAF_TERM_DATA_OFFSET = LEAF_TERM_DIRECTORY_COUNT * 2;
 const PATH_PREFIX_SIDECAR_BYTES = 10 * PAGE_SIZE;
@@ -282,14 +283,14 @@ const DOCDATA_ROWS_PER_PAGE = 32;
 const INDEXBLOCKS_PER_PAGE = 32;
 const POSTING_ROWS_PER_PAGE = 32;
 const SEARCH_RESULTS_PER_PAGE = 20;
-const { default: init, parse_index_summary, parse_index, search_index, vector_search_index } = await import(`./pkg/moon_wasm.js?${BUILD_STAMP}`);
+const { default: init, parse_index_summary, parse_index, search_index } = await import(`./pkg/moon_wasm.js?${BUILD_STAMP}`);
 const wasmBytes = await fetch(`./pkg/moon_wasm_bg.wasm?${BUILD_STAMP}`, { cache: 'no-store' })
   .then(r => r.ok ? r.arrayBuffer() : Promise.reject(r.status));
 await init(wasmBytes);
-window._wasm = { parse_index_summary, parse_index, search_index, vector_search_index };
+window._wasm = { parse_index_summary, parse_index, search_index };
 window.MOONSHOT_VIEWER_BUILD = BUILD_STAMP;
 
-let G = { bytes: null, parsed: null, sc: null, localFile: null, fullIndexBytes: null, indexUrl: '', indexSize: 0 };
+let G = { bytes: null, parsed: null, sc: null, localFile: null, vectorDocDataBytes: null, vectorPathPrefixBytes: null, indexUrl: '', indexSize: 0 };
 const TEXT_DECODER = new TextDecoder('utf-8');
 
 // ── Drag-to-resize + click-to-collapse for hex pane divider ──────────────────
@@ -400,7 +401,8 @@ function parseWasmJson(raw, context) {
 // ── loading ───────────────────────────────────────────────────────────────────
 async function loadFile(file) {
   G.localFile = null;
-  G.fullIndexBytes = null;
+  G.vectorDocDataBytes = null;
+  G.vectorPathPrefixBytes = null;
   G.indexUrl = '';
   G.indexSize = file.size;
   let headerBytes;
@@ -423,7 +425,8 @@ async function loadFile(file) {
 
 async function loadRemoteIndex(url, size) {
   G.localFile = null;
-  G.fullIndexBytes = null;
+  G.vectorDocDataBytes = null;
+  G.vectorPathPrefixBytes = null;
   G.indexUrl = url;
   G.indexSize = size || 0;
   if (size > 0) {
@@ -482,7 +485,6 @@ function loadSummaryData(headerBytes, name, fileSize, reason) {
 function loadData(bytes, name) {
   G.bytes = bytes;
   G.localFile = null;
-  G.fullIndexBytes = bytes;
   G.indexSize = bytes.length;
   setStatus('Parsing ' + (name||'file') + '…');
   try {
@@ -1018,7 +1020,7 @@ async function findPagedTerm(term) {
 
 function queryTerms(q) {
   const raw = (q || '').toLowerCase().match(/[\p{L}\p{N}_]+/gu) || [];
-  const suffixes = ['B', 'T'];
+  const suffixes = ['A', 'U', 'T', 'B'];
   const terms = [];
   for (const tok of raw) for (const s of suffixes) terms.push(tok + s);
   return [...new Set(terms)];
@@ -1905,14 +1907,69 @@ async function runVectorDocumentSearch(q, out) {
     if (embed.error) throw new Error(embed.error);
     if (!Array.isArray(embed.vector)) throw new Error('embedding response missing vector');
     const vector = adaptVectorForIndex(embed.vector);
-    const indexBytes = await ensureFullIndexBytesForVector(out, q);
-    const raw = window._wasm.vector_search_index(indexBytes, JSON.stringify(vector), 1000, 1000);
-    const res = parseWasmJson(raw, 'vector_search_index');
-    if (res && !Array.isArray(res) && res.error) throw new Error(res.error);
-    renderSearchResults(q, res, false);
+    out.innerHTML = `<div class="search-summary">Collecting AUTB candidates for "${esc(q)}"…</div>`;
+    const candidates = G.summaryOnly ? await runPagedSearch(q) : parseWasmJson(window._wasm.search_index(G.bytes, q, 'AUTB'), 'search_index');
+    if (candidates && !Array.isArray(candidates) && candidates.error) throw new Error(candidates.error);
+    const res = await rerankCandidatesWithVector(out, q, candidates, vector);
+    renderSearchResults(q, res, G.summaryOnly);
   } catch (e) {
     out.innerHTML = `<p class="srch-hint">BGE vector search failed: ${esc(e)}</p>`;
   }
+}
+
+async function ensureVectorTablesForSearch(out, q) {
+  if (G.vectorDocDataBytes && G.vectorPathPrefixBytes) return [G.vectorDocDataBytes, G.vectorPathPrefixBytes];
+  const h = G.parsed?.header;
+  if (!h) throw new Error('index header is not loaded');
+  out.innerHTML = `<div class="search-summary">Loading DocData vectors for BGE vector search on "${esc(q)}"…</div>`;
+  const docBytes = Number(h.num_docs || 0) * DOC_REC_SIZE;
+  if (G.bytes && G.bytes.length >= Number(h.docdata_off || 0) + docBytes) {
+    G.vectorPathPrefixBytes = G.bytes.slice(INDEX_HEADER_BYTES, INDEX_HEADER_BYTES + PATH_PREFIX_SIDECAR_BYTES);
+    G.vectorDocDataBytes = G.bytes.slice(h.docdata_off, Number(h.docdata_off) + docBytes);
+  } else {
+    G.vectorPathPrefixBytes = await rangeRead(INDEX_HEADER_BYTES, PATH_PREFIX_SIDECAR_BYTES);
+    G.vectorDocDataBytes = await rangeRead(h.docdata_off, docBytes);
+  }
+  return [G.vectorDocDataBytes, G.vectorPathPrefixBytes];
+}
+
+async function rerankCandidatesWithVector(out, q, candidates, vector) {
+  if (!Array.isArray(candidates) || candidates.length === 0) return [];
+  await ensureVectorTablesForSearch(out, q);
+  out.innerHTML = `<div class="search-summary">Re-ranking ${candidates.length} AUTB candidate(s) with BGE vector score…</div>`;
+  const firstDocId = G.vectorDocDataBytes.length >= 4 ? u32(G.vectorDocDataBytes, 0) : 0;
+  const ranked = candidates.map(candidate => {
+    const textScore = Number(candidate.score || 0);
+    const vectorScore = vectorScoreForDoc(candidate.doc_id, vector, firstDocId);
+    return { ...candidate, score: textScore + vectorScore, text_score: textScore, vector_score: vectorScore };
+  });
+  ranked.sort((a, b) => Number(b.score || 0) - Number(a.score || 0) || Number(a.doc_id) - Number(b.doc_id));
+  return ranked.slice(0, 1000);
+}
+
+function vectorScoreForDoc(docId, vector, firstDocId) {
+  const id = Number(docId);
+  if (!Number.isFinite(id) || !G.vectorDocDataBytes || id < firstDocId) return 0;
+  const offset = (id - firstDocId) * DOC_REC_SIZE;
+  if (offset < 0 || offset + DOC_REC_SIZE > G.vectorDocDataBytes.length) return 0;
+  if (u32(G.vectorDocDataBytes, offset) !== id) return 0;
+  const dim = u16(G.vectorDocDataBytes, offset + 54);
+  const format = u16(G.vectorDocDataBytes, offset + 56);
+  if (dim !== DOC_VECTOR_DIM || format === 0) return 0;
+  let dot = 0, nq = 0, nd = 0;
+  for (let i = 0; i < DOC_VECTOR_DIM; i++) {
+    const qv = vector[i] || 0;
+    const dv = signedByte(G.vectorDocDataBytes[offset + DOC_VECTOR_OFFSET + i]) / 128;
+    dot += qv * dv;
+    nq += qv * qv;
+    nd += dv * dv;
+  }
+  if (nq <= 0 || nd <= 0) return 0;
+  return BGE_COSINE_WEIGHT * dot / (Math.sqrt(nq) * Math.sqrt(nd));
+}
+
+function signedByte(value) {
+  return value >= 128 ? value - 256 : value;
 }
 
 function adaptVectorForIndex(vector) {
@@ -1920,25 +1977,6 @@ function adaptVectorForIndex(vector) {
   const out = new Array(DOC_VECTOR_DIM).fill(0);
   for (let i = 0; i < Math.min(vector.length, DOC_VECTOR_DIM); i++) out[i] = Number(vector[i]) || 0;
   return out;
-}
-
-async function ensureFullIndexBytesForVector(out, q) {
-  if (G.fullIndexBytes) return G.fullIndexBytes;
-  const size = Number(G.parsed?.header?.file_size || G.indexSize || 0);
-  if (size > VECTOR_FULL_INDEX_LIMIT) {
-    throw new Error(`paged vector search needs to load the raw index into browser memory; ${formatBytes(size)} exceeds the ${formatBytes(VECTOR_FULL_INDEX_LIMIT)} safety limit`);
-  }
-  out.innerHTML = `<div class="search-summary">Loading raw index bytes for BGE vector search on "${esc(q)}"…</div>`;
-  if (G.localFile) {
-    G.fullIndexBytes = new Uint8Array(await G.localFile.arrayBuffer());
-    return G.fullIndexBytes;
-  }
-  const url = G.indexUrl || (typeof window.MOONSHOT_IDX === 'string' ? window.MOONSHOT_IDX : '');
-  if (!url) throw new Error('no configured index URL is available for vector search');
-  const response = await fetch(withCacheBuster(url), { cache: 'no-store' });
-  if (!response.ok) throw new Error(`raw index fetch failed: ${response.status}`);
-  G.fullIndexBytes = new Uint8Array(await response.arrayBuffer());
-  return G.fullIndexBytes;
 }
 
 function renderSearchResults(q, res, paged) {

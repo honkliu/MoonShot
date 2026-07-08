@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::HashMap;
 
 use wasm_bindgen::prelude::*;
@@ -23,6 +24,26 @@ use crate::index_context::IndexContext;
 use crate::executor::IndexSearchExecutor;
 use crate::posting_store::PostingStore;
 use crate::serializer::IndexSerializer;
+
+#[derive(Clone, PartialEq, Eq)]
+struct VectorCacheKey {
+    file_size: usize,
+    version: u32,
+    num_docs: u64,
+    num_terms: u64,
+    docdata_off: u64,
+    index_block_count: u64,
+    checksum: u64,
+}
+
+struct CachedVectorContext {
+    key: VectorCacheKey,
+    context: IndexContext,
+}
+
+thread_local! {
+    static VECTOR_CONTEXT_CACHE: RefCell<Option<CachedVectorContext>> = RefCell::new(None);
+}
 
 #[wasm_bindgen]
 pub fn parse_index_summary(data: &[u8], file_size: usize) -> String {
@@ -313,28 +334,127 @@ pub fn search_index(data: &[u8], query: &str, streams: &str) -> String {
 
 #[wasm_bindgen]
 pub fn vector_search_index(data: &[u8], query_vector_json: &str, top_k: usize, ef_search: usize) -> String {
-    let mut context = IndexContext::new();
-    if let Err(error) = context.LoadFromBytes(data) {
-        return format!(r#"{{"error":"Failed to load index: {error:?}"}}"#);
-    }
     let query_vector: Vec<f32> = match serde_json::from_str(query_vector_json) {
         Ok(vector) => vector,
         Err(error) => return format!(r#"{{"error":"Invalid query vector: {error}"}}"#),
     };
-    let results = context.VectorSearch(&query_vector, top_k.max(1), ef_search.max(top_k.max(1)));
+    let key = match vector_cache_key(data) {
+        Ok(key) => key,
+        Err(error) => return format!(r#"{{"error":"Failed to read index header: {error}"}}"#),
+    };
+    let results = match VECTOR_CONTEXT_CACHE.with(|cache| -> Result<Vec<(u64, f32, String)>, String> {
+        let mut cache = cache.borrow_mut();
+        let reload = cache.as_ref().map(|cached| cached.key != key).unwrap_or(true);
+        if reload {
+            let mut context = IndexContext::new();
+            context.LoadVectorFromBytes(data).map_err(|error| format!("{error:?}"))?;
+            *cache = Some(CachedVectorContext { key: key.clone(), context });
+        }
+        let cached = cache.as_mut().ok_or_else(|| "vector cache unavailable".to_string())?;
+        Ok(cached.context.VectorSearch(&query_vector, top_k.max(1), ef_search.max(top_k.max(1)))
+            .into_iter()
+            .map(|result| {
+                let path = cached.context.GetDocPath(result.doc_id);
+                (result.doc_id, result.score, path)
+            })
+            .collect())
+    }) {
+        Ok(results) => results,
+        Err(error) => return format!(r#"{{"error":"Failed to load vector index: {error}"}}"#),
+    };
     let mut out = String::from("[");
-    for (index, result) in results.iter().enumerate() {
+    for (index, (doc_id, score, path)) in results.iter().enumerate() {
         if index > 0 { out.push(','); }
-        let path = context.GetDocPath(result.doc_id);
         out.push_str(&format!(
             r#"{{"doc_id":"{}","score":{:.4},"path":{}}}"#,
-            result.doc_id,
-            result.score,
+            doc_id,
+            score,
             serde_json::to_string(&path).unwrap_or_default()
         ));
     }
     out.push(']');
     out
+}
+
+#[wasm_bindgen]
+pub fn vector_search_tables(docdata: &[u8], path_prefix_sidecar: &[u8], query_vector_json: &str, top_k: usize, ef_search: usize) -> String {
+    let query_vector: Vec<f32> = match serde_json::from_str(query_vector_json) {
+        Ok(vector) => vector,
+        Err(error) => return format!(r#"{{"error":"Invalid query vector: {error}"}}"#),
+    };
+    let key = VectorCacheKey {
+        file_size: docdata.len() + path_prefix_sidecar.len(),
+        version: 0,
+        num_docs: (docdata.len() / DOC_REC_SIZE) as u64,
+        num_terms: 0,
+        docdata_off: 0,
+        index_block_count: 0,
+        checksum: sampled_checksum(docdata) ^ sampled_checksum(path_prefix_sidecar).rotate_left(1),
+    };
+    let results = match VECTOR_CONTEXT_CACHE.with(|cache| -> Result<Vec<(u64, f32, String)>, String> {
+        let mut cache = cache.borrow_mut();
+        let reload = cache.as_ref().map(|cached| cached.key != key).unwrap_or(true);
+        if reload {
+            let mut context = IndexContext::new();
+            context.LoadVectorTables(docdata, path_prefix_sidecar).map_err(|error| format!("{error:?}"))?;
+            *cache = Some(CachedVectorContext { key: key.clone(), context });
+        }
+        let cached = cache.as_mut().ok_or_else(|| "vector cache unavailable".to_string())?;
+        Ok(cached.context.VectorSearch(&query_vector, top_k.max(1), ef_search.max(top_k.max(1)))
+            .into_iter()
+            .map(|result| {
+                let path = cached.context.GetDocPath(result.doc_id);
+                (result.doc_id, result.score, path)
+            })
+            .collect())
+    }) {
+        Ok(results) => results,
+        Err(error) => return format!(r#"{{"error":"Failed to load vector tables: {error}"}}"#),
+    };
+    let mut out = String::from("[");
+    for (index, (doc_id, score, path)) in results.iter().enumerate() {
+        if index > 0 { out.push(','); }
+        out.push_str(&format!(
+            r#"{{"doc_id":"{}","score":{:.4},"path":{}}}"#,
+            doc_id,
+            score,
+            serde_json::to_string(&path).unwrap_or_default()
+        ));
+    }
+    out.push(']');
+    out
+}
+
+fn vector_cache_key(data: &[u8]) -> Result<VectorCacheKey, String> {
+    let header = parse_header(data)?;
+    Ok(VectorCacheKey {
+        file_size: data.len(),
+        version: header.version,
+        num_docs: header.num_docs,
+        num_terms: header.num_terms,
+        docdata_off: header.docdata_off,
+        index_block_count: header.index_block_count,
+        checksum: 0,
+    })
+}
+
+fn sampled_checksum(data: &[u8]) -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x100000001b3;
+    let mut hash = FNV_OFFSET ^ data.len() as u64;
+    let head = data.len().min(4096);
+    for byte in &data[..head] {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    if data.len() > head {
+        let tail_start = data.len().saturating_sub(4096);
+        for byte in &data[tail_start..] {
+            hash ^= *byte as u64;
+            hash = hash.wrapping_mul(FNV_PRIME);
+        }
+    }
+    hash
 }
 
 struct Header {
