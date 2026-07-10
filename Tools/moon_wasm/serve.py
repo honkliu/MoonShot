@@ -15,7 +15,7 @@ LARGE_INDEX_COPY_LIMIT = 128 * 1024 * 1024
 DOC_REC_SIZE = 256
 DOC_PATH_MAX = 64
 DOC_PATH_OFFSET = 192
-PATH_PREFIX_SIDECAR_BYTES = 10 * 4096
+PATH_PREFIX_SIDECAR_BYTES = 20 * 4096
 PATH_PREFIX_SIDECAR_MAGIC = b'MSPATHS\0'
 resolved_doc_path_cache = {}
 served_prefix_cache = None
@@ -294,8 +294,6 @@ class MoonShotHandler(http.server.SimpleHTTPRequestHandler):
                 return
 
             file_path = os.path.abspath(os.path.expanduser(raw_path))
-            if not os.path.isfile(file_path):
-                file_path = resolve_existing_doc_path(raw_path, load_served_prefixes())
             if not os.path.isfile(file_path):
                 self.send_error(404, 'file not found')
                 return
