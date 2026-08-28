@@ -25,27 +25,27 @@
 
 #include "moonshot.h"
 
-#include <array>
-#include <cstdint>
-#include <cstring>
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <cctype>
-#include <unordered_map>
-#include <unordered_set>
+#include <chrono>
+#include <cstdint>
 #include <cstdlib>
+#include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <map>
+#include <mutex>
 #include <set>
 #include <sstream>
 #include <string>
-#include <vector>
-#include <filesystem>
-#include <chrono>
-#include <atomic>
-#include <mutex>
 #include <thread>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
 
 #ifdef _WIN32
 #  include <winsock2.h>
@@ -67,7 +67,9 @@
 #ifdef _WIN32
 static std::wstring Utf8ToWide(const std::string& s)
 {
-    if (s.empty()) return {};
+    if (s.empty())
+        return {};
+
     int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, nullptr, 0);
     std::wstring w(n - 1, L'\0');
     MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, w.data(), n);
@@ -76,7 +78,9 @@ static std::wstring Utf8ToWide(const std::string& s)
 
 static std::string WideToUtf8(const wchar_t* w)
 {
-    if (!w) return {};
+    if (!w)
+        return {};
+
     int n = WideCharToMultiByte(CP_UTF8, 0, w, -1, nullptr, 0, nullptr, nullptr);
     std::string s(n - 1, '\0');
     WideCharToMultiByte(CP_UTF8, 0, w, -1, s.data(), n, nullptr, nullptr);
@@ -91,7 +95,9 @@ static std::string HomeDir()
     return p ? p : "C:/Users/Default";
 #else
     const char* p = getenv("HOME");
-    if (p) return p;
+    if (p)
+        return p;
+
     struct passwd* pw = getpwuid(getuid());
     return pw ? pw->pw_dir : "/tmp";
 #endif
@@ -137,8 +143,9 @@ static std::string DeltaIndexPath(const std::string& path)
 {
     const size_t slash = path.find_last_of("/\\");
     const size_t dot = path.find_last_of('.');
-    if (dot != std::string::npos && (slash == std::string::npos || dot > slash))
+    if (dot != std::string::npos && (slash == std::string::npos || dot > slash)) {
         return path.substr(0, dot) + ".delta" + path.substr(dot);
+    }
     return path + ".delta.idx";
 }
 
@@ -147,19 +154,17 @@ static std::string BatchIndexPath(const std::string& path)
     return path + ".batch.tmp";
 }
 
-// ─── path→id map: loaded from existing .idx DocData ───────────────────────────
+// ─── Paths and file collection ───────────────────────────────────────────────
 
 using PathMap = std::map<std::string, uint64_t>;  // filepath → sequential id
 static constexpr uintmax_t MAX_INDEX_FILE_BYTES = 8ull * 1024ull * 1024ull;
 
 struct FileItem {
     std::string path;
-    uintmax_t   size = 0;
+    uintmax_t size = 0;
 };
 
 static std::filesystem::path FsPathFromUtf8(const std::string& path);
-
-// ─── file helpers ─────────────────────────────────────────────────────────────
 
 static std::string ReadFile(const std::string& path)
 {
@@ -168,7 +173,9 @@ static std::string ReadFile(const std::string& path)
 #else
     std::ifstream f(path);
 #endif
-    if (!f) return {};
+    if (!f)
+        return {};
+
     std::ostringstream ss;
     ss << f.rdbuf();
     return ss.str();
@@ -179,23 +186,29 @@ static std::string AbsolutePath(const std::string& path)
 #ifdef _WIN32
     std::wstring input = Utf8ToWide(path);
     DWORD needed = GetFullPathNameW(input.c_str(), 0, nullptr, nullptr);
-    if (needed == 0) return path;
+    if (needed == 0)
+        return path;
 
     std::wstring full(needed, L'\0');
     DWORD written = GetFullPathNameW(input.c_str(), needed, full.data(), nullptr);
-    if (written == 0) return path;
-    if (!full.empty() && full.back() == L'\0') full.pop_back();
+    if (written == 0)
+        return path;
+    if (!full.empty() && full.back() == L'\0')
+        full.pop_back();
     return WideToUtf8(full.c_str());
 #else
     char resolved[PATH_MAX];
-    if (realpath(path.c_str(), resolved))
+    if (realpath(path.c_str(), resolved)) {
         return resolved;
-    if (!path.empty() && path[0] == '/')
+    }
+    if (!path.empty() && path[0] == '/') {
         return path;
+    }
 
     char cwd[PATH_MAX];
-    if (getcwd(cwd, sizeof(cwd)))
+    if (getcwd(cwd, sizeof(cwd))) {
         return std::string(cwd) + "/" + path;
+    }
     return path;
 #endif
 }
@@ -220,20 +233,23 @@ static std::string PathToUtf8(const std::filesystem::path& path)
 
 static std::string Trim(std::string text)
 {
-    while (!text.empty() && std::isspace(static_cast<unsigned char>(text.front())))
+    while (!text.empty() && std::isspace(static_cast<unsigned char>(text.front()))) {
         text.erase(text.begin());
-    while (!text.empty() && std::isspace(static_cast<unsigned char>(text.back())))
+    }
+    while (!text.empty() && std::isspace(static_cast<unsigned char>(text.back()))) {
         text.pop_back();
+    }
     return text;
 }
 
 static std::string NormalizeExtension(std::string ext)
 {
     ext = Trim(std::move(ext));
-    while (!ext.empty() && ext.front() == '.')
+    while (!ext.empty() && ext.front() == '.') {
         ext.erase(ext.begin());
+    }
     std::transform(ext.begin(), ext.end(), ext.begin(),
-                   [](unsigned char c){ return static_cast<char>(std::tolower(c)); });
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
     return ext;
 }
 
@@ -244,8 +260,9 @@ static std::vector<std::string> ParseExtensions(const std::string& text)
     std::string item;
     while (std::getline(ss, item, ',')) {
         item = NormalizeExtension(std::move(item));
-        if (!item.empty())
+        if (!item.empty()) {
             extensions.push_back(std::move(item));
+        }
     }
     return extensions;
 }
@@ -270,10 +287,13 @@ static void AddFileIfIndexable(const std::filesystem::path& path,
                                std::vector<FileItem>& files)
 {
     std::error_code ec;
-    if (!std::filesystem::is_regular_file(path, ec) || ec) return;
-    if (checkExtension && !IsIndexableTextFile(path, extensions)) return;
+    if (!std::filesystem::is_regular_file(path, ec) || ec)
+        return;
+    if (checkExtension && !IsIndexableTextFile(path, extensions))
+        return;
     uintmax_t size = std::filesystem::file_size(path, ec);
-    if (ec || size > MAX_INDEX_FILE_BYTES) return;
+    if (ec || size > MAX_INDEX_FILE_BYTES)
+        return;
     files.push_back({AbsolutePath(PathToUtf8(path)), size});
 }
 
@@ -295,10 +315,16 @@ static std::vector<FileItem> CollectDirectoryFiles(const std::string& path,
         return files;
 
     if (!recursive) {
-        std::filesystem::directory_iterator it(root, std::filesystem::directory_options::skip_permission_denied, ec);
+        std::filesystem::directory_iterator it(
+            root,
+            std::filesystem::directory_options::skip_permission_denied,
+            ec);
         std::filesystem::directory_iterator end;
         for (; it != end; it.increment(ec)) {
-            if (ec) { ec.clear(); continue; }
+            if (ec) {
+                ec.clear();
+                continue;
+            }
             AddFileIfIndexable(it->path(), extensions, true, files);
         }
         return files;
@@ -310,8 +336,14 @@ static std::vector<FileItem> CollectDirectoryFiles(const std::string& path,
         ec);
     std::filesystem::recursive_directory_iterator end;
     for (; it != end; it.increment(ec)) {
-        if (ec) { ec.clear(); continue; }
-        if (it->is_directory(ec) || ec) { ec.clear(); continue; }
+        if (ec) {
+            ec.clear();
+            continue;
+        }
+        if (it->is_directory(ec) || ec) {
+            ec.clear();
+            continue;
+        }
         AddFileIfIndexable(it->path(), extensions, true, files);
     }
     return files;
@@ -364,7 +396,7 @@ static bool EmbedDocumentWithBge(const std::string& text,
                                  const SearchOptions& options,
                                  std::vector<float>& vector);
 
-// ─── index: build one batch delta ─────────────────────────────────────────────
+// ─── Index construction ──────────────────────────────────────────────────────
 
 static bool BuildIndexFile(const std::string& savePath,
                            const PathMap& pathMap,
@@ -401,8 +433,9 @@ static bool BuildIndexFile(const std::string& savePath,
                     embeddingText.push_back('\n');
                 embeddingText += doc.body;
             }
-            if (embeddingText.size() > BGE_MAX_TEXT_BYTES - std::strlen(BGE_DOCUMENT_MARKER))
+            if (embeddingText.size() > BGE_MAX_TEXT_BYTES - std::strlen(BGE_DOCUMENT_MARKER)) {
                 embeddingText.resize(BGE_MAX_TEXT_BYTES - std::strlen(BGE_DOCUMENT_MARKER));
+            }
 
             std::vector<float> vector;
             if (EmbedDocumentWithBge(embeddingText, embeddingOptions, vector)) {
@@ -442,8 +475,9 @@ static bool AddFileDocument(IndexContext& ctx,
         return false;
     }
 
-    if (firstContent && firstContent->empty())
+    if (firstContent && firstContent->empty()) {
         *firstContent = content;
+    }
 
     Document doc;
     doc.doc_id = docId;
@@ -455,7 +489,7 @@ static bool AddFileDocument(IndexContext& ctx,
     return true;
 }
 
-// ─── search ──────────────────────────────────────────────────────────────────
+// ─── Search and interactive workflow ─────────────────────────────────────────
 
 struct SearchHit {
     const IndexContext* context = nullptr;
@@ -465,16 +499,21 @@ struct SearchHit {
 static std::string SearchStreamSet(const SearchOptions& options)
 {
     std::string streams;
-    if (options.inverted) streams += "AUTB";
-    if (options.vector && !options.bge) streams += "V";
+    if (options.inverted)
+        streams += "AUTB";
+    if (options.vector && !options.bge)
+        streams += "V";
     return streams;
 }
 
 static const char* SearchModeName(const SearchOptions& options)
 {
-    if (options.bge && options.inverted && options.vector) return "inverted+BGE";
-    if (options.bge && options.vector) return "BGE vector";
-    if (options.inverted && options.vector) return "inverted+vector";
+    if (options.bge && options.inverted && options.vector)
+        return "inverted+BGE";
+    if (options.bge && options.vector)
+        return "BGE vector";
+    if (options.inverted && options.vector)
+        return "inverted+vector";
     return options.inverted ? "inverted" : "vector";
 }
 
@@ -485,8 +524,10 @@ static std::string QuoteShellArg(std::string text)
 
     std::string quoted = "\"";
     for (char ch : text) {
-        if (ch == '"') quoted += "\\\"";
-        else quoted.push_back(ch);
+        if (ch == '"')
+            quoted += "\\\"";
+        else
+            quoted.push_back(ch);
     }
     quoted.push_back('"');
     return quoted;
@@ -512,7 +553,8 @@ static bool ReadSingleI8Vector(const std::string& path, std::vector<float>& vect
 {
     static constexpr char Magic[8] = {'M','S','V','E','C','I','8','1'};
     std::ifstream input(FsPathFromUtf8(path), std::ios::binary);
-    if (!input) return false;
+    if (!input)
+        return false;
     char magic[8]{};
     uint32_t dim = 0;
     uint32_t idBytes = 0;
@@ -526,7 +568,8 @@ static bool ReadSingleI8Vector(const std::string& path, std::vector<float>& vect
     std::array<int8_t, DOC_VECTOR_DIM> payload{};
     input.read(idBuffer.data(), static_cast<std::streamsize>(idBuffer.size()));
     input.read(reinterpret_cast<char*>(payload.data()), static_cast<std::streamsize>(payload.size()));
-    if (!input) return false;
+    if (!input)
+        return false;
 
     vector.assign(DOC_VECTOR_DIM, 0.0f);
     for (size_t i = 0; i < DOC_VECTOR_DIM; ++i)
@@ -674,7 +717,8 @@ static bool EmbedTextWithBge(const std::string& text,
     const auto vectorPath = tempDir / (std::string(prefix) + std::to_string(stamp) + ".i8bin");
     {
         std::ofstream out(textPath, std::ios::binary);
-        if (!out) return false;
+        if (!out)
+            return false;
         out << text;
     }
 
@@ -693,7 +737,8 @@ static bool EmbedTextWithBge(const std::string& text,
     ec.clear();
     std::filesystem::remove(vectorPath, ec);
     if (!ok)
-        std::cerr << "BGE " << (documentMode ? "document" : "query") << " embedding failed; command was: " << command << "\n";
+        std::cerr << "BGE " << (documentMode ? "document" : "query")
+              << " embedding failed; command was: " << command << "\n";
     return ok;
 }
 
@@ -714,11 +759,16 @@ static bool EmbedDocumentWithBge(const std::string& text,
 static std::string SourceMaskText(uint8_t sourceMask)
 {
     std::string text = "-----";
-    if (sourceMask & READER_SOURCE_ANCHOR) text[0] = 'A';
-    if (sourceMask & READER_SOURCE_URL) text[1] = 'U';
-    if (sourceMask & READER_SOURCE_TITLE) text[2] = 'T';
-    if (sourceMask & READER_SOURCE_BODY) text[3] = 'B';
-    if (sourceMask & READER_SOURCE_VECTOR) text[4] = 'V';
+    if (sourceMask & READER_SOURCE_ANCHOR)
+        text[0] = 'A';
+    if (sourceMask & READER_SOURCE_URL)
+        text[1] = 'U';
+    if (sourceMask & READER_SOURCE_TITLE)
+        text[2] = 'T';
+    if (sourceMask & READER_SOURCE_BODY)
+        text[3] = 'B';
+    if (sourceMask & READER_SOURCE_VECTOR)
+        text[4] = 'V';
     return text;
 }
 
@@ -746,16 +796,23 @@ static void CollectSearchResults(IndexContext& ctx,
         tree->vector_query = std::move(queryVector);
         tree->vector_ef_search = options.vectorEf;
 
-        for (const auto& result : executor->Execute(ctx.GetReader(tree.get()), static_cast<int>(options.topK), &tree->vector_query))
+        for (const auto& result : executor->Execute(
+                 ctx.GetReader(tree.get()),
+                 static_cast<int>(options.topK),
+                 &tree->vector_query)) {
             hits.push_back({&ctx, result});
+        }
         return;
     }
 
     if (!streams.empty()) {
         auto tree = std::unique_ptr<EvalTree>(ctx.Compile(query.c_str(), streams.c_str()));
-        const std::vector<float>* vectorQuery = tree && tree->HasTextQuery() && tree->HasVectorQuery() ? &tree->vector_query : nullptr;
-        for (const auto& result : executor->Execute(ctx.GetReader(tree.get()), 0, vectorQuery))
+        const std::vector<float>* vectorQuery = tree && tree->HasTextQuery() && tree->HasVectorQuery()
+            ? &tree->vector_query
+            : nullptr;
+        for (const auto& result : executor->Execute(ctx.GetReader(tree.get()), 0, vectorQuery)) {
             hits.push_back({&ctx, result});
+        }
     }
 }
 
@@ -795,7 +852,8 @@ static void Search(IndexContext& ctx, const std::string& query, const SearchOpti
             std::cout << "-- press any key for next page, q to stop --" << std::flush;
             char ch = ReadSingleKey();
             std::cout << "\n";
-            if (ch == 'q' || ch == 'Q') break;
+            if (ch == 'q' || ch == 'Q')
+                break;
         }
     }
 }
@@ -884,8 +942,9 @@ static bool AddInteractiveFiles(IndexContext& ctx,
                 embeddingText.push_back('\n');
             embeddingText += doc.body;
         }
-        if (embeddingText.size() > BGE_MAX_TEXT_BYTES - std::strlen(BGE_DOCUMENT_MARKER))
+        if (embeddingText.size() > BGE_MAX_TEXT_BYTES - std::strlen(BGE_DOCUMENT_MARKER)) {
             embeddingText.resize(BGE_MAX_TEXT_BYTES - std::strlen(BGE_DOCUMENT_MARKER));
+        }
 
         std::vector<float> vector;
         if (EmbedDocumentWithBge(embeddingText, options, vector)) {
@@ -897,8 +956,9 @@ static bool AddInteractiveFiles(IndexContext& ctx,
         ++kept;
         ++nextDocId;
     }
-    if (options.bge)
+    if (options.bge) {
         std::cout << "  embedded " << bgeVectors << " BGE document vector(s)\n";
+    }
     return kept > 0;
 }
 
@@ -940,7 +1000,8 @@ static bool HandleAddCommand(IndexContext& ctx, const SearchOptions& options, co
     uint64_t skipped = 0;
     AddInteractiveFiles(ctx, files, options, kept, skipped);
     std::cout << "added " << kept << " document(s) to memory";
-    if (skipped) std::cout << " (skipped " << skipped << ")";
+    if (skipped)
+        std::cout << " (skipped " << skipped << ")";
     std::cout << "; run /s to publish as delta\n";
     return true;
 }
@@ -991,12 +1052,22 @@ static bool HandleInteractiveCommand(IndexContext& ctx,
                                      bool& shouldQuit)
 {
     const auto args = SplitCommandLine(line);
-    if (args.empty()) return true;
-    if (args[0] == "/q") { shouldQuit = true; return true; }
-    if (args[0] == "/h") { PrintInteractiveHelp(); return true; }
-    if (args[0] == "/a") return HandleAddCommand(ctx, options, args);
-    if (args[0] == "/s") return SaveInteractiveDelta(ctx, idxPath);
-    if (args[0] == "/m") return MergeInteractiveDelta(ctx, idxPath);
+    if (args.empty())
+        return true;
+    if (args[0] == "/q") {
+        shouldQuit = true;
+        return true;
+    }
+    if (args[0] == "/h") {
+        PrintInteractiveHelp();
+        return true;
+    }
+    if (args[0] == "/a")
+        return HandleAddCommand(ctx, options, args);
+    if (args[0] == "/s")
+        return SaveInteractiveDelta(ctx, idxPath);
+    if (args[0] == "/m")
+        return MergeInteractiveDelta(ctx, idxPath);
     std::cout << "unknown command: " << args[0] << " (try /h)\n";
     return true;
 }
@@ -1028,13 +1099,16 @@ static int RunInteractiveSearch(const std::string& idxPath, const SearchOptions&
     while (true) {
         std::cout << "> ";
         std::cout.flush();
-        if (!std::getline(std::cin, line)) break;
+        if (!std::getline(std::cin, line))
+            break;
         line = Trim(std::move(line));
-        if (line.empty()) continue;
+        if (line.empty())
+            continue;
         if (!line.empty() && line[0] == '/') {
             bool shouldQuit = false;
             HandleInteractiveCommand(ctx, idxPath, options, line, shouldQuit);
-            if (shouldQuit) break;
+            if (shouldQuit)
+                break;
             continue;
         }
         Search(ctx, line, options);
@@ -1043,7 +1117,7 @@ static int RunInteractiveSearch(const std::string& idxPath, const SearchOptions&
     return 0;
 }
 
-// ─── main ─────────────────────────────────────────────────────────────────────
+// ─── Command-line options and parsing ─────────────────────────────────────────
 
 struct IndexOptions {
     std::string filePath;
@@ -1113,20 +1187,28 @@ static bool IsHybridMode(const std::string& mode)
 
 static bool ParseBatchSize(const std::string& text, uint64_t& batchSize)
 {
-    if (text.empty()) return false;
+    if (text.empty())
+        return false;
+
     char* end = nullptr;
     unsigned long long value = std::strtoull(text.c_str(), &end, 10);
-    if (!end || *end != '\0' || value == 0) return false;
+    if (!end || *end != '\0' || value == 0)
+        return false;
+
     batchSize = static_cast<uint64_t>(value);
     return true;
 }
 
 static bool ParseUInt64(const std::string& text, uint64_t& value)
 {
-    if (text.empty()) return false;
+    if (text.empty())
+        return false;
+
     char* end = nullptr;
     unsigned long long parsed = std::strtoull(text.c_str(), &end, 10);
-    if (!end || *end != '\0') return false;
+    if (!end || *end != '\0')
+        return false;
+
     value = static_cast<uint64_t>(parsed);
     return true;
 }
@@ -1152,10 +1234,12 @@ static bool ParseAtList(const std::string& text, std::vector<int>& values)
     std::string item;
     while (std::getline(ss, item, ',')) {
         item = Trim(std::move(item));
-        if (item.empty()) continue;
+        if (item.empty())
+            continue;
         char* end = nullptr;
         long parsed = std::strtol(item.c_str(), &end, 10);
-        if (!end || *end != '\0' || parsed <= 0) return false;
+        if (!end || *end != '\0' || parsed <= 0)
+            return false;
         values.push_back(static_cast<int>(parsed));
     }
     std::sort(values.begin(), values.end());
@@ -1179,31 +1263,61 @@ static bool ParseSearchOptions(const std::vector<std::string>& args,
         } else if (arg == "-bge-sidecar") {
             options.bgeSidecar = true;
         } else if (arg == "-bge-python") {
-            if (i + 1 >= args.size()) { error = "Usage: moon -v -bge -bge-python <python>"; return false; }
+            if (i + 1 >= args.size()) {
+                error = "Usage: moon -v -bge -bge-python <python>";
+                return false;
+            }
             options.bgePython = args[++i];
         } else if (arg == "-bge-script") {
-            if (i + 1 >= args.size()) { error = "Usage: moon -v -bge -bge-script <embed_query.py>"; return false; }
+            if (i + 1 >= args.size()) {
+                error = "Usage: moon -v -bge -bge-script <embed_query.py>";
+                return false;
+            }
             options.bgeScript = args[++i];
         } else if (arg == "-bge-model") {
-            if (i + 1 >= args.size()) { error = "Usage: moon -v -bge -bge-model <model>"; return false; }
+            if (i + 1 >= args.size()) {
+                error = "Usage: moon -v -bge -bge-model <model>";
+                return false;
+            }
             options.bgeModel = args[++i];
         } else if (arg == "-bge-host") {
-            if (i + 1 >= args.size()) { error = "Usage: moon -v -bge -bge-host <host>"; return false; }
+            if (i + 1 >= args.size()) {
+                error = "Usage: moon -v -bge -bge-host <host>";
+                return false;
+            }
             options.bgeHost = args[++i];
         } else if (arg == "-bge-port") {
-            if (i + 1 >= args.size()) { error = "Usage: moon -v -bge -bge-port <port>"; return false; }
+            if (i + 1 >= args.size()) {
+                error = "Usage: moon -v -bge -bge-port <port>";
+                return false;
+            }
             uint64_t value = 0;
-            if (!ParseUInt64(args[++i], value) || value == 0 || value > 65535) { error = "-bge-port must be 1..65535"; return false; }
+            if (!ParseUInt64(args[++i], value) || value == 0 || value > 65535) {
+                error = "-bge-port must be 1..65535";
+                return false;
+            }
             options.bgePort = static_cast<uint16_t>(value);
         } else if (arg == "-k") {
-            if (i + 1 >= args.size()) { error = "Usage: moon -v -bge -k N"; return false; }
+            if (i + 1 >= args.size()) {
+                error = "Usage: moon -v -bge -k N";
+                return false;
+            }
             uint64_t value = 0;
-            if (!ParseUInt64(args[++i], value) || value == 0) { error = "-k must be positive"; return false; }
+            if (!ParseUInt64(args[++i], value) || value == 0) {
+                error = "-k must be positive";
+                return false;
+            }
             options.topK = static_cast<size_t>(value);
         } else if (arg == "-ef") {
-            if (i + 1 >= args.size()) { error = "Usage: moon -v -bge -ef N"; return false; }
+            if (i + 1 >= args.size()) {
+                error = "Usage: moon -v -bge -ef N";
+                return false;
+            }
             uint64_t value = 0;
-            if (!ParseUInt64(args[++i], value) || value == 0) { error = "-ef must be positive"; return false; }
+            if (!ParseUInt64(args[++i], value) || value == 0) {
+                error = "-ef must be positive";
+                return false;
+            }
             options.vectorEf = static_cast<size_t>(value);
         } else {
             error = "Unknown search option: " + arg;
@@ -1235,19 +1349,40 @@ static bool ParseIndexOptions(const std::vector<std::string>& args,
     for (size_t i = 0; i < args.size(); ++i) {
         const std::string& arg = args[i];
         if (arg == "-file") {
-            if (i + 1 >= args.size()) { error = "Usage: moon -file <filename>"; return false; }
+            if (i + 1 >= args.size()) {
+                error = "Usage: moon -file <filename>";
+                return false;
+            }
             options.filePath = args[++i];
         } else if (arg == "-dir") {
-            if (i + 1 >= args.size()) { error = "Usage: moon -dir <directory> [-ext md,txt] [-r]"; return false; }
+            if (i + 1 >= args.size()) {
+                error = "Usage: moon -dir <directory> [-ext md,txt] [-r]";
+                return false;
+            }
             options.dirPath = args[++i];
         } else if (arg == "-ext") {
-            if (i + 1 >= args.size()) { error = "Usage: moon -ext md,txt,cpp,h"; return false; }
+            if (i + 1 >= args.size()) {
+                error = "Usage: moon -ext md,txt,cpp,h";
+                return false;
+            }
             options.extensions = ParseExtensions(args[++i]);
-            if (options.extensions.empty()) { error = "-ext must include at least one extension"; return false; }
+            if (options.extensions.empty()) {
+                error = "-ext must include at least one extension";
+                return false;
+            }
         } else if (arg == "-b") {
-            if (i + 1 >= args.size()) { error = "Usage: moon -b 10000"; return false; }
-            if (!ParseBatchSize(args[++i], options.batchSize)) { error = "-b must be a positive integer"; return false; }
-            if (options.batchSize < 10000) { error = "-b must be at least 10000 for indexing performance"; return false; }
+            if (i + 1 >= args.size()) {
+                error = "Usage: moon -b 10000";
+                return false;
+            }
+            if (!ParseBatchSize(args[++i], options.batchSize)) {
+                error = "-b must be a positive integer";
+                return false;
+            }
+            if (options.batchSize < 10000) {
+                error = "-b must be at least 10000 for indexing performance";
+                return false;
+            }
         } else if (arg == "-r") {
             options.recursive = true;
         } else if (arg == "-bge") {
@@ -1255,21 +1390,39 @@ static bool ParseIndexOptions(const std::vector<std::string>& args,
         } else if (arg == "-bge-sidecar") {
             options.embedding.bgeSidecar = true;
         } else if (arg == "-bge-python") {
-            if (i + 1 >= args.size()) { error = "Usage: moon -file <file> -bge -bge-python <python>"; return false; }
+            if (i + 1 >= args.size()) {
+                error = "Usage: moon -file <file> -bge -bge-python <python>";
+                return false;
+            }
             options.embedding.bgePython = args[++i];
         } else if (arg == "-bge-script") {
-            if (i + 1 >= args.size()) { error = "Usage: moon -file <file> -bge -bge-script <embed_query.py>"; return false; }
+            if (i + 1 >= args.size()) {
+                error = "Usage: moon -file <file> -bge -bge-script <embed_query.py>";
+                return false;
+            }
             options.embedding.bgeScript = args[++i];
         } else if (arg == "-bge-model") {
-            if (i + 1 >= args.size()) { error = "Usage: moon -file <file> -bge -bge-model <model>"; return false; }
+            if (i + 1 >= args.size()) {
+                error = "Usage: moon -file <file> -bge -bge-model <model>";
+                return false;
+            }
             options.embedding.bgeModel = args[++i];
         } else if (arg == "-bge-host") {
-            if (i + 1 >= args.size()) { error = "Usage: moon -file <file> -bge -bge-host <host>"; return false; }
+            if (i + 1 >= args.size()) {
+                error = "Usage: moon -file <file> -bge -bge-host <host>";
+                return false;
+            }
             options.embedding.bgeHost = args[++i];
         } else if (arg == "-bge-port") {
-            if (i + 1 >= args.size()) { error = "Usage: moon -file <file> -bge -bge-port <port>"; return false; }
+            if (i + 1 >= args.size()) {
+                error = "Usage: moon -file <file> -bge -bge-port <port>";
+                return false;
+            }
             uint64_t value = 0;
-            if (!ParseUInt64(args[++i], value) || value == 0 || value > 65535) { error = "-bge-port must be 1..65535"; return false; }
+            if (!ParseUInt64(args[++i], value) || value == 0 || value > 65535) {
+                error = "-bge-port must be 1..65535";
+                return false;
+            }
             options.embedding.bgePort = static_cast<uint16_t>(value);
         } else {
             error = "Unknown option: " + arg;
@@ -1283,7 +1436,8 @@ static bool ParseIndexOptions(const std::vector<std::string>& args,
     }
     if (!options.filePath.empty() || !options.dirPath.empty())
         return true;
-    error = "Usage: moon -file <filename> | moon -dir <directory> [-ext md,txt] [-r] [-b 10000] [-bge [-bge-host host] [-bge-port port]]";
+    error = "Usage: moon -file <filename> | moon -dir <directory> [-ext md,txt] [-r] "
+            "[-b 10000] [-bge [-bge-host host] [-bge-port port]]";
     return false;
 }
 
@@ -1294,15 +1448,27 @@ static bool ParseSampleMergeOptions(const std::vector<std::string>& args,
     for (size_t i = 1; i < args.size(); ++i) {
         const std::string& arg = args[i];
         if (arg == "-dir") {
-            if (i + 1 >= args.size()) { error = "Usage: moon -sample-merge -dir <root> -out <index-path> [-ext cpp,h,rs]"; return false; }
+            if (i + 1 >= args.size()) {
+                error = "Usage: moon -sample-merge -dir <root> -out <index-path> [-ext cpp,h,rs]";
+                return false;
+            }
             options.dirPath = args[++i];
         } else if (arg == "-out") {
-            if (i + 1 >= args.size()) { error = "Usage: moon -sample-merge -dir <root> -out <index-path> [-ext cpp,h,rs]"; return false; }
+            if (i + 1 >= args.size()) {
+                error = "Usage: moon -sample-merge -dir <root> -out <index-path> [-ext cpp,h,rs]";
+                return false;
+            }
             options.outPath = args[++i];
         } else if (arg == "-ext") {
-            if (i + 1 >= args.size()) { error = "Usage: moon -sample-merge -dir <root> -out <index-path> [-ext cpp,h,rs]"; return false; }
+            if (i + 1 >= args.size()) {
+                error = "Usage: moon -sample-merge -dir <root> -out <index-path> [-ext cpp,h,rs]";
+                return false;
+            }
             options.extensions = ParseExtensions(args[++i]);
-            if (options.extensions.empty()) { error = "-ext must include at least one extension"; return false; }
+            if (options.extensions.empty()) {
+                error = "-ext must include at least one extension";
+                return false;
+            }
         } else {
             error = "Unknown sample merge option: " + arg;
             return false;
@@ -1323,16 +1489,28 @@ static bool ParseBeirBuildOptions(const std::vector<std::string>& args,
     for (size_t i = 1; i < args.size(); ++i) {
         const std::string& arg = args[i];
         if (arg == "-data") {
-            if (i + 1 >= args.size()) { error = "Usage: moon [-idx <index>] -beir-build -data <beir-dir> [-limit N]"; return false; }
+            if (i + 1 >= args.size()) {
+                error = "Usage: moon [-idx <index>] -beir-build -data <beir-dir> [-limit N]";
+                return false;
+            }
             options.dataPath = args[++i];
         } else if (arg == "-doc-vectors") {
-            if (i + 1 >= args.size()) { error = "Usage: moon -beir-build -doc-vectors <docid-tab-vector.tsv>"; return false; }
+            if (i + 1 >= args.size()) {
+                error = "Usage: moon -beir-build -doc-vectors <docid-tab-vector.tsv>";
+                return false;
+            }
             options.docVectorsPath = args[++i];
         } else if (arg == "-build-vectors") {
             options.buildVectors = true;
         } else if (arg == "-limit") {
-            if (i + 1 >= args.size()) { error = "Usage: moon -beir-build -limit N"; return false; }
-            if (!ParseUInt64(args[++i], options.limit)) { error = "-limit must be a non-negative integer"; return false; }
+            if (i + 1 >= args.size()) {
+                error = "Usage: moon -beir-build -limit N";
+                return false;
+            }
+            if (!ParseUInt64(args[++i], options.limit)) {
+                error = "-limit must be a non-negative integer";
+                return false;
+            }
         } else {
             error = "Unknown BEIR build option: " + arg;
             return false;
@@ -1353,14 +1531,26 @@ static bool ParseBeirPatchVectorOptions(const std::vector<std::string>& args,
     for (size_t i = 1; i < args.size(); ++i) {
         const std::string& arg = args[i];
         if (arg == "-src-index") {
-            if (i + 1 >= args.size()) { error = "Usage: moon -beir-patch-vectors -src-index <index> -doc-vectors <vectors>"; return false; }
+            if (i + 1 >= args.size()) {
+                error = "Usage: moon -beir-patch-vectors -src-index <index> -doc-vectors <vectors>";
+                return false;
+            }
             options.sourceIndexPath = args[++i];
         } else if (arg == "-doc-vectors") {
-            if (i + 1 >= args.size()) { error = "Usage: moon -beir-patch-vectors -doc-vectors <vectors>"; return false; }
+            if (i + 1 >= args.size()) {
+                error = "Usage: moon -beir-patch-vectors -doc-vectors <vectors>";
+                return false;
+            }
             options.docVectorsPath = args[++i];
         } else if (arg == "-limit") {
-            if (i + 1 >= args.size()) { error = "Usage: moon -beir-patch-vectors -limit N"; return false; }
-            if (!ParseUInt64(args[++i], options.limit)) { error = "-limit must be a non-negative integer"; return false; }
+            if (i + 1 >= args.size()) {
+                error = "Usage: moon -beir-patch-vectors -limit N";
+                return false;
+            }
+            if (!ParseUInt64(args[++i], options.limit)) {
+                error = "-limit must be a non-negative integer";
+                return false;
+            }
         } else {
             error = "Unknown BEIR patch option: " + arg;
             return false;
@@ -1380,50 +1570,124 @@ static bool ParseBeirEvalOptions(const std::vector<std::string>& args,
     for (size_t i = 1; i < args.size(); ++i) {
         const std::string& arg = args[i];
         if (arg == "-data") {
-            if (i + 1 >= args.size()) { error = "Usage: moon [-idx <index>] -beir-eval -data <beir-dir> [-qrels test] [-k 10,100,1000]"; return false; }
+            if (i + 1 >= args.size()) {
+                error = "Usage: moon [-idx <index>] -beir-eval -data <beir-dir> "
+                        "[-qrels test] [-k 10,100,1000]";
+                return false;
+            }
             options.dataPath = args[++i];
         } else if (arg == "-qrels") {
-            if (i + 1 >= args.size()) { error = "Usage: moon -beir-eval -qrels <split-or-path>"; return false; }
+            if (i + 1 >= args.size()) {
+                error = "Usage: moon -beir-eval -qrels <split-or-path>";
+                return false;
+            }
             options.qrels = args[++i];
         } else if (arg == "-run-out") {
-            if (i + 1 >= args.size()) { error = "Usage: moon -beir-eval -run-out <trec-run-path>"; return false; }
+            if (i + 1 >= args.size()) {
+                error = "Usage: moon -beir-eval -run-out <trec-run-path>";
+                return false;
+            }
             options.runOut = args[++i];
         } else if (arg == "-dump-features") {
-            if (i + 1 >= args.size()) { error = "Usage: moon -beir-eval -dump-features <features.tsv>"; return false; }
+            if (i + 1 >= args.size()) {
+                error = "Usage: moon -beir-eval -dump-features <features.tsv>";
+                return false;
+            }
             options.dumpFeaturesPath = args[++i];
         } else if (arg == "-query-vectors") {
-            if (i + 1 >= args.size()) { error = "Usage: moon -beir-eval -query-vectors <qid-tab-vector.tsv>"; return false; }
+            if (i + 1 >= args.size()) {
+                error = "Usage: moon -beir-eval -query-vectors <qid-tab-vector.tsv>";
+                return false;
+            }
             options.queryVectorsPath = args[++i];
         } else if (arg == "-k") {
-            if (i + 1 >= args.size()) { error = "Usage: moon -beir-eval -k 10,100,1000"; return false; }
-            if (!ParseAtList(args[++i], options.at)) { error = "-k must be a comma-separated list of positive integers"; return false; }
+            if (i + 1 >= args.size()) {
+                error = "Usage: moon -beir-eval -k 10,100,1000";
+                return false;
+            }
+            if (!ParseAtList(args[++i], options.at)) {
+                error = "-k must be a comma-separated list of positive integers";
+                return false;
+            }
         } else if (arg == "-streams") {
-            if (i + 1 >= args.size()) { error = "Usage: moon -beir-eval -streams TB"; return false; }
+            if (i + 1 >= args.size()) {
+                error = "Usage: moon -beir-eval -streams TB";
+                return false;
+            }
             options.streams = args[++i];
         } else if (arg == "-mode") {
-            if (i + 1 >= args.size()) { error = "Usage: moon -beir-eval -mode bow|weakandbigram|weakandbigramboost|weakandbigramboostdoc|vector|hybrid|hybridboost|hybridboostdoc|compile"; return false; }
+            if (i + 1 >= args.size()) {
+                error = "Usage: moon -beir-eval -mode bow|weakandbigram|weakandbigramboost|"
+                        "weakandbigramboostdoc|vector|hybrid|hybridboost|hybridboostdoc|compile";
+                return false;
+            }
             options.mode = args[++i];
-            if (options.mode != "bow" && options.mode != "weakandbigram" && options.mode != "weakandbigramboost" && options.mode != "weakandbigramboostdoc" && options.mode != "vector" && options.mode != "hybrid" && options.mode != "hybridboost" && options.mode != "hybridboostdoc" && options.mode != "compile") { error = "-mode must be bow, weakandbigram, weakandbigramboost, weakandbigramboostdoc, vector, hybrid, hybridboost, hybridboostdoc, or compile"; return false; }
+            if (options.mode != "bow"
+                && options.mode != "weakandbigram"
+                && options.mode != "weakandbigramboost"
+                && options.mode != "weakandbigramboostdoc"
+                && options.mode != "vector"
+                && options.mode != "hybrid"
+                && options.mode != "hybridboost"
+                && options.mode != "hybridboostdoc"
+                && options.mode != "compile") {
+                error = "-mode must be bow, weakandbigram, weakandbigramboost, "
+                        "weakandbigramboostdoc, vector, hybrid, hybridboost, "
+                        "hybridboostdoc, or compile";
+                return false;
+            }
         } else if (arg == "-weakand-shape") {
-            if (i + 1 >= args.size()) { error = "Usage: moon -beir-eval -weakand-shape flat|or|or-prune"; return false; }
+            if (i + 1 >= args.size()) {
+                error = "Usage: moon -beir-eval -weakand-shape flat|or|or-prune";
+                return false;
+            }
             options.weakAndShape = args[++i];
-            if (options.weakAndShape != "flat" && options.weakAndShape != "or" && options.weakAndShape != "or-prune") { error = "-weakand-shape must be flat, or, or-prune"; return false; }
+            if (options.weakAndShape != "flat"
+                && options.weakAndShape != "or"
+                && options.weakAndShape != "or-prune") {
+                error = "-weakand-shape must be flat, or, or-prune";
+                return false;
+            }
         } else if (arg == "-no-mphf") {
             options.noMphf = true;
         } else if (arg == "-leaf-cache-mb") {
-            if (i + 1 >= args.size()) { error = "Usage: moon -beir-eval -leaf-cache-mb N"; return false; }
-            if (!ParseUInt64(args[++i], options.leafCacheMb) || options.leafCacheMb == 0) { error = "-leaf-cache-mb must be a positive integer"; return false; }
+            if (i + 1 >= args.size()) {
+                error = "Usage: moon -beir-eval -leaf-cache-mb N";
+                return false;
+            }
+            if (!ParseUInt64(args[++i], options.leafCacheMb) || options.leafCacheMb == 0) {
+                error = "-leaf-cache-mb must be a positive integer";
+                return false;
+            }
         } else if (arg == "-leaf-cache-match-mphf") {
             options.leafCacheMatchMphf = true;
         } else if (arg == "-limit") {
-            if (i + 1 >= args.size()) { error = "Usage: moon -beir-eval -limit N"; return false; }
-            if (!ParseUInt64(args[++i], options.limit)) { error = "-limit must be a non-negative integer"; return false; }
+            if (i + 1 >= args.size()) {
+                error = "Usage: moon -beir-eval -limit N";
+                return false;
+            }
+            if (!ParseUInt64(args[++i], options.limit)) {
+                error = "-limit must be a non-negative integer";
+                return false;
+            }
         } else if (arg == "-vector-ef") {
-            if (i + 1 >= args.size()) { error = "Usage: moon -beir-eval -vector-ef N"; return false; }
-            if (!ParseUInt64(args[++i], options.vectorEf) || options.vectorEf == 0) { error = "-vector-ef must be a positive integer"; return false; }
+            if (i + 1 >= args.size()) {
+                error = "Usage: moon -beir-eval -vector-ef N";
+                return false;
+            }
+            if (!ParseUInt64(args[++i], options.vectorEf) || options.vectorEf == 0) {
+                error = "-vector-ef must be a positive integer";
+                return false;
+            }
         } else if (arg == "-query-threads") {
-            if (i + 1 >= args.size()) { error = "Usage: moon -beir-eval -query-threads N"; return false; }
-            if (!ParseUInt64(args[++i], options.queryThreads) || options.queryThreads == 0) { error = "-query-threads must be a positive integer"; return false; }
+            if (i + 1 >= args.size()) {
+                error = "Usage: moon -beir-eval -query-threads N";
+                return false;
+            }
+            if (!ParseUInt64(args[++i], options.queryThreads) || options.queryThreads == 0) {
+                error = "-query-threads must be a positive integer";
+                return false;
+            }
         } else if (arg == "-enqueue") {
             options.useEnqueue = true;
         } else {
@@ -1447,7 +1711,8 @@ static std::string JoinExtensions(const std::vector<std::string>& extensions)
 {
     std::string text;
     for (size_t i = 0; i < extensions.size(); ++i) {
-        if (i) text += ",";
+        if (i)
+            text += ",";
         text += extensions[i];
     }
     return text;
@@ -1463,7 +1728,8 @@ static void PrintHelp(const std::string& idxPath)
         << "Build or update an index:\n"
         << "  moon [-idx <index>] -file <file> [-bge [-bge-host 127.0.0.1] [-bge-port 8765]]\n"
         << "      Index one file. With -bge, store document vectors from the configured BGE service.\n\n"
-        << "  moon [-idx <index>] -dir <dir> -ext md,txt [-r] [-b 10000] [-bge [-bge-host 127.0.0.1] [-bge-port 8765]]\n"
+        << "  moon [-idx <index>] -dir <dir> -ext md,txt [-r] [-b 10000] "
+           "[-bge [-bge-host 127.0.0.1] [-bge-port 8765]]\n"
         << "      Index files under <dir>. Use -r for recursive traversal.\n"
         << "      -ext is a comma-separated extension list without or with dots.\n"
         << "      -b controls how many new files are saved per delta batch; minimum 10000.\n"
@@ -1489,7 +1755,12 @@ static void PrintHelp(const std::string& idxPath)
         << "      Build an index from BEIR corpus.jsonl. Stored doc paths are BEIR ids.\n\n"
         << "  moon -idx <output-index> -beir-patch-vectors -src-index <index> -doc-vectors <vectors.i8bin>\n"
         << "      Copy an existing BEIR index and patch only DocData vector fields.\n\n"
-        << "  moon [-idx <index>] -beir-eval -data <beir-dir> [-qrels test] [-run-out out.trec] [-k 10,100,1000] [-streams TB] [-mode bow|weakandbigram|weakandbigramboost|weakandbigramboostdoc|vector|hybrid|hybridboost|hybridboostdoc|compile] [-weakand-shape flat|or|or-prune] [-no-mphf] [-leaf-cache-mb N] [-leaf-cache-match-mphf] [-limit N]\n"
+        << "  moon [-idx <index>] -beir-eval -data <beir-dir> [-qrels test] "
+           "[-run-out out.trec] [-k 10,100,1000] [-streams TB] "
+           "[-mode bow|weakandbigram|weakandbigramboost|weakandbigramboostdoc|"
+           "vector|hybrid|hybridboost|hybridboostdoc|compile] "
+           "[-weakand-shape flat|or|or-prune] [-no-mphf] [-leaf-cache-mb N] "
+           "[-leaf-cache-match-mphf] [-limit N]\n"
         << "      Evaluate Recall@k from BEIR queries.jsonl and qrels/<split>.tsv.\n"
         << "      Default mode is weakandbigram. bow is kept as a recall-ceiling baseline.\n\n"
         << "Examples:\n"
@@ -1547,6 +1818,8 @@ static bool HasSearchResults(IndexContext& ctx, const std::string& query)
     return !results.empty();
 }
 
+// ─── BEIR data parsing and evaluation ────────────────────────────────────────
+
 static std::string BeirFilePath(const std::string& dataPath, const std::string& relativePath)
 {
     auto path = FsPathFromUtf8(dataPath);
@@ -1556,9 +1829,12 @@ static std::string BeirFilePath(const std::string& dataPath, const std::string& 
 
 static int HexDigit(char ch)
 {
-    if (ch >= '0' && ch <= '9') return ch - '0';
-    if (ch >= 'a' && ch <= 'f') return 10 + ch - 'a';
-    if (ch >= 'A' && ch <= 'F') return 10 + ch - 'A';
+    if (ch >= '0' && ch <= '9')
+        return ch - '0';
+    if (ch >= 'a' && ch <= 'f')
+        return 10 + ch - 'a';
+    if (ch >= 'A' && ch <= 'F')
+        return 10 + ch - 'A';
     return -1;
 }
 
@@ -1585,39 +1861,62 @@ static bool ExtractJsonString(const std::string& line, const std::string& key, s
 {
     const std::string needle = "\"" + key + "\"";
     const size_t keyPos = line.find(needle);
-    if (keyPos == std::string::npos) return false;
+    if (keyPos == std::string::npos)
+        return false;
     const size_t colon = line.find(':', keyPos + needle.size());
-    if (colon == std::string::npos) return false;
+    if (colon == std::string::npos)
+        return false;
     size_t pos = colon + 1;
     while (pos < line.size() && std::isspace(static_cast<unsigned char>(line[pos]))) ++pos;
-    if (pos >= line.size() || line[pos] != '"') return false;
+    if (pos >= line.size() || line[pos] != '"')
+        return false;
     ++pos;
 
     value.clear();
     while (pos < line.size()) {
         char ch = line[pos++];
-        if (ch == '"') return true;
+        if (ch == '"')
+            return true;
         if (ch != '\\') {
             value.push_back(ch);
             continue;
         }
-        if (pos >= line.size()) return false;
+        if (pos >= line.size())
+            return false;
         const char esc = line[pos++];
         switch (esc) {
-        case '"': value.push_back('"'); break;
-        case '\\': value.push_back('\\'); break;
-        case '/': value.push_back('/'); break;
-        case 'b': value.push_back('\b'); break;
-        case 'f': value.push_back('\f'); break;
-        case 'n': value.push_back('\n'); break;
-        case 'r': value.push_back('\r'); break;
-        case 't': value.push_back('\t'); break;
+        case '"':
+            value.push_back('"');
+            break;
+        case '\\':
+            value.push_back('\\');
+            break;
+        case '/':
+            value.push_back('/');
+            break;
+        case 'b':
+            value.push_back('\b');
+            break;
+        case 'f':
+            value.push_back('\f');
+            break;
+        case 'n':
+            value.push_back('\n');
+            break;
+        case 'r':
+            value.push_back('\r');
+            break;
+        case 't':
+            value.push_back('\t');
+            break;
         case 'u': {
-            if (pos + 4 > line.size()) return false;
+            if (pos + 4 > line.size())
+                return false;
             uint32_t codepoint = 0;
             for (int i = 0; i < 4; ++i) {
                 const int digit = HexDigit(line[pos + i]);
-                if (digit < 0) return false;
+                if (digit < 0)
+                    return false;
                 codepoint = (codepoint << 4) | static_cast<uint32_t>(digit);
             }
             pos += 4;
@@ -1647,11 +1946,13 @@ static bool ReadExternalVectorRecord(ExternalVectorStream& stream, std::string& 
 static bool LoadBeirQrels(const std::string& path, BeirQrels& qrels)
 {
     std::ifstream in(FsPathFromUtf8(path));
-    if (!in) return false;
+    if (!in)
+        return false;
     std::string line;
     bool firstLine = true;
     while (std::getline(in, line)) {
-        if (line.empty()) continue;
+        if (line.empty())
+            continue;
         if (firstLine) {
             firstLine = false;
             if (line.find("query-id") != std::string::npos || line.find("corpus-id") != std::string::npos)
@@ -1662,10 +1963,12 @@ static bool LoadBeirQrels(const std::string& path, BeirQrels& qrels)
         std::string column;
         while (std::getline(ss, column, '\t'))
             columns.push_back(std::move(column));
-        if (columns.size() < 3) continue;
+        if (columns.size() < 3)
+            continue;
         char* end = nullptr;
         const double score = std::strtod(columns[2].c_str(), &end);
-        if (!end || end == columns[2].c_str() || score <= 0.0) continue;
+        if (!end || end == columns[2].c_str() || score <= 0.0)
+            continue;
         qrels[columns[0]].insert(columns[1]);
     }
     return true;
@@ -1822,12 +2125,23 @@ static std::vector<std::string> ParseBeirStreams(const std::string& streamSet)
     std::vector<std::string> streams;
     for (char ch : streamSet) {
         switch (ch) {
-        case 'A': streams.emplace_back("A"); break;
-        case 'U': streams.emplace_back("U"); break;
-        case 'T': streams.emplace_back("T"); break;
-        case 'B': streams.emplace_back("B"); break;
-        case 'M': streams.emplace_back("M"); break;
-        default: break;
+        case 'A':
+            streams.emplace_back("A");
+            break;
+        case 'U':
+            streams.emplace_back("U");
+            break;
+        case 'T':
+            streams.emplace_back("T");
+            break;
+        case 'B':
+            streams.emplace_back("B");
+            break;
+        case 'M':
+            streams.emplace_back("M");
+            break;
+        default:
+            break;
         }
     }
     if (streams.empty())
@@ -1852,7 +2166,8 @@ static std::shared_ptr<IndexReader> BuildBeirBowReader(IndexContext& ctx,
 
     if (streamKeys.empty()) {
         for (const auto& token : tokens) {
-            if (token.empty()) continue;
+            if (token.empty())
+                continue;
             for (const auto& stream : streams)
                 streamKeys.insert(token + stream);
         }
@@ -2065,7 +2380,8 @@ static std::string ResolveBeirQrelsPath(const BeirEvalOptions& options)
 static bool ReadIndexHeaderOnly(const std::string& idxPath, IndexFileHeader& header)
 {
     std::ifstream input(FsPathFromUtf8(idxPath), std::ios::binary);
-    if (!input) return false;
+    if (!input)
+        return false;
     input.read(reinterpret_cast<char*>(&header), sizeof(header));
     return input.good()
         && std::memcmp(header.IFH_Magic, INDEX_FILE_MAGIC, sizeof(INDEX_FILE_MAGIC)) == 0
@@ -2120,7 +2436,8 @@ static int RunBeirBuild(const std::string& idxPath, const BeirBuildOptions& opti
     uint64_t vectorDocs = 0;
     auto start = std::chrono::steady_clock::now();
     while (std::getline(corpus, line)) {
-        if (options.limit > 0 && docId >= options.limit) break;
+        if (options.limit > 0 && docId >= options.limit)
+            break;
         std::string id;
         std::string url;
         std::string title;
@@ -2173,8 +2490,10 @@ static int RunBeirBuild(const std::string& idxPath, const BeirBuildOptions& opti
     const auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - start).count();
     std::cout << "BEIR build complete docs=" << docId;
-    if (docVectorInput.input.is_open() || options.buildVectors) std::cout << " vector_docs=" << vectorDocs;
-    if (skipped) std::cout << " skipped=" << skipped;
+    if (docVectorInput.input.is_open() || options.buildVectors)
+        std::cout << " vector_docs=" << vectorDocs;
+    if (skipped)
+        std::cout << " skipped=" << skipped;
     std::cout << " elapsed_ms=" << elapsedMs << "\n";
     return 0;
 }
@@ -2299,8 +2618,10 @@ static int RunBeirEval(const std::string& idxPath, const BeirEvalOptions& option
             std::cerr << "Could not open BEIR feature dump: " << options.dumpFeaturesPath << "\n";
             return 1;
         }
-        featureOutput << "qid\tdocid\tlabel\tweak_score\tbigram_score\tweak_hit\tbigram_hit\tweak_source\tbigram_source"
-                      << "\tstatic_rank\tdoc_prior\tdoc_len\tquality\tauthority\tspam\ttitle_len\tbody_len\tdiversity\tlength_quality\n";
+        featureOutput
+            << "qid\tdocid\tlabel\tweak_score\tbigram_score\tweak_hit\tbigram_hit\tweak_source\tbigram_source"
+            << "\tstatic_rank\tdoc_prior\tdoc_len\tquality\tauthority\tspam\ttitle_len\tbody_len"
+            << "\tdiversity\tlength_quality\n";
     }
 
     ExternalVectorMap queryVectors;
@@ -2370,7 +2691,8 @@ static int RunBeirEval(const std::string& idxPath, const BeirEvalOptions& option
                 ++missingQrels;
                 continue;
             }
-            if (options.limit > 0 && tasks.size() >= options.limit) break;
+            if (options.limit > 0 && tasks.size() >= options.limit)
+                break;
             tasks.push_back({std::move(qid), std::move(query), &qrelIt->second});
         }
 
@@ -2388,7 +2710,9 @@ static int RunBeirEval(const std::string& idxPath, const BeirEvalOptions& option
                 }
             }
 
-            const char* queryText = (evalPath == BeirEvalPath::VectorOrHybrid && !isHybridEval) ? "" : task.query.c_str();
+            const char* queryText = evalPath == BeirEvalPath::VectorOrHybrid && !isHybridEval
+                ? ""
+                : task.query.c_str();
             searchTasks.push_back(ctx.Enqueue(queryText,
                                              std::move(queryVector),
                                              options.streams.c_str(),
@@ -2425,7 +2749,10 @@ static int RunBeirEval(const std::string& idxPath, const BeirEvalOptions& option
                   << " weakand_shape=" << options.weakAndShape
                   << " bigram_weight=" << parameters.QMP_BigramWeight
                   << " mphf=" << (options.noMphf ? "off" : "on")
-                  << " leaf_cache_mb=" << (leafCacheBytes ? (leafCacheBytes / (1024ull * 1024ull)) : (LEAF_TERM_CACHE_BYTES / (1024ull * 1024ull)))
+                  << " leaf_cache_mb="
+                  << (leafCacheBytes
+                      ? leafCacheBytes / (1024ull * 1024ull)
+                      : LEAF_TERM_CACHE_BYTES / (1024ull * 1024ull))
                   << " query_threads=4"
                   << " enqueue=on"
                   << " queries=" << evaluated
@@ -2441,7 +2768,10 @@ static int RunBeirEval(const std::string& idxPath, const BeirEvalOptions& option
                       << " cache_misses=" << stats.CacheMisses
                       << " disk_reads=" << stats.DiskReads << "\n";
             const auto ioStats = FileAccess::GetIoStats();
-            if (ioStats.IoUringReads || ioStats.PreadFallbackReads || ioStats.IoUringSetupOk || ioStats.IoUringSetupFailed) {
+            if (ioStats.IoUringReads
+                || ioStats.PreadFallbackReads
+                || ioStats.IoUringSetupOk
+                || ioStats.IoUringSetupFailed) {
                 std::cout << "FileAccess io_uring_reads=" << ioStats.IoUringReads
                           << " pread_fallback_reads=" << ioStats.PreadFallbackReads
                           << " io_uring_setup_ok=" << ioStats.IoUringSetupOk
@@ -2474,7 +2804,8 @@ static int RunBeirEval(const std::string& idxPath, const BeirEvalOptions& option
                 ++missingQrels;
                 continue;
             }
-            if (options.limit > 0 && tasks.size() >= options.limit) break;
+            if (options.limit > 0 && tasks.size() >= options.limit)
+                break;
             tasks.push_back({std::move(qid), std::move(query), &qrelIt->second});
         }
 
@@ -2498,10 +2829,14 @@ static int RunBeirEval(const std::string& idxPath, const BeirEvalOptions& option
             state.microHits.assign(options.at.size(), 0);
         }
 
-        auto evaluateTask = [&](const BeirEvalTask& task, IndexSearchExecutor& localExecutor, SmartTokenizer& localTokenizer) {
+        auto evaluateTask = [&](const BeirEvalTask& task,
+                                IndexSearchExecutor& localExecutor,
+                                SmartTokenizer& localTokenizer) {
             switch (evalPath) {
             case BeirEvalPath::Bow:
-                return localExecutor.Execute(BuildBeirBowReader(ctx, localTokenizer, task.query, options.streams), maxK);
+                return localExecutor.Execute(
+                    BuildBeirBowReader(ctx, localTokenizer, task.query, options.streams),
+                    maxK);
             case BeirEvalPath::WeakAndBigram: {
                 std::unique_ptr<EvalTree> tree;
                 {
@@ -2561,14 +2896,22 @@ static int RunBeirEval(const std::string& idxPath, const BeirEvalOptions& option
                 auto& state = threadStates[static_cast<size_t>(threadIndex)];
                 while (true) {
                     const uint64_t taskIndex = nextTask.fetch_add(1, std::memory_order_relaxed);
-                    if (taskIndex >= tasks.size()) break;
+                    if (taskIndex >= tasks.size())
+                        break;
                     const auto& task = tasks[static_cast<size_t>(taskIndex)];
                     auto results = evaluateTask(task, localExecutor, localTokenizer);
                     if (runWriter) {
                         std::lock_guard<std::mutex> lock(outputMutex);
                         WriteBeirRun(runWriter, ctx, task.qid, results, runTag);
                     }
-                    AddBeirRecallForResults(ctx, results, *task.relevant, options.at, state.macroRecall, state.microHits, state.microRelevant);
+                    AddBeirRecallForResults(
+                        ctx,
+                        results,
+                        *task.relevant,
+                        options.at,
+                        state.macroRecall,
+                        state.microHits,
+                        state.microRelevant);
                     ++state.evaluated;
                     const uint64_t done = progress.fetch_add(1, std::memory_order_relaxed) + 1;
                     if (done % 100 == 0) {
@@ -2605,7 +2948,10 @@ static int RunBeirEval(const std::string& idxPath, const BeirEvalOptions& option
                   << " weakand_shape=" << options.weakAndShape
                   << " bigram_weight=" << parameters.QMP_BigramWeight
                   << " mphf=" << (options.noMphf ? "off" : "on")
-                  << " leaf_cache_mb=" << (leafCacheBytes ? (leafCacheBytes / (1024ull * 1024ull)) : (LEAF_TERM_CACHE_BYTES / (1024ull * 1024ull)))
+                  << " leaf_cache_mb="
+                  << (leafCacheBytes
+                      ? leafCacheBytes / (1024ull * 1024ull)
+                      : LEAF_TERM_CACHE_BYTES / (1024ull * 1024ull))
                   << " query_threads=" << threadCount
                   << " queries=" << evaluated
                   << " missing_qrels=" << missingQrels
@@ -2620,7 +2966,10 @@ static int RunBeirEval(const std::string& idxPath, const BeirEvalOptions& option
                       << " cache_misses=" << stats.CacheMisses
                       << " disk_reads=" << stats.DiskReads << "\n";
             const auto ioStats = FileAccess::GetIoStats();
-            if (ioStats.IoUringReads || ioStats.PreadFallbackReads || ioStats.IoUringSetupOk || ioStats.IoUringSetupFailed) {
+            if (ioStats.IoUringReads
+                || ioStats.PreadFallbackReads
+                || ioStats.IoUringSetupOk
+                || ioStats.IoUringSetupFailed) {
                 std::cout << "FileAccess io_uring_reads=" << ioStats.IoUringReads
                           << " pread_fallback_reads=" << ioStats.PreadFallbackReads
                           << " io_uring_setup_ok=" << ioStats.IoUringSetupOk
@@ -2652,10 +3001,14 @@ static int RunBeirEval(const std::string& idxPath, const BeirEvalOptions& option
             ++missingQrels;
             continue;
         }
-        if (options.limit > 0 && evaluated >= options.limit) break;
+        if (options.limit > 0 && evaluated >= options.limit)
+            break;
 
         if (evalPath == BeirEvalPath::FeatureDump) {
-            auto tree = std::unique_ptr<EvalTree>(ctx.Compile(query.c_str(), options.streams.c_str(), QueryCompileMode::WeakAndBigram));
+            auto tree = std::unique_ptr<EvalTree>(ctx.Compile(
+                query.c_str(),
+                options.streams.c_str(),
+                QueryCompileMode::WeakAndBigram));
             const auto rows = CollectBeirCandidateFeatures(ctx, tree.get());
 
             WriteFeatureRows(featureOutput, qrels, qid, rows);
@@ -2745,7 +3098,10 @@ static int RunBeirEval(const std::string& idxPath, const BeirEvalOptions& option
               << " weakand_shape=" << options.weakAndShape
               << " bigram_weight=" << parameters.QMP_BigramWeight
               << " mphf=" << (options.noMphf ? "off" : "on")
-              << " leaf_cache_mb=" << (leafCacheBytes ? (leafCacheBytes / (1024ull * 1024ull)) : (LEAF_TERM_CACHE_BYTES / (1024ull * 1024ull)))
+              << " leaf_cache_mb="
+              << (leafCacheBytes
+                      ? leafCacheBytes / (1024ull * 1024ull)
+                      : LEAF_TERM_CACHE_BYTES / (1024ull * 1024ull))
               << " queries=" << evaluated
               << " missing_qrels=" << missingQrels
               << " elapsed_ms=" << elapsedMs << "\n";
@@ -2759,7 +3115,10 @@ static int RunBeirEval(const std::string& idxPath, const BeirEvalOptions& option
                   << " cache_misses=" << stats.CacheMisses
                   << " disk_reads=" << stats.DiskReads << "\n";
         const auto ioStats = FileAccess::GetIoStats();
-        if (ioStats.IoUringReads || ioStats.PreadFallbackReads || ioStats.IoUringSetupOk || ioStats.IoUringSetupFailed) {
+        if (ioStats.IoUringReads
+            || ioStats.PreadFallbackReads
+            || ioStats.IoUringSetupOk
+            || ioStats.IoUringSetupFailed) {
             std::cout << "FileAccess io_uring_reads=" << ioStats.IoUringReads
                       << " pread_fallback_reads=" << ioStats.PreadFallbackReads
                       << " io_uring_setup_ok=" << ioStats.IoUringSetupOk
@@ -2829,7 +3188,8 @@ static int RunSampleMerge(const SampleMergeOptions& options)
             return 1;
         }
         std::cout << "sample-merge: saved base docs=" << baseKept;
-        if (baseSkipped) std::cout << " skipped=" << baseSkipped;
+        if (baseSkipped)
+            std::cout << " skipped=" << baseSkipped;
         std::cout << "\n";
     }
 
@@ -2846,7 +3206,8 @@ static int RunSampleMerge(const SampleMergeOptions& options)
             return 1;
         }
         std::cout << "sample-merge: saved delta docs=" << deltaKept;
-        if (deltaSkipped) std::cout << " skipped=" << deltaSkipped;
+        if (deltaSkipped)
+            std::cout << " skipped=" << deltaSkipped;
         std::cout << "\n";
     }
 
@@ -3006,7 +3367,8 @@ static int RunIndexCommand(const std::string& idxPath, const IndexOptions& optio
               << "Batch size: " << options.batchSize << "\n"
               << "Saved batches: " << savedBatches << "\n"
               << "Saved:   " << totalKept << " document(s)";
-    if (totalSkipped) std::cout << " (skipped " << totalSkipped << ")";
+    if (totalSkipped)
+        std::cout << " (skipped " << totalSkipped << ")";
     std::cout << " to " << idxPath << "\n"
               << "Total:   " << totalKept
               << " indexed document(s)\n";

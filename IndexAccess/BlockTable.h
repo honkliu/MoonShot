@@ -785,7 +785,7 @@ class IndexBlockTable
         uint8_t*                                m_TermMphfEntryPages = nullptr;
         uint32_t                                m_TermMphfEntryPageCount = 0;
         bool                                    m_TermMphfEnabled = true;
-        bool                                    m_DirectBlockAccess = false;
+        bool                                    m_DirectBlockAccess = true;
         std::atomic<uint64_t>                   m_DirectGets{0};
         std::atomic<uint64_t>                   m_DirectReleases{0};
         std::atomic<uint64_t>                   m_WorkerGets{0};

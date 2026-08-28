@@ -1122,13 +1122,12 @@ private:
     static constexpr uint32_t LEAF_TERM_BLOCK_CACHE_SLOT_COUNT =
         static_cast<uint32_t>(LEAF_TERM_CACHE_BYTES / sizeof(LeafTermBlock));
 
-    void EnsureSearchWorkersStarted(uint32_t workerCount = 4)
+    void EnsureSearchWorkersStarted(uint32_t workerCount = 16)
     {
         std::lock_guard<std::mutex> lock(m_SearchWorkerMutex);
         if (!m_SearchWorkers.empty())
             return;
 
-        SetDirectBlockAccessEnabled(false);
         EnsureStreamLengthStats();
         m_StopSearchWorkers = false;
         workerCount = std::max<uint32_t>(1, workerCount);

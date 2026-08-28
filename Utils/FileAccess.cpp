@@ -226,17 +226,7 @@ bool FileAccess::Init()
     return m_FileHandle != INVALID_HANDLE_VALUE;
 #else
     m_FileHandle = open(m_FileName, O_RDONLY);
-    if (m_FileHandle == -1)
-        return false;
-    m_IoUring = new FileAccessIoUring();
-    if (!m_IoUring->Init()) {
-        ++g_IoUringSetupFailed;
-        delete m_IoUring;
-        m_IoUring = nullptr;
-    } else {
-        ++g_IoUringSetupOk;
-    }
-    return true;
+    return m_FileHandle != -1;
 #endif
 }
 
@@ -368,11 +358,6 @@ bool FileAccess::ReadBlock(uint32_t block_seq, void* buffer, size_t block_size,
 
     off_t position = static_cast<off_t>(base_byte_offset)
                    + static_cast<off_t>(block_seq) * static_cast<off_t>(block_size);
-
-    if (m_IoUring && m_IoUring->Read(m_FileHandle, buffer, block_size, static_cast<uint64_t>(position))) {
-        ++g_IoUringReads;
-        return true;
-    }
 
     ++g_PreadFallbackReads;
     ssize_t bytesRead = pread(m_FileHandle, buffer, block_size, position);
