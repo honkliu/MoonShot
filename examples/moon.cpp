@@ -816,7 +816,7 @@ static void CollectSearchResults(IndexContext& ctx,
     }
 }
 
-static void Search(IndexContext& ctx, const std::string& query, const SearchOptions& options)
+static std::vector<std::string> Search(IndexContext& ctx, const std::string& query, const SearchOptions& options)
 {
     std::vector<SearchHit> results;
     CollectSearchResults(ctx, query, options, results);
@@ -829,8 +829,13 @@ static void Search(IndexContext& ctx, const std::string& query, const SearchOpti
 
     if (results.empty()) {
         std::cout << "(no results)\n";
-        return;
+        return {};
     }
+
+    std::vector<std::string> resultPaths;
+    resultPaths.reserve(results.size());
+    for (const auto& hit : results)
+        resultPaths.push_back(hit.context->GetDocPath(hit.result.doc_id));
 
     constexpr size_t PAGE_SIZE_RESULTS = 20;
     std::cout << results.size() << " result(s)\n";
@@ -843,9 +848,12 @@ static void Search(IndexContext& ctx, const std::string& query, const SearchOpti
 
         for (size_t i = offset; i < end; ++i) {
             const auto& hit = results[i];
-            const std::string path = hit.context->GetDocPath(hit.result.doc_id);
-            std::cout << SourceMaskText(ReaderDocumentIDSourceMask(hit.result.doc_id)) << " "
-                      << (path.empty() ? "[unknown]" : path) << "\n";
+            std::ostringstream score;
+            score << std::fixed << std::setprecision(2)
+                << std::setw(5) << std::setfill('0') << std::max(0.0f, hit.result.score);
+            std::cout << (i + 1) << " " << score.str() << " "
+                    << SourceMaskText(ReaderDocumentIDSourceMask(hit.result.doc_id)) << " "
+                    << (resultPaths[i].empty() ? "[unknown]" : resultPaths[i]) << "\n";
         }
 
         if (end < results.size()) {
@@ -856,6 +864,8 @@ static void Search(IndexContext& ctx, const std::string& query, const SearchOpti
                 break;
         }
     }
+
+    return resultPaths;
 }
 
 static void WarmVectorGraph(IndexContext& ctx)
@@ -894,7 +904,53 @@ static void PrintInteractiveHelp()
         << "  /s                         Save pending additions as delta and publish it\n"
         << "  /m                         Merge delta into the main index and reload\n"
         << "Queries:\n"
+        << "  @N                         Page through result N from the latest search\n"
         << "  anything else              Search current base + delta\n";
+}
+
+static bool ParseResultReference(const std::string& line, size_t& resultNumber)
+{
+    if (line.size() < 2 || line[0] != '@')
+        return false;
+
+    char* end = nullptr;
+    const unsigned long long parsed = std::strtoull(line.c_str() + 1, &end, 10);
+    if (!end || *end != '\0' || parsed == 0)
+        return false;
+
+    resultNumber = static_cast<size_t>(parsed);
+    return static_cast<unsigned long long>(resultNumber) == parsed;
+}
+
+static void PageFile(const std::string& path)
+{
+#ifdef _WIN32
+    std::ifstream input(Utf8ToWide(path));
+#else
+    std::ifstream input(path);
+#endif
+    if (!input) {
+        std::cout << "unable to read: " << path << "\n";
+        return;
+    }
+
+    constexpr size_t PAGE_LINES = 20;
+    std::string line;
+    size_t linesOnPage = 0;
+    while (std::getline(input, line)) {
+        std::cout << line << "\n";
+        if (++linesOnPage < PAGE_LINES || input.peek() == std::char_traits<char>::eof())
+            continue;
+
+        std::cout << "-- More -- (press any key, q to quit)" << std::flush;
+        const char ch = ReadSingleKey();
+        std::cout << "\r                                      \r" << std::flush;
+        if (ch == 'q' || ch == 'Q') {
+            std::cout << "\n";
+            return;
+        }
+        linesOnPage = 0;
+    }
 }
 
 static uint64_t NextInteractiveDocId(IndexContext& ctx)
@@ -1096,6 +1152,7 @@ static int RunInteractiveSearch(const std::string& idxPath, const SearchOptions&
     std::cout << "Type a query, or /h for commands.\n";
 
     std::string line;
+    std::vector<std::string> lastResultPaths;
     while (true) {
         std::cout << "> ";
         std::cout.flush();
@@ -1111,7 +1168,22 @@ static int RunInteractiveSearch(const std::string& idxPath, const SearchOptions&
                 break;
             continue;
         }
-        Search(ctx, line, options);
+
+        if (line[0] == '@') {
+            size_t resultNumber = 0;
+            if (!ParseResultReference(line, resultNumber)) {
+                std::cout << "usage: @N (for example, @1)\n";
+            } else if (resultNumber > lastResultPaths.size()) {
+                std::cout << "result " << resultNumber << " is not available; run a search first\n";
+            } else if (lastResultPaths[resultNumber - 1].empty()) {
+                std::cout << "result " << resultNumber << " has no file path\n";
+            } else {
+                PageFile(lastResultPaths[resultNumber - 1]);
+            }
+            continue;
+        }
+
+        lastResultPaths = Search(ctx, line, options);
     }
 
     return 0;
