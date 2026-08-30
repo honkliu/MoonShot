@@ -810,17 +810,23 @@ void TestIndexContextMergeContinuationPostings()
 
     constexpr uint32_t BASE_DOCS = 760;
     constexpr uint32_t DELTA_DOCS = 760;
+    const auto longMergeTokens = g_tokenizer.Tokenize("longmerge");
+    const auto afterTokens = g_tokenizer.Tokenize("zzzafter");
+    if (longMergeTokens.size() != 1 || afterTokens.size() != 1)
+        throw std::runtime_error("continuation test terms must each tokenize to one term");
+    const std::string longMergeKey = longMergeTokens[0] + "T";
+    const std::string afterKey = afterTokens[0] + "T";
     const auto vector = BuildHashedEmbedding(g_tokenizer.Tokenize("longmerge zzzafter"));
 
     {
         IndexContext base;
         auto writer = base.GetWriter();
         for (uint32_t docId = 0; docId < BASE_DOCS; ++docId) {
-            writer->Write(g_tokenizer.Tokenize("longmerge"), docId, "Title");
+            writer->Write(longMergeTokens, docId, "Title");
             writer->SetDocImportance(docId, 0.1f);
             writer->SetDocVector(docId, vector);
         }
-        writer->Write(g_tokenizer.Tokenize("zzzafter"), BASE_DOCS, "Title");
+        writer->Write(afterTokens, BASE_DOCS, "Title");
         writer->SetDocImportance(BASE_DOCS, 0.1f);
         writer->SetDocVector(BASE_DOCS, vector);
         if (!base.SaveIndex(INDEX_FILE))
@@ -833,7 +839,7 @@ void TestIndexContextMergeContinuationPostings()
         auto writer = delta.GetWriter();
         for (uint32_t docId = 0; docId < DELTA_DOCS; ++docId) {
             const uint64_t finalDocId = BASE_DOCS + 1 + docId;
-            writer->Write(g_tokenizer.Tokenize("longmerge"), finalDocId, "Title");
+            writer->Write(longMergeTokens, finalDocId, "Title");
             writer->SetDocImportance(finalDocId, 0.1f);
             writer->SetDocVector(finalDocId, vector);
         }
@@ -854,7 +860,7 @@ void TestIndexContextMergeContinuationPostings()
         assert(merged.DocumentCount() == static_cast<uint64_t>(BASE_DOCS + 1 + DELTA_DOCS));
         std::cout << "  continuation index loaded for readback\n";
 
-        auto reader = merged.GetStreamReader("longmergeT");
+        auto reader = merged.GetStreamReader(longMergeKey.c_str());
         uint32_t seen = 0;
         while (!reader->IsEnd()) {
             if (seen < BASE_DOCS)
@@ -866,7 +872,7 @@ void TestIndexContextMergeContinuationPostings()
         }
         assert(seen == BASE_DOCS + DELTA_DOCS);
 
-        auto afterReader = merged.GetStreamReader("zzzafterT");
+        auto afterReader = merged.GetStreamReader(afterKey.c_str());
         assert(!afterReader->IsEnd());
         assert(afterReader->GetDocumentID() == BASE_DOCS);
         afterReader->GoNext();
