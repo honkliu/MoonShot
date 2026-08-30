@@ -2,6 +2,7 @@
 #![allow(non_snake_case, non_upper_case_globals)]
 
 use rustblade::embeddings::build_hashed_embedding;
+use rustblade::index_reader::ReaderDocumentIDValue;
 use rustblade::index_writer::IndexWriter;
 use rustblade::tokenizer::Tokenizer;
 use rustblade::{IndexContext, SmartTokenizer};
@@ -27,7 +28,7 @@ fn sync_results(ctx: &mut IndexContext, query: &str) -> Vec<u64> {
     executor
         .Execute(reader.as_mut(), 10)
         .into_iter()
-        .map(|result| result.doc_id)
+        .map(|result| ReaderDocumentIDValue(result.doc_id))
         .collect()
 }
 
@@ -59,7 +60,7 @@ fn enqueue_matches_sync_search() {
         .Enqueue("fox lazy", Vec::new(), "AUTB", 10)
         .Wait()
         .into_iter()
-        .map(|result| result.doc_id)
+        .map(|result| ReaderDocumentIDValue(result.doc_id))
         .collect();
     assert!(!expected.is_empty());
     assert_eq!(actual, expected);
@@ -102,7 +103,7 @@ fn enqueue_handles_many_tasks() {
         let docs: Vec<u64> = task
             .Wait()
             .into_iter()
-            .map(|result| result.doc_id)
+            .map(|result| ReaderDocumentIDValue(result.doc_id))
             .collect();
         assert!(!docs.is_empty());
         if i % 2 == 0 {

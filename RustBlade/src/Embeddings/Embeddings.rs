@@ -10,16 +10,12 @@ use serde::{Deserialize, Serialize};
 use crate::block_table::{DOC_REC_SIZE, DOC_VECTOR_DIM, DOC_VECTOR_OFFSET};
 use crate::posting_store::StableHashMap;
 
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 pub enum VectorMetric {
+    #[default]
     Cosine,
     DotProduct,
     L2,
-}
-impl Default for VectorMetric {
-    fn default() -> Self {
-        Self::Cosine
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]

@@ -96,19 +96,21 @@ impl<'a> IndexSearchExecutor<'a> {
                 snippet: String::new(),
             };
 
-            if limit.is_none() {
+            if let Some(limit) = limit {
+                if heap.len() < limit {
+                    heap.push(Reverse(HeapEntry {
+                        score: ScoreKey(score),
+                        result,
+                    }));
+                } else if score > heap.peek().unwrap().0.result.score {
+                    heap.pop();
+                    heap.push(Reverse(HeapEntry {
+                        score: ScoreKey(score),
+                        result,
+                    }));
+                }
+            } else {
                 results.push(result);
-            } else if heap.len() < limit.unwrap() {
-                heap.push(Reverse(HeapEntry {
-                    score: ScoreKey(score),
-                    result,
-                }));
-            } else if score > heap.peek().unwrap().0.result.score {
-                heap.pop();
-                heap.push(Reverse(HeapEntry {
-                    score: ScoreKey(score),
-                    result,
-                }));
             }
 
             reader.GoNext();
@@ -152,19 +154,21 @@ impl<'a> IndexSearchExecutor<'a> {
                 snippet: String::new(),
             };
 
-            if limit.is_none() {
+            if let Some(limit) = limit {
+                if heap.len() < limit {
+                    heap.push(Reverse(HeapEntry {
+                        score: ScoreKey(score),
+                        result,
+                    }));
+                } else if score > heap.peek().unwrap().0.result.score {
+                    heap.pop();
+                    heap.push(Reverse(HeapEntry {
+                        score: ScoreKey(score),
+                        result,
+                    }));
+                }
+            } else {
                 results.push(result);
-            } else if heap.len() < limit.unwrap() {
-                heap.push(Reverse(HeapEntry {
-                    score: ScoreKey(score),
-                    result,
-                }));
-            } else if score > heap.peek().unwrap().0.result.score {
-                heap.pop();
-                heap.push(Reverse(HeapEntry {
-                    score: ScoreKey(score),
-                    result,
-                }));
             }
 
             visited += 1;
@@ -244,9 +248,8 @@ fn VectorScoreFeature(
     let mut dot = 0.0f32;
     let mut nq = 0.0f32;
     let mut nd = 0.0f32;
-    for i in 0..DOC_VECTOR_DIM {
-        let q = query[i];
-        let d = entry.DDE_VectorData[i] as f32 / 128.0;
+    for (&q, &encoded) in query.iter().zip(&entry.DDE_VectorData) {
+        let d = encoded as f32 / 128.0;
         dot += q * d;
         nq += q * q;
         nd += d * d;

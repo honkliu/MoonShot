@@ -9,8 +9,9 @@ use crate::block_table::{
     IndexBlock, IndexBlockContinuationHeader, IndexFileHeader, LeafTermBlock, LeafTermEntry,
     TermMphfHeader, DOC_PATH_FILENAME_MAX, DOC_PATH_MAX, DOC_PATH_OFFSET, DOC_PATH_PREFIX_ID_BYTES,
     DOC_PATH_PREFIX_INVALID, DOC_REC_SIZE, DOC_VECTOR_DIM, DOC_VECTOR_OFFSET, HEAD_TERM_KEY_MAX,
-    INDEX_BLOCK_CONTINUATION_HEADER_SIZE, INDEX_FILE_HEADER_SIZE, LEAF_TERM_DATA_OFFSET,
-    LEAF_TERM_DIRECTORY_COUNT, PAGE_SIZE, PATH_PREFIX_SIDECAR_BYTES, TERM_MPHF_HEADER_SIZE,
+    INDEX_BLOCK_CACHE_BYTES, INDEX_BLOCK_CONTINUATION_HEADER_SIZE, INDEX_FILE_HEADER_SIZE,
+    LEAF_TERM_CACHE_BYTES, LEAF_TERM_DATA_OFFSET, LEAF_TERM_DIRECTORY_COUNT, PAGE_SIZE,
+    PATH_PREFIX_SIDECAR_BYTES, TERM_MPHF_HEADER_SIZE,
 };
 use crate::embeddings::{FreshDiskAnnVectorIndex, VectorMetric, VectorSearchResult};
 use crate::error::{Result, RustBladeError};
@@ -339,6 +340,7 @@ impl SearchExecutionContext for SearchRuntime {
     }
 }
 
+#[derive(Default)]
 pub struct SearchTask {
     receiver: Option<mpsc::Receiver<Vec<SearchResult>>>,
 }
@@ -361,12 +363,6 @@ impl SearchTask {
 
     pub fn Valid(&self) -> bool {
         self.receiver.is_some()
-    }
-}
-
-impl Default for SearchTask {
-    fn default() -> Self {
-        Self { receiver: None }
     }
 }
 
@@ -403,6 +399,15 @@ pub struct IndexContext {
     m_SearchWorkers: Vec<JoinHandle<()>>,
     m_StreamLengthStats: Mutex<StreamLengthStats>,
 }
+
+type BuiltIndexData = (
+    IndexFileHeader,
+    IndexBlockTable,
+    FreshDiskAnnVectorIndex,
+    Arc<[u8]>,
+    Vec<u8>,
+    Vec<String>,
+);
 
 impl SearchExecutionContext for IndexContext {
     fn GetDocDataEntry(&self, docId: u64) -> Option<&DocDataEntry> {
@@ -1337,15 +1342,13 @@ impl IndexContext {
         let leafOffset = headOffset + headEntryCount as usize * 32;
         let docDataOffset = leafOffset + headEntryCount as usize * PAGE_SIZE;
         let indexOffset = docDataOffset + mergedDocData.len();
-        let baseTotalDocLength =
-            (self.m_IndexFileHeader.IFH_AvgDocLength as f64 * baseDocCount as f64) as u64;
-        let deltaTotalDocLength =
-            (delta.m_IndexFileHeader.IFH_AvgDocLength as f64 * deltaDocCount as f64) as u64;
-        let totalDocLength = baseTotalDocLength.wrapping_add(deltaTotalDocLength);
         let avgDocLength = if mergedDocs == 0 {
             1.0
         } else {
-            totalDocLength as f32 / mergedDocs as f32
+            ((self.m_IndexFileHeader.IFH_AvgDocLength as f64 * baseDocCount as f64)
+                + (delta.m_IndexFileHeader.IFH_AvgDocLength as f64 * deltaDocCount as f64))
+                as f32
+                / mergedDocs as f32
         };
 
         let mut mergedLeafBlocks = Vec::with_capacity(headEntryCount as usize);
@@ -1454,17 +1457,7 @@ impl IndexContext {
         *self.m_StreamLengthStats.lock().unwrap() = StreamLengthStats::default();
     }
 
-    fn BuildIndexData(
-        store: &PostingStore,
-        buildVectorIndex: bool,
-    ) -> (
-        IndexFileHeader,
-        IndexBlockTable,
-        FreshDiskAnnVectorIndex,
-        Arc<[u8]>,
-        Vec<u8>,
-        Vec<String>,
-    ) {
+    fn BuildIndexData(store: &PostingStore, buildVectorIndex: bool) -> BuiltIndexData {
         let blocks = IndexSerializer::BuildBlocks(store);
         let (docData, pathPrefixSidecar, pathPrefixes) = Self::EncodeDocData(store);
         let firstDocId = Self::StoreFirstDocId(store);
@@ -1976,13 +1969,16 @@ impl IndexContext {
     pub fn LoadVectorTables(&mut self, docdata: &[u8], pathPrefixSidecar: &[u8]) -> Result<()> {
         self.StopSearchWorkers();
         self.m_DeltaContext = None;
-        if docdata.len() % DOC_REC_SIZE != 0 || pathPrefixSidecar.len() != PATH_PREFIX_SIDECAR_BYTES
+        if !docdata.len().is_multiple_of(DOC_REC_SIZE)
+            || pathPrefixSidecar.len() != PATH_PREFIX_SIDECAR_BYTES
         {
             return Err(RustBladeError::InvalidFormat);
         }
         let pathPrefixes = IndexSerializer::DecodePathPrefixSidecar(pathPrefixSidecar)?;
-        let mut header = IndexFileHeader::default();
-        header.IFH_NumDocuments = (docdata.len() / DOC_REC_SIZE) as u64;
+        let header = IndexFileHeader {
+            IFH_NumDocuments: (docdata.len() / DOC_REC_SIZE) as u64,
+            ..IndexFileHeader::default()
+        };
 
         let docdata: Arc<[u8]> = Arc::from(docdata);
         let mut vector_index = FreshDiskAnnVectorIndex::new(32, 200);
@@ -2028,7 +2024,7 @@ impl IndexContext {
             return;
         }
 
-        let mut delta = IndexContext::with_path_and_load_delta(Some(deltaPath), false);
+        let delta = IndexContext::with_path_and_load_delta(Some(deltaPath), false);
         if delta.m_LoadedFromDisk && delta.DocumentCount() > 0 {
             self.m_DeltaContext = Some(Box::new(delta));
         }
@@ -2568,15 +2564,13 @@ impl<'a> LeafTermBlockView<'a> {
         let entry = self.Current()?;
         let first =
             blockTable.GetBlock::<IndexBlock>(BlockKind::Index, entry.LTE_IndexBlockID, true)?;
-        let firstSlot = first.Slot();
         let begin = entry.LTE_IndexOffset as usize;
         let end = begin.checked_add(entry.LTE_IndexLength as usize)?;
         if end > PAGE_SIZE {
-            blockTable.ReleaseBlock(BlockKind::Index, firstSlot, true);
             return None;
         }
         let mut bytes = first.IB_Data[begin..end].to_vec();
-        blockTable.ReleaseBlock(BlockKind::Index, firstSlot, true);
+        drop(first);
 
         for offset in 0..entry.LTE_ContinuationBlockCount as u32 {
             let block = blockTable.GetBlock::<IndexBlock>(
@@ -2584,7 +2578,6 @@ impl<'a> LeafTermBlockView<'a> {
                 entry.LTE_IndexBlockID + 1 + offset,
                 true,
             )?;
-            let slot = block.Slot();
             let result = (|| {
                 let header = IndexBlockContinuationHeader::from_bytes(&block.IB_Data)?;
                 let dataEnd = INDEX_BLOCK_CONTINUATION_HEADER_SIZE
@@ -2594,7 +2587,6 @@ impl<'a> LeafTermBlockView<'a> {
                 }
                 Some(block.IB_Data[INDEX_BLOCK_CONTINUATION_HEADER_SIZE..dataEnd].to_vec())
             })();
-            blockTable.ReleaseBlock(BlockKind::Index, slot, true);
             bytes.extend_from_slice(&result?);
         }
         Some(bytes)
@@ -2691,11 +2683,7 @@ impl<'a> LeafTermBlockView<'a> {
                 return;
             }
 
-            if let Some(block) = self.m_CurrentLeaf.take() {
-                self.m_BlockTable
-                    .unwrap()
-                    .ReleaseBlock(BlockKind::LeafTerm, block.Slot(), true);
-            }
+            drop(self.m_CurrentLeaf.take());
             self.m_LeafBlockID += 1;
             self.m_EntryIndex = 0;
         }
@@ -2704,9 +2692,7 @@ impl<'a> LeafTermBlockView<'a> {
 
 impl Drop for LeafTermBlockView<'_> {
     fn drop(&mut self) {
-        if let (Some(blockTable), Some(block)) = (self.m_BlockTable, self.m_CurrentLeaf.take()) {
-            blockTable.ReleaseBlock(BlockKind::LeafTerm, block.Slot(), true);
-        }
+        drop(self.m_CurrentLeaf.take());
     }
 }
 

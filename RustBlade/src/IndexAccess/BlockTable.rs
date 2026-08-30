@@ -305,6 +305,18 @@ impl Default for TermMphfHeader {
 }
 
 impl TermMphfHeader {
+    pub fn zeroed() -> Self {
+        Self {
+            TMH_Magic: 0,
+            TMH_TermCount: 0,
+            TMH_BucketCount: 0,
+            TMH_SlotCount: 0,
+            TMH_BucketSeed: 0,
+            TMH_SlotSeed: 0,
+            TMH_FingerprintSeed: 0,
+        }
+    }
+
     pub fn to_bytes(&self) -> [u8; TERM_MPHF_HEADER_SIZE] {
         let mut out = [0u8; TERM_MPHF_HEADER_SIZE];
         out[0..8].copy_from_slice(&self.TMH_Magic.to_le_bytes());
@@ -673,7 +685,7 @@ impl Drop for WriterSpinLock<'_> {
 }
 
 pub fn DocDataEncodeScore(value: f32) -> u16 {
-    if !(value > 0.0) {
+    if value.is_nan() || value <= 0.0 {
         0
     } else if value >= 1.0 {
         u16::MAX
@@ -715,7 +727,6 @@ impl Default for IndexSlotEntry {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum BlockRequestType {
     Get,
-    Release,
 }
 
 pub struct BlockRequest {
@@ -742,6 +753,8 @@ impl BlockRequest {
             complete = cv.wait(complete).unwrap();
         }
     }
+
+    #[cfg(not(target_arch = "wasm32"))]
     fn Complete(&self) {
         let (lock, cv) = &self.Completion;
         *lock.lock().unwrap() = true;
@@ -779,6 +792,7 @@ pub struct BlockCachePool {
     BCP_StateCv: Condvar,
     BCP_Requests: Mutex<VecDeque<Arc<BlockRequest>>>,
     BCP_RequestCv: Condvar,
+    #[cfg(not(target_arch = "wasm32"))]
     BCP_ExitThread: AtomicBool,
     #[cfg(not(target_arch = "wasm32"))]
     BCP_Thread: Mutex<Option<JoinHandle<()>>>,
@@ -790,6 +804,7 @@ impl BlockCachePool {
             BCP_StateCv: Condvar::new(),
             BCP_Requests: Mutex::new(VecDeque::new()),
             BCP_RequestCv: Condvar::new(),
+            #[cfg(not(target_arch = "wasm32"))]
             BCP_ExitThread: AtomicBool::new(false),
             #[cfg(not(target_arch = "wasm32"))]
             BCP_Thread: Mutex::new(None),
@@ -812,9 +827,24 @@ pub struct BlockHandle<T> {
     page: NonNull<T>,
     slot: u32,
     kind: BlockKind,
+    pool: Arc<BlockCachePool>,
+    counters: Arc<BlockAccessCounters>,
+    release_mode: BlockReleaseMode,
     _marker: PhantomData<T>,
 }
+
+#[derive(Clone, Copy)]
+enum BlockReleaseMode {
+    Sequential,
+    Direct,
+    Worker,
+}
+
+// SAFETY: A handle owns a cache pin, so the page cannot be evicted until Drop.
+// Cache mutation is serialized by BCP_State; callers only receive shared pages.
 unsafe impl<T: Send> Send for BlockHandle<T> {}
+// SAFETY: The instantiated page types are immutable repr(C) blocks. Their
+// pinned backing allocation remains alive for the handle's lifetime.
 unsafe impl<T: Sync> Sync for BlockHandle<T> {}
 impl<T> BlockHandle<T> {
     pub fn Slot(&self) -> u32 {
@@ -827,7 +857,36 @@ impl<T> BlockHandle<T> {
 impl<T> Deref for BlockHandle<T> {
     type Target = T;
     fn deref(&self) -> &T {
+        // SAFETY: constructors point at an initialized, page-aligned cache slot
+        // whose reference count is held by this handle.
         unsafe { self.page.as_ref() }
+    }
+}
+
+impl<T> Drop for BlockHandle<T> {
+    fn drop(&mut self) {
+        match self.release_mode {
+            BlockReleaseMode::Sequential => {}
+            BlockReleaseMode::Direct => {
+                self.counters
+                    .m_DirectReleases
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            BlockReleaseMode::Worker => {
+                self.counters
+                    .m_WorkerReleases
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        if let Ok(mut state) = self.pool.BCP_State.lock() {
+            let slot_count = state.BCP_SlotCount;
+            if let Some(table) = state.BCP_SlotTable.as_mut() {
+                if self.slot < slot_count && table[self.slot as usize].Ref > 0 {
+                    table[self.slot as usize].Ref -= 1;
+                }
+            }
+        }
     }
 }
 
@@ -979,7 +1038,7 @@ impl IndexBlockTable {
         self.FindTermDataHeadLeaf(term)
     }
 
-    pub fn GetBlock<T>(
+    pub(crate) fn GetBlock<T>(
         &self,
         kind: BlockKind,
         blockSeq: u32,
@@ -999,7 +1058,14 @@ impl IndexBlockTable {
                 let slot = state.BCP_LogicTable.as_ref()?.as_slice()[blockSeq as usize];
                 if slot != u32::MAX && slot < state.BCP_SlotCount {
                     state.BCP_SlotTable.as_mut()?.as_mut_slice()[slot as usize].Ref += 1;
-                    return Self::MakeHandle(&state, kind, slot);
+                    return Self::MakeHandle(
+                        pool,
+                        &self.m_AccessCounters,
+                        &state,
+                        kind,
+                        slot,
+                        BlockReleaseMode::Sequential,
+                    );
                 }
             }
             if !Self::LoadSequentialWindow(&mut state, blockSeq) {
@@ -1007,7 +1073,14 @@ impl IndexBlockTable {
             }
             let slot = state.BCP_LogicTable.as_ref()?.as_slice()[blockSeq as usize];
             state.BCP_SlotTable.as_mut()?.as_mut_slice()[slot as usize].Ref += 1;
-            return Self::MakeHandle(&state, kind, slot);
+            return Self::MakeHandle(
+                pool,
+                &self.m_AccessCounters,
+                &state,
+                kind,
+                slot,
+                BlockReleaseMode::Sequential,
+            );
         }
 
         if self.m_DirectBlockAccess.load(Ordering::Relaxed) {
@@ -1016,7 +1089,13 @@ impl IndexBlockTable {
                 .fetch_add(1, Ordering::Relaxed);
             let request = BlockRequest::new(BlockRequestType::Get, blockSeq, u32::MAX);
             Self::ProcessGetBlockLocked(pool, &request, &self.m_AccessCounters);
-            return Self::RequestHandle(kind, &request);
+            return Self::RequestHandle(
+                pool,
+                &self.m_AccessCounters,
+                kind,
+                &request,
+                BlockReleaseMode::Direct,
+            );
         }
 
         if let Some(handle) = self.TryPinReadyOrWait::<T>(pool, kind, blockSeq) {
@@ -1028,35 +1107,13 @@ impl IndexBlockTable {
         let request = Arc::new(BlockRequest::new(BlockRequestType::Get, blockSeq, u32::MAX));
         Self::SubmitBlockRequest(pool, Arc::clone(&request));
         request.Wait();
-        Self::RequestHandle(kind, &request)
-    }
-
-    pub fn ReleaseBlock(&self, kind: BlockKind, slot: u32, sequential: bool) {
-        if slot == u32::MAX {
-            return;
-        }
-        let pool = self.Pool(kind);
-        if sequential {
-            if let Ok(mut state) = pool.BCP_State.lock() {
-                if let Some(table) = state.BCP_SlotTable.as_mut() {
-                    if slot < state.BCP_SlotCount && table[slot as usize].Ref > 0 {
-                        table[slot as usize].Ref -= 1;
-                    }
-                }
-            }
-            return;
-        }
-        if self.m_DirectBlockAccess.load(Ordering::Relaxed) {
-            self.m_AccessCounters
-                .m_DirectReleases
-                .fetch_add(1, Ordering::Relaxed);
-        } else {
-            self.m_AccessCounters
-                .m_WorkerReleases
-                .fetch_add(1, Ordering::Relaxed);
-        }
-        let request = BlockRequest::new(BlockRequestType::Release, 0, slot);
-        Self::ProcessReleaseBlockLocked(pool, &request);
+        Self::RequestHandle(
+            pool,
+            &self.m_AccessCounters,
+            kind,
+            &request,
+            BlockReleaseMode::Worker,
+        )
     }
 
     pub fn SetBlockMemory(
@@ -1112,12 +1169,40 @@ impl IndexBlockTable {
             IndexSlotEntry::default();
             state.BCP_SlotCount as usize
         ]));
+
+        // C++ eagerly fills the resident cache window immediately after Init.
+        // Rust owns the cache allocation inside this method, so perform the
+        // equivalent read here before publishing any slot as ready.
         if state.BCP_SlotCount > 0 {
+            let byte_count = state.BCP_SlotCount as usize * PAGE_SIZE;
+            let file = state.BCP_File.as_ref().map(Arc::clone).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "file-backed block cache requires an index path",
+                )
+            })?;
+            let pages = state
+                .BCP_Pages
+                .as_mut()
+                .expect("cache pages were allocated");
+            if !file.ReadBlock(
+                0,
+                &mut pages.as_mut_slice()[..byte_count],
+                byte_count,
+                baseOffset,
+            ) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "initial index cache read failed",
+                ));
+            }
+
             for block in 0..state.BCP_SlotCount {
                 state.BCP_LogicTable.as_mut().unwrap()[block as usize] = block;
                 state.BCP_SlotTable.as_mut().unwrap()[block as usize].BlockID = block;
             }
         }
+
         drop(state);
         self.StartBlockThread(pool);
         Ok(())
@@ -1176,10 +1261,15 @@ impl IndexBlockTable {
     }
 
     fn MakeHandle<T>(
+        pool: &Arc<BlockCachePool>,
+        counters: &Arc<BlockAccessCounters>,
         state: &BlockCacheState,
         kind: BlockKind,
         slot: u32,
+        release_mode: BlockReleaseMode,
     ) -> Option<BlockHandle<T>> {
+        // SAFETY: PinnedMemory is page-aligned, GetBlock validates that T is
+        // exactly one page, and this slot has already acquired a cache pin.
         let address = unsafe {
             state
                 .BCP_Pages
@@ -1192,16 +1282,28 @@ impl IndexBlockTable {
             page: NonNull::new(address)?,
             slot,
             kind,
+            pool: Arc::clone(pool),
+            counters: Arc::clone(counters),
+            release_mode,
             _marker: PhantomData,
         })
     }
 
-    fn RequestHandle<T>(kind: BlockKind, request: &BlockRequest) -> Option<BlockHandle<T>> {
+    fn RequestHandle<T>(
+        pool: &Arc<BlockCachePool>,
+        counters: &Arc<BlockAccessCounters>,
+        kind: BlockKind,
+        request: &BlockRequest,
+        release_mode: BlockReleaseMode,
+    ) -> Option<BlockHandle<T>> {
         let address = request.Address.load(Ordering::Acquire) as *mut T;
         Some(BlockHandle {
             page: NonNull::new(address)?,
             slot: request.Slot.load(Ordering::Acquire),
             kind,
+            pool: Arc::clone(pool),
+            counters: Arc::clone(counters),
+            release_mode,
             _marker: PhantomData,
         })
     }
@@ -1304,8 +1406,7 @@ impl IndexBlockTable {
         }
         let blockID = entries[pos - 1].HTE_LeafTermBlockID;
         let block = self.GetBlock::<LeafTermBlock>(BlockKind::LeafTerm, blockID, false)?;
-        let slot = block.Slot();
-        let result = (|| {
+        (|| {
             let mut left = 0usize;
             let mut right = block.entry_count();
             while left < right {
@@ -1330,9 +1431,7 @@ impl IndexBlockTable {
                 doc_freq: entry.LTE_DocFreq,
                 continuation_block_count: entry.LTE_ContinuationBlockCount as u32,
             })
-        })();
-        self.ReleaseBlock(BlockKind::LeafTerm, slot, false);
-        result
+        })()
     }
 
     fn HasTermMphf(&self) -> bool {
@@ -1361,11 +1460,12 @@ impl IndexBlockTable {
     }
 
     fn StartBlockThread(&self, pool: &Arc<BlockCachePool>) {
-        if self.m_DirectBlockAccess.load(Ordering::Relaxed) {
-            return;
-        }
         #[cfg(not(target_arch = "wasm32"))]
         {
+            if self.m_DirectBlockAccess.load(Ordering::Relaxed) {
+                return;
+            }
+
             let ready = pool
                 .BCP_State
                 .lock()
@@ -1382,9 +1482,15 @@ impl IndexBlockTable {
                 Self::BlockThreadMain(target, counters)
             }));
         }
+
+        #[cfg(target_arch = "wasm32")]
+        let _ = (self, pool);
     }
 
     fn ExitBlockThread(pool: &Arc<BlockCachePool>) {
+        #[cfg(target_arch = "wasm32")]
+        let _ = pool;
+
         #[cfg(not(target_arch = "wasm32"))]
         {
             let handle = pool.BCP_Thread.lock().unwrap().take();
@@ -1454,6 +1560,7 @@ impl IndexBlockTable {
         state.BCP_LogicTable.as_ref().unwrap()[startBlock as usize] != u32::MAX
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     fn BlockThreadMain(pool: Arc<BlockCachePool>, counters: Arc<BlockAccessCounters>) {
         loop {
             let request = {
@@ -1471,11 +1578,7 @@ impl IndexBlockTable {
             let Some(request) = request else {
                 continue;
             };
-            if request.Type == BlockRequestType::Get {
-                Self::ProcessGetBlockLocked(&pool, &request, &counters);
-            } else {
-                Self::ProcessReleaseBlockLocked(&pool, &request);
-            }
+            Self::ProcessGetBlockLocked(&pool, &request, &counters);
             request.Complete();
         }
     }
@@ -1513,7 +1616,14 @@ impl IndexBlockTable {
                     .m_CacheHits
                     .fetch_add(1, Ordering::Relaxed);
                 state.BCP_SlotTable.as_mut()?.as_mut_slice()[slot as usize].Ref += 1;
-                return Self::MakeHandle(&state, kind, slot);
+                return Self::MakeHandle(
+                    pool,
+                    &self.m_AccessCounters,
+                    &state,
+                    kind,
+                    slot,
+                    BlockReleaseMode::Worker,
+                );
             }
             state = pool.BCP_StateCv.wait(state).ok()?;
         }
@@ -1639,22 +1749,6 @@ impl IndexBlockTable {
             }
         }
         pool.BCP_StateCv.notify_all();
-    }
-
-    fn ProcessReleaseBlockLocked(pool: &Arc<BlockCachePool>, request: &BlockRequest) {
-        if let Ok(mut state) = pool.BCP_State.lock() {
-            Self::ProcessReleaseBlock(&mut state, request);
-        }
-    }
-
-    fn ProcessReleaseBlock(state: &mut BlockCacheState, request: &BlockRequest) {
-        let slot = request.Slot.load(Ordering::Acquire);
-        let slotCount = state.BCP_SlotCount;
-        if let Some(table) = state.BCP_SlotTable.as_mut() {
-            if slot != u32::MAX && slot < slotCount && table[slot as usize].Ref > 0 {
-                table[slot as usize].Ref -= 1;
-            }
-        }
     }
 }
 

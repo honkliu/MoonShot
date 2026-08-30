@@ -6,7 +6,7 @@ Date: 2026-08-29
 
 The current C++ implementation is the source of truth. This audit compared every listed C++ source file against its RustBlade implementation, including types, fields, constants, defaults, binary offsets, control flow, scoring formulas, reader/cache state machines, serialization, merge behavior, vector search, and public API naming.
 
-Validation in this pass was static only. Per the session constraint, no Cargo/CMake build or test was run, and generated WASM package files were not modified.
+The source audit was followed by `rustfmt`, strict Clippy, an all-target Cargo build, all Rust tests, and a host-side check of the optional WASM feature. Generated WASM package files were not modified.
 
 ## File-by-file matrix
 
@@ -23,7 +23,7 @@ Validation in this pass was static only. Per the session constraint, no Cargo/CM
 | Utils/Constants.h | RustBlade/src/Utils/Constants.rs | Aligned constants |
 | Utils/FileAccess.h | RustBlade/src/Utils/FileAccess.rs | Aligned API, cursor operations, positioned block reads, writes, and statistics surface |
 | Utils/FileAccess.cpp | RustBlade/src/Utils/FileAccess.rs | Aligned active read/write behavior; platform implementation remains language/OS-specific |
-| IndexAccess/AdvancedIndexReader.h | RustBlade/src/IndexAccess/AdvancedIndexReader.rs | Aligned fields, lifecycle, explicit block release, stream/span weights, and reader API |
+| IndexAccess/AdvancedIndexReader.h | RustBlade/src/IndexAccess/AdvancedIndexReader.rs | Aligned fields, lifecycle, RAII cache-pin release, stream/span weights, and reader API |
 | IndexAccess/AdvancedIndexReader.cpp | RustBlade/src/IndexAccess/AdvancedIndexReader.rs | Aligned lookup, continuation traversal, BM25 constants/formula, GoNext, and GoUntil |
 | IndexAccess/AdvancedIndexWriter.h | RustBlade/src/IndexAccess/AdvancedIndexWriter.rs | Aligned writer type/API |
 | IndexAccess/AdvancedIndexWriter.cpp | RustBlade/src/IndexAccess/AdvancedIndexWriter.rs | Aligned stream indexing, TF, bigrams, paths, vectors, and document statistics |
@@ -69,7 +69,7 @@ These do not change legal-input search semantics and are not translated into C++
 
 - Rust bounds checks for malformed VarByte and continuation payloads.
 - Strict v20 section validation for damaged files.
-- Rust ownership via Arc, Vec, Mutex, RwLock, and explicit mutation barriers.
+- Rust ownership via Arc, Vec, Mutex, RwLock, RAII cache pins, and explicit mutation barriers.
 - Locked sequential cache state instead of reproducing a potential C++ data race.
 
 ## Remaining limits to an absolute guarantee
@@ -84,8 +84,17 @@ The following cannot be guaranteed solely by source translation:
 6. Internal zero-norm ANN cosine can produce NaN in both implementations; NaN heap/sort behavior is not cross-language total ordering.
 7. Non-queued BEIR evaluation with `-query-threads` greater than one remains unsupported because RustBlade does not expose independently shareable reader contexts; queued concurrent evaluation is supported.
 8. Portable Rust CLI paging waits for Enter rather than using the C++ platform-specific single-key terminal APIs.
-9. Compilation, linking, round-trip index tests, differential search tests, WASM execution, and browser behavior remain unverified because this session explicitly prohibited builds and tests.
+9. Host-side WASM-feature compilation is verified, but an actual `wasm32` build, browser execution, and browser differential testing remain unverified.
 
-## Static completion result
+## Validation result
 
-The core RustBlade library has one implementation per C++ component, C++-matching physical filenames and canonical module names, no standalone Rust ranking helper, no disabled legacy/parity modules, no standalone BM25 scorer, no old HNSW alias, and no duplicate root implementation files. Editor diagnostics report no errors.
+The core RustBlade library has one implementation per C++ component, C++-matching physical filenames and canonical module names, no standalone Rust ranking helper, no disabled legacy/parity modules, no standalone BM25 scorer, no old HNSW alias, and no duplicate root implementation files.
+
+- `cargo fmt --all`: clean.
+- `cargo clippy --all-targets -- -D warnings`: clean.
+- `cargo build --all-targets`: passed.
+- `cargo test --all-targets`: 13 tests passed, 0 failed.
+- `cargo check --all-targets --features wasm`: passed on the Windows host target.
+- Independent final source review: PASS.
+
+Cargo occasionally reports that Windows denied finalizing an incremental-compilation cache directory. This does not affect compilation or test results, but prevents reuse of that incremental session.

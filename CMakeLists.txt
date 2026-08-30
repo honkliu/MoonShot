@@ -47,7 +47,7 @@ if(MSVC)
     # Prevent windows.h from defining min/max macros.
     # Silence MSVC deprecation warnings on C standard functions.
     add_compile_definitions(NOMINMAX _CRT_SECURE_NO_WARNINGS)
-    add_compile_options(/W3 /wd4996)
+    add_compile_options(/W3 /FS /wd4996)
 elseif(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     add_compile_options(-Wall -Wextra -Wno-unused-parameter)
 endif()

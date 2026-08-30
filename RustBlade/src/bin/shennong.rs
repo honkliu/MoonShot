@@ -346,7 +346,7 @@ impl SearchService {
 fn http_response(status: u16, status_text: &str, body: &str) -> String {
     format!(
         "HTTP/1.1 {} {}\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type\r\nConnection: close\r\n\r\n{}",
-        status, status_text, body.as_bytes().len(), body)
+        status, status_text, body.len(), body)
 }
 
 fn handle_request(service: &SearchService, request: &str) -> String {

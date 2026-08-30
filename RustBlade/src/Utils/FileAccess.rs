@@ -35,7 +35,7 @@ extern "C" {
 pub(crate) fn browser_read_range(offset: u64, destination: &mut [u8]) -> bool {
     #[cfg(feature = "wasm")]
     {
-        return moonshot_browser_read(offset as f64, destination);
+        moonshot_browser_read(offset as f64, destination)
     }
     #[cfg(not(feature = "wasm"))]
     {
@@ -51,6 +51,7 @@ pub struct FileAccess {
     // logical-position reads instead of reproducing the C++ data race.
     m_SequentialAccess: Mutex<()>,
     m_Position: AtomicU64,
+    #[cfg(not(target_arch = "wasm32"))]
     m_FileName: String,
 }
 
@@ -67,11 +68,15 @@ static PREAD_FALLBACK_READS: AtomicU64 = AtomicU64::new(0);
 
 impl FileAccess {
     pub fn new(fileName: &str) -> Self {
+        #[cfg(target_arch = "wasm32")]
+        let _ = fileName;
+
         Self {
             #[cfg(not(target_arch = "wasm32"))]
             m_FileHandle: None,
             m_SequentialAccess: Mutex::new(()),
             m_Position: AtomicU64::new(0),
+            #[cfg(not(target_arch = "wasm32"))]
             m_FileName: fileName.to_string(),
         }
     }
@@ -148,10 +153,12 @@ impl FileAccess {
         let Ok(_sequential) = self.m_SequentialAccess.lock() else {
             return false;
         };
+
         #[cfg(target_arch = "wasm32")]
         {
-            return false;
+            false
         }
+
         #[cfg(not(target_arch = "wasm32"))]
         {
             let Some(file) = self.m_FileHandle.as_ref() else {
@@ -168,10 +175,11 @@ impl FileAccess {
                     _ => return false,
                 }
             }
+
+            self.m_Position
+                .fetch_add(buffer.len() as u64, Ordering::Relaxed);
+            true
         }
-        self.m_Position
-            .fetch_add(buffer.len() as u64, Ordering::Relaxed);
-        true
     }
 
     pub fn ReadBlock(

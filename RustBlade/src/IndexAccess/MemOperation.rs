@@ -37,12 +37,12 @@ impl<T: Copy + Default> PinnedMemory<T> {
         {
             let mut buffer = vec![T::default(); len].into_boxed_slice();
             let ptr = NonNull::new(buffer.as_mut_ptr()).expect("Box returned null");
-            return Self {
+            Self {
                 ptr,
                 len,
                 buffer,
                 _marker: PhantomData,
-            };
+            }
         }
 
         #[cfg(not(target_arch = "wasm32"))]

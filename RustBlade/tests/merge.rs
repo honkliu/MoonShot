@@ -3,6 +3,7 @@
 
 use rustblade::block_table::INDEX_FILE_HEADER_SIZE;
 use rustblade::embeddings::build_hashed_embedding;
+use rustblade::index_reader::ReaderDocumentIDValue;
 use rustblade::index_serializer::{IndexFileHeader, IndexSerializer};
 use rustblade::index_writer::IndexWriter;
 use rustblade::posting_store::PostingStore;
@@ -58,7 +59,7 @@ fn search_doc_ids(ctx: &mut IndexContext, query: &str) -> Vec<u64> {
     executor
         .Execute(reader.as_mut(), 0)
         .into_iter()
-        .map(|result| result.doc_id)
+        .map(|result| ReaderDocumentIDValue(result.doc_id))
         .collect()
 }
 
@@ -179,8 +180,7 @@ fn title_score_uses_title_length_instead_of_body_length() {
     let long = Document {
         doc_id: 1,
         title: "needle".to_string(),
-        body: std::iter::repeat("filler")
-            .take(200)
+        body: std::iter::repeat_n("filler", 200)
             .collect::<Vec<_>>()
             .join(" "),
         importance: 0.0,
@@ -198,18 +198,11 @@ fn title_score_uses_title_length_instead_of_body_length() {
         .unwrap();
     let stream_key = format!("{token}T");
     let mut reader = ctx.GetStreamReader(&stream_key);
-    let executor = ctx.GetExecutor();
-    let results = executor.Execute(reader.as_mut(), 0);
-    let short_score = results
-        .iter()
-        .find(|result| result.doc_id == 0)
-        .unwrap()
-        .score;
-    let long_score = results
-        .iter()
-        .find(|result| result.doc_id == 1)
-        .unwrap()
-        .score;
+    assert_eq!(reader.GetDocumentID(), 0);
+    let short_score = reader.GetScore(ctx.GetDocDataEntry(0).unwrap());
+    reader.GoNext();
+    assert_eq!(reader.GetDocumentID(), 1);
+    let long_score = reader.GetScore(ctx.GetDocDataEntry(1).unwrap());
     assert!(
         (short_score - long_score).abs() < 1e-6,
         "short_score={short_score}, long_score={long_score}"

@@ -748,7 +748,7 @@ fn interactive(index: &Path, options: SearchOptions) -> io::Result<()> {
     println!("Type a query, or /h for commands.");
 
     let mut line = String::new();
-    let mut last_paths = Vec::new();
+    let mut last_paths: Vec<String> = Vec::new();
     loop {
         print!("> ");
         io::stdout().flush()?;
@@ -846,8 +846,8 @@ fn interactive(index: &Path, options: SearchOptions) -> io::Result<()> {
             } else {
                 println!("no delta loaded");
             }
-        } else if query.starts_with('@') {
-            let Ok(number) = query[1..].parse::<usize>() else {
+        } else if let Some(result_number) = query.strip_prefix('@') {
+            let Ok(number) = result_number.parse::<usize>() else {
                 println!("usage: @N (for example, @1)");
                 continue;
             };
@@ -1343,7 +1343,7 @@ fn run_beir_build(index: &Path, options: &BeirBuildOptions) -> io::Result<()> {
             vector_docs += 1;
         }
         doc_id += 1;
-        if doc_id % 1000 == 0 {
+        if doc_id.is_multiple_of(1000) {
             println!("  BEIR indexed {doc_id} docs");
         }
     }
@@ -1424,7 +1424,7 @@ fn run_beir_patch_vectors(index: &Path, options: &BeirPatchVectorOptions) -> io:
         output.seek(SeekFrom::Start(entry_offset + data_offset))?;
         output.write_all(&quantized)?;
         patched += 1;
-        if patched % 100_000 == 0 {
+        if patched.is_multiple_of(100_000) {
             println!("  patched {patched} vectors");
         }
     }
@@ -1878,7 +1878,7 @@ fn run_beir_eval(index: &Path, options: &BeirEvalOptions) -> io::Result<()> {
                 &mut micro_relevant,
             );
             evaluated += 1;
-            if evaluated % 100 == 0 {
+            if evaluated.is_multiple_of(100) {
                 println!("  BEIR evaluated {evaluated} queries");
             }
         }
@@ -1984,7 +1984,7 @@ fn run_beir_eval(index: &Path, options: &BeirEvalOptions) -> io::Result<()> {
                 &mut micro_relevant,
             );
             evaluated += 1;
-            if evaluated % 100 == 0 {
+            if evaluated.is_multiple_of(100) {
                 println!("  BEIR evaluated {evaluated} queries");
             }
         }

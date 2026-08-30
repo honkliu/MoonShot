@@ -67,8 +67,15 @@ impl Tokenizer for SmartTokenizer {
         let mut start = 0usize;
 
         for (end, word_type) in segmenter.segment_str(&normalized).iter_with_word_type() {
-            if end > start && word_type.is_word_like() {
-                let word = lowercase_for_locale(&normalized[start..end], &self.m_Locale);
+            let segment = &normalized[start..end];
+
+            // ICU4C assigns CJK segments a non-zero rule status. icu_segmenter can
+            // return `None` for the same complex-script segment, so retain segments
+            // containing Unicode letters or numbers to preserve the C++ behavior.
+            let is_word_like =
+                word_type.is_word_like() || segment.chars().any(char::is_alphanumeric);
+            if end > start && is_word_like {
+                let word = lowercase_for_locale(segment, &self.m_Locale);
                 let word = StemEnglishToken(&word);
                 if Self::IsIndexableToken(&word) {
                     tokens.push(word);
@@ -168,7 +175,7 @@ fn normalize_nfc(text: &str) -> String {
 
 #[cfg(all(target_arch = "wasm32", feature = "wasm"))]
 fn normalize_nfc(text: &str) -> String {
-    String::from(js_sys::JsString::from(text).normalize())
+    String::from(js_sys::JsString::from(text).normalize("NFC"))
 }
 
 #[cfg(not(any(windows, target_arch = "wasm32")))]
@@ -471,7 +478,7 @@ fn step_5(word: &mut String, r1: usize, r2: usize, original_marked_y: &[bool]) {
                 word.pop();
             }
         }
-    } else if word.ends_with("ll") && word.len() - 1 >= r2 {
+    } else if word.ends_with("ll") && word.len() > r2 {
         word.pop();
     }
 }

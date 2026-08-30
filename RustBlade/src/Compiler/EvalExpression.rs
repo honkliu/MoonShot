@@ -156,30 +156,14 @@ impl TermNode {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct AndNode {
     pub children: Vec<EvalNode>,
 }
 
-impl Default for AndNode {
-    fn default() -> Self {
-        Self {
-            children: Vec::new(),
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct OrNode {
     pub children: Vec<EvalNode>,
-}
-
-impl Default for OrNode {
-    fn default() -> Self {
-        Self {
-            children: Vec::new(),
-        }
-    }
 }
 
 #[derive(Debug, Clone)]

@@ -117,10 +117,7 @@ impl AdvancedIndexReader {
     }
 
     fn ReleaseCurrentBlock(&mut self) {
-        if let Some(block) = self.m_Decoder.TakeBlock() {
-            self.m_BlockTable
-                .ReleaseBlock(block.Kind(), block.Slot(), false);
-        }
+        drop(self.m_Decoder.TakeBlock());
     }
 }
 
@@ -156,23 +153,23 @@ impl IndexReader for AdvancedIndexReader {
                 break;
             }
             self.ReleaseCurrentBlock();
-            let Some(block) =
-                self.m_BlockTable
-                    .GetBlock(BlockKind::Index, self.m_BlockSeqNumber + 1, false)
+            let Some(block) = self
+                .m_BlockTable
+                .GetBlock::<crate::block_table::IndexBlock>(
+                    BlockKind::Index,
+                    self.m_BlockSeqNumber + 1,
+                    false,
+                )
             else {
                 break;
             };
             let Some(header) = IndexBlockContinuationHeader::from_bytes(&block.IB_Data) else {
-                self.m_BlockTable
-                    .ReleaseBlock(block.Kind(), block.Slot(), false);
                 break;
             };
             self.m_BlockSeqNumber += 1;
             self.m_RemainingContinuationBlocks =
                 self.m_RemainingContinuationBlocks.saturating_sub(1);
             if target > header.IBCH_MaxDocID {
-                self.m_BlockTable
-                    .ReleaseBlock(block.Kind(), block.Slot(), false);
                 continue;
             }
             self.OpenContinuation(block);

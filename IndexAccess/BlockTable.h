@@ -258,6 +258,10 @@ struct alignas(8) IndexBlock {
 static_assert(sizeof(IndexBlock) == PAGE_SIZE);
 
 #pragma pack(push,1)
+#ifdef _MSC_VER
+#pragma warning(push)
+#pragma warning(disable:4200) // Intentional trailing payload; fixed prefix is 16 bytes.
+#endif
 struct LeafTermEntry {
     uint32_t    LTE_DocFreq                 = 0;
     uint32_t    LTE_IndexBlockID            = 0;
@@ -269,6 +273,9 @@ struct LeafTermEntry {
 
     char        LTE_Term[0];
 };
+#ifdef _MSC_VER
+#pragma warning(pop)
+#endif
 #pragma pack(pop)
 
 /* Kept only for reading legacy MPHF pages; new indexes do not build MPHF. */

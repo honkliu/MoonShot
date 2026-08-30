@@ -9,7 +9,10 @@
  * LeafTermBlock::LTB_Directory[0..159] holds entry offsets and [160] holds count.
  */
 use std::fs::File;
-use std::io::{BufReader, Read, Seek, Write};
+use std::io::{Read, Write};
+
+#[cfg(not(target_arch = "wasm32"))]
+use std::io::{BufReader, Seek};
 
 pub use crate::block_table::IndexFileHeader;
 use crate::block_table::{
@@ -39,6 +42,18 @@ pub struct BuildBlocksResult {
 }
 
 pub struct IndexSerializer;
+
+type DecodedIndexData = (
+    Vec<HeadTermEntry>,
+    Vec<LeafTermBlock>,
+    Vec<IndexBlock>,
+    Vec<u8>,
+    Vec<u8>,
+    Vec<String>,
+    TermMphfHeader,
+    Vec<i32>,
+    Vec<IndexBlock>,
+);
 
 #[derive(Clone)]
 #[allow(non_snake_case)]
@@ -84,10 +99,7 @@ fn TryBuildTermMphf(
     }
     let bucket_count = next_power_of_two(std::cmp::max(1, term_count / 2));
     let slot_count = term_count;
-    let max_displacement = std::cmp::min(
-        1u32 << 20,
-        std::cmp::max(65536u32, std::cmp::max(1u32, slot_count / 8)),
-    );
+    let max_displacement = std::cmp::max(1u32, slot_count / 8).clamp(65536u32, 1u32 << 20);
 
     let mut ids: Vec<usize> = (0..terms.len()).collect();
     ids.sort_by(|a, b| terms[*a].Term.cmp(&terms[*b].Term));
@@ -133,11 +145,7 @@ fn TryBuildTermMphf(
                     displacement,
                 );
                 candidate_slots[i] = slot;
-                if used[slot as usize]
-                    || candidate_slots[..i]
-                        .iter()
-                        .any(|candidate| *candidate == slot)
-                {
+                if used[slot as usize] || candidate_slots[..i].contains(&slot) {
                     ok = false;
                     break;
                 }
@@ -185,8 +193,7 @@ fn TryBuildTermMphf(
         slots[bucket_terms[0]] = slot;
     }
 
-    let page_count = (slot_count as usize + (PAGE_SIZE / TERM_MPHF_ENTRY_SIZE) - 1)
-        / (PAGE_SIZE / TERM_MPHF_ENTRY_SIZE);
+    let page_count = (slot_count as usize).div_ceil(PAGE_SIZE / TERM_MPHF_ENTRY_SIZE);
     let mut entry_pages = vec![IndexBlock::default(); page_count];
     for (index, source) in terms.iter().enumerate() {
         let slot = slots[index];
@@ -379,7 +386,7 @@ impl IndexSerializer {
                 .into());
             }
             Self::DecodeDocData(store, &header, &docdata)?;
-            return Ok((header, head, docdata));
+            Ok((header, head, docdata))
         }
 
         #[cfg(not(target_arch = "wasm32"))]
@@ -419,7 +426,7 @@ impl IndexSerializer {
                 .into());
             }
             let prefixes = Self::DecodePathPrefixSidecar(&sidecar)?;
-            return Ok((sidecar, prefixes));
+            Ok((sidecar, prefixes))
         }
 
         #[cfg(not(target_arch = "wasm32"))]
@@ -500,7 +507,7 @@ impl IndexSerializer {
                 }
                 pages.push(block);
             }
-            return Ok((mphf_header, displacements, pages));
+            Ok((mphf_header, displacements, pages))
         }
 
         #[cfg(not(target_arch = "wasm32"))]
@@ -566,20 +573,7 @@ impl IndexSerializer {
         Self::LoadFileTables(store, path)
     }
 
-    pub fn decode(
-        store: &mut PostingStore,
-        data: &[u8],
-    ) -> Result<(
-        Vec<HeadTermEntry>,
-        Vec<LeafTermBlock>,
-        Vec<IndexBlock>,
-        Vec<u8>,
-        Vec<u8>,
-        Vec<String>,
-        TermMphfHeader,
-        Vec<i32>,
-        Vec<IndexBlock>,
-    )> {
+    pub fn decode(store: &mut PostingStore, data: &[u8]) -> Result<DecodedIndexData> {
         let header = IndexFileHeader::parse(data)?;
         header.validate_layout(Some(data.len() as u64))?;
 
@@ -714,6 +708,7 @@ impl IndexSerializer {
     }
 
     #[allow(non_snake_case)]
+    #[cfg(not(target_arch = "wasm32"))]
     fn LoadDocData<R: Read + std::io::Seek>(
         store: &mut PostingStore,
         reader: &mut R,
@@ -735,7 +730,7 @@ impl IndexSerializer {
         if docdata.len() != header.IFH_NumDocuments as usize * DOC_REC_SIZE {
             return Err(RustBladeError::InvalidFormat);
         }
-        let first_doc_id = Self::DocDataFirstDocId(&docdata, header);
+        let first_doc_id = Self::DocDataFirstDocId(docdata, header);
         for index in 0..header.IFH_NumDocuments as usize {
             let offset = index * DOC_REC_SIZE;
             Self::DecodeDocDataRecord(
@@ -893,7 +888,7 @@ impl IndexSerializer {
                                  cur: &mut IndexBlock,
                                  wptr: &mut usize,
                                  seq: &mut u32| {
-            IndexBlocks.push(cur.clone());
+            IndexBlocks.push(*cur);
             *seq += 1;
             *cur = IndexBlock::default();
             *wptr = 0;
@@ -913,7 +908,7 @@ impl IndexSerializer {
                 first_leaf_term,
                 leaf_blocks.len() as u32,
             ));
-            leaf_blocks.push(leaf_block.clone());
+            leaf_blocks.push(*leaf_block);
             *leaf_block = LeafTermBlock::default();
             *leaf_write_offset = 0;
             *leaf_entry_count = 0;
@@ -1034,7 +1029,7 @@ impl IndexSerializer {
             &mut first_leaf_term,
         );
         let (mphf_header, mphf_displacements, mphf_entry_pages) =
-            (TermMphfHeader::default(), Vec::new(), Vec::new());
+            (TermMphfHeader::zeroed(), Vec::new(), Vec::new());
 
         BuildBlocksResult {
             BBR_IndexBlocks: IndexBlocks,

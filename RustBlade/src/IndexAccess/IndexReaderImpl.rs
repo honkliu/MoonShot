@@ -626,7 +626,7 @@ pub struct VectorIndexReader {
 #[allow(non_snake_case)]
 impl VectorIndexReader {
     pub fn new(mut results: Vec<VectorSearchResult>) -> Self {
-        results.sort_by(|a, b| a.doc_id.cmp(&b.doc_id));
+        results.sort_by_key(|result| result.doc_id);
         Self {
             m_Results: results,
             m_Pos: 0,

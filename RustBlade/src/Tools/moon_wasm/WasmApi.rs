@@ -36,9 +36,9 @@ struct CachedVectorContext {
 }
 
 thread_local! {
-    static VECTOR_CONTEXT_CACHE: RefCell<Option<CachedVectorContext>> = RefCell::new(None);
+    static VECTOR_CONTEXT_CACHE: RefCell<Option<CachedVectorContext>> = const { RefCell::new(None) };
     #[cfg(target_arch = "wasm32")]
-    static INDEX_CONTEXT: RefCell<Option<IndexContext>> = RefCell::new(None);
+    static INDEX_CONTEXT: RefCell<Option<IndexContext>> = const { RefCell::new(None) };
 }
 
 #[wasm_bindgen]
