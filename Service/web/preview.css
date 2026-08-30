@@ -1,0 +1,95 @@
+.with-preview #results {
+  flex: 1;
+  min-width: 260px;
+  width: auto;
+  border-right: 0;
+}
+
+#preview-resizer {
+  display: none;
+  width: 7px;
+  flex: 0 0 7px;
+  cursor: col-resize;
+  background: #e5e7eb;
+  touch-action: none;
+}
+
+.with-preview #preview-resizer {
+  display: block;
+}
+
+#preview-resizer:hover,
+#preview-resizer:focus {
+  background: #93c5fd;
+  outline: 0;
+}
+
+.resizing {
+  cursor: col-resize;
+  user-select: none;
+}
+
+.resizing iframe {
+  pointer-events: none;
+}
+
+#preview {
+  flex: 0 0 var(--preview-width, 58%);
+  width: var(--preview-width, 58%);
+}
+
+#document-content.markdown .katex-display {
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding: .25em 0;
+}
+
+#document-content.markdown .mermaid {
+  overflow-x: auto;
+  padding: 16px;
+  border-radius: 8px;
+  background: #fff;
+  text-align: center;
+}
+
+#document-content.markdown .mermaid svg {
+  max-width: 100%;
+  height: auto;
+}
+
+#pagination {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 16px;
+  margin: 0 auto 40px;
+}
+
+#pagination[hidden] {
+  display: none;
+}
+
+#pagination button {
+  padding: 10px 22px;
+  border-radius: 20px;
+  background: #eef2ff;
+  color: #1d4ed8;
+  font-weight: 650;
+}
+
+#pagination button:disabled {
+  cursor: default;
+  opacity: .45;
+}
+
+@media (max-width: 800px) {
+  #preview-resizer,
+  .with-preview #preview-resizer {
+    display: none;
+  }
+
+  #preview {
+    flex: none;
+    width: 100%;
+  }
+}

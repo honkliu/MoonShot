@@ -341,6 +341,10 @@ public:
 
     const IndexFileHeader& GetIndexFileHeader() const { return m_IndexFileHeader; }
     uint64_t DocumentCount() const { return m_IndexFileHeader.IFH_NumDocuments; }
+    uint64_t TotalDocumentCount() const
+    {
+        return DocumentCount() + (m_DeltaContext ? m_DeltaContext->TotalDocumentCount() : 0);
+    }
 
     uint32_t GetStreamDocFreq(const char* streamKey)
     {

@@ -21,11 +21,14 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cctype>
+#include <cerrno>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <limits>
 #include <optional>
@@ -48,15 +51,17 @@ static constexpr socket_t INVALID_SOCKET_FD = -1;
 #endif
 
 static constexpr size_t MAX_REQUEST_BYTES = 2 * 1024 * 1024;
-static constexpr size_t MAX_RESULT_WINDOW = 1000;
 static constexpr size_t MAX_PAGE_SIZE = 100;
 static constexpr size_t MAX_EF_SEARCH = 1000000;
 static constexpr size_t BGE_MAX_TEXT_BYTES = 65536;
+static constexpr size_t MAX_DOCUMENT_BYTES = 1024 * 1024;
 static constexpr long BGE_TIMEOUT_MS = 2000;
 
 struct Options {
+    std::string ListenAddress = "127.0.0.1";
     uint16_t Port = 9000;
     std::string IndexPath;
+    std::string WebPath;
     std::string BgeHost = "127.0.0.1";
     uint16_t BgePort = 8765;
 };
@@ -160,19 +165,25 @@ static Options ParseArguments(int argc, char** argv)
 {
     Options options;
     options.IndexPath = DefaultIndexPath();
+    options.WebPath = (std::filesystem::absolute(argv[0]).parent_path() / "web").string();
 
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
-        if (arg == "--port" && i + 1 < argc) {
+        if (arg == "--listen" && i + 1 < argc) {
+            options.ListenAddress = argv[++i];
+        } else if (arg == "--port" && i + 1 < argc) {
             options.Port = ParsePort(argv[++i], arg);
         } else if (arg == "--index" && i + 1 < argc) {
             options.IndexPath = ExpandUserPath(argv[++i]);
+        } else if (arg == "--ui" && i + 1 < argc) {
+            options.WebPath = ExpandUserPath(argv[++i]);
         } else if ((arg == "--bge-host" || arg == "--gbe-host") && i + 1 < argc) {
             options.BgeHost = argv[++i];
         } else if ((arg == "--bge-port" || arg == "--gbe-port") && i + 1 < argc) {
             options.BgePort = ParsePort(argv[++i], arg);
         } else if (arg == "--help" || arg == "-h") {
-            std::cout << "usage: shennong [--port 9000] [--index ~/moon.idx] "
+            std::cout << "usage: shennong [--listen 127.0.0.1] [--port 9000] [--index ~/moon.idx] "
+                         "[--ui <web-directory>] "
                          "[--bge-host 127.0.0.1] [--bge-port 8765]\n";
             std::exit(0);
         } else {
@@ -476,7 +487,7 @@ static std::vector<float> ParseVector(const json& body)
     return vector;
 }
 
-static SearchRequest ParseSearchRequest(const json& body)
+static SearchRequest ParseSearchRequest(const json& body, size_t documentCount)
 {
     if (!body.is_object())
         throw ApiError(400, "invalid_request", "request body must be a JSON object");
@@ -497,10 +508,8 @@ static SearchRequest ParseSearchRequest(const json& body)
         request.Query = body["query"].get<std::string>();
     }
     request.Vector = ParseVector(body);
-    request.Offset = ReadSize(body, "offset", 0, 0, MAX_RESULT_WINDOW - 1);
+    request.Offset = ReadSize(body, "offset", 0, 0, documentCount - 1);
     request.Limit = ReadSize(body, "limit", 20, 1, MAX_PAGE_SIZE);
-    if (request.Offset + request.Limit > MAX_RESULT_WINDOW)
-        throw ApiError(422, "invalid_pagination", "offset plus limit must not exceed 1000");
 
     const bool hasQuery = !request.Query.empty();
     const bool hasVector = !request.Vector.empty();
@@ -582,7 +591,8 @@ public:
                 throw ApiError(503, "vector_search_unavailable", "the loaded index has no vector index");
         }
 
-        const size_t resultWindow = request.Offset + request.Limit + 1;
+        const size_t resultWindow = std::min<size_t>(m_Context.TotalDocumentCount(),
+                             request.Offset + request.Limit + 1);
         const std::string query = request.Mode == SearchMode::Vector ? "" : request.Query;
         auto task = m_Context.Enqueue(query.c_str(),
                                       std::move(request.Vector),
@@ -634,6 +644,61 @@ public:
         };
     }
 
+    size_t DocumentCount() const
+    {
+        return static_cast<size_t>(m_Context.TotalDocumentCount());
+    }
+
+    json GetDocument(uint64_t documentId) const
+    {
+        const std::string path = m_Context.GetDocPath(documentId);
+        if (path.empty())
+            throw ApiError(404, "document_not_found", "document was not found");
+        if (path.starts_with("http://") || path.starts_with("https://")) {
+            return {
+                {"document_id", std::to_string(documentId)},
+                {"kind", "url"},
+                {"url", path},
+            };
+        }
+
+        const std::filesystem::path filePath(path);
+        std::error_code error;
+        if (!std::filesystem::is_regular_file(filePath, error) || error)
+            throw ApiError(404, "document_not_found", "document file is unavailable");
+
+        const uintmax_t fileSize = std::filesystem::file_size(filePath, error);
+        if (error)
+            throw ApiError(404, "document_not_found", "document file is unavailable");
+        const size_t bytes = static_cast<size_t>(std::min<uintmax_t>(fileSize, MAX_DOCUMENT_BYTES));
+        std::ifstream input(filePath, std::ios::binary);
+        if (!input)
+            throw ApiError(403, "document_unreadable", "document file cannot be read");
+        std::string content(bytes, '\0');
+        input.read(content.data(), static_cast<std::streamsize>(content.size()));
+        content.resize(static_cast<size_t>(input.gcount()));
+        if (content.find('\0') != std::string::npos)
+            throw ApiError(415, "unsupported_document_type", "document is not a text file");
+
+        std::string contentType = "text/plain; charset=utf-8";
+        std::string extension = filePath.extension().string();
+        std::transform(extension.begin(), extension.end(), extension.begin(),
+                       [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+        if (extension == ".md" || extension == ".markdown")
+            contentType = "text/markdown; charset=utf-8";
+        else if (extension == ".html" || extension == ".htm")
+            contentType = "text/html; charset=utf-8";
+
+        return {
+            {"document_id", std::to_string(documentId)},
+            {"kind", "file"},
+            {"path", path},
+            {"content_type", contentType},
+            {"content", std::move(content)},
+            {"truncated", fileSize > bytes},
+        };
+    }
+
 private:
     std::string m_IndexPath;
     BgeEmbeddingClient m_Embedding;
@@ -679,7 +744,8 @@ static json SearchResponseJson(const SearchResponse& response, const std::string
 static void SetJsonResponse(httplib::Response& response, int status, const json& body)
 {
     response.status = status;
-    response.set_content(body.dump(), "application/json; charset=utf-8");
+    response.set_content(body.dump(-1, ' ', false, json::error_handler_t::replace),
+                         "application/json; charset=utf-8");
 }
 
 static void SetErrorResponse(httplib::Response& response,
@@ -697,18 +763,27 @@ static void SetErrorResponse(httplib::Response& response,
     });
 }
 
-static void ConfigureServer(httplib::Server& server, SearchService& service)
+static uint64_t ParseDocumentId(const std::string& value)
+{
+    errno = 0;
+    char* end = nullptr;
+    const unsigned long long parsed = std::strtoull(value.c_str(), &end, 10);
+    if (value.empty() || !end || *end != '\0' || errno == ERANGE)
+        throw ApiError(400, "invalid_document_id", "document ID must be an unsigned integer");
+    return static_cast<uint64_t>(parsed);
+}
+
+static void ConfigureServer(httplib::Server& server,
+                            SearchService& service,
+                            const std::string& webPath)
 {
     server.set_payload_max_length(MAX_REQUEST_BYTES);
-    server.set_post_routing_handler([](const httplib::Request&, httplib::Response& response) {
-        response.set_header("Access-Control-Allow-Origin", "*");
-        response.set_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-        response.set_header("Access-Control-Allow-Headers", "Content-Type");
+    server.set_default_headers({{"Cache-Control", "no-store"}});
+    server.Get("/", [](const httplib::Request&, httplib::Response& response) {
+        response.set_redirect("/ui/");
     });
-
-    server.Options(R"(/.*)", [](const httplib::Request&, httplib::Response& response) {
-        response.status = 204;
-    });
+    if (!server.set_mount_point("/ui", webPath))
+        throw std::runtime_error("failed to mount web UI directory: " + webPath);
 
     server.Get("/v1/health/live", [](const httplib::Request&, httplib::Response& response) {
         SetJsonResponse(response, 200, {{"status", "alive"}});
@@ -723,7 +798,7 @@ static void ConfigureServer(httplib::Server& server, SearchService& service)
         const std::string requestId = MakeRequestId();
         try {
             const json body = json::parse(request.body);
-            SearchRequest searchRequest = ParseSearchRequest(body);
+            SearchRequest searchRequest = ParseSearchRequest(body, service.DocumentCount());
             SetJsonResponse(response, 200,
                             SearchResponseJson(service.Search(std::move(searchRequest)), requestId));
         } catch (const json::parse_error&) {
@@ -733,6 +808,27 @@ static void ConfigureServer(httplib::Server& server, SearchService& service)
         } catch (const std::exception& error) {
             std::cerr << "request " << requestId << " failed: " << error.what() << '\n';
             SetErrorResponse(response, 500, requestId, "internal_error", "search failed");
+        }
+    });
+
+    server.Get(R"(/v1/documents/([0-9]+))", [&service](const httplib::Request& request,
+                                                       httplib::Response& response) {
+        const std::string requestId = MakeRequestId();
+        try {
+            const json document = service.GetDocument(ParseDocumentId(request.matches[1].str()));
+            if (request.has_param("raw") && request.get_param_value("raw") == "1"
+                && document.at("kind") == "file") {
+                response.status = 200;
+                response.set_content(document.at("content").get<std::string>(),
+                                     "text/plain; charset=utf-8");
+            } else {
+                SetJsonResponse(response, 200, document);
+            }
+        } catch (const ApiError& error) {
+            SetErrorResponse(response, error.Status, requestId, error.Code, error.what());
+        } catch (const std::exception& error) {
+            std::cerr << "request " << requestId << " failed: " << error.what() << '\n';
+            SetErrorResponse(response, 500, requestId, "internal_error", "document retrieval failed");
         }
     });
 
@@ -761,14 +857,15 @@ int main(int argc, char** argv)
 
         std::cout << "ShenNong HTTP service starting\n"
                   << "Index: " << options.IndexPath << '\n'
-                  << "Listen: 0.0.0.0:" << options.Port << '\n';
+                  << "Listen: " << options.ListenAddress << ':' << options.Port << '\n';
 
         SearchService service(options.IndexPath, options.BgeHost, options.BgePort);
         httplib::Server server;
-        ConfigureServer(server, service);
+        ConfigureServer(server, service, options.WebPath);
 
-        std::cout << "Ready: http://localhost:" << options.Port << "/v1/health/ready\n";
-        if (!server.listen("0.0.0.0", options.Port))
+        std::cout << "Search UI: http://localhost:" << options.Port << "/ui/\n"
+                  << "Ready: http://localhost:" << options.Port << "/v1/health/ready\n";
+        if (!server.listen(options.ListenAddress, options.Port))
             throw std::runtime_error("failed to bind HTTP server");
     } catch (const std::exception& error) {
         std::cerr << "shennong: " << error.what() << '\n';

@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>MoonShot Search</title>
+  <link rel="stylesheet" href="/ui/style.css">
+  <link rel="stylesheet" href="/ui/preview.css">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.22/dist/katex.min.css">
+</head>
+<body>
+  <main>
+    <header>
+      <a class="brand" href="/ui/">MoonShot</a>
+      <form id="search-form">
+        <input id="query" type="search" placeholder="Search your documents" autocomplete="off" autofocus required>
+        <select id="mode" aria-label="Search mode">
+          <option value="text">Text</option>
+          <option value="vector">Vector</option>
+          <option value="hybrid">Hybrid</option>
+        </select>
+        <button type="submit">Search</button>
+      </form>
+    </header>
+    <div id="status" role="status"></div>
+    <section id="workspace">
+      <div id="results"></div>
+      <div id="preview-resizer" role="separator" aria-label="Resize document preview" aria-orientation="vertical" tabindex="0"></div>
+      <aside id="preview" hidden>
+        <div class="preview-bar">
+          <span id="preview-title"></span>
+          <a id="open-link" target="_blank" rel="noopener">Open</a>
+          <button id="close-preview" type="button" aria-label="Close preview">×</button>
+        </div>
+        <div id="document-content"></div>
+        <iframe id="document-frame" title="Document preview" sandbox referrerpolicy="no-referrer" hidden></iframe>
+      </aside>
+    </section>
+    <nav id="pagination" aria-label="Search result pages" hidden>
+      <button id="previous" type="button">Previous</button>
+      <span id="page-number"></span>
+      <button id="next" type="button">Next</button>
+    </nav>
+  </main>
+  <script src="https://cdn.jsdelivr.net/npm/marked@16.2.1/lib/marked.umd.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/dompurify@3.2.6/dist/purify.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.22/dist/katex.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.22/dist/contrib/auto-render.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11.12.0/dist/mermaid.min.js"></script>
+  <script src="/ui/app.js"></script>
+</body>
+</html>

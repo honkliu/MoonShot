@@ -5,16 +5,20 @@
 ## Build and Run
 
 ```powershell
-cmake --build build --target shennong --config Debug
-.\build\x64\Debug\shennong.exe --port 9000 --index "$env:USERPROFILE\moon.idx"
+cmake --build build --config Release
+.\build\x64\Release\shennong.exe --port 9000 --index "$env:USERPROFILE\moon.idx"
 ```
+
+With a Visual Studio multi-configuration build, omitting `--config Release` builds Debug by default. Omitting `--target` builds the complete default target set, including examples, tests, Rust tools, Shennong clients, WASM assets, and web assets.
 
 Supported options:
 
 | Option | Default | Meaning |
 | :--- | :--- | :--- |
+| `--listen` | `127.0.0.1` | HTTP listen address. Use a non-loopback address only on a trusted network. |
 | `--port` | `9000` | HTTP listen port. |
 | `--index` | `~/moon.idx` | MoonShot index loaded at startup. |
+| `--ui` | `web` beside the executable | Static search-interface directory. |
 | `--bge-host` | `127.0.0.1` | Query embedding service numeric IPv4 address. `--gbe-host` remains an accepted spelling. |
 | `--bge-port` | `8765` | Query embedding service port. `--gbe-port` remains an accepted spelling. |
 
@@ -26,6 +30,19 @@ curl.exe -sS http://localhost:9000/v1/health/ready
 ```
 
 `live` reports that the HTTP process is running. `ready` reports the loaded index metadata and configured embedding endpoint.
+
+## Browser Search
+
+Open `http://localhost:9000/`; Shennong redirects to `http://localhost:9000/ui/`. The integrated interface supports text, vector, and hybrid queries, 20-result previous/next pages through all matching results, a horizontally resizable split document preview, sanitized Markdown rendering, and best-effort URL framing. Markdown parsing uses pinned Marked, DOMPurify, KaTeX, and Mermaid browser scripts. KaTeX renders `$...$`, `$$...$$`, `\\(...\\)`, and `\\[...\\]`; fenced `mermaid` blocks render as diagrams. If a rendering script is unavailable, its content safely falls back to text or a code block.
+
+## Command-Line Search
+
+```powershell
+cmake --build build --target shennong_cli --config Debug
+.\build\x64\Debug\shennong_cli.exe --host 127.0.0.1 --port 9000 --mode text
+```
+
+Enter a query to search, `@N` to display result N from the latest page, `/n` for the next page, `/h` for help, or `/q` to quit. The client contains no MoonShot search logic; all queries and document reads go through Shennong.
 
 ## Search
 
@@ -86,7 +103,7 @@ Current hybrid semantics are lexical retrieval followed by vector-aware scoring.
 | `query` | Required for text and hybrid. In vector mode, use exactly one of `query` or `vector`. |
 | `vector` | Optional numeric array. In hybrid mode it replaces query embedding. |
 | `fields` | Lexical fields: `anchor`, `url`, `title`, `body`, `meta`. Default: anchor, URL, title, and body. |
-| `offset` | Default `0`; `offset + limit` must not exceed 1000. |
+| `offset` | Default `0`; must be smaller than the loaded index's document count. |
 | `limit` | Default `20`; maximum `100`. |
 | `ef_search` | Vector-only ANN budget; must cover the requested result window. |
 
@@ -137,6 +154,10 @@ Field names map to MoonShot stream letters only at the service boundary: anchor=
 | `422` | Invalid mode, fields, pagination, vector, or mode-specific options. |
 | `503` | Embedding or vector search is unavailable. |
 | `500` | Unexpected internal search failure. |
+
+## Documents
+
+`GET /v1/documents/{document_id}` returns the indexed file contents or an HTTP/HTTPS URL descriptor. `?raw=1` returns file content directly. Shennong accepts only IDs resolved through the loaded index, reads regular text files only, and limits previews to 1 MiB.
 
 ## SDK Search Mapping
 

@@ -85,7 +85,8 @@ std::vector<SearchResult> IndexSearchExecutor::Execute(std::shared_ptr<IndexRead
         results.reserve(heapLimit);
 
     auto worseScoreFirst = [](const SearchResult& a, const SearchResult& b) {
-        return a.score > b.score;
+        return a.score > b.score || (a.score == b.score
+            && ReaderDocumentIDValue(a.doc_id) < ReaderDocumentIDValue(b.doc_id));
     };
 
     float score = 0.0;
@@ -104,7 +105,7 @@ std::vector<SearchResult> IndexSearchExecutor::Execute(std::shared_ptr<IndexRead
         } else if (results.size() < heapLimit) {
             results.push_back(std::move(result));
             std::push_heap(results.begin(), results.end(), worseScoreFirst);
-        } else if (score > results.front().score) {
+        } else if (worseScoreFirst(result, results.front())) {
             std::pop_heap(results.begin(), results.end(), worseScoreFirst);
             results.back() = std::move(result);
             std::push_heap(results.begin(), results.end(), worseScoreFirst);
@@ -132,7 +133,8 @@ std::vector<SearchResult> IndexSearchExecutor::ExecuteBounded(
         results.reserve(heapLimit);
 
     auto worseScoreFirst = [](const SearchResult& a, const SearchResult& b) {
-        return a.score > b.score;
+        return a.score > b.score || (a.score == b.score
+            && ReaderDocumentIDValue(a.doc_id) < ReaderDocumentIDValue(b.doc_id));
     };
 
     uint64_t visited = 0;
@@ -149,7 +151,7 @@ std::vector<SearchResult> IndexSearchExecutor::ExecuteBounded(
         } else if (results.size() < heapLimit) {
             results.push_back(std::move(result));
             std::push_heap(results.begin(), results.end(), worseScoreFirst);
-        } else if (score > results.front().score) {
+        } else if (worseScoreFirst(result, results.front())) {
             std::pop_heap(results.begin(), results.end(), worseScoreFirst);
             results.back() = std::move(result);
             std::push_heap(results.begin(), results.end(), worseScoreFirst);
@@ -173,7 +175,8 @@ void IndexSearchExecutor::SortAndTruncate(std::vector<SearchResult>& results, in
 {
     std::sort(results.begin(), results.end(),
         [](const SearchResult& a, const SearchResult& b){
-            return a.score > b.score;
+            return a.score > b.score || (a.score == b.score
+                && ReaderDocumentIDValue(a.doc_id) < ReaderDocumentIDValue(b.doc_id));
         });
 
     if (topK > 0 && (int)results.size() > topK)
