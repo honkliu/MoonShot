@@ -1,3 +1,6 @@
+//! Direct translation of the C++ posting store; symbol names stay aligned for debugging.
+#![allow(non_snake_case, non_upper_case_globals)]
+
 use std::collections::{hash_map::DefaultHasher, HashMap};
 use std::hash::BuildHasherDefault;
 
@@ -7,8 +10,8 @@ pub type StableHashMap<K, V> = HashMap<K, V, BuildHasherDefault<DefaultHasher>>;
 
 #[derive(Clone, Debug)]
 pub struct IndexEntry {
-    pub ie_doc_id:          u64,
-    pub ie_term_frequency:  u32,
+    pub ie_doc_id: u64,
+    pub ie_term_frequency: u32,
 }
 
 /* PostingList — sorted entries. get_bytes() encodes the current entries. */
@@ -18,7 +21,9 @@ pub struct PostingList {
 }
 
 impl PostingList {
-    pub fn doc_freq(&self) -> u32 { self.entries.len() as u32 }
+    pub fn doc_freq(&self) -> u32 {
+        self.entries.len() as u32
+    }
 
     pub fn get_bytes(&self) -> Vec<u8> {
         self.encode()
@@ -42,7 +47,10 @@ fn tf8_encode(tf: u32) -> u8 {
 
 fn vb_write(mut v: u64, out: &mut Vec<u8>) {
     loop {
-        if v < 0x80 { out.push(v as u8); break; }
+        if v < 0x80 {
+            out.push(v as u8);
+            break;
+        }
         out.push(((v & 0x7F) | 0x80) as u8);
         v >>= 7;
     }
@@ -50,22 +58,22 @@ fn vb_write(mut v: u64, out: &mut Vec<u8>) {
 
 #[derive(Clone, Debug, Default)]
 pub struct DocStats {
-    pub doc_len:    u32,
+    pub doc_len: u32,
     pub unique_terms: u32,
-    pub title_len:  u32,
-    pub body_len:   u32,
-    pub url_len:    u32,
+    pub title_len: u32,
+    pub body_len: u32,
+    pub url_len: u32,
     pub anchor_len: u32,
-    pub meta_len:   u32,
+    pub meta_len: u32,
     pub importance: f32,
-    pub path:       String,
+    pub path: String,
 }
 
 #[allow(non_snake_case)]
 #[derive(Debug, Default)]
 pub struct PostingStore {
-    m_Postings:    StableHashMap<String, PostingList>,
-    m_DocStats:   StableHashMap<u64, DocStats>,
+    m_Postings: StableHashMap<String, PostingList>,
+    m_DocStats: StableHashMap<u64, DocStats>,
     m_DocVectors: StableHashMap<u64, [i8; DOC_VECTOR_DIM]>,
     m_TotalTerms: u64,
     m_PostingEntries: u64,
@@ -73,13 +81,23 @@ pub struct PostingStore {
 
 #[allow(non_snake_case)]
 impl PostingStore {
-    pub fn new() -> Self { Self::default() }
+    pub fn new() -> Self {
+        Self::default()
+    }
 
     #[allow(non_snake_case)]
     pub fn AddPosting(&mut self, stream_key: &str, doc_id: u64, tf: u32) {
         let pl = self.m_Postings.entry(stream_key.to_string()).or_default();
-        if pl.entries.last().map(|entry| entry.ie_doc_id < doc_id).unwrap_or(true) {
-            pl.entries.push(IndexEntry { ie_doc_id: doc_id, ie_term_frequency: tf });
+        if pl
+            .entries
+            .last()
+            .map(|entry| entry.ie_doc_id < doc_id)
+            .unwrap_or(true)
+        {
+            pl.entries.push(IndexEntry {
+                ie_doc_id: doc_id,
+                ie_term_frequency: tf,
+            });
             self.m_PostingEntries += 1;
             return;
         }
@@ -92,11 +110,17 @@ impl PostingStore {
         }
 
         match pl.entries.binary_search_by_key(&doc_id, |e| e.ie_doc_id) {
-            Ok(i)  => pl.entries[i].ie_term_frequency = tf,
+            Ok(i) => pl.entries[i].ie_term_frequency = tf,
             Err(i) => {
-                pl.entries.insert(i, IndexEntry { ie_doc_id: doc_id, ie_term_frequency: tf });
+                pl.entries.insert(
+                    i,
+                    IndexEntry {
+                        ie_doc_id: doc_id,
+                        ie_term_frequency: tf,
+                    },
+                );
                 self.m_PostingEntries += 1;
-            },
+            }
         }
     }
 
@@ -107,7 +131,13 @@ impl PostingStore {
     }
 
     #[allow(non_snake_case)]
-    pub fn AddStreamStats(&mut self, doc_id: u64, stream: char, token_count: u32, unique_count: u32) {
+    pub fn AddStreamStats(
+        &mut self,
+        doc_id: u64,
+        stream: char,
+        token_count: u32,
+        unique_count: u32,
+    ) {
         let stats = self.m_DocStats.entry(doc_id).or_default();
         stats.unique_terms += unique_count;
         match stream {
@@ -116,7 +146,7 @@ impl PostingStore {
             'U' => stats.url_len += token_count,
             'A' => stats.anchor_len += token_count,
             'M' => stats.meta_len += token_count,
-            _ => {},
+            _ => {}
         }
     }
 
@@ -127,7 +157,15 @@ impl PostingStore {
     }
 
     #[allow(non_snake_case)]
-    pub fn SetDocLengths(&mut self, doc_id: u64, title_len: u32, body_len: u32, url_len: u32, anchor_len: u32, meta_len: u32) {
+    pub fn SetDocLengths(
+        &mut self,
+        doc_id: u64,
+        title_len: u32,
+        body_len: u32,
+        url_len: u32,
+        anchor_len: u32,
+        meta_len: u32,
+    ) {
         let stats = self.m_DocStats.entry(doc_id).or_default();
         self.m_TotalTerms = self.m_TotalTerms.saturating_sub(stats.doc_len as u64);
         stats.title_len = title_len;
@@ -152,7 +190,9 @@ impl PostingStore {
 
     #[allow(non_snake_case)]
     pub fn SetDocVector(&mut self, doc_id: u64, vector: Vec<f32>) -> bool {
-        if vector.len() != DOC_VECTOR_DIM { return false; }
+        if vector.len() != DOC_VECTOR_DIM {
+            return false;
+        }
         self.m_DocStats.entry(doc_id).or_default();
         self.m_DocVectors.insert(doc_id, QuantizeVector(&vector));
         true
@@ -160,7 +200,9 @@ impl PostingStore {
 
     #[allow(non_snake_case)]
     pub fn SetDocVectorBytes(&mut self, doc_id: u64, vector: &[u8]) -> bool {
-        if vector.len() < DOC_VECTOR_DIM { return false; }
+        if vector.len() < DOC_VECTOR_DIM {
+            return false;
+        }
         self.m_DocStats.entry(doc_id).or_default();
         let mut bytes = [0i8; DOC_VECTOR_DIM];
         for i in 0..DOC_VECTOR_DIM {
@@ -172,7 +214,9 @@ impl PostingStore {
 
     #[allow(non_snake_case)]
     pub fn GetDocVector(&self, doc_id: u64) -> &[i8; DOC_VECTOR_DIM] {
-        self.m_DocVectors.get(&doc_id).expect("fixed DocData vector is required")
+        self.m_DocVectors
+            .get(&doc_id)
+            .expect("fixed DocData vector is required")
     }
 
     pub fn HasDocVector(&self, doc_id: u64) -> bool {
@@ -181,7 +225,10 @@ impl PostingStore {
 
     #[allow(non_snake_case)]
     pub fn GetDocPath(&self, doc_id: u64) -> &str {
-        self.m_DocStats.get(&doc_id).map(|s| s.path.as_str()).unwrap_or("")
+        self.m_DocStats
+            .get(&doc_id)
+            .map(|s| s.path.as_str())
+            .unwrap_or("")
     }
 
     #[allow(non_snake_case)]
@@ -196,7 +243,9 @@ impl PostingStore {
 
     #[allow(non_snake_case)]
     pub fn GetStreamLen(&self, doc_id: u64, stream: char) -> u32 {
-        let Some(stats) = self.m_DocStats.get(&doc_id) else { return 1; };
+        let Some(stats) = self.m_DocStats.get(&doc_id) else {
+            return 1;
+        };
         let doc_len = stats.body_len.max(1);
         let stream_len = match stream {
             'T' => stats.title_len,
@@ -206,12 +255,18 @@ impl PostingStore {
             'M' => stats.meta_len,
             _ => 0,
         };
-        if stream_len > 0 { stream_len } else { doc_len }
+        if stream_len > 0 {
+            stream_len
+        } else {
+            doc_len
+        }
     }
 
     #[allow(non_snake_case)]
     pub fn GetRawStreamLen(&self, doc_id: u64, stream: char) -> u32 {
-        let Some(stats) = self.m_DocStats.get(&doc_id) else { return 0; };
+        let Some(stats) = self.m_DocStats.get(&doc_id) else {
+            return 0;
+        };
         match stream {
             'T' => stats.title_len,
             'B' => stats.body_len,
@@ -224,7 +279,10 @@ impl PostingStore {
 
     #[allow(non_snake_case)]
     pub fn GetDocImportance(&self, doc_id: u64) -> f32 {
-        self.m_DocStats.get(&doc_id).map(|s| s.importance).unwrap_or(0.0)
+        self.m_DocStats
+            .get(&doc_id)
+            .map(|s| s.importance)
+            .unwrap_or(0.0)
     }
 
     pub fn HasDoc(&self, doc_id: u64) -> bool {
@@ -232,14 +290,24 @@ impl PostingStore {
     }
 
     #[allow(non_snake_case)]
-    pub fn TotalDocs(&self)  -> u64 { self.m_DocStats.len() as u64 }
-    pub fn TotalTerms(&self) -> u64 { self.m_TotalTerms }
-    pub fn TotalPostingEntries(&self) -> u64 { self.m_PostingEntries }
-    pub fn UniqueTermCount(&self) -> usize { self.m_Postings.len() }
+    pub fn TotalDocs(&self) -> u64 {
+        self.m_DocStats.len() as u64
+    }
+    pub fn TotalTerms(&self) -> u64 {
+        self.m_TotalTerms
+    }
+    pub fn TotalPostingEntries(&self) -> u64 {
+        self.m_PostingEntries
+    }
+    pub fn UniqueTermCount(&self) -> usize {
+        self.m_Postings.len()
+    }
 
     #[allow(non_snake_case)]
     pub fn AvgDocLen(&self) -> f32 {
-        if self.m_DocStats.is_empty() { return 1.0; }
+        if self.m_DocStats.is_empty() {
+            return 1.0;
+        }
         self.m_TotalTerms as f32 / self.m_DocStats.len() as f32
     }
 
@@ -261,14 +329,21 @@ impl PostingStore {
                 count += 1;
             }
         }
-        if count > 0 { total as f32 / count as f32 }
-        else if stream == 'T' { 1.0 }
-        else { self.AvgDocLen().max(1.0) }
+        if count > 0 {
+            total as f32 / count as f32
+        } else if stream == 'T' {
+            1.0
+        } else {
+            self.AvgDocLen().max(1.0)
+        }
     }
 
     #[allow(non_snake_case)]
     pub fn DocFreq(&self, key: &str) -> u32 {
-        self.m_Postings.get(key).map(|pl| pl.doc_freq()).unwrap_or(0)
+        self.m_Postings
+            .get(key)
+            .map(|pl| pl.doc_freq())
+            .unwrap_or(0)
     }
 
     #[allow(non_snake_case)]
@@ -287,8 +362,8 @@ impl PostingStore {
     }
 }
 
-    #[allow(non_snake_case)]
-    fn QuantizeVector(vector: &[f32]) -> [i8; DOC_VECTOR_DIM] {
+#[allow(non_snake_case)]
+fn QuantizeVector(vector: &[f32]) -> [i8; DOC_VECTOR_DIM] {
     let mut out = [0i8; DOC_VECTOR_DIM];
     for i in 0..DOC_VECTOR_DIM {
         let clipped = (vector[i] * 128.0).clamp(-128.0, 127.0);

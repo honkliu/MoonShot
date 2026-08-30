@@ -1,11 +1,14 @@
+//! Direct translation of the C++ query compiler; symbol names stay aligned for debugging.
+#![allow(non_snake_case, non_upper_case_globals)]
+
 use std::collections::HashSet;
 
+use crate::embeddings::{build_hashed_embedding, IEmbeddingModel};
 use crate::eval_expression::{
-    AndNode, BoostNode, EvalNode, EvalTree, NotNode, OrNode, QueryCompileMode,
-    TermNode, WeakAndNode, BIGRAM_SEP, GetQueryCompileModeParameters,
+    AndNode, BoostNode, EvalNode, EvalTree, GetQueryCompileModeParameters, NotNode, OrNode,
+    QueryCompileMode, TermNode, WeakAndNode, BIGRAM_SEP,
 };
 use crate::tokenizer::Tokenizer;
-use crate::embeddings::{build_hashed_embedding, IEmbeddingModel};
 
 /*
 * IndexSearchCompiler — tokenizes a query string and builds an EvalTree.
@@ -26,7 +29,9 @@ pub struct IndexSearchCompiler {
 
 impl IndexSearchCompiler {
     pub fn new(tokenizer: impl Tokenizer + 'static) -> Self {
-        Self { m_Tokenizer: Box::new(tokenizer) }
+        Self {
+            m_Tokenizer: Box::new(tokenizer),
+        }
     }
 
     #[allow(non_snake_case)]
@@ -35,22 +40,41 @@ impl IndexSearchCompiler {
     }
 
     #[allow(non_snake_case)]
-    pub fn CompileWithMode(&self, query: &str, stream_set: &str, mode: QueryCompileMode) -> EvalTree {
-        if query.is_empty() { return EvalTree::empty(); }
+    pub fn CompileWithMode(
+        &self,
+        query: &str,
+        stream_set: &str,
+        mode: QueryCompileMode,
+    ) -> EvalTree {
+        if query.is_empty() {
+            return EvalTree::empty();
+        }
         let streams = ParseStreamSet(stream_set);
-        let root = if streams.is_empty() { None } else { parse_expression(query, &streams, self.m_Tokenizer.as_ref(), mode) };
+        let root = if streams.is_empty() {
+            None
+        } else {
+            parse_expression(query, &streams, self.m_Tokenizer.as_ref(), mode)
+        };
         EvalTree::new(root)
     }
 
     #[allow(non_snake_case)]
-    pub fn CompileWithEmbeddingModel(&self,
-                                     query: &str,
-                                     stream_set: &str,
-                                     embedding_model: Option<&dyn IEmbeddingModel>,
-                                     mode: QueryCompileMode) -> EvalTree {
-        if query.is_empty() { return EvalTree::empty(); }
+    pub fn CompileWithEmbeddingModel(
+        &self,
+        query: &str,
+        stream_set: &str,
+        embedding_model: Option<&dyn IEmbeddingModel>,
+        mode: QueryCompileMode,
+    ) -> EvalTree {
+        if query.is_empty() {
+            return EvalTree::empty();
+        }
         let streams = ParseStreamSet(stream_set);
-        let root = if streams.is_empty() { None } else { parse_expression(query, &streams, self.m_Tokenizer.as_ref(), mode) };
+        let root = if streams.is_empty() {
+            None
+        } else {
+            parse_expression(query, &streams, self.m_Tokenizer.as_ref(), mode)
+        };
         let mut tree = EvalTree::new(root);
         if HasVectorStream(stream_set) {
             if let Some(model) = embedding_model {
@@ -77,18 +101,24 @@ impl IndexSearchCompiler {
 #[allow(non_snake_case)]
 fn ParseStreamSet(s: &str) -> Vec<String> {
     let mut saw_vector_only_candidate = false;
-    let mut streams: Vec<String> = s.chars()
+    let mut streams: Vec<String> = s
+        .chars()
         .filter_map(|c| match c {
             'A' => Some("A".into()),
             'U' => Some("U".into()),
             'T' => Some("T".into()),
             'B' => Some("B".into()),
             'M' => Some("M".into()),
-            'V' | 'v' => { saw_vector_only_candidate = true; None },
-            _   => None,
+            'V' | 'v' => {
+                saw_vector_only_candidate = true;
+                None
+            }
+            _ => None,
         })
         .collect();
-    if streams.is_empty() && !saw_vector_only_candidate { streams.push("T".into()); }
+    if streams.is_empty() && !saw_vector_only_candidate {
+        streams.push("T".into());
+    }
     streams
 }
 
@@ -105,11 +135,14 @@ fn make_term_group(term: &str, streams: &[String], word_span: u32) -> EvalNode {
         });
     }
     EvalNode::Or(OrNode {
-        children: streams.iter()
-            .map(|s| EvalNode::Term(TermNode {
-                stream_key: format!("{}{}", term, s),
-                word_span,
-            }))
+        children: streams
+            .iter()
+            .map(|s| {
+                EvalNode::Term(TermNode {
+                    stream_key: format!("{}{}", term, s),
+                    word_span,
+                })
+            })
             .collect(),
     })
 }
@@ -125,7 +158,9 @@ fn streams_for_field(field: &str, fallback: &[String]) -> Vec<String> {
     }
 }
 
-fn is_or_token(raw: &str) -> bool { raw.eq_ignore_ascii_case("or") }
+fn is_or_token(raw: &str) -> bool {
+    raw.eq_ignore_ascii_case("or")
+}
 fn is_not_token(raw: &str) -> bool {
     matches!(raw, "not" | "NOT" | "Not" | "nOT" | "-")
 }
@@ -142,7 +177,9 @@ fn split_raw_items(query: &str) -> Vec<String> {
             current.push(ch);
         }
     }
-    if !current.is_empty() { items.push(current); }
+    if !current.is_empty() {
+        items.push(current);
+    }
     items
 }
 
@@ -164,30 +201,46 @@ fn query_term_key(term: &QueryTerm) -> String {
 
 fn filter_weak_and_terms(tokens: &[QueryTerm]) -> Vec<QueryTerm> {
     let mut seen = HashSet::new();
-    let mut filtered: Vec<QueryTerm> = tokens.iter()
+    let mut filtered: Vec<QueryTerm> = tokens
+        .iter()
         .filter(|token| token.term.len() > 1)
         .filter(|token| seen.insert(query_term_key(token)))
         .cloned()
         .collect();
-    if !filtered.is_empty() { return filtered; }
-    filtered.extend(tokens.iter()
-        .filter(|token| !token.term.is_empty())
-        .filter(|token| seen.insert(query_term_key(token)))
-        .cloned());
+    if !filtered.is_empty() {
+        return filtered;
+    }
+    filtered.extend(
+        tokens
+            .iter()
+            .filter(|token| !token.term.is_empty())
+            .filter(|token| seen.insert(query_term_key(token)))
+            .cloned(),
+    );
     filtered
 }
 
-fn add_raw_item(raw: &str,
-                default_streams: &[String],
-                tokenizer: &dyn Tokenizer,
-                positive: &mut Vec<QueryTerm>,
-                negative: &mut Vec<QueryTerm>,
-                force_exclude: bool) {
-    if raw.is_empty() || is_or_token(raw) || is_not_token(raw) { return; }
+fn add_raw_item(
+    raw: &str,
+    default_streams: &[String],
+    tokenizer: &dyn Tokenizer,
+    positive: &mut Vec<QueryTerm>,
+    negative: &mut Vec<QueryTerm>,
+    force_exclude: bool,
+) {
+    if raw.is_empty() || is_or_token(raw) || is_not_token(raw) {
+        return;
+    }
     let has_minus_prefix = raw.starts_with('-') && raw.len() > 1;
     let exclude = has_minus_prefix || force_exclude;
-    let mut item = if has_minus_prefix { raw[1..].to_string() } else { raw.to_string() };
-    if item.is_empty() { return; }
+    let mut item = if has_minus_prefix {
+        raw[1..].to_string()
+    } else {
+        raw.to_string()
+    };
+    if item.is_empty() {
+        return;
+    }
     let mut streams = default_streams.to_vec();
 
     if let Some(colon) = item.find(':') {
@@ -200,7 +253,10 @@ fn add_raw_item(raw: &str,
 
     let target = if exclude { negative } else { positive };
     for token in tokenizer.Tokenize(&item) {
-        target.push(QueryTerm { term: token, streams: streams.clone() });
+        target.push(QueryTerm {
+            term: token,
+            streams: streams.clone(),
+        });
     }
 }
 
@@ -209,28 +265,43 @@ fn make_query_term_group(term: &QueryTerm, word_span: u32) -> EvalNode {
 }
 
 fn build_bigram_query(terms: &[QueryTerm]) -> Option<EvalNode> {
-    if terms.len() < 2 { return None; }
-    let groups: Vec<EvalNode> = terms.windows(2)
+    if terms.len() < 2 {
+        return None;
+    }
+    let groups: Vec<EvalNode> = terms
+        .windows(2)
         .filter(|w| w[0].streams == w[1].streams)
-        .map(|w| make_term_group(
-            &format!("{}{}{}", w[0].term, BIGRAM_SEP, w[1].term),
-            &w[0].streams,
-            2,  /* word_span = 2, mirrors REF AtomType_Bigram */
-        ))
+        .map(|w| {
+            make_term_group(
+                &format!("{}{}{}", w[0].term, BIGRAM_SEP, w[1].term),
+                &w[0].streams,
+                2, /* word_span = 2, mirrors REF AtomType_Bigram */
+            )
+        })
         .collect();
-    if groups.is_empty()   { return None; }
-    if groups.len() == 1   { return Some(groups.into_iter().next().unwrap()); }
+    if groups.is_empty() {
+        return None;
+    }
+    if groups.len() == 1 {
+        return Some(groups.into_iter().next().unwrap());
+    }
     Some(EvalNode::And(AndNode { children: groups }))
 }
 
 fn build_any_bigram_query(terms: &[QueryTerm]) -> Option<EvalNode> {
-    if terms.len() < 2 { return None; }
-    let groups: Vec<EvalNode> = terms.windows(2)
+    if terms.len() < 2 {
+        return None;
+    }
+    let groups: Vec<EvalNode> = terms
+        .windows(2)
         .filter(|window| window[0].streams == window[1].streams)
-        .map(|window| make_term_group(
-            &format!("{}{}{}", window[0].term, BIGRAM_SEP, window[1].term),
-            &window[0].streams,
-            2))
+        .map(|window| {
+            make_term_group(
+                &format!("{}{}{}", window[0].term, BIGRAM_SEP, window[1].term),
+                &window[0].streams,
+                2,
+            )
+        })
         .collect();
     match groups.len() {
         0 => None,
@@ -240,15 +311,31 @@ fn build_any_bigram_query(terms: &[QueryTerm]) -> Option<EvalNode> {
 }
 
 fn min_should_match(term_count: usize) -> u32 {
-    if term_count <= 2 { 1 } else if term_count <= 5 { 2 } else { 3 }
+    if term_count <= 2 {
+        1
+    } else if term_count <= 5 {
+        2
+    } else {
+        3
+    }
 }
 
 fn build_weak_and_base_expression(terms: &[QueryTerm]) -> Option<EvalNode> {
-    if terms.is_empty() { return None; }
-    if terms.len() == 1 { return Some(make_query_term_group(&terms[0], 1)); }
-    let children: Vec<EvalNode> = terms.iter().map(|term| make_query_term_group(term, 1)).collect();
+    if terms.is_empty() {
+        return None;
+    }
+    if terms.len() == 1 {
+        return Some(make_query_term_group(&terms[0], 1));
+    }
+    let children: Vec<EvalNode> = terms
+        .iter()
+        .map(|term| make_query_term_group(term, 1))
+        .collect();
     let min_should_match = min_should_match(terms.len()).min(children.len() as u32);
-    Some(EvalNode::WeakAnd(WeakAndNode { children, min_should_match }))
+    Some(EvalNode::WeakAnd(WeakAndNode {
+        children,
+        min_should_match,
+    }))
 }
 
 fn build_weak_and_bigram_expression(tokens: &[QueryTerm]) -> Option<EvalNode> {
@@ -256,16 +343,23 @@ fn build_weak_and_bigram_expression(tokens: &[QueryTerm]) -> Option<EvalNode> {
     let base = build_weak_and_base_expression(&terms);
     let bigram = build_any_bigram_query(&terms);
     match (base, bigram) {
-        (Some(base), Some(bigram)) => Some(EvalNode::Or(OrNode { children: vec![base, bigram] })),
+        (Some(base), Some(bigram)) => Some(EvalNode::Or(OrNode {
+            children: vec![base, bigram],
+        })),
         (Some(base), None) => Some(base),
         (None, bigram) => bigram,
     }
 }
 
-fn build_weak_and_bigram_boost_expression(tokens: &[QueryTerm], mode: QueryCompileMode) -> Option<EvalNode> {
+fn build_weak_and_bigram_boost_expression(
+    tokens: &[QueryTerm],
+    mode: QueryCompileMode,
+) -> Option<EvalNode> {
     let terms = filter_weak_and_terms(tokens);
     let base = build_weak_and_base_expression(&terms)?;
-    let Some(bigram) = build_any_bigram_query(&terms) else { return Some(base); };
+    let Some(bigram) = build_any_bigram_query(&terms) else {
+        return Some(base);
+    };
     Some(EvalNode::Boost(BoostNode {
         base: Box::new(base),
         boost: Box::new(bigram),
@@ -281,16 +375,18 @@ fn build_implicit_expression(tokens: &[QueryTerm], mode: QueryCompileMode) -> Op
         }
         QueryCompileMode::Default => {}
     }
-    let free_nodes: Vec<EvalNode> = tokens.iter()
-        .map(|t| make_query_term_group(t, 1))
-        .collect();
+    let free_nodes: Vec<EvalNode> = tokens.iter().map(|t| make_query_term_group(t, 1)).collect();
 
-    if free_nodes.is_empty() { return None; }
+    if free_nodes.is_empty() {
+        return None;
+    }
 
     let unigram_base = if free_nodes.len() == 1 {
         free_nodes.into_iter().next().unwrap()
     } else {
-        EvalNode::And(AndNode { children: free_nodes })
+        EvalNode::And(AndNode {
+            children: free_nodes,
+        })
     };
 
     match build_bigram_query(tokens) {
@@ -301,16 +397,29 @@ fn build_implicit_expression(tokens: &[QueryTerm], mode: QueryCompileMode) -> Op
     }
 }
 
-fn build_minus_expression(positive: &[QueryTerm], negative: &[QueryTerm], mode: QueryCompileMode) -> Option<EvalNode> {
-    if negative.is_empty() { return build_implicit_expression(positive, mode); }
-    if positive.is_empty() { return None; }
+fn build_minus_expression(
+    positive: &[QueryTerm],
+    negative: &[QueryTerm],
+    mode: QueryCompileMode,
+) -> Option<EvalNode> {
+    if negative.is_empty() {
+        return build_implicit_expression(positive, mode);
+    }
+    if positive.is_empty() {
+        return None;
+    }
     Some(EvalNode::Not(NotNode {
         base: Box::new(build_implicit_expression(positive, mode)?),
         exclude: Box::new(build_implicit_expression(negative, mode)?),
     }))
 }
 
-fn parse_expression(query: &str, streams: &[String], tokenizer: &dyn Tokenizer, mode: QueryCompileMode) -> Option<EvalNode> {
+fn parse_expression(
+    query: &str,
+    streams: &[String],
+    tokenizer: &dyn Tokenizer,
+    mode: QueryCompileMode,
+) -> Option<EvalNode> {
     let mut disjuncts = Vec::new();
     let mut positive = Vec::new();
     let mut negative = Vec::new();
@@ -328,17 +437,32 @@ fn parse_expression(query: &str, streams: &[String], tokenizer: &dyn Tokenizer, 
         } else if is_not_token(&raw) {
             next_is_negative = true;
         } else {
-            add_raw_item(&raw, streams, tokenizer, &mut positive, &mut negative, next_is_negative);
+            add_raw_item(
+                &raw,
+                streams,
+                tokenizer,
+                &mut positive,
+                &mut negative,
+                next_is_negative,
+            );
             next_is_negative = false;
             saw_any = true;
         }
     }
 
-    if !saw_any { return None; }
+    if !saw_any {
+        return None;
+    }
     if let Some(node) = build_minus_expression(&positive, &negative, mode) {
         disjuncts.push(node);
     }
-    if disjuncts.is_empty() { return None; }
-    if disjuncts.len() == 1 { return disjuncts.into_iter().next(); }
-    Some(EvalNode::Or(OrNode { children: disjuncts }))
+    if disjuncts.is_empty() {
+        return None;
+    }
+    if disjuncts.len() == 1 {
+        return disjuncts.into_iter().next();
+    }
+    Some(EvalNode::Or(OrNode {
+        children: disjuncts,
+    }))
 }

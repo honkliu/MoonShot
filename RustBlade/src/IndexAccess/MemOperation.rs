@@ -1,3 +1,6 @@
+//! Direct translation of the C++ memory helpers; symbol names stay aligned for debugging.
+#![allow(non_snake_case, non_upper_case_globals)]
+
 use std::marker::PhantomData;
 use std::ops::{Index, IndexMut};
 use std::ptr::NonNull;
@@ -34,16 +37,28 @@ impl<T: Copy + Default> PinnedMemory<T> {
         {
             let mut buffer = vec![T::default(); len].into_boxed_slice();
             let ptr = NonNull::new(buffer.as_mut_ptr()).expect("Box returned null");
-            return Self { ptr, len, buffer, _marker: PhantomData };
+            return Self {
+                ptr,
+                len,
+                buffer,
+                _marker: PhantomData,
+            };
         }
 
         #[cfg(not(target_arch = "wasm32"))]
         unsafe {
-            let bytes = len.checked_mul(std::mem::size_of::<T>()).expect("pinned allocation size overflow");
+            let bytes = len
+                .checked_mul(std::mem::size_of::<T>())
+                .expect("pinned allocation size overflow");
             let raw = PinnedMemAlloc(bytes as u64);
             let ptr = NonNull::new(raw as *mut T).expect("pinned allocation failed");
             std::ptr::write_bytes(ptr.as_ptr(), 0, len);
-            Self { ptr, len, bytes, _marker: PhantomData }
+            Self {
+                ptr,
+                len,
+                bytes,
+                _marker: PhantomData,
+            }
         }
     }
 
@@ -55,8 +70,12 @@ impl<T: Copy + Default> PinnedMemory<T> {
 }
 
 impl<T: Copy> PinnedMemory<T> {
-    pub fn len(&self) -> usize { self.len }
-    pub fn is_empty(&self) -> bool { self.len == 0 }
+    pub fn len(&self) -> usize {
+        self.len
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
 
     pub fn as_slice(&self) -> &[T] {
         unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
@@ -69,18 +88,24 @@ impl<T: Copy> PinnedMemory<T> {
 
 impl<T: Copy> Index<usize> for PinnedMemory<T> {
     type Output = T;
-    fn index(&self, index: usize) -> &Self::Output { &self.as_slice()[index] }
+    fn index(&self, index: usize) -> &Self::Output {
+        &self.as_slice()[index]
+    }
 }
 
 impl<T: Copy> IndexMut<usize> for PinnedMemory<T> {
-    fn index_mut(&mut self, index: usize) -> &mut Self::Output { &mut self.as_mut_slice()[index] }
+    fn index_mut(&mut self, index: usize) -> &mut Self::Output {
+        &mut self.as_mut_slice()[index]
+    }
 }
 
 impl<T: Copy> Drop for PinnedMemory<T> {
     fn drop(&mut self) {
         #[cfg(not(target_arch = "wasm32"))]
         if self.bytes > 0 {
-            unsafe { PinnedMemFree(self.ptr.as_ptr() as *mut u8, self.bytes as u64); }
+            unsafe {
+                PinnedMemFree(self.ptr.as_ptr() as *mut u8, self.bytes as u64);
+            }
         }
     }
 }
@@ -88,8 +113,15 @@ impl<T: Copy> Drop for PinnedMemory<T> {
 #[cfg(windows)]
 #[allow(non_snake_case)]
 unsafe fn PinnedMemAlloc(bytes: u64) -> *mut u8 {
-    use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualLock, MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE};
-    let ptr = VirtualAlloc(std::ptr::null_mut(), bytes as usize, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) as *mut u8;
+    use windows_sys::Win32::System::Memory::{
+        VirtualAlloc, VirtualLock, MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE,
+    };
+    let ptr = VirtualAlloc(
+        std::ptr::null_mut(),
+        bytes as usize,
+        MEM_RESERVE | MEM_COMMIT,
+        PAGE_READWRITE,
+    ) as *mut u8;
     if !ptr.is_null() {
         let _ = VirtualLock(ptr as *const _, bytes as usize);
     }

@@ -1,6 +1,10 @@
-#![allow(non_snake_case)]
+//! Direct translation of the C++ file-access surface; names stay aligned for API parity.
+#![allow(non_snake_case, non_upper_case_globals)]
 
-use std::sync::{Mutex, atomic::{AtomicU64, Ordering}};
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Mutex,
+};
 
 #[cfg(not(target_arch = "wasm32"))]
 use std::fs::{File, OpenOptions};
@@ -104,7 +108,13 @@ impl FileAccess {
         }
         #[cfg(not(target_arch = "wasm32"))]
         {
-            match OpenOptions::new().read(true).write(true).create(true).truncate(truncate).open(&self.m_FileName) {
+            match OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(truncate)
+                .open(&self.m_FileName)
+            {
                 Ok(file) => {
                     self.m_FileHandle = Some(Mutex::new(file));
                     true
@@ -115,26 +125,41 @@ impl FileAccess {
     }
 
     pub fn GetData(&self, buffer: &mut [u8], numBytes: i32) -> i32 {
-        if numBytes < 0 { return -1; }
-        let Ok(_sequential) = self.m_SequentialAccess.lock() else { return -1; };
+        if numBytes < 0 {
+            return -1;
+        }
+        let Ok(_sequential) = self.m_SequentialAccess.lock() else {
+            return -1;
+        };
         let requested = (numBytes as usize).min(buffer.len());
         let position = self.m_Position.load(Ordering::Relaxed);
         let count = self.ReadAt(position, &mut buffer[..requested]);
         if count > 0 {
-            self.m_Position.store(position + count as u64, Ordering::Relaxed);
+            self.m_Position
+                .store(position + count as u64, Ordering::Relaxed);
         }
         count
     }
 
     pub fn PutData(&self, buffer: &[u8]) -> bool {
-        if buffer.is_empty() { return true; }
-        let Ok(_sequential) = self.m_SequentialAccess.lock() else { return false; };
+        if buffer.is_empty() {
+            return true;
+        }
+        let Ok(_sequential) = self.m_SequentialAccess.lock() else {
+            return false;
+        };
         #[cfg(target_arch = "wasm32")]
-        { return false; }
+        {
+            return false;
+        }
         #[cfg(not(target_arch = "wasm32"))]
         {
-            let Some(file) = self.m_FileHandle.as_ref() else { return false; };
-            let Ok(mut file) = file.lock() else { return false; };
+            let Some(file) = self.m_FileHandle.as_ref() else {
+                return false;
+            };
+            let Ok(mut file) = file.lock() else {
+                return false;
+            };
             let mut offset = 0usize;
             while offset < buffer.len() {
                 let end = offset.saturating_add(i32::MAX as usize).min(buffer.len());
@@ -144,12 +169,21 @@ impl FileAccess {
                 }
             }
         }
-        self.m_Position.fetch_add(buffer.len() as u64, Ordering::Relaxed);
+        self.m_Position
+            .fetch_add(buffer.len() as u64, Ordering::Relaxed);
         true
     }
 
-    pub fn ReadBlock(&self, block_seq: u32, buffer: &mut [u8], block_size: usize, base_byte_offset: u64) -> bool {
-        if block_size > buffer.len() { return false; }
+    pub fn ReadBlock(
+        &self,
+        block_seq: u32,
+        buffer: &mut [u8],
+        block_size: usize,
+        base_byte_offset: u64,
+    ) -> bool {
+        if block_size > buffer.len() {
+            return false;
+        }
         let position = base_byte_offset + block_seq as u64 * block_size as u64;
         #[cfg(all(unix, not(target_arch = "wasm32")))]
         if self.m_FileHandle.is_some() {
@@ -159,22 +193,35 @@ impl FileAccess {
     }
 
     pub fn WriteBlock(&self, block_seq: u32, buffer: &[u8], block_size: usize) -> bool {
-        if block_size > buffer.len() { return false; }
-        let Ok(_sequential) = self.m_SequentialAccess.lock() else { return false; };
+        if block_size > buffer.len() {
+            return false;
+        }
+        let Ok(_sequential) = self.m_SequentialAccess.lock() else {
+            return false;
+        };
         let position = block_seq as u64 * block_size as u64;
         #[cfg(target_arch = "wasm32")]
-        { let _ = position; false }
+        {
+            let _ = position;
+            false
+        }
         #[cfg(not(target_arch = "wasm32"))]
         {
-            let Some(file) = self.m_FileHandle.as_ref() else { return false; };
-            let Ok(mut file) = file.lock() else { return false; };
+            let Some(file) = self.m_FileHandle.as_ref() else {
+                return false;
+            };
+            let Ok(mut file) = file.lock() else {
+                return false;
+            };
             file.seek(SeekFrom::Start(position)).is_ok()
                 && matches!(file.write(&buffer[..block_size]), Ok(count) if count == block_size)
         }
     }
 
     pub fn SetPosition(&self, position: u64) -> bool {
-        let Ok(_sequential) = self.m_SequentialAccess.lock() else { return false; };
+        let Ok(_sequential) = self.m_SequentialAccess.lock() else {
+            return false;
+        };
         self.m_Position.store(position, Ordering::Relaxed);
         #[cfg(target_arch = "wasm32")]
         {
@@ -182,8 +229,12 @@ impl FileAccess {
         }
         #[cfg(not(target_arch = "wasm32"))]
         {
-            let Some(file) = self.m_FileHandle.as_ref() else { return false; };
-            let Ok(mut file) = file.lock() else { return false; };
+            let Some(file) = self.m_FileHandle.as_ref() else {
+                return false;
+            };
+            let Ok(mut file) = file.lock() else {
+                return false;
+            };
             file.seek(SeekFrom::Start(position)).is_ok()
         }
     }
@@ -191,19 +242,35 @@ impl FileAccess {
     fn ReadAt(&self, position: u64, buffer: &mut [u8]) -> i32 {
         #[cfg(target_arch = "wasm32")]
         {
-            if browser_read_range(position, buffer) { buffer.len() as i32 } else { -1 }
+            if browser_read_range(position, buffer) {
+                buffer.len() as i32
+            } else {
+                -1
+            }
         }
         #[cfg(all(unix, not(target_arch = "wasm32")))]
         {
-            let Some(file) = self.m_FileHandle.as_ref() else { return -1; };
-            let Ok(file) = file.lock() else { return -1; };
-            file.read_at(buffer, position).map(|count| count as i32).unwrap_or(-1)
+            let Some(file) = self.m_FileHandle.as_ref() else {
+                return -1;
+            };
+            let Ok(file) = file.lock() else {
+                return -1;
+            };
+            file.read_at(buffer, position)
+                .map(|count| count as i32)
+                .unwrap_or(-1)
         }
         #[cfg(all(windows, not(target_arch = "wasm32")))]
         {
-            let Some(file) = self.m_FileHandle.as_ref() else { return -1; };
-            let Ok(file) = file.lock() else { return -1; };
-            file.seek_read(buffer, position).map(|count| count as i32).unwrap_or(-1)
+            let Some(file) = self.m_FileHandle.as_ref() else {
+                return -1;
+            };
+            let Ok(file) = file.lock() else {
+                return -1;
+            };
+            file.seek_read(buffer, position)
+                .map(|count| count as i32)
+                .unwrap_or(-1)
         }
     }
 }

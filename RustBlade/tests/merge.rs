@@ -1,9 +1,12 @@
-use rustblade::index_writer::IndexWriter;
+//! C++-parity merge tests; MoonShot API calls intentionally retain their public names.
+#![allow(non_snake_case, non_upper_case_globals)]
+
 use rustblade::block_table::INDEX_FILE_HEADER_SIZE;
-use rustblade::posting_store::PostingStore;
-use rustblade::index_serializer::{IndexFileHeader, IndexSerializer};
-use rustblade::tokenizer::Tokenizer;
 use rustblade::embeddings::build_hashed_embedding;
+use rustblade::index_serializer::{IndexFileHeader, IndexSerializer};
+use rustblade::index_writer::IndexWriter;
+use rustblade::posting_store::PostingStore;
+use rustblade::tokenizer::Tokenizer;
 use rustblade::{Document, IndexContext, SmartTokenizer};
 use std::fs::File;
 use std::io::Read;
@@ -11,7 +14,11 @@ use std::io::Read;
 fn delta_index_path(path: &std::path::Path) -> String {
     let text = path.to_string_lossy();
     if let Some(dot) = text.rfind('.') {
-        if text.rfind(['/', '\\']).map(|slash| dot > slash).unwrap_or(true) {
+        if text
+            .rfind(['/', '\\'])
+            .map(|slash| dot > slash)
+            .unwrap_or(true)
+        {
             return format!("{}{}.{}", &text[..dot], ".delta", &text[dot + 1..]);
         }
     }
@@ -48,7 +55,11 @@ fn add_doc_via_context(ctx: &mut IndexContext, doc_id: u64, title: &str, body: &
 fn search_doc_ids(ctx: &mut IndexContext, query: &str) -> Vec<u64> {
     let mut reader = ctx.GetReaderForQuery(query, "AUTB");
     let executor = ctx.GetExecutor();
-    executor.Execute(reader.as_mut(), 0).into_iter().map(|result| result.doc_id).collect()
+    executor
+        .Execute(reader.as_mut(), 0)
+        .into_iter()
+        .map(|result| result.doc_id)
+        .collect()
 }
 
 fn read_header(path: &std::path::Path) -> IndexFileHeader {
@@ -168,7 +179,10 @@ fn title_score_uses_title_length_instead_of_body_length() {
     let long = Document {
         doc_id: 1,
         title: "needle".to_string(),
-        body: std::iter::repeat("filler").take(200).collect::<Vec<_>>().join(" "),
+        body: std::iter::repeat("filler")
+            .take(200)
+            .collect::<Vec<_>>()
+            .join(" "),
         importance: 0.0,
         ..Document::default()
     };
@@ -176,14 +190,30 @@ fn title_score_uses_title_length_instead_of_body_length() {
     ctx.AddDocument(&long, true);
     ctx.Build();
 
-    let token = ctx.GetTokenizer().Tokenize("needle").into_iter().next().unwrap();
+    let token = ctx
+        .GetTokenizer()
+        .Tokenize("needle")
+        .into_iter()
+        .next()
+        .unwrap();
     let stream_key = format!("{token}T");
     let mut reader = ctx.GetStreamReader(&stream_key);
     let executor = ctx.GetExecutor();
     let results = executor.Execute(reader.as_mut(), 0);
-    let short_score = results.iter().find(|result| result.doc_id == 0).unwrap().score;
-    let long_score = results.iter().find(|result| result.doc_id == 1).unwrap().score;
-    assert!((short_score - long_score).abs() < 1e-6, "short_score={short_score}, long_score={long_score}");
+    let short_score = results
+        .iter()
+        .find(|result| result.doc_id == 0)
+        .unwrap()
+        .score;
+    let long_score = results
+        .iter()
+        .find(|result| result.doc_id == 1)
+        .unwrap()
+        .score;
+    assert!(
+        (short_score - long_score).abs() < 1e-6,
+        "short_score={short_score}, long_score={long_score}"
+    );
 }
 
 #[test]
@@ -269,13 +299,25 @@ fn merge_continuation_postings() {
 
     let mut base = IndexContext::new();
     for doc_id in 0..BASE_DOCS {
-        add_doc(&mut base, doc_id, "longmerge", "base common", &format!("base-{doc_id}.txt"));
+        add_doc(
+            &mut base,
+            doc_id,
+            "longmerge",
+            "base common",
+            &format!("base-{doc_id}.txt"),
+        );
     }
     base.SaveIndex(&base_path_text).unwrap();
 
     let mut delta = IndexContext::new();
     for doc_id in BASE_DOCS..BASE_DOCS + DELTA_DOCS {
-        add_doc(&mut delta, doc_id, "longmerge", "delta common", &format!("delta-{doc_id}.txt"));
+        add_doc(
+            &mut delta,
+            doc_id,
+            "longmerge",
+            "delta common",
+            &format!("delta-{doc_id}.txt"),
+        );
     }
     delta.SaveIndex(&delta_path).unwrap();
 

@@ -1,3 +1,6 @@
+//! Rust-specific error channel used where C++ reports bools or exceptions.
+#![allow(non_snake_case, non_upper_case_globals)]
+
 use thiserror::Error;
 
 // Rust-only counterpart to C++'s bool/exception-style failure paths.

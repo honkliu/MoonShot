@@ -1,3 +1,6 @@
+//! Browser adapter; exported names preserve the JavaScript contract and C++-parity API.
+#![allow(non_snake_case, non_upper_case_globals)]
+
 use std::cell::RefCell;
 use std::collections::HashMap;
 
@@ -7,23 +10,14 @@ use wasm_bindgen::prelude::*;
 // C++ peer file; the binary structures below mirror BlockTable.h/IndexSerializer.h.
 
 use crate::block_table::{
-    IndexBlock,
-    IndexBlockContinuationHeader,
-    LeafTermEntry,
-    INDEX_BLOCK_CONTINUATION_HEADER_SIZE,
-    INDEX_FILE_HEADER_SIZE,
-    INDEX_FORMAT_VERSION,
-    PAGE_SIZE,
-    DOC_REC_SIZE,
-    DOC_PATH_MAX,
-    DOC_PATH_OFFSET,
-    DOC_PATH_PREFIX_ID_BYTES,
-    DOC_PATH_PREFIX_INVALID,
+    IndexBlock, IndexBlockContinuationHeader, LeafTermEntry, DOC_PATH_MAX, DOC_PATH_OFFSET,
+    DOC_PATH_PREFIX_ID_BYTES, DOC_PATH_PREFIX_INVALID, DOC_REC_SIZE,
+    INDEX_BLOCK_CONTINUATION_HEADER_SIZE, INDEX_FILE_HEADER_SIZE, INDEX_FORMAT_VERSION, PAGE_SIZE,
 };
-use crate::index_context::IndexContext;
 use crate::embeddings::VectorMetric;
-use crate::posting_store::PostingStore;
+use crate::index_context::IndexContext;
 use crate::index_serializer::IndexSerializer;
+use crate::posting_store::PostingStore;
 
 #[derive(Clone, PartialEq, Eq)]
 struct VectorCacheKey {
@@ -98,12 +92,15 @@ pub fn parse_index(data: &[u8]) -> String {
 fn parse_index_inner(data: &[u8]) -> Result<String, String> {
     let header = parse_header(data)?;
     let mut store = PostingStore::new();
-    let (head_entries, leaf_blocks, blocks, docdata, _, prefixes, _, _, _) = IndexSerializer::decode(&mut store, data)
-        .map_err(|error| format!("{error:?}"))?;
+    let (head_entries, leaf_blocks, blocks, docdata, _, prefixes, _, _, _) =
+        IndexSerializer::decode(&mut store, data).map_err(|error| format!("{error:?}"))?;
 
     let mut block_entry_map: HashMap<u32, Vec<LeafTermEntry>> = HashMap::new();
     for entry in leaf_blocks.iter().flat_map(|block| block.entries()) {
-        block_entry_map.entry(entry.LTE_IndexBlockID).or_default().push(entry);
+        block_entry_map
+            .entry(entry.LTE_IndexBlockID)
+            .or_default()
+            .push(entry);
     }
 
     let mut out = String::from("{");
@@ -138,7 +135,9 @@ fn parse_index_inner(data: &[u8]) -> Result<String, String> {
 
     out.push_str(r#""head_leaf_term_table":{"head":["#);
     for (index, entry) in head_entries.iter().enumerate() {
-        if index > 0 { out.push(','); }
+        if index > 0 {
+            out.push(',');
+        }
         out.push_str(&format!(
             r#"{{"HTE_FirstTerm":{},"HTE_LeafTermBlockID":{},"byte_offset":{},"byte_len":32,"leaf_term_block_offset":{},"leaf_term_block_len":{}}}"#,
             serde_json::to_string(entry.first_term()).unwrap_or_default(),
@@ -151,7 +150,9 @@ fn parse_index_inner(data: &[u8]) -> Result<String, String> {
 
     out.push_str(r#"],"leaf_blocks":["#);
     for (block_index, block) in leaf_blocks.iter().enumerate() {
-        if block_index > 0 { out.push(','); }
+        if block_index > 0 {
+            out.push(',');
+        }
         let block_offset = header.leaf_term_off as usize + block_index * PAGE_SIZE;
         out.push_str(&format!(
             r#"{{"id":{},"byte_offset":{},"byte_len":{},"entry_count":{},"entries":["#,
@@ -161,8 +162,12 @@ fn parse_index_inner(data: &[u8]) -> Result<String, String> {
             block.entry_count()
         ));
         for entry_index in 0..block.entry_count() {
-            if entry_index > 0 { out.push(','); }
-            let Some(entry) = block.entry(entry_index) else { continue; };
+            if entry_index > 0 {
+                out.push(',');
+            }
+            let Some(entry) = block.entry(entry_index) else {
+                continue;
+            };
             let entry_offset = block.LTB_Directory[entry_index] as usize;
             out.push_str(&format!(
                 r#"{{"LTE_Term":{},"LTE_DocFreq":{},"LTE_IndexBlockID":{},"LTE_IndexOffset":{},"LTE_IndexLength":{},"LTE_ContinuationBlockCount":{},"LTE_Flags":{},"byte_offset":{},"byte_len":{}}}"#,
@@ -183,17 +188,28 @@ fn parse_index_inner(data: &[u8]) -> Result<String, String> {
 
     out.push_str(r#""docdata":["#);
     let mut docs: Vec<(u64, f32, u32, String)> = Vec::new();
-    let first_doc_id = if header.num_docs > 0 && docdata.len() >= DOC_REC_SIZE { u32_at(&docdata, 0) as u64 } else { 0 };
+    let first_doc_id = if header.num_docs > 0 && docdata.len() >= DOC_REC_SIZE {
+        u32_at(&docdata, 0) as u64
+    } else {
+        0
+    };
     for slot in 0..header.num_docs as usize {
         let offset = slot * DOC_REC_SIZE;
-        if offset + DOC_REC_SIZE > docdata.len() { break; }
+        if offset + DOC_REC_SIZE > docdata.len() {
+            break;
+        }
         let doc_id = u32_at(&docdata, offset) as u64;
-        if doc_id != first_doc_id + slot as u64 { continue; }
+        if doc_id != first_doc_id + slot as u64 {
+            continue;
+        }
         let importance = u16_at(&docdata, offset + 4) as f32 / 65535.0;
         let doc_len = u32_at(&docdata, offset + 30);
         let path_len = (u16_at(&docdata, offset + 18) as usize).min(DOC_PATH_MAX);
         let path = if path_len > 0 {
-            decode_doc_path(&docdata[offset + DOC_PATH_OFFSET..offset + DOC_PATH_OFFSET + path_len], &prefixes)
+            decode_doc_path(
+                &docdata[offset + DOC_PATH_OFFSET..offset + DOC_PATH_OFFSET + path_len],
+                &prefixes,
+            )
         } else {
             String::new()
         };
@@ -201,7 +217,9 @@ fn parse_index_inner(data: &[u8]) -> Result<String, String> {
     }
     docs.sort_by_key(|(doc_id, _, _, _)| *doc_id);
     for (index, (doc_id, importance, doc_len, path)) in docs.iter().enumerate() {
-        if index > 0 { out.push(','); }
+        if index > 0 {
+            out.push(',');
+        }
         out.push_str(&format!(
             r#"{{"doc_id":"{}","importance":{:.4},"doc_len":{},"path":{}}}"#,
             doc_id,
@@ -214,7 +232,9 @@ fn parse_index_inner(data: &[u8]) -> Result<String, String> {
 
     out.push_str(r#""blocks":["#);
     for (seq, block) in blocks.iter().enumerate() {
-        if seq > 0 { out.push(','); }
+        if seq > 0 {
+            out.push(',');
+        }
         out.push_str(&format!(
             r#"{{"seq":{},"byte_off":{},"terms":["#,
             seq,
@@ -223,9 +243,15 @@ fn parse_index_inner(data: &[u8]) -> Result<String, String> {
 
         let terms = decode_block_terms(
             block,
-            block_entry_map.get(&(seq as u32)).map(|entries| entries.as_slice()).unwrap_or(&[]));
+            block_entry_map
+                .get(&(seq as u32))
+                .map(|entries| entries.as_slice())
+                .unwrap_or(&[]),
+        );
         for (index, term) in terms.iter().enumerate() {
-            if index > 0 { out.push(','); }
+            if index > 0 {
+                out.push(',');
+            }
             out.push_str(term);
         }
         out.push_str("]}");
@@ -241,35 +267,49 @@ fn decode_block_terms(block: &IndexBlock, entries: &[LeafTermEntry]) -> Vec<Stri
     if let Some(header) = IndexBlockContinuationHeader::from_bytes(&block.IB_Data) {
         let len = header.IBCH_DataLength as usize;
         if len > 0 && INDEX_BLOCK_CONTINUATION_HEADER_SIZE + len <= PAGE_SIZE {
-            let postings = decode_postings(&block.IB_Data[INDEX_BLOCK_CONTINUATION_HEADER_SIZE..INDEX_BLOCK_CONTINUATION_HEADER_SIZE + len]);
-            terms.push(format_postings("[continuation]", 0, INDEX_BLOCK_CONTINUATION_HEADER_SIZE, len, 0, postings));
+            let postings = decode_postings(
+                &block.IB_Data[INDEX_BLOCK_CONTINUATION_HEADER_SIZE
+                    ..INDEX_BLOCK_CONTINUATION_HEADER_SIZE + len],
+            );
+            terms.push(format_postings(
+                "[continuation]",
+                0,
+                INDEX_BLOCK_CONTINUATION_HEADER_SIZE,
+                len,
+                0,
+                postings,
+            ));
         }
     }
 
     for entry in entries {
         let start = entry.LTE_IndexOffset as usize;
         let len = entry.LTE_IndexLength as usize;
-        if start + len > PAGE_SIZE { continue; }
+        if start + len > PAGE_SIZE {
+            continue;
+        }
         let postings = decode_postings(&block.IB_Data[start..start + len]);
-            terms.push(format_postings(
-                &entry.LTE_Term,
-                entry.LTE_DocFreq,
-                start,
-                len,
-                entry.LTE_ContinuationBlockCount as u32,
-                postings));
+        terms.push(format_postings(
+            &entry.LTE_Term,
+            entry.LTE_DocFreq,
+            start,
+            len,
+            entry.LTE_ContinuationBlockCount as u32,
+            postings,
+        ));
     }
 
     terms
 }
 
-fn format_postings(term: &str,
-                   doc_freq: u32,
-                   offset: usize,
-                   len: usize,
-                   continuation_count: u32,
-                   postings: Vec<(u64, u32)>) -> String
-{
+fn format_postings(
+    term: &str,
+    doc_freq: u32,
+    offset: usize,
+    len: usize,
+    continuation_count: u32,
+    postings: Vec<(u64, u32)>,
+) -> String {
     let shown = postings.len().min(5);
     let mut out = format!(
         r#"{{"LTE_Term":{},"LTE_DocFreq":{},"LTE_IndexLength":{},"LTE_IndexOffset":{},"LTE_ContinuationBlockCount":{},"index_entries":["#,
@@ -280,12 +320,22 @@ fn format_postings(term: &str,
         continuation_count
     );
     for (index, (doc_id, tf)) in postings[..shown].iter().enumerate() {
-        if index > 0 { out.push(','); }
-        out.push_str(&format!(r#"{{"ie_doc_id":"{}","ie_term_frequency":{}}}"#, doc_id, tf));
+        if index > 0 {
+            out.push(',');
+        }
+        out.push_str(&format!(
+            r#"{{"ie_doc_id":"{}","ie_term_frequency":{}}}"#,
+            doc_id, tf
+        ));
     }
     if postings.len() > shown {
-        if shown > 0 { out.push(','); }
-        out.push_str(&format!(r#"{{"ie_doc_id":"...","ie_term_frequency":"({} more)"}}"#, postings.len() - shown));
+        if shown > 0 {
+            out.push(',');
+        }
+        out.push_str(&format!(
+            r#"{{"ie_doc_id":"...","ie_term_frequency":"({} more)"}}"#,
+            postings.len() - shown
+        ));
     }
     out.push_str("]}");
     out
@@ -297,7 +347,9 @@ fn decode_postings(data: &[u8]) -> Vec<(u64, u32)> {
     while pos < data.len() {
         let (doc_id, doc_bytes) = vb_read(data, pos);
         pos += doc_bytes;
-        if pos >= data.len() { break; }
+        if pos >= data.len() {
+            break;
+        }
         let tf = data[pos] as u32;
         pos += 1;
         result.push((doc_id, tf));
@@ -319,7 +371,9 @@ pub fn search_index(data: &[u8], query: &str, streams: &str) -> String {
     };
     let mut out = String::from("[");
     for (index, result) in results.iter().enumerate() {
-        if index > 0 { out.push(','); }
+        if index > 0 {
+            out.push(',');
+        }
         let path = context.GetDocPath(result.doc_id);
         out.push_str(&format!(
             r#"{{"doc_id":"{}","score":{:.4},"path":{}}}"#,
@@ -336,7 +390,8 @@ pub fn search_index(data: &[u8], query: &str, streams: &str) -> String {
 #[wasm_bindgen]
 pub fn open_index() -> Result<(), JsValue> {
     let mut context = IndexContext::with_path_and_load_delta(None, false);
-    context.LoadIndex("browser-file")
+    context
+        .LoadIndex("browser-file")
         .map_err(|error| JsValue::from_str(&format!("Failed to load index: {error:?}")))?;
     INDEX_CONTEXT.with(|cached| *cached.borrow_mut() = Some(context));
     Ok(())
@@ -358,7 +413,9 @@ pub fn search_loaded_index(query: &str, streams: &str) -> String {
         };
         let mut out = String::from("[");
         for (index, result) in results.iter().enumerate() {
-            if index > 0 { out.push(','); }
+            if index > 0 {
+                out.push(',');
+            }
             let path = context.GetDocPath(result.doc_id);
             out.push_str(&format!(
                 r#"{{"doc_id":"{}","score":{:.4},"path":{}}}"#,
@@ -373,41 +430,70 @@ pub fn search_loaded_index(query: &str, streams: &str) -> String {
 }
 
 #[wasm_bindgen]
-pub fn vector_search_index(data: &[u8], query_vector_json: &str, top_k: usize, ef_search: usize) -> String {
+pub fn vector_search_index(
+    data: &[u8],
+    query_vector_json: &str,
+    top_k: usize,
+    ef_search: usize,
+) -> String {
     let query_vector: Vec<f32> = match serde_json::from_str(query_vector_json) {
         Ok(vector) => vector,
         Err(error) => return format!(r#"{{"error":"Invalid query vector: {error}"}}"#),
     };
     if query_vector.len() != crate::block_table::DOC_VECTOR_DIM {
-        return format!(r#"{{"error":"Invalid query vector dimension: expected {}, got {}"}}"#, crate::block_table::DOC_VECTOR_DIM, query_vector.len());
+        return format!(
+            r#"{{"error":"Invalid query vector dimension: expected {}, got {}"}}"#,
+            crate::block_table::DOC_VECTOR_DIM,
+            query_vector.len()
+        );
     }
     let key = match vector_cache_key(data) {
         Ok(key) => key,
         Err(error) => return format!(r#"{{"error":"Failed to read index header: {error}"}}"#),
     };
-    let results = match VECTOR_CONTEXT_CACHE.with(|cache| -> Result<Vec<(u64, f32, String)>, String> {
-        let mut cache = cache.borrow_mut();
-        let reload = cache.as_ref().map(|cached| cached.key != key).unwrap_or(true);
-        if reload {
-            let mut context = IndexContext::new();
-            context.LoadVectorFromBytes(data).map_err(|error| format!("{error:?}"))?;
-            *cache = Some(CachedVectorContext { key: key.clone(), context });
-        }
-        let cached = cache.as_mut().ok_or_else(|| "vector cache unavailable".to_string())?;
-        Ok(cached.context.VectorSearch(&query_vector, top_k, VectorMetric::Cosine, ef_search.max(if top_k == 0 { 1 } else { top_k }))
-            .into_iter()
-            .map(|result| {
-                let path = cached.context.GetDocPath(result.doc_id);
-                (result.doc_id, result.score, path)
-            })
-            .collect())
-    }) {
-        Ok(results) => results,
-        Err(error) => return format!(r#"{{"error":"Failed to load vector index: {error}"}}"#),
-    };
+    let results =
+        match VECTOR_CONTEXT_CACHE.with(|cache| -> Result<Vec<(u64, f32, String)>, String> {
+            let mut cache = cache.borrow_mut();
+            let reload = cache
+                .as_ref()
+                .map(|cached| cached.key != key)
+                .unwrap_or(true);
+            if reload {
+                let mut context = IndexContext::new();
+                context
+                    .LoadVectorFromBytes(data)
+                    .map_err(|error| format!("{error:?}"))?;
+                *cache = Some(CachedVectorContext {
+                    key: key.clone(),
+                    context,
+                });
+            }
+            let cached = cache
+                .as_mut()
+                .ok_or_else(|| "vector cache unavailable".to_string())?;
+            Ok(cached
+                .context
+                .VectorSearch(
+                    &query_vector,
+                    top_k,
+                    VectorMetric::Cosine,
+                    ef_search.max(if top_k == 0 { 1 } else { top_k }),
+                )
+                .into_iter()
+                .map(|result| {
+                    let path = cached.context.GetDocPath(result.doc_id);
+                    (result.doc_id, result.score, path)
+                })
+                .collect())
+        }) {
+            Ok(results) => results,
+            Err(error) => return format!(r#"{{"error":"Failed to load vector index: {error}"}}"#),
+        };
     let mut out = String::from("[");
     for (index, (doc_id, score, path)) in results.iter().enumerate() {
-        if index > 0 { out.push(','); }
+        if index > 0 {
+            out.push(',');
+        }
         out.push_str(&format!(
             r#"{{"doc_id":"{}","score":{:.4},"path":{}}}"#,
             doc_id,
@@ -420,13 +506,23 @@ pub fn vector_search_index(data: &[u8], query_vector_json: &str, top_k: usize, e
 }
 
 #[wasm_bindgen]
-pub fn vector_search_tables(docdata: &[u8], path_prefix_sidecar: &[u8], query_vector_json: &str, top_k: usize, ef_search: usize) -> String {
+pub fn vector_search_tables(
+    docdata: &[u8],
+    path_prefix_sidecar: &[u8],
+    query_vector_json: &str,
+    top_k: usize,
+    ef_search: usize,
+) -> String {
     let query_vector: Vec<f32> = match serde_json::from_str(query_vector_json) {
         Ok(vector) => vector,
         Err(error) => return format!(r#"{{"error":"Invalid query vector: {error}"}}"#),
     };
     if query_vector.len() != crate::block_table::DOC_VECTOR_DIM {
-        return format!(r#"{{"error":"Invalid query vector dimension: expected {}, got {}"}}"#, crate::block_table::DOC_VECTOR_DIM, query_vector.len());
+        return format!(
+            r#"{{"error":"Invalid query vector dimension: expected {}, got {}"}}"#,
+            crate::block_table::DOC_VECTOR_DIM,
+            query_vector.len()
+        );
     }
     let key = VectorCacheKey {
         file_size: docdata.len() + path_prefix_sidecar.len(),
@@ -437,29 +533,49 @@ pub fn vector_search_tables(docdata: &[u8], path_prefix_sidecar: &[u8], query_ve
         index_block_count: 0,
         checksum: content_checksum(docdata) ^ content_checksum(path_prefix_sidecar).rotate_left(1),
     };
-    let results = match VECTOR_CONTEXT_CACHE.with(|cache| -> Result<Vec<(u64, f32, String)>, String> {
-        let mut cache = cache.borrow_mut();
-        let reload = cache.as_ref().map(|cached| cached.key != key).unwrap_or(true);
-        if reload {
-            let mut context = IndexContext::new();
-            context.LoadVectorTables(docdata, path_prefix_sidecar).map_err(|error| format!("{error:?}"))?;
-            *cache = Some(CachedVectorContext { key: key.clone(), context });
-        }
-        let cached = cache.as_mut().ok_or_else(|| "vector cache unavailable".to_string())?;
-        Ok(cached.context.VectorSearch(&query_vector, top_k, VectorMetric::Cosine, ef_search.max(if top_k == 0 { 1 } else { top_k }))
-            .into_iter()
-            .map(|result| {
-                let path = cached.context.GetDocPath(result.doc_id);
-                (result.doc_id, result.score, path)
-            })
-            .collect())
-    }) {
-        Ok(results) => results,
-        Err(error) => return format!(r#"{{"error":"Failed to load vector tables: {error}"}}"#),
-    };
+    let results =
+        match VECTOR_CONTEXT_CACHE.with(|cache| -> Result<Vec<(u64, f32, String)>, String> {
+            let mut cache = cache.borrow_mut();
+            let reload = cache
+                .as_ref()
+                .map(|cached| cached.key != key)
+                .unwrap_or(true);
+            if reload {
+                let mut context = IndexContext::new();
+                context
+                    .LoadVectorTables(docdata, path_prefix_sidecar)
+                    .map_err(|error| format!("{error:?}"))?;
+                *cache = Some(CachedVectorContext {
+                    key: key.clone(),
+                    context,
+                });
+            }
+            let cached = cache
+                .as_mut()
+                .ok_or_else(|| "vector cache unavailable".to_string())?;
+            Ok(cached
+                .context
+                .VectorSearch(
+                    &query_vector,
+                    top_k,
+                    VectorMetric::Cosine,
+                    ef_search.max(if top_k == 0 { 1 } else { top_k }),
+                )
+                .into_iter()
+                .map(|result| {
+                    let path = cached.context.GetDocPath(result.doc_id);
+                    (result.doc_id, result.score, path)
+                })
+                .collect())
+        }) {
+            Ok(results) => results,
+            Err(error) => return format!(r#"{{"error":"Failed to load vector tables: {error}"}}"#),
+        };
     let mut out = String::from("[");
     for (index, (doc_id, score, path)) in results.iter().enumerate() {
-        if index > 0 { out.push(','); }
+        if index > 0 {
+            out.push(',');
+        }
         out.push_str(&format!(
             r#"{{"doc_id":"{}","score":{:.4},"path":{}}}"#,
             doc_id,
@@ -485,7 +601,11 @@ pub fn combined_search_index(
         Err(error) => return format!(r#"{{"error":"Invalid query vector: {error}"}}"#),
     };
     if query_vector.len() != crate::block_table::DOC_VECTOR_DIM {
-        return format!(r#"{{"error":"Invalid query vector dimension: expected {}, got {}"}}"#, crate::block_table::DOC_VECTOR_DIM, query_vector.len());
+        return format!(
+            r#"{{"error":"Invalid query vector dimension: expected {}, got {}"}}"#,
+            crate::block_table::DOC_VECTOR_DIM,
+            query_vector.len()
+        );
     }
     if top_k < 0 {
         return r#"{"error":"top_k must be zero or positive"}"#.to_string();
@@ -499,10 +619,15 @@ pub fn combined_search_index(
     tree.vector_ef_search = ef_search.max(1);
     let vector_query = tree.vector_query.clone();
     let mut reader = context.GetReader(tree);
-    let results = context.GetExecutor().ExecuteWithVector(reader.as_mut(), top_k, Some(&vector_query));
+    let results =
+        context
+            .GetExecutor()
+            .ExecuteWithVector(reader.as_mut(), top_k, Some(&vector_query));
     let mut out = String::from("[");
     for (index, result) in results.iter().enumerate() {
-        if index > 0 { out.push(','); }
+        if index > 0 {
+            out.push(',');
+        }
         let path = context.GetDocPath(result.doc_id);
         out.push_str(&format!(
             r#"{{"doc_id":"{}","score":{:.4},"path":{}}}"#,
@@ -528,7 +653,7 @@ fn vector_cache_key(data: &[u8]) -> Result<VectorCacheKey, String> {
     })
 }
 
-    fn content_checksum(data: &[u8]) -> u64 {
+fn content_checksum(data: &[u8]) -> u64 {
     const FNV_OFFSET: u64 = 0xcbf29ce484222325;
     const FNV_PRIME: u64 = 0x100000001b3;
     let mut hash = FNV_OFFSET ^ data.len() as u64;
@@ -560,14 +685,20 @@ struct Header {
 
 fn parse_header(data: &[u8]) -> Result<Header, String> {
     if data.len() < INDEX_FILE_HEADER_SIZE {
-        return Err(format!("Index header is shorter than {} bytes", INDEX_FILE_HEADER_SIZE));
+        return Err(format!(
+            "Index header is shorter than {} bytes",
+            INDEX_FILE_HEADER_SIZE
+        ));
     }
     if &data[0..8] != b"MOONSHOT" {
         return Err("Not a valid MOONSHOT index (bad magic)".to_string());
     }
     let version = u32_at(data, 8);
     if version != INDEX_FORMAT_VERSION {
-        return Err(format!("Unsupported index version {}; expected {}", version, INDEX_FORMAT_VERSION));
+        return Err(format!(
+            "Unsupported index version {}; expected {}",
+            version, INDEX_FORMAT_VERSION
+        ));
     }
     Ok(Header {
         version,
@@ -600,7 +731,9 @@ fn u64_at(data: &[u8], offset: usize) -> u64 {
 }
 
 fn decode_doc_path(payload: &[u8], prefixes: &[String]) -> String {
-    if payload.is_empty() { return String::new(); }
+    if payload.is_empty() {
+        return String::new();
+    }
     if payload.len() < DOC_PATH_PREFIX_ID_BYTES {
         return std::str::from_utf8(payload).unwrap_or("").to_string();
     }
@@ -610,21 +743,30 @@ fn decode_doc_path(payload: &[u8], prefixes: &[String]) -> String {
         return filename.to_string();
     }
     let prefix = &prefixes[prefix_id as usize];
-    if prefix.is_empty() { return filename.to_string(); }
+    if prefix.is_empty() {
+        return filename.to_string();
+    }
     let separator = if prefix.contains('\\') { '\\' } else { '/' };
-    if prefix.ends_with(['/', '\\']) { format!("{prefix}{filename}") }
-    else { format!("{prefix}{separator}{filename}") }
+    if prefix.ends_with(['/', '\\']) {
+        format!("{prefix}{filename}")
+    } else {
+        format!("{prefix}{separator}{filename}")
+    }
 }
 fn vb_read(data: &[u8], start: usize) -> (u64, usize) {
     let mut value = 0u64;
     let mut shift = 0u8;
     let mut pos = start;
     loop {
-        if pos >= data.len() { break; }
+        if pos >= data.len() {
+            break;
+        }
         let byte = data[pos];
         pos += 1;
         value |= ((byte & 0x7F) as u64) << shift;
-        if byte & 0x80 == 0 { break; }
+        if byte & 0x80 == 0 {
+            break;
+        }
         shift += 7;
     }
     (value, pos - start)

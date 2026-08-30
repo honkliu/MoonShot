@@ -1,3 +1,6 @@
+//! Direct translation of the C++ reader contract; names stay aligned for API parity.
+#![allow(non_snake_case, non_upper_case_globals)]
+
 use crate::block_table::DocDataEntry;
 
 pub const NO_MORE_DOCS: u64 = u64::MAX;
@@ -52,11 +55,17 @@ pub fn ReaderSourceMaskForStream(stream: char) -> u8 {
 pub trait IndexReader {
     fn GoNext(&mut self);
     fn GoUntil(&mut self, target: u64, limit: u64);
-    fn IsEnd(&self)            -> bool;
-    fn GetDocumentID(&self)   -> u64;
-    fn GetTermFreq(&self)     -> u32   { 1u32 }
-    fn GetScore(&mut self, _entry: &DocDataEntry) -> f32 { 0.0 }
-    fn GetSourceMask(&mut self) -> u8 { 0 }
+    fn IsEnd(&self) -> bool;
+    fn GetDocumentID(&self) -> u64;
+    fn GetTermFreq(&self) -> u32 {
+        1u32
+    }
+    fn GetScore(&mut self, _entry: &DocDataEntry) -> f32 {
+        0.0
+    }
+    fn GetSourceMask(&mut self) -> u8 {
+        0
+    }
     fn SetDebug(&mut self, _label: &str, _depth: usize) {}
     fn Close(&mut self);
 }

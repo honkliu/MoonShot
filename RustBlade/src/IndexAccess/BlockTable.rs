@@ -1,18 +1,19 @@
-#![allow(non_snake_case)]
+//! Direct translation of the C++ block table and cache; names stay aligned for debugging.
+#![allow(non_snake_case, non_upper_case_globals)]
 
+use std::collections::VecDeque;
 use std::marker::PhantomData;
 use std::ops::Deref;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
-use std::collections::VecDeque;
 #[cfg(not(target_arch = "wasm32"))]
 use std::thread::{self, JoinHandle};
 
+use crate::element_filter::ElementFilter;
+use crate::error::{Result, RustBladeError};
 use crate::file_access::FileAccess;
 use crate::mem_operation::PinnedMemory;
-use crate::error::{Result, RustBladeError};
-use crate::element_filter::ElementFilter;
 
 pub const PAGE_SIZE: usize = 4096;
 pub const DOC_REC_SIZE: usize = 256;
@@ -155,14 +156,25 @@ impl IndexFileHeader {
         out[8..12].copy_from_slice(&self.IFH_Version.to_le_bytes());
         out[12..16].copy_from_slice(&self.IFH_AvgDocLength.to_le_bytes());
         for (index, value) in [
-            self.IFH_NumDocuments, self.IFH_NumTerms,
-            self.IFH_HeadTermEntryOffset, self.IFH_HeadTermEntryCount,
-            self.IFH_LeafTermBlockOffset, self.IFH_LeafTermBlockCount,
-            self.IFH_DocDataOffset, self.IFH_IndexBlockOffset, self.IFH_IndexBlockCount,
-            self.IFH_TermMphfHeaderOffset, self.IFH_TermMphfHeaderCount,
-            self.IFH_TermMphfDisplacementOffset, self.IFH_TermMphfDisplacementCount,
-            self.IFH_TermMphfEntryOffset, self.IFH_TermMphfEntryPageCount,
-        ].into_iter().enumerate() {
+            self.IFH_NumDocuments,
+            self.IFH_NumTerms,
+            self.IFH_HeadTermEntryOffset,
+            self.IFH_HeadTermEntryCount,
+            self.IFH_LeafTermBlockOffset,
+            self.IFH_LeafTermBlockCount,
+            self.IFH_DocDataOffset,
+            self.IFH_IndexBlockOffset,
+            self.IFH_IndexBlockCount,
+            self.IFH_TermMphfHeaderOffset,
+            self.IFH_TermMphfHeaderCount,
+            self.IFH_TermMphfDisplacementOffset,
+            self.IFH_TermMphfDisplacementCount,
+            self.IFH_TermMphfEntryOffset,
+            self.IFH_TermMphfEntryPageCount,
+        ]
+        .into_iter()
+        .enumerate()
+        {
             let begin = 16 + index * 8;
             out[begin..begin + 8].copy_from_slice(&value.to_le_bytes());
         }
@@ -179,37 +191,71 @@ impl IndexFileHeader {
             || self.IFH_TermMphfDisplacementCount > u32::MAX as u64
             || self.IFH_TermMphfEntryPageCount > u32::MAX as u64
             || (self.IFH_TermMphfHeaderCount == 0
-                && (self.IFH_TermMphfDisplacementCount != 0 || self.IFH_TermMphfEntryPageCount != 0))
+                && (self.IFH_TermMphfDisplacementCount != 0
+                    || self.IFH_TermMphfEntryPageCount != 0))
             || (self.IFH_TermMphfHeaderCount == 1
-                && (self.IFH_TermMphfDisplacementCount == 0 || self.IFH_TermMphfEntryPageCount == 0))
+                && (self.IFH_TermMphfDisplacementCount == 0
+                    || self.IFH_TermMphfEntryPageCount == 0))
         {
             return Err(RustBladeError::InvalidFormat);
         }
         let checked_end = |offset: u64, count: u64, width: u64| {
-            count.checked_mul(width).and_then(|bytes| offset.checked_add(bytes))
+            count
+                .checked_mul(width)
+                .and_then(|bytes| offset.checked_add(bytes))
         };
         let head = (INDEX_FILE_HEADER_SIZE + PATH_PREFIX_SIDECAR_BYTES) as u64;
-        if self.IFH_HeadTermEntryOffset != head { return Err(RustBladeError::InvalidFormat); }
-        let leaf = checked_end(head, self.IFH_HeadTermEntryCount, 32).ok_or(RustBladeError::InvalidFormat)?;
-        if self.IFH_LeafTermBlockOffset != leaf { return Err(RustBladeError::InvalidFormat); }
-        let docdata = checked_end(leaf, self.IFH_LeafTermBlockCount, PAGE_SIZE as u64).ok_or(RustBladeError::InvalidFormat)?;
-        if self.IFH_DocDataOffset != docdata { return Err(RustBladeError::InvalidFormat); }
-        let index = checked_end(docdata, self.IFH_NumDocuments, DOC_REC_SIZE as u64).ok_or(RustBladeError::InvalidFormat)?;
-        if self.IFH_IndexBlockOffset != index { return Err(RustBladeError::InvalidFormat); }
-        let mphf_header = checked_end(index, self.IFH_IndexBlockCount, PAGE_SIZE as u64).ok_or(RustBladeError::InvalidFormat)?;
-        if self.IFH_TermMphfHeaderOffset != mphf_header { return Err(RustBladeError::InvalidFormat); }
-        let displacement = checked_end(mphf_header, self.IFH_TermMphfHeaderCount, TERM_MPHF_HEADER_SIZE as u64).ok_or(RustBladeError::InvalidFormat)?;
-        if self.IFH_TermMphfDisplacementOffset != displacement { return Err(RustBladeError::InvalidFormat); }
-        let entries = checked_end(displacement, self.IFH_TermMphfDisplacementCount, 4).ok_or(RustBladeError::InvalidFormat)?;
-        if self.IFH_TermMphfEntryOffset != entries { return Err(RustBladeError::InvalidFormat); }
-        let end = checked_end(entries, self.IFH_TermMphfEntryPageCount, PAGE_SIZE as u64).ok_or(RustBladeError::InvalidFormat)?;
-        if file_bytes.map(|bytes| end > bytes).unwrap_or(false) { return Err(RustBladeError::InvalidFormat); }
+        if self.IFH_HeadTermEntryOffset != head {
+            return Err(RustBladeError::InvalidFormat);
+        }
+        let leaf = checked_end(head, self.IFH_HeadTermEntryCount, 32)
+            .ok_or(RustBladeError::InvalidFormat)?;
+        if self.IFH_LeafTermBlockOffset != leaf {
+            return Err(RustBladeError::InvalidFormat);
+        }
+        let docdata = checked_end(leaf, self.IFH_LeafTermBlockCount, PAGE_SIZE as u64)
+            .ok_or(RustBladeError::InvalidFormat)?;
+        if self.IFH_DocDataOffset != docdata {
+            return Err(RustBladeError::InvalidFormat);
+        }
+        let index = checked_end(docdata, self.IFH_NumDocuments, DOC_REC_SIZE as u64)
+            .ok_or(RustBladeError::InvalidFormat)?;
+        if self.IFH_IndexBlockOffset != index {
+            return Err(RustBladeError::InvalidFormat);
+        }
+        let mphf_header = checked_end(index, self.IFH_IndexBlockCount, PAGE_SIZE as u64)
+            .ok_or(RustBladeError::InvalidFormat)?;
+        if self.IFH_TermMphfHeaderOffset != mphf_header {
+            return Err(RustBladeError::InvalidFormat);
+        }
+        let displacement = checked_end(
+            mphf_header,
+            self.IFH_TermMphfHeaderCount,
+            TERM_MPHF_HEADER_SIZE as u64,
+        )
+        .ok_or(RustBladeError::InvalidFormat)?;
+        if self.IFH_TermMphfDisplacementOffset != displacement {
+            return Err(RustBladeError::InvalidFormat);
+        }
+        let entries = checked_end(displacement, self.IFH_TermMphfDisplacementCount, 4)
+            .ok_or(RustBladeError::InvalidFormat)?;
+        if self.IFH_TermMphfEntryOffset != entries {
+            return Err(RustBladeError::InvalidFormat);
+        }
+        let end = checked_end(entries, self.IFH_TermMphfEntryPageCount, PAGE_SIZE as u64)
+            .ok_or(RustBladeError::InvalidFormat)?;
+        if file_bytes.map(|bytes| end > bytes).unwrap_or(false) {
+            return Err(RustBladeError::InvalidFormat);
+        }
         Ok(end)
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BlockKind { Index, LeafTerm }
+pub enum BlockKind {
+    Index,
+    LeafTerm,
+}
 
 pub fn TermMphfHash(term: &[u8], seed: u64) -> u64 {
     let mut hash = 1469598103934665603u64 ^ seed;
@@ -272,7 +318,9 @@ impl TermMphfHeader {
     }
 
     pub fn from_bytes(data: &[u8]) -> Option<Self> {
-        if data.len() < TERM_MPHF_HEADER_SIZE { return None; }
+        if data.len() < TERM_MPHF_HEADER_SIZE {
+            return None;
+        }
         Some(Self {
             TMH_Magic: u64::from_le_bytes(data[0..8].try_into().ok()?),
             TMH_TermCount: u64::from_le_bytes(data[8..16].try_into().ok()?),
@@ -350,8 +398,16 @@ const _: [(); DOC_REC_SIZE] = [(); std::mem::size_of::<DocDataEntry>()];
 
 #[repr(C, align(8))]
 #[derive(Clone, Copy)]
-pub struct IndexBlock { pub IB_Data: [u8; PAGE_SIZE] }
-impl Default for IndexBlock { fn default() -> Self { Self { IB_Data: [0; PAGE_SIZE] } } }
+pub struct IndexBlock {
+    pub IB_Data: [u8; PAGE_SIZE],
+}
+impl Default for IndexBlock {
+    fn default() -> Self {
+        Self {
+            IB_Data: [0; PAGE_SIZE],
+        }
+    }
+}
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -360,17 +416,30 @@ pub struct LeafTermBlock {
     pub LTB_Data: [u8; PAGE_SIZE - LEAF_TERM_DATA_OFFSET],
 }
 impl Default for LeafTermBlock {
-    fn default() -> Self { Self { LTB_Directory: [0; LEAF_TERM_DIRECTORY_COUNT], LTB_Data: [0; PAGE_SIZE - LEAF_TERM_DATA_OFFSET] } }
+    fn default() -> Self {
+        Self {
+            LTB_Directory: [0; LEAF_TERM_DIRECTORY_COUNT],
+            LTB_Data: [0; PAGE_SIZE - LEAF_TERM_DATA_OFFSET],
+        }
+    }
 }
 const _: [(); PAGE_SIZE] = [(); std::mem::size_of::<IndexBlock>()];
 const _: [(); PAGE_SIZE] = [(); std::mem::size_of::<LeafTermBlock>()];
 
 #[derive(Debug, Clone, Copy, Default)]
-pub struct IndexBlockContinuationHeader { pub IBCH_MaxDocID: u64, pub IBCH_DataLength: u32 }
+pub struct IndexBlockContinuationHeader {
+    pub IBCH_MaxDocID: u64,
+    pub IBCH_DataLength: u32,
+}
 impl IndexBlockContinuationHeader {
     pub fn from_bytes(data: &[u8]) -> Option<Self> {
-        if data.len() < INDEX_BLOCK_CONTINUATION_HEADER_SIZE { return None; }
-        Some(Self { IBCH_MaxDocID: u64::from_le_bytes(data[0..8].try_into().ok()?), IBCH_DataLength: u32::from_le_bytes(data[8..12].try_into().ok()?) })
+        if data.len() < INDEX_BLOCK_CONTINUATION_HEADER_SIZE {
+            return None;
+        }
+        Some(Self {
+            IBCH_MaxDocID: u64::from_le_bytes(data[0..8].try_into().ok()?),
+            IBCH_DataLength: u32::from_le_bytes(data[8..12].try_into().ok()?),
+        })
     }
     pub fn write_to(&self, data: &mut [u8]) {
         data[0..8].copy_from_slice(&self.IBCH_MaxDocID.to_le_bytes());
@@ -390,7 +459,11 @@ impl HeadTermEntry {
         let bytes = term.as_bytes();
         let mut first = [0u8; HEAD_TERM_KEY_MAX];
         first[..bytes.len()].copy_from_slice(bytes);
-        Self { HTE_LeafTermBlockID: block_id, HTE_FirstTermLength: bytes.len() as u16, HTE_FirstTerm: first }
+        Self {
+            HTE_LeafTermBlockID: block_id,
+            HTE_FirstTermLength: bytes.len() as u16,
+            HTE_FirstTerm: first,
+        }
     }
     pub fn first_term(&self) -> &str {
         std::str::from_utf8(&self.HTE_FirstTerm[..self.HTE_FirstTermLength as usize]).unwrap_or("")
@@ -403,12 +476,20 @@ impl HeadTermEntry {
         out
     }
     pub fn from_bytes(data: &[u8]) -> Option<Self> {
-        if data.len() < 32 { return None; }
+        if data.len() < 32 {
+            return None;
+        }
         let term_length = u16::from_le_bytes(data[4..6].try_into().ok()?);
-        if term_length as usize > HEAD_TERM_KEY_MAX { return None; }
+        if term_length as usize > HEAD_TERM_KEY_MAX {
+            return None;
+        }
         let mut first = [0u8; HEAD_TERM_KEY_MAX];
         first.copy_from_slice(&data[6..32]);
-        Some(Self { HTE_LeafTermBlockID: u32::from_le_bytes(data[0..4].try_into().ok()?), HTE_FirstTermLength: term_length, HTE_FirstTerm: first })
+        Some(Self {
+            HTE_LeafTermBlockID: u32::from_le_bytes(data[0..4].try_into().ok()?),
+            HTE_FirstTermLength: term_length,
+            HTE_FirstTerm: first,
+        })
     }
 }
 
@@ -423,21 +504,34 @@ pub struct LeafTermEntry {
     pub LTE_Flags: u8,
     pub LTE_TermLength: u8,
 }
-impl LeafTermEntry { pub fn byte_len(&self) -> usize { LEAF_TERM_ENTRY_SIZE + self.LTE_Term.len() } }
+impl LeafTermEntry {
+    pub fn byte_len(&self) -> usize {
+        LEAF_TERM_ENTRY_SIZE + self.LTE_Term.len()
+    }
+}
 
 impl LeafTermBlock {
     pub fn entry_count(&self) -> usize {
-        (self.LTB_Directory[LEAF_TERM_DIRECTORY_COUNT - 1] as usize).min(LEAF_TERM_DIRECTORY_COUNT - 1)
+        (self.LTB_Directory[LEAF_TERM_DIRECTORY_COUNT - 1] as usize)
+            .min(LEAF_TERM_DIRECTORY_COUNT - 1)
     }
     pub fn entry(&self, index: usize) -> Option<LeafTermEntry> {
-        if index >= self.entry_count() { return None; }
+        if index >= self.entry_count() {
+            return None;
+        }
         let block_offset = self.LTB_Directory[index] as usize;
-        if block_offset < LEAF_TERM_DATA_OFFSET { return None; }
+        if block_offset < LEAF_TERM_DATA_OFFSET {
+            return None;
+        }
         let offset = block_offset - LEAF_TERM_DATA_OFFSET;
-        if offset + LEAF_TERM_ENTRY_SIZE > self.LTB_Data.len() { return None; }
+        if offset + LEAF_TERM_ENTRY_SIZE > self.LTB_Data.len() {
+            return None;
+        }
         let data = &self.LTB_Data[offset..];
         let term_len = data[15] as usize;
-        if offset + LEAF_TERM_ENTRY_SIZE + term_len > self.LTB_Data.len() { return None; }
+        if offset + LEAF_TERM_ENTRY_SIZE + term_len > self.LTB_Data.len() {
+            return None;
+        }
         Some(LeafTermEntry {
             LTE_DocFreq: u32::from_le_bytes(data[0..4].try_into().ok()?),
             LTE_IndexBlockID: u32::from_le_bytes(data[4..8].try_into().ok()?),
@@ -446,29 +540,53 @@ impl LeafTermBlock {
             LTE_ContinuationBlockCount: u16::from_le_bytes(data[12..14].try_into().ok()?),
             LTE_Flags: data[14],
             LTE_TermLength: data[15],
-            LTE_Term: std::str::from_utf8(&data[16..16 + term_len]).ok()?.to_string(),
+            LTE_Term: std::str::from_utf8(&data[16..16 + term_len])
+                .ok()?
+                .to_string(),
         })
     }
-    pub fn entries(&self) -> Vec<LeafTermEntry> { (0..self.entry_count()).filter_map(|i| self.entry(i)).collect() }
+    pub fn entries(&self) -> Vec<LeafTermEntry> {
+        (0..self.entry_count())
+            .filter_map(|i| self.entry(i))
+            .collect()
+    }
     pub fn to_bytes(&self) -> [u8; PAGE_SIZE] {
         let mut out = [0u8; PAGE_SIZE];
-        for (i, value) in self.LTB_Directory.iter().enumerate() { out[i * 2..i * 2 + 2].copy_from_slice(&value.to_le_bytes()); }
+        for (i, value) in self.LTB_Directory.iter().enumerate() {
+            out[i * 2..i * 2 + 2].copy_from_slice(&value.to_le_bytes());
+        }
         out[LEAF_TERM_DATA_OFFSET..].copy_from_slice(&self.LTB_Data);
         out
     }
     pub fn from_bytes(data: &[u8]) -> Option<Self> {
-        if data.len() < PAGE_SIZE { return None; }
+        if data.len() < PAGE_SIZE {
+            return None;
+        }
         let mut block = Self::default();
-        for i in 0..LEAF_TERM_DIRECTORY_COUNT { block.LTB_Directory[i] = u16::from_le_bytes(data[i * 2..i * 2 + 2].try_into().ok()?); }
-        if block.LTB_Directory[LEAF_TERM_DIRECTORY_COUNT - 1] as usize > LEAF_TERM_DIRECTORY_COUNT - 1 { return None; }
-        block.LTB_Data.copy_from_slice(&data[LEAF_TERM_DATA_OFFSET..PAGE_SIZE]);
-        for index in 0..block.entry_count() { block.entry(index)?; }
+        for i in 0..LEAF_TERM_DIRECTORY_COUNT {
+            block.LTB_Directory[i] = u16::from_le_bytes(data[i * 2..i * 2 + 2].try_into().ok()?);
+        }
+        if block.LTB_Directory[LEAF_TERM_DIRECTORY_COUNT - 1] as usize
+            > LEAF_TERM_DIRECTORY_COUNT - 1
+        {
+            return None;
+        }
+        block
+            .LTB_Data
+            .copy_from_slice(&data[LEAF_TERM_DATA_OFFSET..PAGE_SIZE]);
+        for index in 0..block.entry_count() {
+            block.entry(index)?;
+        }
         Some(block)
     }
 }
 
 pub struct BloomFilter;
-impl BloomFilter { pub fn CanTermExist(&self, _term: &[u8]) -> bool { true } }
+impl BloomFilter {
+    pub fn CanTermExist(&self, _term: &[u8]) -> bool {
+        true
+    }
+}
 
 #[repr(C, packed)]
 #[derive(Debug, Clone, Copy, Default)]
@@ -484,42 +602,88 @@ pub struct TermMphfEntry {
 
 const _: [(); TERM_MPHF_ENTRY_SIZE] = [(); std::mem::size_of::<TermMphfEntry>()];
 
-pub struct RWSpinLock { m_rwSpinlock: AtomicI32 }
+pub struct RWSpinLock {
+    m_rwSpinlock: AtomicI32,
+}
 
 #[allow(non_snake_case)]
 impl RWSpinLock {
-    pub fn new() -> Self { Self { m_rwSpinlock: AtomicI32::new(0) } }
+    pub fn new() -> Self {
+        Self {
+            m_rwSpinlock: AtomicI32::new(0),
+        }
+    }
     pub fn ReadLock(&self) {
         self.m_rwSpinlock.fetch_add(2, Ordering::AcqRel);
-        while self.m_rwSpinlock.load(Ordering::Acquire) & 1 != 0 { std::hint::spin_loop(); }
+        while self.m_rwSpinlock.load(Ordering::Acquire) & 1 != 0 {
+            std::hint::spin_loop();
+        }
     }
-    pub fn ReadUnlock(&self) { self.m_rwSpinlock.fetch_sub(2, Ordering::Release); }
+    pub fn ReadUnlock(&self) {
+        self.m_rwSpinlock.fetch_sub(2, Ordering::Release);
+    }
     pub fn WriteLock(&self) {
-        while self.m_rwSpinlock.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire).is_err() {
+        while self
+            .m_rwSpinlock
+            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
             std::thread::yield_now();
         }
     }
-    pub fn WriteUnlock(&self) { self.m_rwSpinlock.fetch_sub(1, Ordering::Release); }
+    pub fn WriteUnlock(&self) {
+        self.m_rwSpinlock.fetch_sub(1, Ordering::Release);
+    }
 }
 
-impl Default for RWSpinLock { fn default() -> Self { Self::new() } }
+impl Default for RWSpinLock {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
-pub struct ReaderSpinLock<'a> { m_lock: &'a RWSpinLock }
+pub struct ReaderSpinLock<'a> {
+    m_lock: &'a RWSpinLock,
+}
 impl<'a> ReaderSpinLock<'a> {
-    pub fn new(lock: &'a RWSpinLock) -> Self { lock.ReadLock(); Self { m_lock: lock } }
+    pub fn new(lock: &'a RWSpinLock) -> Self {
+        lock.ReadLock();
+        Self { m_lock: lock }
+    }
 }
-impl Drop for ReaderSpinLock<'_> { fn drop(&mut self) { self.m_lock.ReadUnlock(); } }
+impl Drop for ReaderSpinLock<'_> {
+    fn drop(&mut self) {
+        self.m_lock.ReadUnlock();
+    }
+}
 
-pub struct WriterSpinLock<'a> { m_lock: &'a RWSpinLock }
-impl<'a> WriterSpinLock<'a> {
-    pub fn new(lock: &'a RWSpinLock) -> Self { lock.WriteLock(); Self { m_lock: lock } }
+pub struct WriterSpinLock<'a> {
+    m_lock: &'a RWSpinLock,
 }
-impl Drop for WriterSpinLock<'_> { fn drop(&mut self) { self.m_lock.WriteUnlock(); } }
+impl<'a> WriterSpinLock<'a> {
+    pub fn new(lock: &'a RWSpinLock) -> Self {
+        lock.WriteLock();
+        Self { m_lock: lock }
+    }
+}
+impl Drop for WriterSpinLock<'_> {
+    fn drop(&mut self) {
+        self.m_lock.WriteUnlock();
+    }
+}
 
 pub fn DocDataEncodeScore(value: f32) -> u16 {
-    if !(value > 0.0) { 0 } else if value >= 1.0 { u16::MAX } else { (value * 65535.0 + 0.5) as u16 }
+    if !(value > 0.0) {
+        0
+    } else if value >= 1.0 {
+        u16::MAX
+    } else {
+        (value * 65535.0 + 0.5) as u16
+    }
 }
-pub fn DocDataDecodeScore(value: u16) -> f32 { value as f32 / 65535.0 }
+pub fn DocDataDecodeScore(value: u16) -> f32 {
+    value as f32 / 65535.0
+}
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct BlockAccessStats {
@@ -533,11 +697,26 @@ pub struct BlockAccessStats {
 }
 
 #[derive(Clone, Copy)]
-pub struct IndexSlotEntry { pub BlockID: u32, pub Ref: u32, pub Loading: bool }
-impl Default for IndexSlotEntry { fn default() -> Self { Self { BlockID: u32::MAX, Ref: 0, Loading: false } } }
+pub struct IndexSlotEntry {
+    pub BlockID: u32,
+    pub Ref: u32,
+    pub Loading: bool,
+}
+impl Default for IndexSlotEntry {
+    fn default() -> Self {
+        Self {
+            BlockID: u32::MAX,
+            Ref: 0,
+            Loading: false,
+        }
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub enum BlockRequestType { Get, Release }
+pub enum BlockRequestType {
+    Get,
+    Release,
+}
 
 pub struct BlockRequest {
     pub Type: BlockRequestType,
@@ -548,12 +727,20 @@ pub struct BlockRequest {
 }
 impl BlockRequest {
     fn new(requestType: BlockRequestType, blockSeq: u32, slot: u32) -> Self {
-        Self { Type: requestType, BlockSeq: blockSeq, Slot: AtomicU32::new(slot), Address: AtomicUsize::new(0), Completion: (Mutex::new(false), Condvar::new()) }
+        Self {
+            Type: requestType,
+            BlockSeq: blockSeq,
+            Slot: AtomicU32::new(slot),
+            Address: AtomicUsize::new(0),
+            Completion: (Mutex::new(false), Condvar::new()),
+        }
     }
     fn Wait(&self) {
         let (lock, cv) = &self.Completion;
         let mut complete = lock.lock().unwrap();
-        while !*complete { complete = cv.wait(complete).unwrap(); }
+        while !*complete {
+            complete = cv.wait(complete).unwrap();
+        }
     }
     fn Complete(&self) {
         let (lock, cv) = &self.Completion;
@@ -574,7 +761,16 @@ struct BlockCacheState {
 }
 impl BlockCacheState {
     fn new() -> Self {
-        Self { BCP_Pages: None, BCP_BaseOffset: 0, BCP_TotalBlockCount: 0, BCP_SlotCount: 0, BCP_EvictSlot: 0, BCP_LogicTable: None, BCP_SlotTable: None, BCP_File: None }
+        Self {
+            BCP_Pages: None,
+            BCP_BaseOffset: 0,
+            BCP_TotalBlockCount: 0,
+            BCP_SlotCount: 0,
+            BCP_EvictSlot: 0,
+            BCP_LogicTable: None,
+            BCP_SlotTable: None,
+            BCP_File: None,
+        }
     }
 }
 
@@ -621,12 +817,18 @@ pub struct BlockHandle<T> {
 unsafe impl<T: Send> Send for BlockHandle<T> {}
 unsafe impl<T: Sync> Sync for BlockHandle<T> {}
 impl<T> BlockHandle<T> {
-    pub fn Slot(&self) -> u32 { self.slot }
-    pub fn Kind(&self) -> BlockKind { self.kind }
+    pub fn Slot(&self) -> u32 {
+        self.slot
+    }
+    pub fn Kind(&self) -> BlockKind {
+        self.kind
+    }
 }
 impl<T> Deref for BlockHandle<T> {
     type Target = T;
-    fn deref(&self) -> &T { unsafe { self.page.as_ref() } }
+    fn deref(&self) -> &T {
+        unsafe { self.page.as_ref() }
+    }
 }
 
 pub struct IndexLocation {
@@ -679,12 +881,30 @@ impl IndexBlockTable {
         self.m_HeadTermEntries = head;
     }
 
-    pub fn SetTermMphf(&mut self, header: TermMphfHeader, displacements: Vec<i32>, entryPages: Vec<IndexBlock>) {
+    pub fn SetTermMphf(
+        &mut self,
+        header: TermMphfHeader,
+        displacements: Vec<i32>,
+        entryPages: Vec<IndexBlock>,
+    ) {
         self.ClearTermMphf();
-        if header.TMH_TermCount == 0 || header.TMH_BucketCount == 0 || header.TMH_SlotCount == 0 || displacements.is_empty() || entryPages.is_empty() { return; }
+        if header.TMH_TermCount == 0
+            || header.TMH_BucketCount == 0
+            || header.TMH_SlotCount == 0
+            || displacements.is_empty()
+            || entryPages.is_empty()
+        {
+            return;
+        }
         let requiredBytes = header.TMH_SlotCount as usize * TERM_MPHF_ENTRY_SIZE;
         let availableBytes = entryPages.len() * PAGE_SIZE;
-        if header.TMH_Magic != TERM_MPHF_MAGIC || header.TMH_SlotCount as u64 != header.TMH_TermCount || displacements.len() != header.TMH_BucketCount as usize || requiredBytes > availableBytes { return; }
+        if header.TMH_Magic != TERM_MPHF_MAGIC
+            || header.TMH_SlotCount as u64 != header.TMH_TermCount
+            || displacements.len() != header.TMH_BucketCount as usize
+            || requiredBytes > availableBytes
+        {
+            return;
+        }
         self.m_TermMphfHeader = header;
         self.m_TermMphfDisplacements = displacements;
         self.m_TermMphfDisplacementCount = self.m_TermMphfDisplacements.len() as u32;
@@ -692,12 +912,18 @@ impl IndexBlockTable {
         self.m_TermMphfEntryPageCount = self.m_TermMphfEntryPages.len() as u32;
     }
 
-    pub fn SetTermMphfEnabled(&self, enabled: bool) { self.m_TermMphfEnabled.store(enabled, Ordering::Relaxed); }
+    pub fn SetTermMphfEnabled(&self, enabled: bool) {
+        self.m_TermMphfEnabled.store(enabled, Ordering::Relaxed);
+    }
 
     pub fn SetDirectBlockAccessEnabled(&self, enabled: bool) {
-        if self.m_DirectBlockAccess.load(Ordering::Relaxed) == enabled { return; }
+        if self.m_DirectBlockAccess.load(Ordering::Relaxed) == enabled {
+            return;
+        }
         #[cfg(target_arch = "wasm32")]
-        if !enabled { panic!("IndexBlockTable worker mode is not supported on wasm32"); }
+        if !enabled {
+            panic!("IndexBlockTable worker mode is not supported on wasm32");
+        }
         self.m_DirectBlockAccess.store(enabled, Ordering::Relaxed);
         if enabled {
             Self::ExitBlockThread(&self.m_IndexPool);
@@ -709,7 +935,9 @@ impl IndexBlockTable {
     }
 
     pub fn HandOverBlockTable(&mut self, source: &mut IndexBlockTable) {
-        if std::ptr::eq(self, source) { return; }
+        if std::ptr::eq(self, source) {
+            return;
+        }
         Self::ExitBlockThread(&self.m_IndexPool);
         Self::ExitBlockThread(&self.m_LeafTermPool);
         Self::ExitBlockThread(&source.m_IndexPool);
@@ -734,43 +962,69 @@ impl IndexBlockTable {
 
     pub fn FindTermData(&self, term: &str) -> Option<IndexLocation> {
         let bytes = term.as_bytes();
-        let termLength = bytes.iter().position(|byte| *byte == 0).unwrap_or(bytes.len());
+        let termLength = bytes
+            .iter()
+            .position(|byte| *byte == 0)
+            .unwrap_or(bytes.len());
         let termBytes = &bytes[..termLength];
         let term = &term[..termLength];
-        if !self.m_BloomFilter.CanTermExist(termBytes) { return None; }
+        if !self.m_BloomFilter.CanTermExist(termBytes) {
+            return None;
+        }
         if self.HasTermMphf() {
-            if let Some(location) = self.FindTermDataMphf(termBytes) { return Some(location); }
+            if let Some(location) = self.FindTermDataMphf(termBytes) {
+                return Some(location);
+            }
         }
         self.FindTermDataHeadLeaf(term)
     }
 
-    pub fn GetBlock<T>(&self, kind: BlockKind, blockSeq: u32, sequential: bool) -> Option<BlockHandle<T>> {
-        if std::mem::size_of::<T>() != PAGE_SIZE { return None; }
+    pub fn GetBlock<T>(
+        &self,
+        kind: BlockKind,
+        blockSeq: u32,
+        sequential: bool,
+    ) -> Option<BlockHandle<T>> {
+        if std::mem::size_of::<T>() != PAGE_SIZE {
+            return None;
+        }
         let pool = self.Pool(kind);
         if sequential {
             let mut state = pool.BCP_State.lock().ok()?;
-            if state.BCP_Pages.is_some() && state.BCP_LogicTable.is_some() && state.BCP_SlotTable.is_some() && blockSeq < state.BCP_TotalBlockCount {
+            if state.BCP_Pages.is_some()
+                && state.BCP_LogicTable.is_some()
+                && state.BCP_SlotTable.is_some()
+                && blockSeq < state.BCP_TotalBlockCount
+            {
                 let slot = state.BCP_LogicTable.as_ref()?.as_slice()[blockSeq as usize];
                 if slot != u32::MAX && slot < state.BCP_SlotCount {
                     state.BCP_SlotTable.as_mut()?.as_mut_slice()[slot as usize].Ref += 1;
                     return Self::MakeHandle(&state, kind, slot);
                 }
             }
-            if !Self::LoadSequentialWindow(&mut state, blockSeq) { return None; }
+            if !Self::LoadSequentialWindow(&mut state, blockSeq) {
+                return None;
+            }
             let slot = state.BCP_LogicTable.as_ref()?.as_slice()[blockSeq as usize];
             state.BCP_SlotTable.as_mut()?.as_mut_slice()[slot as usize].Ref += 1;
             return Self::MakeHandle(&state, kind, slot);
         }
 
         if self.m_DirectBlockAccess.load(Ordering::Relaxed) {
-            self.m_AccessCounters.m_DirectGets.fetch_add(1, Ordering::Relaxed);
+            self.m_AccessCounters
+                .m_DirectGets
+                .fetch_add(1, Ordering::Relaxed);
             let request = BlockRequest::new(BlockRequestType::Get, blockSeq, u32::MAX);
             Self::ProcessGetBlockLocked(pool, &request, &self.m_AccessCounters);
             return Self::RequestHandle(kind, &request);
         }
 
-        if let Some(handle) = self.TryPinReadyOrWait::<T>(pool, kind, blockSeq) { return Some(handle); }
-        self.m_AccessCounters.m_WorkerGets.fetch_add(1, Ordering::Relaxed);
+        if let Some(handle) = self.TryPinReadyOrWait::<T>(pool, kind, blockSeq) {
+            return Some(handle);
+        }
+        self.m_AccessCounters
+            .m_WorkerGets
+            .fetch_add(1, Ordering::Relaxed);
         let request = Arc::new(BlockRequest::new(BlockRequestType::Get, blockSeq, u32::MAX));
         Self::SubmitBlockRequest(pool, Arc::clone(&request));
         request.Wait();
@@ -778,36 +1032,57 @@ impl IndexBlockTable {
     }
 
     pub fn ReleaseBlock(&self, kind: BlockKind, slot: u32, sequential: bool) {
-        if slot == u32::MAX { return; }
+        if slot == u32::MAX {
+            return;
+        }
         let pool = self.Pool(kind);
         if sequential {
             if let Ok(mut state) = pool.BCP_State.lock() {
                 if let Some(table) = state.BCP_SlotTable.as_mut() {
-                    if slot < state.BCP_SlotCount && table[slot as usize].Ref > 0 { table[slot as usize].Ref -= 1; }
+                    if slot < state.BCP_SlotCount && table[slot as usize].Ref > 0 {
+                        table[slot as usize].Ref -= 1;
+                    }
                 }
             }
             return;
         }
         if self.m_DirectBlockAccess.load(Ordering::Relaxed) {
-            self.m_AccessCounters.m_DirectReleases.fetch_add(1, Ordering::Relaxed);
+            self.m_AccessCounters
+                .m_DirectReleases
+                .fetch_add(1, Ordering::Relaxed);
         } else {
-            self.m_AccessCounters.m_WorkerReleases.fetch_add(1, Ordering::Relaxed);
+            self.m_AccessCounters
+                .m_WorkerReleases
+                .fetch_add(1, Ordering::Relaxed);
         }
         let request = BlockRequest::new(BlockRequestType::Release, 0, slot);
         Self::ProcessReleaseBlockLocked(pool, &request);
     }
 
-    pub fn SetBlockMemory(&mut self, indexBlocks: Option<Vec<IndexBlock>>, leafTermBlocks: Option<Vec<LeafTermBlock>>) {
+    pub fn SetBlockMemory(
+        &mut self,
+        indexBlocks: Option<Vec<IndexBlock>>,
+        leafTermBlocks: Option<Vec<LeafTermBlock>>,
+    ) {
         Self::ExitBlockThread(&self.m_IndexPool);
         Self::ExitBlockThread(&self.m_LeafTermPool);
         Self::SetPoolMemory(&self.m_IndexPool, indexBlocks.as_deref());
         Self::SetPoolMemory(&self.m_LeafTermPool, leafTermBlocks.as_deref());
         self.StartBlockThread(&self.m_IndexPool);
         self.StartBlockThread(&self.m_LeafTermPool);
-        if indexBlocks.is_none() && leafTermBlocks.is_none() { self.ClearTermMphf(); }
+        if indexBlocks.is_none() && leafTermBlocks.is_none() {
+            self.ClearTermMphf();
+        }
     }
 
-    pub fn Init(&mut self, kind: BlockKind, path: Option<&str>, baseOffset: u64, blockCount: u32, slotCount: u32) -> std::io::Result<()> {
+    pub fn Init(
+        &mut self,
+        kind: BlockKind,
+        path: Option<&str>,
+        baseOffset: u64,
+        blockCount: u32,
+        slotCount: u32,
+    ) -> std::io::Result<()> {
         let pool = self.Pool(kind);
         Self::ExitBlockThread(pool);
         let mut state = pool.BCP_State.lock().unwrap();
@@ -818,12 +1093,25 @@ impl IndexBlockTable {
         state.BCP_EvictSlot = state.BCP_SlotCount;
         if let Some(path) = path.filter(|path| !path.is_empty()) {
             let mut file = FileAccess::new(path);
-            if !file.Init() { return Err(std::io::Error::new(std::io::ErrorKind::NotFound, "index file open failed")); }
+            if !file.Init() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "index file open failed",
+                ));
+            }
             state.BCP_File = Some(Arc::new(file));
         }
-        state.BCP_Pages = Some(PinnedMemory::new_zeroed(state.BCP_SlotCount as usize * PAGE_SIZE));
-        state.BCP_LogicTable = Some(PinnedMemory::from_slice(&vec![u32::MAX; blockCount as usize]));
-        state.BCP_SlotTable = Some(PinnedMemory::from_slice(&vec![IndexSlotEntry::default(); state.BCP_SlotCount as usize]));
+        state.BCP_Pages = Some(PinnedMemory::new_zeroed(
+            state.BCP_SlotCount as usize * PAGE_SIZE,
+        ));
+        state.BCP_LogicTable = Some(PinnedMemory::from_slice(&vec![
+            u32::MAX;
+            blockCount as usize
+        ]));
+        state.BCP_SlotTable = Some(PinnedMemory::from_slice(&vec![
+            IndexSlotEntry::default();
+            state.BCP_SlotCount as usize
+        ]));
         if state.BCP_SlotCount > 0 {
             for block in 0..state.BCP_SlotCount {
                 state.BCP_LogicTable.as_mut().unwrap()[block as usize] = block;
@@ -838,73 +1126,162 @@ impl IndexBlockTable {
     pub fn GetBlockAccessStats(&self) -> BlockAccessStats {
         BlockAccessStats {
             DirectGets: self.m_AccessCounters.m_DirectGets.load(Ordering::Relaxed),
-            DirectReleases: self.m_AccessCounters.m_DirectReleases.load(Ordering::Relaxed),
+            DirectReleases: self
+                .m_AccessCounters
+                .m_DirectReleases
+                .load(Ordering::Relaxed),
             WorkerGets: self.m_AccessCounters.m_WorkerGets.load(Ordering::Relaxed),
-            WorkerReleases: self.m_AccessCounters.m_WorkerReleases.load(Ordering::Relaxed),
+            WorkerReleases: self
+                .m_AccessCounters
+                .m_WorkerReleases
+                .load(Ordering::Relaxed),
             CacheHits: self.m_AccessCounters.m_CacheHits.load(Ordering::Relaxed),
             CacheMisses: self.m_AccessCounters.m_CacheMisses.load(Ordering::Relaxed),
             DiskReads: self.m_AccessCounters.m_DiskReads.load(Ordering::Relaxed),
         }
     }
 
-    pub fn HeadTermEntries(&self) -> &[HeadTermEntry] { &self.m_HeadTermEntries }
-    pub fn TermMphfHeader(&self) -> &TermMphfHeader { &self.m_TermMphfHeader }
-    pub fn TermMphfDisplacements(&self) -> &[i32] { &self.m_TermMphfDisplacements }
-    pub fn TermMphfEntryPages(&self) -> &[IndexBlock] { &self.m_TermMphfEntryPages }
-    pub fn LeafTermBlockCount(&self) -> u32 { self.m_LeafTermPool.BCP_State.lock().map(|s| s.BCP_TotalBlockCount).unwrap_or(0) }
-
-    pub fn IndexBlocks(&self) -> Vec<IndexBlock> { Self::CopyPoolBlocks(&self.m_IndexPool) }
-    pub fn LeafTermBlocks(&self) -> Vec<LeafTermBlock> { Self::CopyPoolBlocks(&self.m_LeafTermPool) }
-
-    fn Pool(&self, kind: BlockKind) -> &Arc<BlockCachePool> {
-        match kind { BlockKind::Index => &self.m_IndexPool, BlockKind::LeafTerm => &self.m_LeafTermPool }
+    pub fn HeadTermEntries(&self) -> &[HeadTermEntry] {
+        &self.m_HeadTermEntries
+    }
+    pub fn TermMphfHeader(&self) -> &TermMphfHeader {
+        &self.m_TermMphfHeader
+    }
+    pub fn TermMphfDisplacements(&self) -> &[i32] {
+        &self.m_TermMphfDisplacements
+    }
+    pub fn TermMphfEntryPages(&self) -> &[IndexBlock] {
+        &self.m_TermMphfEntryPages
+    }
+    pub fn LeafTermBlockCount(&self) -> u32 {
+        self.m_LeafTermPool
+            .BCP_State
+            .lock()
+            .map(|s| s.BCP_TotalBlockCount)
+            .unwrap_or(0)
     }
 
-    fn MakeHandle<T>(state: &BlockCacheState, kind: BlockKind, slot: u32) -> Option<BlockHandle<T>> {
-        let address = unsafe { state.BCP_Pages.as_ref()?.as_slice().as_ptr().add(slot as usize * PAGE_SIZE) as *mut T };
-        Some(BlockHandle { page: NonNull::new(address)?, slot, kind, _marker: PhantomData })
+    pub fn IndexBlocks(&self) -> Vec<IndexBlock> {
+        Self::CopyPoolBlocks(&self.m_IndexPool)
+    }
+    pub fn LeafTermBlocks(&self) -> Vec<LeafTermBlock> {
+        Self::CopyPoolBlocks(&self.m_LeafTermPool)
+    }
+
+    fn Pool(&self, kind: BlockKind) -> &Arc<BlockCachePool> {
+        match kind {
+            BlockKind::Index => &self.m_IndexPool,
+            BlockKind::LeafTerm => &self.m_LeafTermPool,
+        }
+    }
+
+    fn MakeHandle<T>(
+        state: &BlockCacheState,
+        kind: BlockKind,
+        slot: u32,
+    ) -> Option<BlockHandle<T>> {
+        let address = unsafe {
+            state
+                .BCP_Pages
+                .as_ref()?
+                .as_slice()
+                .as_ptr()
+                .add(slot as usize * PAGE_SIZE) as *mut T
+        };
+        Some(BlockHandle {
+            page: NonNull::new(address)?,
+            slot,
+            kind,
+            _marker: PhantomData,
+        })
     }
 
     fn RequestHandle<T>(kind: BlockKind, request: &BlockRequest) -> Option<BlockHandle<T>> {
         let address = request.Address.load(Ordering::Acquire) as *mut T;
-        Some(BlockHandle { page: NonNull::new(address)?, slot: request.Slot.load(Ordering::Acquire), kind, _marker: PhantomData })
+        Some(BlockHandle {
+            page: NonNull::new(address)?,
+            slot: request.Slot.load(Ordering::Acquire),
+            kind,
+            _marker: PhantomData,
+        })
     }
 
     fn SetPoolMemory<T: Copy>(pool: &Arc<BlockCachePool>, blocks: Option<&[T]>) {
         let mut state = pool.BCP_State.lock().unwrap();
         *state = BlockCacheState::new();
-        let Some(blocks) = blocks else { return; };
-        if std::mem::size_of::<T>() != PAGE_SIZE { return; }
+        let Some(blocks) = blocks else {
+            return;
+        };
+        if std::mem::size_of::<T>() != PAGE_SIZE {
+            return;
+        }
         state.BCP_TotalBlockCount = blocks.len() as u32;
         state.BCP_SlotCount = blocks.len() as u32;
         state.BCP_EvictSlot = blocks.len() as u32;
-        let bytes = unsafe { std::slice::from_raw_parts(blocks.as_ptr() as *const u8, blocks.len() * PAGE_SIZE) };
+        let bytes = unsafe {
+            std::slice::from_raw_parts(blocks.as_ptr() as *const u8, blocks.len() * PAGE_SIZE)
+        };
         state.BCP_Pages = Some(PinnedMemory::from_slice(bytes));
-        state.BCP_LogicTable = Some(PinnedMemory::from_slice(&(0..blocks.len() as u32).collect::<Vec<_>>()));
-        state.BCP_SlotTable = Some(PinnedMemory::from_slice(&(0..blocks.len() as u32).map(|block| IndexSlotEntry { BlockID: block, Ref: 0, Loading: false }).collect::<Vec<_>>()));
+        state.BCP_LogicTable = Some(PinnedMemory::from_slice(
+            &(0..blocks.len() as u32).collect::<Vec<_>>(),
+        ));
+        state.BCP_SlotTable = Some(PinnedMemory::from_slice(
+            &(0..blocks.len() as u32)
+                .map(|block| IndexSlotEntry {
+                    BlockID: block,
+                    Ref: 0,
+                    Loading: false,
+                })
+                .collect::<Vec<_>>(),
+        ));
     }
 
     fn CopyPoolBlocks<T: Copy>(pool: &Arc<BlockCachePool>) -> Vec<T> {
-        let Ok(state) = pool.BCP_State.lock() else { return Vec::new(); };
-        let Some(pages) = state.BCP_Pages.as_ref() else { return Vec::new(); };
-        if std::mem::size_of::<T>() != PAGE_SIZE { return Vec::new(); }
+        let Ok(state) = pool.BCP_State.lock() else {
+            return Vec::new();
+        };
+        let Some(pages) = state.BCP_Pages.as_ref() else {
+            return Vec::new();
+        };
+        if std::mem::size_of::<T>() != PAGE_SIZE {
+            return Vec::new();
+        }
         let count = state.BCP_TotalBlockCount.min(state.BCP_SlotCount) as usize;
         unsafe { std::slice::from_raw_parts(pages.as_slice().as_ptr() as *const T, count).to_vec() }
     }
 
     fn FindTermDataMphf(&self, term: &[u8]) -> Option<IndexLocation> {
-        if !self.HasTermMphf() { return None; }
-        let bucket = (TermMphfHash(term, self.m_TermMphfHeader.TMH_BucketSeed) % self.m_TermMphfHeader.TMH_BucketCount as u64) as usize;
+        if !self.HasTermMphf() {
+            return None;
+        }
+        let bucket = (TermMphfHash(term, self.m_TermMphfHeader.TMH_BucketSeed)
+            % self.m_TermMphfHeader.TMH_BucketCount as u64) as usize;
         let displacement = *self.m_TermMphfDisplacements.get(bucket)?;
-        let slot = if displacement < 0 { (-(displacement as i64) - 1) as u64 } else { TermMphfHash(term, TermMphfSlotSeed(self.m_TermMphfHeader.TMH_SlotSeed, displacement as u32)) % self.m_TermMphfHeader.TMH_SlotCount as u64 };
-        if slot >= self.m_TermMphfHeader.TMH_SlotCount as u64 { return None; }
+        let slot = if displacement < 0 {
+            (-(displacement as i64) - 1) as u64
+        } else {
+            TermMphfHash(
+                term,
+                TermMphfSlotSeed(self.m_TermMphfHeader.TMH_SlotSeed, displacement as u32),
+            ) % self.m_TermMphfHeader.TMH_SlotCount as u64
+        };
+        if slot >= self.m_TermMphfHeader.TMH_SlotCount as u64 {
+            return None;
+        }
         let byteOffset = slot as usize * TERM_MPHF_ENTRY_SIZE;
         let pageID = byteOffset / PAGE_SIZE;
-        if pageID >= self.m_TermMphfEntryPageCount as usize { return None; }
-        let data = &self.m_TermMphfEntryPages.get(pageID)?.IB_Data[byteOffset % PAGE_SIZE..byteOffset % PAGE_SIZE + TERM_MPHF_ENTRY_SIZE];
+        if pageID >= self.m_TermMphfEntryPageCount as usize {
+            return None;
+        }
+        let data = &self.m_TermMphfEntryPages.get(pageID)?.IB_Data
+            [byteOffset % PAGE_SIZE..byteOffset % PAGE_SIZE + TERM_MPHF_ENTRY_SIZE];
         let mut fingerprint = TermMphfHash(term, self.m_TermMphfHeader.TMH_FingerprintSeed);
-        if fingerprint == 0 { fingerprint = 1; }
-        if u64::from_le_bytes(data[24..32].try_into().ok()?) != fingerprint { return None; }
+        if fingerprint == 0 {
+            fingerprint = 1;
+        }
+        if u64::from_le_bytes(data[24..32].try_into().ok()?) != fingerprint {
+            return None;
+        }
         Some(IndexLocation {
             doc_freq: u32::from_le_bytes(data[0..4].try_into().ok()?),
             index_block_id: u32::from_le_bytes(data[4..8].try_into().ok()?),
@@ -915,10 +1292,16 @@ impl IndexBlockTable {
     }
 
     fn FindTermDataHeadLeaf(&self, term: &str) -> Option<IndexLocation> {
-        if self.m_HeadTermEntryCount == 0 || term.len() > HEAD_TERM_KEY_MAX { return None; }
-        let entries = self.m_HeadTermEntries.get(..self.m_HeadTermEntryCount as usize)?;
+        if self.m_HeadTermEntryCount == 0 || term.len() > HEAD_TERM_KEY_MAX {
+            return None;
+        }
+        let entries = self
+            .m_HeadTermEntries
+            .get(..self.m_HeadTermEntryCount as usize)?;
         let pos = entries.partition_point(|entry| entry.first_term() <= term);
-        if pos == 0 { return None; }
+        if pos == 0 {
+            return None;
+        }
         let blockID = entries[pos - 1].HTE_LeafTermBlockID;
         let block = self.GetBlock::<LeafTermBlock>(BlockKind::LeafTerm, blockID, false)?;
         let slot = block.Slot();
@@ -927,12 +1310,26 @@ impl IndexBlockTable {
             let mut right = block.entry_count();
             while left < right {
                 let mid = left + (right - left) / 2;
-                if block.entry(mid)?.LTE_Term.as_str() < term { left = mid + 1; } else { right = mid; }
+                if block.entry(mid)?.LTE_Term.as_str() < term {
+                    left = mid + 1;
+                } else {
+                    right = mid;
+                }
             }
-            if left == block.entry_count() { return None; }
+            if left == block.entry_count() {
+                return None;
+            }
             let entry = block.entry(left)?;
-            if entry.LTE_Term != term { return None; }
-            Some(IndexLocation { index_block_id: entry.LTE_IndexBlockID, index_offset: entry.LTE_IndexOffset as usize, index_length: entry.LTE_IndexLength as usize, doc_freq: entry.LTE_DocFreq, continuation_block_count: entry.LTE_ContinuationBlockCount as u32 })
+            if entry.LTE_Term != term {
+                return None;
+            }
+            Some(IndexLocation {
+                index_block_id: entry.LTE_IndexBlockID,
+                index_offset: entry.LTE_IndexOffset as usize,
+                index_length: entry.LTE_IndexLength as usize,
+                doc_freq: entry.LTE_DocFreq,
+                continuation_block_count: entry.LTE_ContinuationBlockCount as u32,
+            })
         })();
         self.ReleaseBlock(BlockKind::LeafTerm, slot, false);
         result
@@ -947,7 +1344,8 @@ impl IndexBlockTable {
             && self.m_TermMphfDisplacementCount == self.m_TermMphfHeader.TMH_BucketCount
             && self.m_TermMphfDisplacements.len() == self.m_TermMphfDisplacementCount as usize
             && self.m_TermMphfEntryPages.len() == self.m_TermMphfEntryPageCount as usize
-            && self.m_TermMphfEntryPageCount as usize * PAGE_SIZE >= self.m_TermMphfHeader.TMH_SlotCount as usize * TERM_MPHF_ENTRY_SIZE
+            && self.m_TermMphfEntryPageCount as usize * PAGE_SIZE
+                >= self.m_TermMphfHeader.TMH_SlotCount as usize * TERM_MPHF_ENTRY_SIZE
     }
 
     fn ClearTermMphf(&mut self) {
@@ -963,16 +1361,26 @@ impl IndexBlockTable {
     }
 
     fn StartBlockThread(&self, pool: &Arc<BlockCachePool>) {
-        if self.m_DirectBlockAccess.load(Ordering::Relaxed) { return; }
+        if self.m_DirectBlockAccess.load(Ordering::Relaxed) {
+            return;
+        }
         #[cfg(not(target_arch = "wasm32"))]
         {
-            let ready = pool.BCP_State.lock().map(|state| state.BCP_Pages.is_some() && state.BCP_SlotCount > 0).unwrap_or(false);
+            let ready = pool
+                .BCP_State
+                .lock()
+                .map(|state| state.BCP_Pages.is_some() && state.BCP_SlotCount > 0)
+                .unwrap_or(false);
             let mut handle = pool.BCP_Thread.lock().unwrap();
-            if !ready || handle.is_some() { return; }
+            if !ready || handle.is_some() {
+                return;
+            }
             pool.BCP_ExitThread.store(false, Ordering::Release);
             let target = Arc::clone(pool);
             let counters = Arc::clone(&self.m_AccessCounters);
-            *handle = Some(thread::spawn(move || Self::BlockThreadMain(target, counters)));
+            *handle = Some(thread::spawn(move || {
+                Self::BlockThreadMain(target, counters)
+            }));
         }
     }
 
@@ -980,7 +1388,9 @@ impl IndexBlockTable {
         #[cfg(not(target_arch = "wasm32"))]
         {
             let handle = pool.BCP_Thread.lock().unwrap().take();
-            let Some(handle) = handle else { return; };
+            let Some(handle) = handle else {
+                return;
+            };
             pool.BCP_ExitThread.store(true, Ordering::Release);
             pool.BCP_RequestCv.notify_one();
             let _ = handle.join();
@@ -988,20 +1398,56 @@ impl IndexBlockTable {
     }
 
     fn LoadSequentialWindow(state: &mut BlockCacheState, startBlock: u32) -> bool {
-        if state.BCP_File.is_none() || state.BCP_Pages.is_none() || state.BCP_LogicTable.is_none() || state.BCP_SlotTable.is_none() || startBlock >= state.BCP_TotalBlockCount || state.BCP_SlotCount == 0 { return false; }
-        if state.BCP_SlotTable.as_ref().unwrap().as_slice().iter().any(|slot| slot.Ref > 0) { return false; }
-        for slot in state.BCP_SlotTable.as_ref().unwrap().as_slice() {
-            if slot.BlockID != u32::MAX { state.BCP_LogicTable.as_mut().unwrap()[slot.BlockID as usize] = u32::MAX; }
+        if state.BCP_File.is_none()
+            || state.BCP_Pages.is_none()
+            || state.BCP_LogicTable.is_none()
+            || state.BCP_SlotTable.is_none()
+            || startBlock >= state.BCP_TotalBlockCount
+            || state.BCP_SlotCount == 0
+        {
+            return false;
         }
-        for slot in state.BCP_SlotTable.as_mut().unwrap().as_mut_slice() { *slot = IndexSlotEntry::default(); }
-        let blockCount = state.BCP_SlotCount.min(state.BCP_TotalBlockCount - startBlock);
+        if state
+            .BCP_SlotTable
+            .as_ref()
+            .unwrap()
+            .as_slice()
+            .iter()
+            .any(|slot| slot.Ref > 0)
+        {
+            return false;
+        }
+        for slot in state.BCP_SlotTable.as_ref().unwrap().as_slice() {
+            if slot.BlockID != u32::MAX {
+                state.BCP_LogicTable.as_mut().unwrap()[slot.BlockID as usize] = u32::MAX;
+            }
+        }
+        for slot in state.BCP_SlotTable.as_mut().unwrap().as_mut_slice() {
+            *slot = IndexSlotEntry::default();
+        }
+        let blockCount = state
+            .BCP_SlotCount
+            .min(state.BCP_TotalBlockCount - startBlock);
         let bytes = blockCount as usize * PAGE_SIZE;
-        if bytes > i32::MAX as usize { return false; }
+        if bytes > i32::MAX as usize {
+            return false;
+        }
         let file = Arc::clone(state.BCP_File.as_ref().unwrap());
-        if !file.SetPosition(state.BCP_BaseOffset + startBlock as u64 * PAGE_SIZE as u64) || file.GetData(&mut state.BCP_Pages.as_mut().unwrap().as_mut_slice()[..bytes], bytes as i32) != bytes as i32 { return false; }
+        if !file.SetPosition(state.BCP_BaseOffset + startBlock as u64 * PAGE_SIZE as u64)
+            || file.GetData(
+                &mut state.BCP_Pages.as_mut().unwrap().as_mut_slice()[..bytes],
+                bytes as i32,
+            ) != bytes as i32
+        {
+            return false;
+        }
         for offset in 0..blockCount {
             let block = startBlock + offset;
-            state.BCP_SlotTable.as_mut().unwrap()[offset as usize] = IndexSlotEntry { BlockID: block, Ref: 0, Loading: false };
+            state.BCP_SlotTable.as_mut().unwrap()[offset as usize] = IndexSlotEntry {
+                BlockID: block,
+                Ref: 0,
+                Loading: false,
+            };
             state.BCP_LogicTable.as_mut().unwrap()[block as usize] = offset;
         }
         state.BCP_EvictSlot = blockCount;
@@ -1012,15 +1458,24 @@ impl IndexBlockTable {
         loop {
             let request = {
                 let mut queue = pool.BCP_Requests.lock().unwrap();
-                while !pool.BCP_ExitThread.load(Ordering::Acquire) && queue.is_empty() { queue = pool.BCP_RequestCv.wait(queue).unwrap(); }
-                if pool.BCP_ExitThread.load(Ordering::Acquire) && queue.is_empty() { break; }
+                while !pool.BCP_ExitThread.load(Ordering::Acquire) && queue.is_empty() {
+                    queue = pool.BCP_RequestCv.wait(queue).unwrap();
+                }
+                if pool.BCP_ExitThread.load(Ordering::Acquire) && queue.is_empty() {
+                    break;
+                }
                 let request = queue.pop_front();
                 pool.BCP_RequestCv.notify_all();
                 request
             };
-            let Some(request) = request else { continue; };
-            if request.Type == BlockRequestType::Get { Self::ProcessGetBlockLocked(&pool, &request, &counters); }
-            else { Self::ProcessReleaseBlockLocked(&pool, &request); }
+            let Some(request) = request else {
+                continue;
+            };
+            if request.Type == BlockRequestType::Get {
+                Self::ProcessGetBlockLocked(&pool, &request, &counters);
+            } else {
+                Self::ProcessReleaseBlockLocked(&pool, &request);
+            }
             request.Complete();
         }
     }
@@ -1034,16 +1489,29 @@ impl IndexBlockTable {
         pool.BCP_RequestCv.notify_one();
     }
 
-    fn TryPinReadyOrWait<T>(&self, pool: &Arc<BlockCachePool>, kind: BlockKind, blockSeq: u32) -> Option<BlockHandle<T>> {
+    fn TryPinReadyOrWait<T>(
+        &self,
+        pool: &Arc<BlockCachePool>,
+        kind: BlockKind,
+        blockSeq: u32,
+    ) -> Option<BlockHandle<T>> {
         let mut state = pool.BCP_State.lock().ok()?;
         loop {
-            if blockSeq >= state.BCP_TotalBlockCount { return None; }
+            if blockSeq >= state.BCP_TotalBlockCount {
+                return None;
+            }
             let slot = state.BCP_LogicTable.as_ref()?.as_slice()[blockSeq as usize];
-            if slot == u32::MAX || slot >= state.BCP_SlotCount { return None; }
+            if slot == u32::MAX || slot >= state.BCP_SlotCount {
+                return None;
+            }
             let entry = state.BCP_SlotTable.as_ref()?.as_slice()[slot as usize];
             if !entry.Loading {
-                if entry.BlockID != blockSeq { return None; }
-                self.m_AccessCounters.m_CacheHits.fetch_add(1, Ordering::Relaxed);
+                if entry.BlockID != blockSeq {
+                    return None;
+                }
+                self.m_AccessCounters
+                    .m_CacheHits
+                    .fetch_add(1, Ordering::Relaxed);
                 state.BCP_SlotTable.as_mut()?.as_mut_slice()[slot as usize].Ref += 1;
                 return Self::MakeHandle(&state, kind, slot);
             }
@@ -1051,20 +1519,44 @@ impl IndexBlockTable {
         }
     }
 
-    fn ProcessGetBlockLocked(pool: &Arc<BlockCachePool>, request: &BlockRequest, counters: &Arc<BlockAccessCounters>) {
+    fn ProcessGetBlockLocked(
+        pool: &Arc<BlockCachePool>,
+        request: &BlockRequest,
+        counters: &Arc<BlockAccessCounters>,
+    ) {
         let (found, address, file, baseOffset) = {
-            let mut state = match pool.BCP_State.lock() { Ok(state) => state, Err(_) => return };
+            let mut state = match pool.BCP_State.lock() {
+                Ok(state) => state,
+                Err(_) => return,
+            };
             let blockSeq = request.BlockSeq;
-            if state.BCP_Pages.is_none() || state.BCP_LogicTable.is_none() || state.BCP_SlotTable.is_none() || blockSeq >= state.BCP_TotalBlockCount || state.BCP_SlotCount == 0 { return; }
+            if state.BCP_Pages.is_none()
+                || state.BCP_LogicTable.is_none()
+                || state.BCP_SlotTable.is_none()
+                || blockSeq >= state.BCP_TotalBlockCount
+                || state.BCP_SlotCount == 0
+            {
+                return;
+            }
             loop {
                 let slot = state.BCP_LogicTable.as_ref().unwrap()[blockSeq as usize];
-                if slot == u32::MAX || slot >= state.BCP_SlotCount { break; }
+                if slot == u32::MAX || slot >= state.BCP_SlotCount {
+                    break;
+                }
                 let entry = state.BCP_SlotTable.as_ref().unwrap()[slot as usize];
                 if !entry.Loading {
                     if entry.BlockID == blockSeq {
                         counters.m_CacheHits.fetch_add(1, Ordering::Relaxed);
                         state.BCP_SlotTable.as_mut().unwrap()[slot as usize].Ref += 1;
-                        let address = unsafe { state.BCP_Pages.as_ref().unwrap().as_slice().as_ptr().add(slot as usize * PAGE_SIZE) as usize };
+                        let address = unsafe {
+                            state
+                                .BCP_Pages
+                                .as_ref()
+                                .unwrap()
+                                .as_slice()
+                                .as_ptr()
+                                .add(slot as usize * PAGE_SIZE) as usize
+                        };
                         request.Slot.store(slot, Ordering::Release);
                         request.Address.store(address, Ordering::Release);
                         return;
@@ -1079,28 +1571,67 @@ impl IndexBlockTable {
                 let candidate = state.BCP_EvictSlot % state.BCP_SlotCount;
                 state.BCP_EvictSlot = state.BCP_EvictSlot.wrapping_add(1);
                 let entry = state.BCP_SlotTable.as_ref().unwrap()[candidate as usize];
-                if entry.Ref == 0 && !entry.Loading { found = candidate; break; }
+                if entry.Ref == 0 && !entry.Loading {
+                    found = candidate;
+                    break;
+                }
             }
-            if found == u32::MAX { return; }
+            if found == u32::MAX {
+                return;
+            }
             let oldBlock = state.BCP_SlotTable.as_ref().unwrap()[found as usize].BlockID;
-            if oldBlock != u32::MAX { state.BCP_LogicTable.as_mut().unwrap()[oldBlock as usize] = u32::MAX; }
-            state.BCP_SlotTable.as_mut().unwrap()[found as usize] = IndexSlotEntry { BlockID: blockSeq, Ref: 1, Loading: true };
+            if oldBlock != u32::MAX {
+                state.BCP_LogicTable.as_mut().unwrap()[oldBlock as usize] = u32::MAX;
+            }
+            state.BCP_SlotTable.as_mut().unwrap()[found as usize] = IndexSlotEntry {
+                BlockID: blockSeq,
+                Ref: 1,
+                Loading: true,
+            };
             state.BCP_LogicTable.as_mut().unwrap()[blockSeq as usize] = found;
-            let address = unsafe { state.BCP_Pages.as_ref().unwrap().as_slice().as_ptr().add(found as usize * PAGE_SIZE) as usize };
+            let address = unsafe {
+                state
+                    .BCP_Pages
+                    .as_ref()
+                    .unwrap()
+                    .as_slice()
+                    .as_ptr()
+                    .add(found as usize * PAGE_SIZE) as usize
+            };
             request.Slot.store(found, Ordering::Release);
             request.Address.store(address, Ordering::Release);
-            (found, address, state.BCP_File.as_ref().map(Arc::clone), state.BCP_BaseOffset)
+            (
+                found,
+                address,
+                state.BCP_File.as_ref().map(Arc::clone),
+                state.BCP_BaseOffset,
+            )
         };
 
         let ok = if let Some(file) = file {
             let bytes = unsafe { std::slice::from_raw_parts_mut(address as *mut u8, PAGE_SIZE) };
             file.ReadBlock(request.BlockSeq, bytes, PAGE_SIZE, baseOffset)
-        } else { false };
-        if ok { counters.m_DiskReads.fetch_add(1, Ordering::Relaxed); }
+        } else {
+            false
+        };
+        if ok {
+            counters.m_DiskReads.fetch_add(1, Ordering::Relaxed);
+        }
         if let Ok(mut state) = pool.BCP_State.lock() {
             if !ok {
-                if request.BlockSeq < state.BCP_TotalBlockCount && state.BCP_LogicTable.as_ref().map(|table| table[request.BlockSeq as usize] == found).unwrap_or(false) { state.BCP_LogicTable.as_mut().unwrap()[request.BlockSeq as usize] = u32::MAX; }
-                if found < state.BCP_SlotCount { state.BCP_SlotTable.as_mut().unwrap()[found as usize] = IndexSlotEntry::default(); }
+                if request.BlockSeq < state.BCP_TotalBlockCount
+                    && state
+                        .BCP_LogicTable
+                        .as_ref()
+                        .map(|table| table[request.BlockSeq as usize] == found)
+                        .unwrap_or(false)
+                {
+                    state.BCP_LogicTable.as_mut().unwrap()[request.BlockSeq as usize] = u32::MAX;
+                }
+                if found < state.BCP_SlotCount {
+                    state.BCP_SlotTable.as_mut().unwrap()[found as usize] =
+                        IndexSlotEntry::default();
+                }
                 request.Slot.store(u32::MAX, Ordering::Release);
                 request.Address.store(0, Ordering::Release);
             } else if found < state.BCP_SlotCount {
@@ -1111,14 +1642,18 @@ impl IndexBlockTable {
     }
 
     fn ProcessReleaseBlockLocked(pool: &Arc<BlockCachePool>, request: &BlockRequest) {
-        if let Ok(mut state) = pool.BCP_State.lock() { Self::ProcessReleaseBlock(&mut state, request); }
+        if let Ok(mut state) = pool.BCP_State.lock() {
+            Self::ProcessReleaseBlock(&mut state, request);
+        }
     }
 
     fn ProcessReleaseBlock(state: &mut BlockCacheState, request: &BlockRequest) {
         let slot = request.Slot.load(Ordering::Acquire);
         let slotCount = state.BCP_SlotCount;
         if let Some(table) = state.BCP_SlotTable.as_mut() {
-            if slot != u32::MAX && slot < slotCount && table[slot as usize].Ref > 0 { table[slot as usize].Ref -= 1; }
+            if slot != u32::MAX && slot < slotCount && table[slot as usize].Ref > 0 {
+                table[slot as usize].Ref -= 1;
+            }
         }
     }
 }

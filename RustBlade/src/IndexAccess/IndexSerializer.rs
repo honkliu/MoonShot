@@ -1,3 +1,6 @@
+//! Direct translation of the C++ index serializer; names stay aligned with the binary contract.
+#![allow(non_snake_case, non_upper_case_globals)]
+
 /*
  * Binary index format v20:
  *   136B Header -> 20 x 4096B PathPrefix sidecar -> 32B HeadTermEntry[]
@@ -8,37 +11,16 @@
 use std::fs::File;
 use std::io::{BufReader, Read, Seek, Write};
 
-use crate::block_table::{
-    HeadTermEntry,
-    IndexBlock,
-    IndexBlockTable,
-    IndexBlockContinuationHeader,
-    TermMphfHash,
-    TermMphfHeader,
-    TermMphfSlotSeed,
-    LeafTermBlock,
-    LeafTermEntry,
-    DocDataDecodeScore,
-    PathPrefixSidecarEntry,
-    PathPrefixSidecarHeader,
-    DOC_REC_SIZE,
-    DOC_VECTOR_DIM,
-    DOC_VECTOR_OFFSET,
-    PATH_PREFIX_SIDECAR_BYTES,
-    PATH_PREFIX_SIDECAR_MAGIC,
-    PATH_PREFIX_SIDECAR_VERSION,
-    HEAD_TERM_KEY_MAX,
-    INDEX_BLOCK_CONTINUATION_HEADER_SIZE,
-    INDEX_FILE_HEADER_SIZE,
-    INDEX_FILE_MAGIC,
-    TERM_MPHF_ENTRY_SIZE,
-    TERM_MPHF_HEADER_SIZE,
-    TERM_MPHF_MAGIC,
-    LEAF_TERM_DATA_OFFSET,
-    LEAF_TERM_DIRECTORY_COUNT,
-    PAGE_SIZE,
-};
 pub use crate::block_table::IndexFileHeader;
+use crate::block_table::{
+    DocDataDecodeScore, HeadTermEntry, IndexBlock, IndexBlockContinuationHeader, IndexBlockTable,
+    LeafTermBlock, LeafTermEntry, PathPrefixSidecarEntry, PathPrefixSidecarHeader, TermMphfHash,
+    TermMphfHeader, TermMphfSlotSeed, DOC_REC_SIZE, DOC_VECTOR_DIM, DOC_VECTOR_OFFSET,
+    HEAD_TERM_KEY_MAX, INDEX_BLOCK_CONTINUATION_HEADER_SIZE, INDEX_FILE_HEADER_SIZE,
+    INDEX_FILE_MAGIC, LEAF_TERM_DATA_OFFSET, LEAF_TERM_DIRECTORY_COUNT, PAGE_SIZE,
+    PATH_PREFIX_SIDECAR_BYTES, PATH_PREFIX_SIDECAR_MAGIC, PATH_PREFIX_SIDECAR_VERSION,
+    TERM_MPHF_ENTRY_SIZE, TERM_MPHF_HEADER_SIZE, TERM_MPHF_MAGIC,
+};
 use crate::error::{Result, RustBladeError};
 use crate::posting_store::PostingStore;
 
@@ -71,7 +53,9 @@ struct TermMphfBuildTerm {
 }
 
 fn next_power_of_two(mut value: u32) -> u32 {
-    if value <= 1 { return 1; }
+    if value <= 1 {
+        return 1;
+    }
     value -= 1;
     value |= value >> 1;
     value |= value >> 2;
@@ -83,28 +67,40 @@ fn next_power_of_two(mut value: u32) -> u32 {
 
 #[allow(non_snake_case)]
 fn MphfSlotFor(term: &str, slot_count: u32, slot_seed: u64, displacement: u32) -> u32 {
-    (TermMphfHash(term.as_bytes(), TermMphfSlotSeed(slot_seed, displacement)) % slot_count as u64) as u32
+    (TermMphfHash(term.as_bytes(), TermMphfSlotSeed(slot_seed, displacement)) % slot_count as u64)
+        as u32
 }
 
 #[allow(non_snake_case)]
-fn TryBuildTermMphf(terms: &[TermMphfBuildTerm], bucket_seed: u64, slot_seed: u64, fingerprint_seed: u64)
-    -> Option<(TermMphfHeader, Vec<i32>, Vec<IndexBlock>)>
-{
+fn TryBuildTermMphf(
+    terms: &[TermMphfBuildTerm],
+    bucket_seed: u64,
+    slot_seed: u64,
+    fingerprint_seed: u64,
+) -> Option<(TermMphfHeader, Vec<i32>, Vec<IndexBlock>)> {
     let term_count = terms.len() as u32;
-    if term_count == 0 { return None; }
+    if term_count == 0 {
+        return None;
+    }
     let bucket_count = next_power_of_two(std::cmp::max(1, term_count / 2));
     let slot_count = term_count;
-    let max_displacement = std::cmp::min(1u32 << 20, std::cmp::max(65536u32, std::cmp::max(1u32, slot_count / 8)));
+    let max_displacement = std::cmp::min(
+        1u32 << 20,
+        std::cmp::max(65536u32, std::cmp::max(1u32, slot_count / 8)),
+    );
 
     let mut ids: Vec<usize> = (0..terms.len()).collect();
     ids.sort_by(|a, b| terms[*a].Term.cmp(&terms[*b].Term));
     for index in 1..ids.len() {
-        if terms[ids[index - 1]].Term == terms[ids[index]].Term { return None; }
+        if terms[ids[index - 1]].Term == terms[ids[index]].Term {
+            return None;
+        }
     }
 
     let mut buckets = vec![Vec::<usize>::new(); bucket_count as usize];
     for (index, term) in terms.iter().enumerate() {
-        let bucket = (TermMphfHash(term.Term.as_bytes(), bucket_seed) % bucket_count as u64) as usize;
+        let bucket =
+            (TermMphfHash(term.Term.as_bytes(), bucket_seed) % bucket_count as u64) as usize;
         buckets[bucket].push(index);
     }
 
@@ -130,14 +126,25 @@ fn TryBuildTermMphf(terms: &[TermMphfBuildTerm], bucket_seed: u64, slot_seed: u6
         for displacement in 0..max_displacement {
             let mut ok = true;
             for (i, term_index) in bucket_terms.iter().enumerate() {
-                let slot = MphfSlotFor(&terms[*term_index].Term, slot_count, slot_seed, displacement);
+                let slot = MphfSlotFor(
+                    &terms[*term_index].Term,
+                    slot_count,
+                    slot_seed,
+                    displacement,
+                );
                 candidate_slots[i] = slot;
-                if used[slot as usize] || candidate_slots[..i].iter().any(|candidate| *candidate == slot) {
+                if used[slot as usize]
+                    || candidate_slots[..i]
+                        .iter()
+                        .any(|candidate| *candidate == slot)
+                {
                     ok = false;
                     break;
                 }
             }
-            if !ok { continue; }
+            if !ok {
+                continue;
+            }
 
             displacements[bucket] = displacement as i32;
             for (i, term_index) in bucket_terms.iter().enumerate() {
@@ -148,7 +155,9 @@ fn TryBuildTermMphf(terms: &[TermMphfBuildTerm], bucket_seed: u64, slot_seed: u6
             break;
         }
 
-        if !placed { return None; }
+        if !placed {
+            return None;
+        }
     }
 
     let mut free_slots = Vec::with_capacity(slot_count as usize);
@@ -159,22 +168,31 @@ fn TryBuildTermMphf(terms: &[TermMphfBuildTerm], bucket_seed: u64, slot_seed: u6
     }
     let mut next_free_slot = 0usize;
     for (bucket, bucket_terms) in buckets.iter().enumerate() {
-        if bucket_terms.len() != 1 { continue; }
-        if next_free_slot >= free_slots.len() { return None; }
+        if bucket_terms.len() != 1 {
+            continue;
+        }
+        if next_free_slot >= free_slots.len() {
+            return None;
+        }
         let slot = free_slots[next_free_slot];
         next_free_slot += 1;
         let direct_displacement = -(slot as i64) - 1;
-        if direct_displacement < i32::MIN as i64 { return None; }
+        if direct_displacement < i32::MIN as i64 {
+            return None;
+        }
         displacements[bucket] = direct_displacement as i32;
         used[slot as usize] = true;
         slots[bucket_terms[0]] = slot;
     }
 
-    let page_count = (slot_count as usize + (PAGE_SIZE / TERM_MPHF_ENTRY_SIZE) - 1) / (PAGE_SIZE / TERM_MPHF_ENTRY_SIZE);
+    let page_count = (slot_count as usize + (PAGE_SIZE / TERM_MPHF_ENTRY_SIZE) - 1)
+        / (PAGE_SIZE / TERM_MPHF_ENTRY_SIZE);
     let mut entry_pages = vec![IndexBlock::default(); page_count];
     for (index, source) in terms.iter().enumerate() {
         let slot = slots[index];
-        if slot == u32::MAX { return None; }
+        if slot == u32::MAX {
+            return None;
+        }
         let byte_offset = slot as usize * TERM_MPHF_ENTRY_SIZE;
         let page = byte_offset / PAGE_SIZE;
         let offset = byte_offset % PAGE_SIZE;
@@ -186,24 +204,32 @@ fn TryBuildTermMphf(terms: &[TermMphfBuildTerm], bucket_seed: u64, slot_seed: u6
         data[16..20].copy_from_slice(&source.ContinuationBlockCount.to_le_bytes());
         data[20..24].copy_from_slice(&source.Flags.to_le_bytes());
         let mut fingerprint = TermMphfHash(source.Term.as_bytes(), fingerprint_seed);
-        if fingerprint == 0 { fingerprint = 1; }
+        if fingerprint == 0 {
+            fingerprint = 1;
+        }
         data[24..32].copy_from_slice(&fingerprint.to_le_bytes());
     }
 
-    Some((TermMphfHeader {
-        TMH_Magic: TERM_MPHF_MAGIC,
-        TMH_TermCount: term_count as u64,
-        TMH_BucketCount: bucket_count,
-        TMH_SlotCount: slot_count,
-        TMH_BucketSeed: bucket_seed,
-        TMH_SlotSeed: slot_seed,
-        TMH_FingerprintSeed: fingerprint_seed,
-    }, displacements, entry_pages))
+    Some((
+        TermMphfHeader {
+            TMH_Magic: TERM_MPHF_MAGIC,
+            TMH_TermCount: term_count as u64,
+            TMH_BucketCount: bucket_count,
+            TMH_SlotCount: slot_count,
+            TMH_BucketSeed: bucket_seed,
+            TMH_SlotSeed: slot_seed,
+            TMH_FingerprintSeed: fingerprint_seed,
+        },
+        displacements,
+        entry_pages,
+    ))
 }
 
 #[allow(non_snake_case)]
 fn BuildTermMphf(terms: &[TermMphfBuildTerm]) -> (TermMphfHeader, Vec<i32>, Vec<IndexBlock>) {
-    if terms.is_empty() { return (TermMphfHeader::default(), Vec::new(), Vec::new()); }
+    if terms.is_empty() {
+        return (TermMphfHeader::default(), Vec::new(), Vec::new());
+    }
     const BUCKET_SEED_BASE: u64 = 0x9ae16a3b2f90404f;
     const SLOT_SEED_BASE: u64 = 0xc3a5c85c97cb3127;
     const FINGERPRINT_SEED_BASE: u64 = 0xb492b66fbe98f273;
@@ -212,7 +238,8 @@ fn BuildTermMphf(terms: &[TermMphfBuildTerm]) -> (TermMphfHeader, Vec<i32>, Vec<
     for attempt in 0..32u64 {
         let bucket_seed = BUCKET_SEED_BASE.wrapping_add(SEED_STEP.wrapping_mul(attempt));
         let slot_seed = SLOT_SEED_BASE ^ SEED_STEP.wrapping_mul(attempt + 1);
-        let fingerprint_seed = FINGERPRINT_SEED_BASE.wrapping_add(SEED_STEP.wrapping_mul(attempt + 3));
+        let fingerprint_seed =
+            FINGERPRINT_SEED_BASE.wrapping_add(SEED_STEP.wrapping_mul(attempt + 3));
         if let Some(result) = TryBuildTermMphf(terms, bucket_seed, slot_seed, fingerprint_seed) {
             return result;
         }
@@ -223,15 +250,23 @@ fn BuildTermMphf(terms: &[TermMphfBuildTerm]) -> (TermMphfHeader, Vec<i32>, Vec<
 
 impl IndexSerializer {
     #[allow(non_snake_case)]
-    pub fn Save(header: &IndexFileHeader, blockTable: &IndexBlockTable, docData: &[u8], pathPrefixSidecar: &[u8], path: &str) -> Result<()> {
+    pub fn Save(
+        header: &IndexFileHeader,
+        blockTable: &IndexBlockTable,
+        docData: &[u8],
+        pathPrefixSidecar: &[u8],
+        path: &str,
+    ) -> Result<()> {
         let empty_unbuilt_index = header.is_zeroed();
         if !empty_unbuilt_index {
             header.validate_layout(None)?;
         }
-        let expected_docdata = usize::try_from(header.IFH_NumDocuments).ok()
+        let expected_docdata = usize::try_from(header.IFH_NumDocuments)
+            .ok()
             .and_then(|count| count.checked_mul(DOC_REC_SIZE))
             .ok_or(RustBladeError::InvalidFormat)?;
-        if docData.len() != expected_docdata || pathPrefixSidecar.len() != PATH_PREFIX_SIDECAR_BYTES
+        if docData.len() != expected_docdata
+            || pathPrefixSidecar.len() != PATH_PREFIX_SIDECAR_BYTES
             || (empty_unbuilt_index && pathPrefixSidecar.iter().any(|byte| *byte != 0))
         {
             return Err(RustBladeError::InvalidFormat);
@@ -241,7 +276,8 @@ impl IndexSerializer {
         if blockTable.HeadTermEntries().len() != header.IFH_HeadTermEntryCount as usize
             || leaf_blocks.len() != header.IFH_LeafTermBlockCount as usize
             || index_blocks.len() != header.IFH_IndexBlockCount as usize
-            || blockTable.TermMphfDisplacements().len() != header.IFH_TermMphfDisplacementCount as usize
+            || blockTable.TermMphfDisplacements().len()
+                != header.IFH_TermMphfDisplacementCount as usize
             || blockTable.TermMphfEntryPages().len() != header.IFH_TermMphfEntryPageCount as usize
         {
             return Err(RustBladeError::InvalidFormat);
@@ -299,15 +335,20 @@ impl IndexSerializer {
     }
 
     #[allow(non_snake_case)]
-    pub fn LoadFileTables(store: &mut PostingStore, path: &str)
-        -> Result<(IndexFileHeader, Vec<HeadTermEntry>, Vec<u8>)>
-    {
+    pub fn LoadFileTables(
+        store: &mut PostingStore,
+        path: &str,
+    ) -> Result<(IndexFileHeader, Vec<HeadTermEntry>, Vec<u8>)> {
         #[cfg(target_arch = "wasm32")]
         {
             let _ = path;
             let mut header_bytes = [0u8; INDEX_FILE_HEADER_SIZE];
             if !browser_read_range(0, &mut header_bytes) {
-                return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "browser index read failed").into());
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "browser index read failed",
+                )
+                .into());
             }
             let header = IndexFileHeader::parse(&header_bytes)?;
             header.validate_layout(None)?;
@@ -316,17 +357,26 @@ impl IndexSerializer {
             for index in 0..header.IFH_HeadTermEntryCount {
                 let mut bytes = [0u8; 32];
                 if !browser_read_range(header.IFH_HeadTermEntryOffset + index * 32, &mut bytes) {
-                    return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "browser index read failed").into());
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "browser index read failed",
+                    )
+                    .into());
                 }
                 head.push(HeadTermEntry::from_bytes(&bytes).ok_or(RustBladeError::InvalidFormat)?);
             }
 
             let docdata_size = usize::try_from(header.IFH_NumDocuments)
-                .ok().and_then(|count| count.checked_mul(DOC_REC_SIZE))
+                .ok()
+                .and_then(|count| count.checked_mul(DOC_REC_SIZE))
                 .ok_or(RustBladeError::InvalidFormat)?;
             let mut docdata = vec![0u8; docdata_size];
             if !browser_read_range(header.IFH_DocDataOffset, &mut docdata) {
-                return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "browser index read failed").into());
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "browser index read failed",
+                )
+                .into());
             }
             Self::DecodeDocData(store, &header, &docdata)?;
             return Ok((header, head, docdata));
@@ -334,24 +384,24 @@ impl IndexSerializer {
 
         #[cfg(not(target_arch = "wasm32"))]
         {
-        let file = File::open(path)?;
-        let file_bytes = file.metadata()?.len();
-        let mut reader = BufReader::new(file);
-        let mut header_bytes = [0u8; INDEX_FILE_HEADER_SIZE];
-        reader.read_exact(&mut header_bytes)?;
-        let header = IndexFileHeader::parse(&header_bytes)?;
-        header.validate_layout(Some(file_bytes))?;
+            let file = File::open(path)?;
+            let file_bytes = file.metadata()?.len();
+            let mut reader = BufReader::new(file);
+            let mut header_bytes = [0u8; INDEX_FILE_HEADER_SIZE];
+            reader.read_exact(&mut header_bytes)?;
+            let header = IndexFileHeader::parse(&header_bytes)?;
+            header.validate_layout(Some(file_bytes))?;
 
-        let mut head = Vec::with_capacity(header.IFH_HeadTermEntryCount as usize);
-        reader.seek(std::io::SeekFrom::Start(header.IFH_HeadTermEntryOffset))?;
-        for _ in 0..header.IFH_HeadTermEntryCount {
-            let mut bytes = [0u8; 32];
-            reader.read_exact(&mut bytes)?;
-            head.push(HeadTermEntry::from_bytes(&bytes).ok_or(RustBladeError::InvalidFormat)?);
-        }
+            let mut head = Vec::with_capacity(header.IFH_HeadTermEntryCount as usize);
+            reader.seek(std::io::SeekFrom::Start(header.IFH_HeadTermEntryOffset))?;
+            for _ in 0..header.IFH_HeadTermEntryCount {
+                let mut bytes = [0u8; 32];
+                reader.read_exact(&mut bytes)?;
+                head.push(HeadTermEntry::from_bytes(&bytes).ok_or(RustBladeError::InvalidFormat)?);
+            }
 
-        let docdata = Self::LoadDocData(store, &mut reader, &header)?;
-        Ok((header, head, docdata))
+            let docdata = Self::LoadDocData(store, &mut reader, &header)?;
+            Ok((header, head, docdata))
         }
     }
 
@@ -362,7 +412,11 @@ impl IndexSerializer {
             let _ = path;
             let mut sidecar = vec![0u8; PATH_PREFIX_SIDECAR_BYTES];
             if !browser_read_range(INDEX_FILE_HEADER_SIZE as u64, &mut sidecar) {
-                return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "browser index read failed").into());
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "browser index read failed",
+                )
+                .into());
             }
             let prefixes = Self::DecodePathPrefixSidecar(&sidecar)?;
             return Ok((sidecar, prefixes));
@@ -370,21 +424,27 @@ impl IndexSerializer {
 
         #[cfg(not(target_arch = "wasm32"))]
         {
-        let mut file = File::open(path)?;
-        file.seek(std::io::SeekFrom::Start(INDEX_FILE_HEADER_SIZE as u64))?;
-        let mut sidecar = vec![0u8; PATH_PREFIX_SIDECAR_BYTES];
-        file.read_exact(&mut sidecar)?;
-        let prefixes = Self::DecodePathPrefixSidecar(&sidecar)?;
-        Ok((sidecar, prefixes))
+            let mut file = File::open(path)?;
+            file.seek(std::io::SeekFrom::Start(INDEX_FILE_HEADER_SIZE as u64))?;
+            let mut sidecar = vec![0u8; PATH_PREFIX_SIDECAR_BYTES];
+            file.read_exact(&mut sidecar)?;
+            let prefixes = Self::DecodePathPrefixSidecar(&sidecar)?;
+            Ok((sidecar, prefixes))
         }
     }
 
     #[allow(non_snake_case)]
-    pub fn LoadTermMphf(path: &str, header: &IndexFileHeader) -> Result<(TermMphfHeader, Vec<i32>, Vec<IndexBlock>)> {
+    pub fn LoadTermMphf(
+        path: &str,
+        header: &IndexFileHeader,
+    ) -> Result<(TermMphfHeader, Vec<i32>, Vec<IndexBlock>)> {
         if header.IFH_TermMphfHeaderCount == 0 {
             return Ok((TermMphfHeader::default(), Vec::new(), Vec::new()));
         }
-        if header.IFH_TermMphfHeaderCount != 1 || header.IFH_TermMphfDisplacementCount == 0 || header.IFH_TermMphfEntryPageCount == 0 {
+        if header.IFH_TermMphfHeaderCount != 1
+            || header.IFH_TermMphfDisplacementCount == 0
+            || header.IFH_TermMphfEntryPageCount == 0
+        {
             return Err(RustBladeError::InvalidFormat);
         }
 
@@ -393,27 +453,50 @@ impl IndexSerializer {
             let _ = path;
             let mut header_bytes = [0u8; TERM_MPHF_HEADER_SIZE];
             if !browser_read_range(header.IFH_TermMphfHeaderOffset, &mut header_bytes) {
-                return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "browser index read failed").into());
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "browser index read failed",
+                )
+                .into());
             }
-            let mphf_header = TermMphfHeader::from_bytes(&header_bytes).ok_or(RustBladeError::InvalidFormat)?;
-            if mphf_header.TMH_Magic != TERM_MPHF_MAGIC { return Err(RustBladeError::InvalidFormat); }
+            let mphf_header =
+                TermMphfHeader::from_bytes(&header_bytes).ok_or(RustBladeError::InvalidFormat)?;
+            if mphf_header.TMH_Magic != TERM_MPHF_MAGIC {
+                return Err(RustBladeError::InvalidFormat);
+            }
 
             let displacement_size = usize::try_from(header.IFH_TermMphfDisplacementCount)
-                .ok().and_then(|count| count.checked_mul(4))
+                .ok()
+                .and_then(|count| count.checked_mul(4))
                 .ok_or(RustBladeError::InvalidFormat)?;
             let mut displacement_bytes = vec![0u8; displacement_size];
-            if !browser_read_range(header.IFH_TermMphfDisplacementOffset, &mut displacement_bytes) {
-                return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "browser index read failed").into());
+            if !browser_read_range(
+                header.IFH_TermMphfDisplacementOffset,
+                &mut displacement_bytes,
+            ) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "browser index read failed",
+                )
+                .into());
             }
-            let displacements = displacement_bytes.chunks_exact(4)
+            let displacements = displacement_bytes
+                .chunks_exact(4)
                 .map(|bytes| i32::from_le_bytes(bytes.try_into().unwrap()))
                 .collect();
 
             let mut pages = Vec::with_capacity(header.IFH_TermMphfEntryPageCount as usize);
             for index in 0..header.IFH_TermMphfEntryPageCount {
                 let mut block = IndexBlock::default();
-                if !browser_read_range(header.IFH_TermMphfEntryOffset + index * PAGE_SIZE as u64, &mut block.IB_Data) {
-                    return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "browser index read failed").into());
+                if !browser_read_range(
+                    header.IFH_TermMphfEntryOffset + index * PAGE_SIZE as u64,
+                    &mut block.IB_Data,
+                ) {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "browser index read failed",
+                    )
+                    .into());
                 }
                 pages.push(block);
             }
@@ -422,35 +505,43 @@ impl IndexSerializer {
 
         #[cfg(not(target_arch = "wasm32"))]
         {
-        let mut file = File::open(path)?;
-        file.seek(std::io::SeekFrom::Start(header.IFH_TermMphfHeaderOffset))?;
-        let mut header_bytes = [0u8; TERM_MPHF_HEADER_SIZE];
-        file.read_exact(&mut header_bytes)?;
-        let mphf_header = TermMphfHeader::from_bytes(&header_bytes).ok_or(RustBladeError::InvalidFormat)?;
-        if mphf_header.TMH_Magic != TERM_MPHF_MAGIC { return Err(RustBladeError::InvalidFormat); }
+            let mut file = File::open(path)?;
+            file.seek(std::io::SeekFrom::Start(header.IFH_TermMphfHeaderOffset))?;
+            let mut header_bytes = [0u8; TERM_MPHF_HEADER_SIZE];
+            file.read_exact(&mut header_bytes)?;
+            let mphf_header =
+                TermMphfHeader::from_bytes(&header_bytes).ok_or(RustBladeError::InvalidFormat)?;
+            if mphf_header.TMH_Magic != TERM_MPHF_MAGIC {
+                return Err(RustBladeError::InvalidFormat);
+            }
 
-        file.seek(std::io::SeekFrom::Start(header.IFH_TermMphfDisplacementOffset))?;
-        let mut displacements = Vec::with_capacity(header.IFH_TermMphfDisplacementCount as usize);
-        for _ in 0..header.IFH_TermMphfDisplacementCount {
-            let mut bytes = [0u8; 4];
-            file.read_exact(&mut bytes)?;
-            displacements.push(i32::from_le_bytes(bytes));
-        }
+            file.seek(std::io::SeekFrom::Start(
+                header.IFH_TermMphfDisplacementOffset,
+            ))?;
+            let mut displacements =
+                Vec::with_capacity(header.IFH_TermMphfDisplacementCount as usize);
+            for _ in 0..header.IFH_TermMphfDisplacementCount {
+                let mut bytes = [0u8; 4];
+                file.read_exact(&mut bytes)?;
+                displacements.push(i32::from_le_bytes(bytes));
+            }
 
-        file.seek(std::io::SeekFrom::Start(header.IFH_TermMphfEntryOffset))?;
-        let mut pages = Vec::with_capacity(header.IFH_TermMphfEntryPageCount as usize);
-        for _ in 0..header.IFH_TermMphfEntryPageCount {
-            let mut block = IndexBlock::default();
-            file.read_exact(&mut block.IB_Data)?;
-            pages.push(block);
-        }
+            file.seek(std::io::SeekFrom::Start(header.IFH_TermMphfEntryOffset))?;
+            let mut pages = Vec::with_capacity(header.IFH_TermMphfEntryPageCount as usize);
+            for _ in 0..header.IFH_TermMphfEntryPageCount {
+                let mut block = IndexBlock::default();
+                file.read_exact(&mut block.IB_Data)?;
+                pages.push(block);
+            }
 
-        Ok((mphf_header, displacements, pages))
+            Ok((mphf_header, displacements, pages))
         }
     }
 
     #[allow(non_snake_case)]
-    pub fn BuildTermMphfFromLeafBlocks(leaf_blocks: &[LeafTermBlock]) -> (TermMphfHeader, Vec<i32>, Vec<IndexBlock>) {
+    pub fn BuildTermMphfFromLeafBlocks(
+        leaf_blocks: &[LeafTermBlock],
+    ) -> (TermMphfHeader, Vec<i32>, Vec<IndexBlock>) {
         let mut terms = Vec::new();
         for block in leaf_blocks {
             for entry in block.entries() {
@@ -468,20 +559,36 @@ impl IndexSerializer {
         BuildTermMphf(&terms)
     }
 
-    pub fn load_file_tables(store: &mut PostingStore, path: &str)
-        -> Result<(IndexFileHeader, Vec<HeadTermEntry>, Vec<u8>)>
-    {
+    pub fn load_file_tables(
+        store: &mut PostingStore,
+        path: &str,
+    ) -> Result<(IndexFileHeader, Vec<HeadTermEntry>, Vec<u8>)> {
         Self::LoadFileTables(store, path)
     }
 
-    pub fn decode(store: &mut PostingStore, data: &[u8])
-        -> Result<(Vec<HeadTermEntry>, Vec<LeafTermBlock>, Vec<IndexBlock>, Vec<u8>, Vec<u8>, Vec<String>, TermMphfHeader, Vec<i32>, Vec<IndexBlock>)>
-    {
+    pub fn decode(
+        store: &mut PostingStore,
+        data: &[u8],
+    ) -> Result<(
+        Vec<HeadTermEntry>,
+        Vec<LeafTermBlock>,
+        Vec<IndexBlock>,
+        Vec<u8>,
+        Vec<u8>,
+        Vec<String>,
+        TermMphfHeader,
+        Vec<i32>,
+        Vec<IndexBlock>,
+    )> {
         let header = IndexFileHeader::parse(data)?;
         header.validate_layout(Some(data.len() as u64))?;
 
-        if INDEX_FILE_HEADER_SIZE + PATH_PREFIX_SIDECAR_BYTES > data.len() { return Err(RustBladeError::InvalidFormat); }
-        let sidecar = data[INDEX_FILE_HEADER_SIZE..INDEX_FILE_HEADER_SIZE + PATH_PREFIX_SIDECAR_BYTES].to_vec();
+        if INDEX_FILE_HEADER_SIZE + PATH_PREFIX_SIDECAR_BYTES > data.len() {
+            return Err(RustBladeError::InvalidFormat);
+        }
+        let sidecar = data
+            [INDEX_FILE_HEADER_SIZE..INDEX_FILE_HEADER_SIZE + PATH_PREFIX_SIDECAR_BYTES]
+            .to_vec();
         let prefixes = Self::DecodePathPrefixSidecar(&sidecar)?;
 
         let head_offset = header.IFH_HeadTermEntryOffset as usize;
@@ -501,65 +608,117 @@ impl IndexSerializer {
         let mut head = Vec::with_capacity(head_count);
         for index in 0..head_count {
             let offset = head_offset + index * 32;
-            if offset + 32 > data.len() { return Err(RustBladeError::InvalidFormat); }
-            head.push(HeadTermEntry::from_bytes(&data[offset..offset + 32]).ok_or(RustBladeError::InvalidFormat)?);
+            if offset + 32 > data.len() {
+                return Err(RustBladeError::InvalidFormat);
+            }
+            head.push(
+                HeadTermEntry::from_bytes(&data[offset..offset + 32])
+                    .ok_or(RustBladeError::InvalidFormat)?,
+            );
         }
 
         let mut leaf_blocks = Vec::with_capacity(leaf_count);
         for index in 0..leaf_count {
             let offset = leaf_offset + index * PAGE_SIZE;
-            if offset + PAGE_SIZE > data.len() { return Err(RustBladeError::InvalidFormat); }
-            leaf_blocks.push(LeafTermBlock::from_bytes(&data[offset..offset + PAGE_SIZE]).ok_or(RustBladeError::InvalidFormat)?);
+            if offset + PAGE_SIZE > data.len() {
+                return Err(RustBladeError::InvalidFormat);
+            }
+            leaf_blocks.push(
+                LeafTermBlock::from_bytes(&data[offset..offset + PAGE_SIZE])
+                    .ok_or(RustBladeError::InvalidFormat)?,
+            );
         }
 
         let docdata_size = num_docs * DOC_REC_SIZE;
-        if docdata_offset + docdata_size > data.len() { return Err(RustBladeError::InvalidFormat); }
+        if docdata_offset + docdata_size > data.len() {
+            return Err(RustBladeError::InvalidFormat);
+        }
         let docdata = data[docdata_offset..docdata_offset + docdata_size].to_vec();
 
         let first_doc_id = Self::DocDataFirstDocId(&docdata, &header);
         for index in 0..num_docs {
             let offset = docdata_offset + index * DOC_REC_SIZE;
-            Self::DecodeDocDataRecord(store, first_doc_id + index as u64, &data[offset..offset + DOC_REC_SIZE])?;
+            Self::DecodeDocDataRecord(
+                store,
+                first_doc_id + index as u64,
+                &data[offset..offset + DOC_REC_SIZE],
+            )?;
         }
 
         let mut index_blocks = Vec::with_capacity(index_count);
         for index in 0..index_count {
             let offset = index_offset + index * PAGE_SIZE;
-            if offset + PAGE_SIZE > data.len() { return Err(RustBladeError::InvalidFormat); }
+            if offset + PAGE_SIZE > data.len() {
+                return Err(RustBladeError::InvalidFormat);
+            }
             let mut block = IndexBlock::default();
-            block.IB_Data.copy_from_slice(&data[offset..offset + PAGE_SIZE]);
+            block
+                .IB_Data
+                .copy_from_slice(&data[offset..offset + PAGE_SIZE]);
             index_blocks.push(block);
         }
 
-        let (mphf_header, mphf_displacements, mphf_entry_pages) = if header.IFH_TermMphfHeaderCount == 0 {
-            (TermMphfHeader::default(), Vec::new(), Vec::new())
-        } else {
-            if header.IFH_TermMphfHeaderCount != 1 { return Err(RustBladeError::InvalidFormat); }
-            if mphf_header_offset + TERM_MPHF_HEADER_SIZE > data.len() { return Err(RustBladeError::InvalidFormat); }
-            let mphf_header = TermMphfHeader::from_bytes(&data[mphf_header_offset..mphf_header_offset + TERM_MPHF_HEADER_SIZE]).ok_or(RustBladeError::InvalidFormat)?;
-            if mphf_header.TMH_Magic != TERM_MPHF_MAGIC { return Err(RustBladeError::InvalidFormat); }
-            if mphf_displacement_offset + mphf_displacement_count * 4 > data.len() { return Err(RustBladeError::InvalidFormat); }
-            let mut mphf_displacements = Vec::with_capacity(mphf_displacement_count);
-            for index in 0..mphf_displacement_count {
-                let offset = mphf_displacement_offset + index * 4;
-                mphf_displacements.push(i32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()));
-            }
-            if mphf_entry_offset + mphf_entry_page_count * PAGE_SIZE > data.len() { return Err(RustBladeError::InvalidFormat); }
-            let mut mphf_entry_pages = Vec::with_capacity(mphf_entry_page_count);
-            for index in 0..mphf_entry_page_count {
-                let offset = mphf_entry_offset + index * PAGE_SIZE;
-                let mut block = IndexBlock::default();
-                block.IB_Data.copy_from_slice(&data[offset..offset + PAGE_SIZE]);
-                mphf_entry_pages.push(block);
-            }
-            (mphf_header, mphf_displacements, mphf_entry_pages)
-        };
+        let (mphf_header, mphf_displacements, mphf_entry_pages) =
+            if header.IFH_TermMphfHeaderCount == 0 {
+                (TermMphfHeader::default(), Vec::new(), Vec::new())
+            } else {
+                if header.IFH_TermMphfHeaderCount != 1 {
+                    return Err(RustBladeError::InvalidFormat);
+                }
+                if mphf_header_offset + TERM_MPHF_HEADER_SIZE > data.len() {
+                    return Err(RustBladeError::InvalidFormat);
+                }
+                let mphf_header = TermMphfHeader::from_bytes(
+                    &data[mphf_header_offset..mphf_header_offset + TERM_MPHF_HEADER_SIZE],
+                )
+                .ok_or(RustBladeError::InvalidFormat)?;
+                if mphf_header.TMH_Magic != TERM_MPHF_MAGIC {
+                    return Err(RustBladeError::InvalidFormat);
+                }
+                if mphf_displacement_offset + mphf_displacement_count * 4 > data.len() {
+                    return Err(RustBladeError::InvalidFormat);
+                }
+                let mut mphf_displacements = Vec::with_capacity(mphf_displacement_count);
+                for index in 0..mphf_displacement_count {
+                    let offset = mphf_displacement_offset + index * 4;
+                    mphf_displacements.push(i32::from_le_bytes(
+                        data[offset..offset + 4].try_into().unwrap(),
+                    ));
+                }
+                if mphf_entry_offset + mphf_entry_page_count * PAGE_SIZE > data.len() {
+                    return Err(RustBladeError::InvalidFormat);
+                }
+                let mut mphf_entry_pages = Vec::with_capacity(mphf_entry_page_count);
+                for index in 0..mphf_entry_page_count {
+                    let offset = mphf_entry_offset + index * PAGE_SIZE;
+                    let mut block = IndexBlock::default();
+                    block
+                        .IB_Data
+                        .copy_from_slice(&data[offset..offset + PAGE_SIZE]);
+                    mphf_entry_pages.push(block);
+                }
+                (mphf_header, mphf_displacements, mphf_entry_pages)
+            };
 
-        Ok((head, leaf_blocks, index_blocks, docdata, sidecar, prefixes, mphf_header, mphf_displacements, mphf_entry_pages))
+        Ok((
+            head,
+            leaf_blocks,
+            index_blocks,
+            docdata,
+            sidecar,
+            prefixes,
+            mphf_header,
+            mphf_displacements,
+            mphf_entry_pages,
+        ))
     }
 
     #[allow(non_snake_case)]
-    fn LoadDocData<R: Read + std::io::Seek>(store: &mut PostingStore, reader: &mut R, header: &IndexFileHeader) -> Result<Vec<u8>> {
+    fn LoadDocData<R: Read + std::io::Seek>(
+        store: &mut PostingStore,
+        reader: &mut R,
+        header: &IndexFileHeader,
+    ) -> Result<Vec<u8>> {
         reader.seek(std::io::SeekFrom::Start(header.IFH_DocDataOffset))?;
         let mut docdata = vec![0u8; header.IFH_NumDocuments as usize * DOC_REC_SIZE];
         reader.read_exact(&mut docdata)?;
@@ -568,14 +727,22 @@ impl IndexSerializer {
     }
 
     #[allow(non_snake_case)]
-    fn DecodeDocData(store: &mut PostingStore, header: &IndexFileHeader, docdata: &[u8]) -> Result<()> {
+    fn DecodeDocData(
+        store: &mut PostingStore,
+        header: &IndexFileHeader,
+        docdata: &[u8],
+    ) -> Result<()> {
         if docdata.len() != header.IFH_NumDocuments as usize * DOC_REC_SIZE {
             return Err(RustBladeError::InvalidFormat);
         }
         let first_doc_id = Self::DocDataFirstDocId(&docdata, header);
         for index in 0..header.IFH_NumDocuments as usize {
             let offset = index * DOC_REC_SIZE;
-            Self::DecodeDocDataRecord(store, first_doc_id + index as u64, &docdata[offset..offset + DOC_REC_SIZE])?;
+            Self::DecodeDocDataRecord(
+                store,
+                first_doc_id + index as u64,
+                &docdata[offset..offset + DOC_REC_SIZE],
+            )?;
         }
         Ok(())
     }
@@ -591,22 +758,30 @@ impl IndexSerializer {
 
     #[allow(non_snake_case)]
     pub fn DecodePathPrefixSidecar(sidecar: &[u8]) -> Result<Vec<String>> {
-        if sidecar.len() != PATH_PREFIX_SIDECAR_BYTES { return Err(RustBladeError::InvalidFormat); }
+        if sidecar.len() != PATH_PREFIX_SIDECAR_BYTES {
+            return Err(RustBladeError::InvalidFormat);
+        }
         let header = PathPrefixSidecarHeader {
-            PPSH_Magic: sidecar[0..8].try_into().map_err(|_| RustBladeError::InvalidFormat)?,
+            PPSH_Magic: sidecar[0..8]
+                .try_into()
+                .map_err(|_| RustBladeError::InvalidFormat)?,
             PPSH_Version: u16_at(sidecar, 8),
             PPSH_PrefixCount: u16_at(sidecar, 10),
             PPSH_EntryOffset: u32_at(sidecar, 12),
             PPSH_StringOffset: u32_at(sidecar, 16),
             PPSH_StringBytes: u32_at(sidecar, 20),
-            PPSH_Reserved: sidecar[24..32].try_into().map_err(|_| RustBladeError::InvalidFormat)?,
+            PPSH_Reserved: sidecar[24..32]
+                .try_into()
+                .map_err(|_| RustBladeError::InvalidFormat)?,
         };
         if &header.PPSH_Magic != PATH_PREFIX_SIDECAR_MAGIC
             || header.PPSH_Version != PATH_PREFIX_SIDECAR_VERSION
             || (header.PPSH_EntryOffset as usize) < 32
             || (header.PPSH_StringOffset as usize) > PATH_PREFIX_SIDECAR_BYTES
-            || (header.PPSH_StringOffset as usize) + (header.PPSH_StringBytes as usize) > PATH_PREFIX_SIDECAR_BYTES
-            || (header.PPSH_EntryOffset as usize) + (header.PPSH_PrefixCount as usize) * 8 > PATH_PREFIX_SIDECAR_BYTES
+            || (header.PPSH_StringOffset as usize) + (header.PPSH_StringBytes as usize)
+                > PATH_PREFIX_SIDECAR_BYTES
+            || (header.PPSH_EntryOffset as usize) + (header.PPSH_PrefixCount as usize) * 8
+                > PATH_PREFIX_SIDECAR_BYTES
         {
             return Err(RustBladeError::InvalidFormat);
         }
@@ -621,8 +796,14 @@ impl IndexSerializer {
             };
             let begin = header.PPSH_StringOffset as usize + entry.PPSE_Offset as usize;
             let end = begin + entry.PPSE_Length as usize;
-            if end > header.PPSH_StringOffset as usize + header.PPSH_StringBytes as usize { return Err(RustBladeError::InvalidFormat); }
-            prefixes.push(std::str::from_utf8(&sidecar[begin..end]).map_err(|_| RustBladeError::InvalidFormat)?.to_string());
+            if end > header.PPSH_StringOffset as usize + header.PPSH_StringBytes as usize {
+                return Err(RustBladeError::InvalidFormat);
+            }
+            prefixes.push(
+                std::str::from_utf8(&sidecar[begin..end])
+                    .map_err(|_| RustBladeError::InvalidFormat)?
+                    .to_string(),
+            );
         }
         Ok(prefixes)
     }
@@ -643,7 +824,8 @@ impl IndexSerializer {
         for (index, prefix) in prefixes.iter().take(count as usize).enumerate() {
             let entry_offset = entry_offset as usize + index * 8;
             sidecar[entry_offset..entry_offset + 4].copy_from_slice(&cursor.to_le_bytes());
-            sidecar[entry_offset + 4..entry_offset + 6].copy_from_slice(&(prefix.len() as u16).to_le_bytes());
+            sidecar[entry_offset + 4..entry_offset + 6]
+                .copy_from_slice(&(prefix.len() as u16).to_le_bytes());
             let string_begin = string_offset as usize + cursor as usize;
             sidecar[string_begin..string_begin + prefix.len()].copy_from_slice(prefix.as_bytes());
             cursor += prefix.len() as u32;
@@ -655,7 +837,9 @@ impl IndexSerializer {
     #[allow(non_snake_case)]
     fn DecodeDocDataRecord(store: &mut PostingStore, index: u64, record: &[u8]) -> Result<()> {
         let doc_id = u32_at(record, 0) as u64;
-        if doc_id != index { return Ok(()); }
+        if doc_id != index {
+            return Ok(());
+        }
         let importance = DocDataDecodeScore(u16_at(record, 4));
         let title_len = u32_at(record, 26);
         let body_len = u32_at(record, 30);
@@ -667,24 +851,31 @@ impl IndexSerializer {
         store.SetDocLengths(doc_id, title_len, body_len, url_len, anchor_len, meta_len);
         store.SetDocImportance(doc_id, importance);
         if vector_dim == DOC_VECTOR_DIM && vector_format != 0 {
-            store.SetDocVectorBytes(doc_id, &record[DOC_VECTOR_OFFSET..DOC_VECTOR_OFFSET + DOC_VECTOR_DIM]);
+            store.SetDocVectorBytes(
+                doc_id,
+                &record[DOC_VECTOR_OFFSET..DOC_VECTOR_OFFSET + DOC_VECTOR_DIM],
+            );
         }
         Ok(())
     }
 
     #[allow(non_snake_case)]
     pub fn IsValidIndex(path: &str) -> bool {
-        let Ok(mut file) = File::open(path) else { return false; };
+        let Ok(mut file) = File::open(path) else {
+            return false;
+        };
         let mut header = [0u8; 8];
-        file.read_exact(&mut header).is_ok()
-            && &header == INDEX_FILE_MAGIC
+        file.read_exact(&mut header).is_ok() && &header == INDEX_FILE_MAGIC
     }
 
-            pub fn is_valid_index(path: &str) -> bool { Self::IsValidIndex(path) }
+    pub fn is_valid_index(path: &str) -> bool {
+        Self::IsValidIndex(path)
+    }
 
     #[allow(non_snake_case)]
     pub fn BuildBlocks(store: &PostingStore) -> BuildBlocksResult {
-        let mut terms: Vec<(&String, &crate::posting_store::PostingList)> = store.AllPostings().iter().collect();
+        let mut terms: Vec<(&String, &crate::posting_store::PostingList)> =
+            store.AllPostings().iter().collect();
         terms.sort_by_key(|(term, _)| term.as_str());
 
         let mut IndexBlocks = Vec::new();
@@ -698,7 +889,10 @@ impl IndexSerializer {
         let mut leaf_entry_count = 0usize;
         let mut first_leaf_term = String::new();
 
-        let flush_index_block = |IndexBlocks: &mut Vec<IndexBlock>, cur: &mut IndexBlock, wptr: &mut usize, seq: &mut u32| {
+        let flush_index_block = |IndexBlocks: &mut Vec<IndexBlock>,
+                                 cur: &mut IndexBlock,
+                                 wptr: &mut usize,
+                                 seq: &mut u32| {
             IndexBlocks.push(cur.clone());
             *seq += 1;
             *cur = IndexBlock::default();
@@ -711,9 +905,14 @@ impl IndexSerializer {
                                 leaf_write_offset: &mut usize,
                                 leaf_entry_count: &mut usize,
                                 first_leaf_term: &mut String| {
-            if *leaf_entry_count == 0 { return; }
+            if *leaf_entry_count == 0 {
+                return;
+            }
             leaf_block.LTB_Directory[LEAF_TERM_DIRECTORY_COUNT - 1] = *leaf_entry_count as u16;
-            head.push(HeadTermEntry::new(first_leaf_term, leaf_blocks.len() as u32));
+            head.push(HeadTermEntry::new(
+                first_leaf_term,
+                leaf_blocks.len() as u32,
+            ));
             leaf_blocks.push(leaf_block.clone());
             *leaf_block = LeafTermBlock::default();
             *leaf_write_offset = 0;
@@ -724,9 +923,13 @@ impl IndexSerializer {
         let mut head_entries = Vec::new();
         let mut total_terms = 0u64;
         for (term, posting_list) in terms {
-            if term.len() > HEAD_TERM_KEY_MAX { continue; }
+            if term.len() > HEAD_TERM_KEY_MAX {
+                continue;
+            }
             let bytes = posting_list.get_bytes();
-            if bytes.is_empty() { continue; }
+            if bytes.is_empty() {
+                continue;
+            }
 
             if wptr >= PAGE_SIZE {
                 flush_index_block(&mut IndexBlocks, &mut cur, &mut wptr, &mut seq);
@@ -740,7 +943,9 @@ impl IndexSerializer {
                 flush_index_block(&mut IndexBlocks, &mut cur, &mut wptr, &mut seq);
                 data_offset = wptr;
                 data_here = PostingPrefixBytes(&bytes[src..], PAGE_SIZE);
-                if data_here == 0 { continue; }
+                if data_here == 0 {
+                    continue;
+                }
             }
 
             let index_block_id = seq;
@@ -756,15 +961,19 @@ impl IndexSerializer {
                 while remaining > 0 {
                     let cont_cap = PAGE_SIZE - INDEX_BLOCK_CONTINUATION_HEADER_SIZE;
                     let cont_here = PostingPrefixBytes(&bytes[src..], cont_cap);
-                    if cont_here == 0 { break; }
+                    if cont_here == 0 {
+                        break;
+                    }
                     let more_cont = cont_here < remaining;
                     let cont_max_doc_id = MaxDocIDInPairs(&bytes[src..src + cont_here]);
                     IndexBlockContinuationHeader {
                         IBCH_MaxDocID: cont_max_doc_id,
                         IBCH_DataLength: cont_here as u32,
-                    }.write_to(&mut cur.IB_Data[wptr..wptr + INDEX_BLOCK_CONTINUATION_HEADER_SIZE]);
+                    }
+                    .write_to(&mut cur.IB_Data[wptr..wptr + INDEX_BLOCK_CONTINUATION_HEADER_SIZE]);
                     wptr += INDEX_BLOCK_CONTINUATION_HEADER_SIZE;
-                    cur.IB_Data[wptr..wptr + cont_here].copy_from_slice(&bytes[src..src + cont_here]);
+                    cur.IB_Data[wptr..wptr + cont_here]
+                        .copy_from_slice(&bytes[src..src + cont_here]);
                     wptr += cont_here;
                     src += cont_here;
                     remaining -= cont_here;
@@ -790,18 +999,42 @@ impl IndexSerializer {
                 && (leaf_entry_count >= LEAF_TERM_DIRECTORY_COUNT - 1
                     || leaf_write_offset + entry_bytes > PAGE_SIZE - LEAF_TERM_DATA_OFFSET)
             {
-                flush_leaf_block(&mut leaf_blocks, &mut head_entries, &mut leaf_block, &mut leaf_write_offset, &mut leaf_entry_count, &mut first_leaf_term);
+                flush_leaf_block(
+                    &mut leaf_blocks,
+                    &mut head_entries,
+                    &mut leaf_block,
+                    &mut leaf_write_offset,
+                    &mut leaf_entry_count,
+                    &mut first_leaf_term,
+                );
             }
-            if leaf_entry_count == 0 { first_leaf_term = term.clone(); }
-            WriteLeafEntry(&mut leaf_block, leaf_entry_count, leaf_write_offset, &leaf_entry);
+            if leaf_entry_count == 0 {
+                first_leaf_term = term.clone();
+            }
+            WriteLeafEntry(
+                &mut leaf_block,
+                leaf_entry_count,
+                leaf_write_offset,
+                &leaf_entry,
+            );
             leaf_write_offset += entry_bytes;
             leaf_entry_count += 1;
             total_terms += 1;
         }
 
-        if wptr > 0 { flush_index_block(&mut IndexBlocks, &mut cur, &mut wptr, &mut seq); }
-        flush_leaf_block(&mut leaf_blocks, &mut head_entries, &mut leaf_block, &mut leaf_write_offset, &mut leaf_entry_count, &mut first_leaf_term);
-        let (mphf_header, mphf_displacements, mphf_entry_pages) = (TermMphfHeader::default(), Vec::new(), Vec::new());
+        if wptr > 0 {
+            flush_index_block(&mut IndexBlocks, &mut cur, &mut wptr, &mut seq);
+        }
+        flush_leaf_block(
+            &mut leaf_blocks,
+            &mut head_entries,
+            &mut leaf_block,
+            &mut leaf_write_offset,
+            &mut leaf_entry_count,
+            &mut first_leaf_term,
+        );
+        let (mphf_header, mphf_displacements, mphf_entry_pages) =
+            (TermMphfHeader::default(), Vec::new(), Vec::new());
 
         BuildBlocksResult {
             BBR_IndexBlocks: IndexBlocks,
@@ -813,11 +1046,15 @@ impl IndexSerializer {
             BBR_TotalTerms: total_terms,
         }
     }
-
 }
 
 #[allow(non_snake_case)]
-fn WriteLeafEntry(block: &mut LeafTermBlock, entryIndex: usize, offset: usize, entry: &LeafTermEntry) {
+fn WriteLeafEntry(
+    block: &mut LeafTermBlock,
+    entryIndex: usize,
+    offset: usize,
+    entry: &LeafTermEntry,
+) {
     block.LTB_Directory[entryIndex] = (LEAF_TERM_DATA_OFFSET + offset) as u16;
     let data = &mut block.LTB_Data[offset..];
     data[0..4].copy_from_slice(&entry.LTE_DocFreq.to_le_bytes());
@@ -836,11 +1073,15 @@ fn ReadVbcPairEnd(data: &[u8], offset: &mut usize) -> bool {
         while *offset < data.len() {
             let byte = data[*offset];
             *offset += 1;
-            if byte & 0x80 == 0 { return true; }
+            if byte & 0x80 == 0 {
+                return true;
+            }
         }
         false
     };
-    if !readOne(data, offset) || *offset >= data.len() { return false; }
+    if !readOne(data, offset) || *offset >= data.len() {
+        return false;
+    }
     *offset += 1;
     true
 }
@@ -866,13 +1107,14 @@ fn MaxDocIDInPairs(data: &[u8]) -> u64 {
     while cursor < data.len() {
         let (doc_id, doc_bytes) = VbRead(data, cursor);
         cursor += doc_bytes;
-        if cursor >= data.len() { break; }
+        if cursor >= data.len() {
+            break;
+        }
         cursor += 1;
         max_doc_id = doc_id;
     }
     max_doc_id
 }
-
 
 #[allow(non_snake_case)]
 fn VbRead(data: &[u8], start: usize) -> (u64, usize) {
@@ -880,11 +1122,15 @@ fn VbRead(data: &[u8], start: usize) -> (u64, usize) {
     let mut shift = 0u8;
     let mut pos = start;
     loop {
-        if pos >= data.len() { break; }
+        if pos >= data.len() {
+            break;
+        }
         let byte = data[pos];
         pos += 1;
         value |= ((byte & 0x7F) as u64) << shift;
-        if byte & 0x80 == 0 { break; }
+        if byte & 0x80 == 0 {
+            break;
+        }
         shift += 7;
     }
     (value, pos - start)

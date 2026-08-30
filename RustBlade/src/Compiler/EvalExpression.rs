@@ -1,3 +1,6 @@
+//! Direct translation of the C++ query expression model; symbol names stay aligned for debugging.
+#![allow(non_snake_case, non_upper_case_globals)]
+
 /*
 * EvalTree — compiled query AST.
 *
@@ -64,21 +67,22 @@ pub const kWeakAndBigramBoostParameters: QueryCompileModeParameters = QueryCompi
     QMP_BodyWeight: 1.0,
 };
 
-pub const kWeakAndBigramBoostForDocParameters: QueryCompileModeParameters = QueryCompileModeParameters {
-    QMP_UnigramWeight: 0.09,
-    QMP_BigramWeight: 0.5,
-    QMP_BigramBoostWeight: 4.0,
-    QMP_StaticWeight: 0.25,
-    QMP_PriorWeight: 2.0,
-    QMP_QualityWeight: 1.0,
-    QMP_AuthorityWeight: 0.1,
-    QMP_SpamPenalty: 1.0,
-    QMP_CosineWeight: 128.0,
-    QMP_AnchorWeight: 1.0,
-    QMP_UrlWeight: 1.0,
-    QMP_TitleWeight: 1.0,
-    QMP_BodyWeight: 1.0,
-};
+pub const kWeakAndBigramBoostForDocParameters: QueryCompileModeParameters =
+    QueryCompileModeParameters {
+        QMP_UnigramWeight: 0.09,
+        QMP_BigramWeight: 0.5,
+        QMP_BigramBoostWeight: 4.0,
+        QMP_StaticWeight: 0.25,
+        QMP_PriorWeight: 2.0,
+        QMP_QualityWeight: 1.0,
+        QMP_AuthorityWeight: 0.1,
+        QMP_SpamPenalty: 1.0,
+        QMP_CosineWeight: 128.0,
+        QMP_AnchorWeight: 1.0,
+        QMP_UrlWeight: 1.0,
+        QMP_TitleWeight: 1.0,
+        QMP_BodyWeight: 1.0,
+    };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueryCompileMode {
@@ -89,13 +93,26 @@ pub enum QueryCompileMode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NodeType { Term, And, Or, Not, WeakAnd, Boost }
+pub enum NodeType {
+    Term,
+    And,
+    Or,
+    Not,
+    WeakAnd,
+    Boost,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WeakAndBuildMode { FlatPruned, OrChildren, OrChildrenPruned }
+pub enum WeakAndBuildMode {
+    FlatPruned,
+    OrChildren,
+    OrChildrenPruned,
+}
 
 #[allow(non_snake_case)]
-pub fn GetQueryCompileModeParameters(mode: QueryCompileMode) -> &'static QueryCompileModeParameters {
+pub fn GetQueryCompileModeParameters(
+    mode: QueryCompileMode,
+) -> &'static QueryCompileModeParameters {
     match mode {
         QueryCompileMode::WeakAndBigramBoost => &kWeakAndBigramBoostParameters,
         QueryCompileMode::WeakAndBigramBoostForDoc => &kWeakAndBigramBoostForDocParameters,
@@ -104,7 +121,9 @@ pub fn GetQueryCompileModeParameters(mode: QueryCompileMode) -> &'static QueryCo
 }
 
 impl Default for QueryCompileModeParameters {
-    fn default() -> Self { kWeakAndBigramParameters }
+    fn default() -> Self {
+        kWeakAndBigramParameters
+    }
 }
 
 /*
@@ -123,11 +142,17 @@ pub struct TermNode {
 
 impl TermNode {
     pub fn new(key: String) -> Self {
-        Self { stream_key: key, word_span: 1 }
+        Self {
+            stream_key: key,
+            word_span: 1,
+        }
     }
 
     pub fn with_span(key: String, span: u32) -> Self {
-        Self { stream_key: key, word_span: span }
+        Self {
+            stream_key: key,
+            word_span: span,
+        }
     }
 }
 
@@ -137,7 +162,11 @@ pub struct AndNode {
 }
 
 impl Default for AndNode {
-    fn default() -> Self { Self { children: Vec::new() } }
+    fn default() -> Self {
+        Self {
+            children: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -146,7 +175,11 @@ pub struct OrNode {
 }
 
 impl Default for OrNode {
-    fn default() -> Self { Self { children: Vec::new() } }
+    fn default() -> Self {
+        Self {
+            children: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -156,18 +189,26 @@ pub struct WeakAndNode {
 }
 
 impl Default for WeakAndNode {
-    fn default() -> Self { Self { children: Vec::new(), min_should_match: 1 } }
+    fn default() -> Self {
+        Self {
+            children: Vec::new(),
+            min_should_match: 1,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct NotNode {
-    pub base:    Box<EvalNode>,
+    pub base: Box<EvalNode>,
     pub exclude: Box<EvalNode>,
 }
 
 impl NotNode {
     pub fn new(base: EvalNode, exclude: EvalNode) -> Self {
-        Self { base: Box::new(base), exclude: Box::new(exclude) }
+        Self {
+            base: Box::new(base),
+            exclude: Box::new(exclude),
+        }
     }
 }
 
@@ -180,11 +221,19 @@ pub struct BoostNode {
 
 impl BoostNode {
     pub fn new(base: EvalNode, boost: EvalNode) -> Self {
-        Self { base: Box::new(base), boost: Box::new(boost), boost_weight: 1.0 }
+        Self {
+            base: Box::new(base),
+            boost: Box::new(boost),
+            boost_weight: 1.0,
+        }
     }
 
     pub fn with_weight(base: EvalNode, boost: EvalNode, boost_weight: f32) -> Self {
-        Self { base: Box::new(base), boost: Box::new(boost), boost_weight }
+        Self {
+            base: Box::new(base),
+            boost: Box::new(boost),
+            boost_weight,
+        }
     }
 }
 
@@ -220,19 +269,37 @@ pub struct EvalTree {
 }
 
 impl EvalTree {
-    pub fn new(root: Option<EvalNode>) -> Self { Self { root, vector_query: Vec::new(), vector_ef_search: 200 } }
-    pub fn empty()                     -> Self { Self::new(None) }
+    pub fn new(root: Option<EvalNode>) -> Self {
+        Self {
+            root,
+            vector_query: Vec::new(),
+            vector_ef_search: 200,
+        }
+    }
+    pub fn empty() -> Self {
+        Self::new(None)
+    }
     #[allow(non_snake_case)]
-    pub fn HasTextQuery(&self)         -> bool { self.root.is_some() }
+    pub fn HasTextQuery(&self) -> bool {
+        self.root.is_some()
+    }
     #[allow(non_snake_case)]
-    pub fn HasVectorQuery(&self)       -> bool { !self.vector_query.is_empty() }
+    pub fn HasVectorQuery(&self) -> bool {
+        !self.vector_query.is_empty()
+    }
     #[allow(non_snake_case)]
-    pub fn IsEmpty(&self)              -> bool { !self.HasTextQuery() && !self.HasVectorQuery() }
-    pub fn is_empty(&self)             -> bool { self.IsEmpty() }
+    pub fn IsEmpty(&self) -> bool {
+        !self.HasTextQuery() && !self.HasVectorQuery()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.IsEmpty()
+    }
 }
 
 impl Default for EvalTree {
-    fn default() -> Self { Self::empty() }
+    fn default() -> Self {
+        Self::empty()
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy)]

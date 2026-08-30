@@ -1,6 +1,9 @@
+//! C++-parity queue tests; MoonShot API calls intentionally retain their public names.
+#![allow(non_snake_case, non_upper_case_globals)]
+
+use rustblade::embeddings::build_hashed_embedding;
 use rustblade::index_writer::IndexWriter;
 use rustblade::tokenizer::Tokenizer;
-use rustblade::embeddings::build_hashed_embedding;
 use rustblade::{IndexContext, SmartTokenizer};
 
 fn add_doc(ctx: &mut IndexContext, doc_id: u64, title: &str, body: &str) {
@@ -21,19 +24,39 @@ fn add_doc(ctx: &mut IndexContext, doc_id: u64, title: &str, body: &str) {
 fn sync_results(ctx: &mut IndexContext, query: &str) -> Vec<u64> {
     let mut reader = ctx.GetReaderForQuery(query, "AUTB");
     let executor = ctx.GetExecutor();
-    executor.Execute(reader.as_mut(), 10).into_iter().map(|result| result.doc_id).collect()
+    executor
+        .Execute(reader.as_mut(), 10)
+        .into_iter()
+        .map(|result| result.doc_id)
+        .collect()
 }
 
 #[test]
 fn enqueue_matches_sync_search() {
     let mut ctx = IndexContext::new();
-    add_doc(&mut ctx, 0, "Quick Fox", "the quick brown fox jumps over the lazy dog");
-    add_doc(&mut ctx, 1, "Rust Search", "rust systems programming and fast search");
-    add_doc(&mut ctx, 2, "Lazy Dog", "the lazy dog sleeps while the fox runs");
+    add_doc(
+        &mut ctx,
+        0,
+        "Quick Fox",
+        "the quick brown fox jumps over the lazy dog",
+    );
+    add_doc(
+        &mut ctx,
+        1,
+        "Rust Search",
+        "rust systems programming and fast search",
+    );
+    add_doc(
+        &mut ctx,
+        2,
+        "Lazy Dog",
+        "the lazy dog sleeps while the fox runs",
+    );
     ctx.Build();
 
     let expected = sync_results(&mut ctx, "fox lazy");
-    let actual: Vec<u64> = ctx.Enqueue("fox lazy", Vec::new(), "AUTB", 10)
+    let actual: Vec<u64> = ctx
+        .Enqueue("fox lazy", Vec::new(), "AUTB", 10)
         .Wait()
         .into_iter()
         .map(|result| result.doc_id)
@@ -45,19 +68,42 @@ fn enqueue_matches_sync_search() {
 #[test]
 fn enqueue_handles_many_tasks() {
     let mut ctx = IndexContext::new();
-    add_doc(&mut ctx, 0, "Quick Fox", "the quick brown fox jumps over the lazy dog");
-    add_doc(&mut ctx, 1, "Rust Search", "rust systems programming and fast search");
-    add_doc(&mut ctx, 2, "Lazy Dog", "the lazy dog sleeps while the fox runs");
+    add_doc(
+        &mut ctx,
+        0,
+        "Quick Fox",
+        "the quick brown fox jumps over the lazy dog",
+    );
+    add_doc(
+        &mut ctx,
+        1,
+        "Rust Search",
+        "rust systems programming and fast search",
+    );
+    add_doc(
+        &mut ctx,
+        2,
+        "Lazy Dog",
+        "the lazy dog sleeps while the fox runs",
+    );
     ctx.Build();
 
     let mut tasks = Vec::new();
     for i in 0..64 {
-        let query = if i % 2 == 0 { "fox lazy" } else { "rust search" };
+        let query = if i % 2 == 0 {
+            "fox lazy"
+        } else {
+            "rust search"
+        };
         tasks.push((i, ctx.Enqueue(query, Vec::new(), "AUTB", 10)));
     }
 
     for (i, task) in tasks {
-        let docs: Vec<u64> = task.Wait().into_iter().map(|result| result.doc_id).collect();
+        let docs: Vec<u64> = task
+            .Wait()
+            .into_iter()
+            .map(|result| result.doc_id)
+            .collect();
         assert!(!docs.is_empty());
         if i % 2 == 0 {
             assert!(docs.contains(&0));

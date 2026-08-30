@@ -1,10 +1,13 @@
+//! Direct translation of the C++ search executor; symbol names stay aligned for debugging.
+#![allow(non_snake_case, non_upper_case_globals)]
+
 use std::cmp::{Ordering, Reverse};
 use std::collections::BinaryHeap;
 use std::sync::{OnceLock, RwLock};
 
-use crate::index_reader::{IndexReader, MakeReaderDocumentID};
 use crate::block_table::{DocDataDecodeScore, DocDataEntry, DOC_VECTOR_DIM};
-use crate::eval_expression::{QueryCompileModeParameters, kWeakAndBigramParameters};
+use crate::eval_expression::{kWeakAndBigramParameters, QueryCompileModeParameters};
+use crate::index_reader::{IndexReader, MakeReaderDocumentID};
 use crate::search_result::SearchResult;
 
 pub trait SearchExecutionContext {
@@ -14,7 +17,11 @@ pub trait SearchExecutionContext {
 #[derive(Clone, Copy, PartialEq)]
 struct ScoreKey(f32);
 impl Eq for ScoreKey {}
-impl PartialOrd for ScoreKey { fn partial_cmp(&self, other: &Self) -> Option<Ordering> { Some(self.cmp(other)) } }
+impl PartialOrd for ScoreKey {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
 impl Ord for ScoreKey {
     fn cmp(&self, other: &Self) -> Ordering {
         self.0.partial_cmp(&other.0).unwrap_or(Ordering::Equal)
@@ -25,10 +32,22 @@ struct HeapEntry {
     score: ScoreKey,
     result: SearchResult,
 }
-impl PartialEq for HeapEntry { fn eq(&self, other: &Self) -> bool { self.score == other.score } }
+impl PartialEq for HeapEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.score == other.score
+    }
+}
 impl Eq for HeapEntry {}
-impl PartialOrd for HeapEntry { fn partial_cmp(&self, other: &Self) -> Option<Ordering> { Some(self.cmp(other)) } }
-impl Ord for HeapEntry { fn cmp(&self, other: &Self) -> Ordering { self.score.cmp(&other.score) } }
+impl PartialOrd for HeapEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for HeapEntry {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.score.cmp(&other.score)
+    }
+}
 
 pub struct IndexSearchExecutor<'a> {
     m_Context: &'a dyn SearchExecutionContext,
@@ -36,7 +55,9 @@ pub struct IndexSearchExecutor<'a> {
 
 #[allow(non_snake_case)]
 impl<'a> IndexSearchExecutor<'a> {
-    pub fn new(context: &'a dyn SearchExecutionContext) -> Self { Self { m_Context: context } }
+    pub fn new(context: &'a dyn SearchExecutionContext) -> Self {
+        Self { m_Context: context }
+    }
 
     pub fn SetScoringParameters(parameters: QueryCompileModeParameters) {
         *ScoringParameters().write().unwrap() = parameters;
@@ -52,7 +73,9 @@ impl<'a> IndexSearchExecutor<'a> {
         topK: i32,
         vectorQuery: Option<&[f32]>,
     ) -> Vec<SearchResult> {
-        if reader.IsEnd() { return Vec::new(); }
+        if reader.IsEnd() {
+            return Vec::new();
+        }
 
         let limit = Self::TopKLimit(topK);
         let parameters = *ScoringParameters().read().unwrap();
@@ -60,7 +83,9 @@ impl<'a> IndexSearchExecutor<'a> {
         let mut heap: BinaryHeap<Reverse<HeapEntry>> = BinaryHeap::new();
         while !reader.IsEnd() {
             let docId = reader.GetDocumentID();
-            let entry = self.m_Context.GetDocDataEntry(docId)
+            let entry = self
+                .m_Context
+                .GetDocDataEntry(docId)
                 .expect("IndexReader returned a document without DocDataEntry");
             let score = reader.GetScore(entry)
                 + DocDataScore(entry, &parameters)
@@ -74,10 +99,16 @@ impl<'a> IndexSearchExecutor<'a> {
             if limit.is_none() {
                 results.push(result);
             } else if heap.len() < limit.unwrap() {
-                heap.push(Reverse(HeapEntry { score: ScoreKey(score), result }));
+                heap.push(Reverse(HeapEntry {
+                    score: ScoreKey(score),
+                    result,
+                }));
             } else if score > heap.peek().unwrap().0.result.score {
                 heap.pop();
-                heap.push(Reverse(HeapEntry { score: ScoreKey(score), result }));
+                heap.push(Reverse(HeapEntry {
+                    score: ScoreKey(score),
+                    result,
+                }));
             }
 
             reader.GoNext();
@@ -97,7 +128,9 @@ impl<'a> IndexSearchExecutor<'a> {
         maxVisitedDocs: u64,
         vectorQuery: Option<&[f32]>,
     ) -> Vec<SearchResult> {
-        if reader.IsEnd() || maxVisitedDocs == 0 { return Vec::new(); }
+        if reader.IsEnd() || maxVisitedDocs == 0 {
+            return Vec::new();
+        }
 
         let limit = Self::TopKLimit(topK);
         let parameters = *ScoringParameters().read().unwrap();
@@ -106,7 +139,9 @@ impl<'a> IndexSearchExecutor<'a> {
         let mut visited = 0u64;
         while !reader.IsEnd() && visited < maxVisitedDocs {
             let docId = reader.GetDocumentID();
-            let entry = self.m_Context.GetDocDataEntry(docId)
+            let entry = self
+                .m_Context
+                .GetDocDataEntry(docId)
                 .expect("IndexReader returned a document without DocDataEntry");
             let score = reader.GetScore(entry)
                 + DocDataScore(entry, &parameters)
@@ -120,10 +155,16 @@ impl<'a> IndexSearchExecutor<'a> {
             if limit.is_none() {
                 results.push(result);
             } else if heap.len() < limit.unwrap() {
-                heap.push(Reverse(HeapEntry { score: ScoreKey(score), result }));
+                heap.push(Reverse(HeapEntry {
+                    score: ScoreKey(score),
+                    result,
+                }));
             } else if score > heap.peek().unwrap().0.result.score {
                 heap.pop();
-                heap.push(Reverse(HeapEntry { score: ScoreKey(score), result }));
+                heap.push(Reverse(HeapEntry {
+                    score: ScoreKey(score),
+                    result,
+                }));
             }
 
             visited += 1;
@@ -143,12 +184,18 @@ impl<'a> IndexSearchExecutor<'a> {
 
     fn SortAndTruncate(results: &mut Vec<SearchResult>, limit: Option<usize>) {
         results.sort_by(|a, b| {
-            if a.score > b.score { Ordering::Less }
-            else if b.score > a.score { Ordering::Greater }
-            else { Ordering::Equal }
+            if a.score > b.score {
+                Ordering::Less
+            } else if b.score > a.score {
+                Ordering::Greater
+            } else {
+                Ordering::Equal
+            }
         });
         if let Some(limit) = limit {
-            if results.len() > limit { results.truncate(limit); }
+            if results.len() > limit {
+                results.truncate(limit);
+            }
         }
     }
 }
@@ -179,9 +226,20 @@ fn DocDataScore(entry: &DocDataEntry, parameters: &QueryCompileModeParameters) -
 }
 
 #[allow(non_snake_case)]
-fn VectorScoreFeature(entry: &DocDataEntry, query: Option<&[f32]>, parameters: &QueryCompileModeParameters) -> f32 {
-    let Some(query) = query else { return 0.0; };
-    if query.len() != DOC_VECTOR_DIM || entry.DDE_VectorDim as usize != DOC_VECTOR_DIM || entry.DDE_VectorFormat == 0 { return 0.0; }
+fn VectorScoreFeature(
+    entry: &DocDataEntry,
+    query: Option<&[f32]>,
+    parameters: &QueryCompileModeParameters,
+) -> f32 {
+    let Some(query) = query else {
+        return 0.0;
+    };
+    if query.len() != DOC_VECTOR_DIM
+        || entry.DDE_VectorDim as usize != DOC_VECTOR_DIM
+        || entry.DDE_VectorFormat == 0
+    {
+        return 0.0;
+    }
 
     let mut dot = 0.0f32;
     let mut nq = 0.0f32;
@@ -193,7 +251,8 @@ fn VectorScoreFeature(entry: &DocDataEntry, query: Option<&[f32]>, parameters: &
         nq += q * q;
         nd += d * d;
     }
-    if nq <= 0.0 || nd <= 0.0 { return 0.0; }
+    if nq <= 0.0 || nd <= 0.0 {
+        return 0.0;
+    }
     parameters.QMP_CosineWeight * dot / (nq.sqrt() * nd.sqrt())
 }
-
