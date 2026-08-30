@@ -1,26 +1,47 @@
 use std::fs;
 use std::fs::File;
 use std::collections::VecDeque;
-use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::sync::{mpsc, Arc, Condvar, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
-use crate::posting_store::PostingStore;
+use crate::posting_store::{PostingStore, StableHashMap};
 use crate::block_table::IndexBlockTable;
-use crate::index_writer::AdvancedIndexWriter;
 use crate::index_writer::IndexWriter;
-use crate::eval_tree::{EvalTree, EvalNode};
-use crate::advanced_reader::AdvancedIndexReader;
-use crate::composite_readers::{AndIndexReader, OrIndexReader, NotIndexReader, VectorIndexReader};
+use crate::advanced_index_writer::AdvancedIndexWriter;
+use crate::eval_expression::{EvalTree, EvalNode, QueryCompileMode, QueryCompileModeParameters, WeakAndBuildMode, kWeakAndBigramParameters};
+use crate::advanced_index_reader::AdvancedIndexReader;
+use crate::index_reader_impl::{AndIndexReader, BoostIndexReader, OrIndexReader, NotIndexReader, VectorIndexReader, WeakAndIndexReader};
 use crate::index_reader::{IndexReader, ReaderDocumentIDValue};
-use crate::compiler::IndexSearchCompiler;
+use crate::index_search_compiler::IndexSearchCompiler;
 use crate::tokenizer::{SmartTokenizer, Tokenizer};
-use crate::serializer::{IndexSerializer, IndexFileHeader};
+use crate::index_serializer::IndexSerializer;
 use crate::error::{Result, RustBladeError};
-use crate::block_table::{DOC_PATH_MAX, DOC_PATH_PREFIX_ID_BYTES, DOC_PATH_FILENAME_MAX, DOC_PATH_PREFIX_INVALID, DOC_REC_SIZE, DOC_VECTOR_DIM, DOC_VECTOR_OFFSET, DOC_PATH_OFFSET, PATH_PREFIX_SIDECAR_BYTES, INDEX_FILE_HEADER_SIZE, PAGE_SIZE, HEAD_TERM_KEY_MAX, INDEX_BLOCK_CONTINUATION_HEADER_SIZE, LEAF_TERM_DATA_OFFSET, LEAF_TERM_DIRECTORY_COUNT, TERM_MPHF_HEADER_SIZE, HeadTermEntry, IndexBlock, IndexBlockContinuationHeader, LeafTermEntry, LeafTermBlock, PinnedBlock, TermMphfHeader, DocDataEncodeScore};
-use crate::vector_index::{HnswIndex, VectorMetric, VectorSearchResult};
-use crate::vector_index::build_hashed_embedding;
-use crate::executor::{IndexSearchExecutor, SearchResult};
+use crate::block_table::{BlockAccessStats, BlockHandle, BlockKind, DOC_PATH_MAX, DOC_PATH_PREFIX_ID_BYTES, DOC_PATH_FILENAME_MAX, DOC_PATH_PREFIX_INVALID, DOC_REC_SIZE, DOC_VECTOR_DIM, DOC_VECTOR_OFFSET, DOC_PATH_OFFSET, PATH_PREFIX_SIDECAR_BYTES, INDEX_FILE_HEADER_SIZE, PAGE_SIZE, HEAD_TERM_KEY_MAX, INDEX_BLOCK_CONTINUATION_HEADER_SIZE, LEAF_TERM_DATA_OFFSET, LEAF_TERM_DIRECTORY_COUNT, TERM_MPHF_HEADER_SIZE, DocDataEntry, HeadTermEntry, IndexFileHeader, IndexBlock, IndexBlockContinuationHeader, LeafTermEntry, LeafTermBlock, TermMphfHeader, DocDataEncodeScore};
+use crate::embeddings::{FreshDiskAnnVectorIndex, VectorMetric, VectorSearchResult};
+use crate::index_search_executor::{IndexSearchExecutor, SearchExecutionContext};
+use crate::search_result::SearchResult;
+
+fn EstimateDocFreq(blockTable: &IndexBlockTable, node: &EvalNode) -> u32 {
+    match node {
+        EvalNode::Term(term) => blockTable.FindTermData(&term.stream_key).map(|location| location.doc_freq).unwrap_or(0),
+        EvalNode::Or(orNode) => orNode.children.iter().fold(0u64, |total, child| total + EstimateDocFreq(blockTable, child) as u64).min(u32::MAX as u64) as u32,
+        _ => 0,
+    }
+}
+
+fn FlattenWeakAndNodes(nodes: &[EvalNode], blockTable: &IndexBlockTable, docCount: u64, allowHighDf: bool) -> Vec<EvalNode> {
+    let mut output = Vec::new();
+    for node in nodes {
+        if let EvalNode::Or(orNode) = node {
+            output.extend(FlattenWeakAndNodes(&orNode.children, blockTable, docCount, allowHighDf));
+            continue;
+        }
+        let docFreq = EstimateDocFreq(blockTable, node);
+        let highDf = docCount > 0 && docFreq > 0 && docFreq as u64 > 100000u64.max(docCount / 5);
+        if allowHighDf || !highDf { output.push(node.clone()); }
+    }
+    output
+}
 
 pub struct Document {
     pub doc_id: u64,
@@ -52,7 +73,9 @@ struct SearchTaskState {
     query: String,
     vector: Vec<f32>,
     streams: String,
-    top_k: usize,
+    top_k: i32,
+    mode: QueryCompileMode,
+    vector_ef_search: usize,
     reply: mpsc::Sender<Vec<SearchResult>>,
 }
 
@@ -64,9 +87,12 @@ struct SearchQueueState {
 struct SearchRuntime {
     store: Arc<RwLock<PostingStore>>,
     block_table: Arc<IndexBlockTable>,
-    vector_index: Arc<HnswIndex>,
-    docdata: Arc<Vec<u8>>,
+    vector_index: Arc<RwLock<FreshDiskAnnVectorIndex>>,
+    docdata: Arc<[u8]>,
     header: IndexFileHeader,
+    query_parameters: QueryCompileModeParameters,
+    weak_and_build_mode: WeakAndBuildMode,
+    average_stream_lengths: [f32; 5],
     delta: Option<Arc<SearchRuntime>>,
 }
 
@@ -75,14 +101,18 @@ impl SearchRuntime {
         Arc::new(Self {
             store: Arc::clone(&ctx.m_Store),
             block_table: Arc::clone(&ctx.m_BlockTable),
-            vector_index: Arc::new(ctx.m_VectorIndex.clone()),
-            docdata: Arc::new(ctx.m_DocData.clone()),
+            vector_index: Arc::clone(&ctx.m_VectorIndex),
+            docdata: Arc::clone(&ctx.m_DocData),
             header: ctx.m_IndexFileHeader,
-            delta: ctx.m_DeltaContext.as_ref().map(|delta| Self::from_context(delta)),
+            query_parameters: ctx.m_QueryParameters,
+            weak_and_build_mode: ctx.m_WeakAndBuildMode,
+            average_stream_lengths: ['T', 'B', 'U', 'A', 'M'].map(|stream| ctx.GetAverageStreamLength(stream)),
+            delta: if ctx.HasDelta() { ctx.m_DeltaContext.as_ref().map(|delta| Self::from_context(delta)) } else { None },
         })
     }
 
     fn get_reader(&self, tree: EvalTree) -> Box<dyn IndexReader> {
+        if tree.IsEmpty() { return self.open_advanced_reader("", 1); }
         let base = self.build_local_reader(tree.clone());
         if let Some(delta) = self.delta.as_ref() {
             return Box::new(OrIndexReader::new(vec![base, delta.build_local_reader(tree)]));
@@ -91,27 +121,31 @@ impl SearchRuntime {
     }
 
     fn build_local_reader(&self, tree: EvalTree) -> Box<dyn IndexReader> {
+        if tree.IsEmpty() { return self.open_advanced_reader("", 1); }
         if tree.HasTextQuery() && tree.HasVectorQuery() {
             return self.build_index_reader(tree.root);
         }
         if tree.HasVectorQuery() {
-            return Box::new(VectorIndexReader::new(self.vector_index.Search(&tree.vector_query, 0, tree.vector_ef_search)));
+            return Box::new(VectorIndexReader::new(self.vector_index.read().unwrap().Search(
+                &tree.vector_query,
+                tree.vector_ef_search.max(1),
+                VectorMetric::Cosine,
+                tree.vector_ef_search)));
         }
         self.build_index_reader(tree.root)
     }
 
     fn build_index_reader(&self, node: Option<EvalNode>) -> Box<dyn IndexReader> {
         match node {
-            None => Box::new(AdvancedIndexReader::open("", Arc::clone(&self.block_table), 0)),
+            None => self.open_advanced_reader("", 1),
             Some(EvalNode::Term(tn)) => {
-                let doc_freq = self.store.read().unwrap().DocFreq(&tn.stream_key);
-                Box::new(AdvancedIndexReader::open(&tn.stream_key, Arc::clone(&self.block_table), doc_freq))
+                self.open_advanced_reader(&tn.stream_key, tn.word_span)
             }
             Some(EvalNode::And(an)) => {
                 let children: Vec<Box<dyn IndexReader>> = an.children.into_iter()
                     .map(|c| self.build_index_reader(Some(c))).collect();
                 if children.iter().any(|c| c.IsEnd()) {
-                    return Box::new(AdvancedIndexReader::open("", Arc::clone(&self.block_table), 0));
+                    return self.open_advanced_reader("", 1);
                 }
                 let mut children = children;
                 if children.len() == 1 { return children.remove(0); }
@@ -122,31 +156,107 @@ impl SearchRuntime {
                     .map(|c| self.build_index_reader(Some(c)))
                     .filter(|r| !r.IsEnd()).collect();
                 if children.is_empty() {
-                    return Box::new(AdvancedIndexReader::open("", Arc::clone(&self.block_table), 0));
+                    return self.open_advanced_reader("", 1);
                 }
                 let mut children = children;
                 if children.len() == 1 { return children.remove(0); }
                 Box::new(OrIndexReader::new(children))
+            }
+            Some(EvalNode::WeakAnd(wn)) => {
+                let mut childNodes = if self.weak_and_build_mode == WeakAndBuildMode::FlatPruned {
+                    FlattenWeakAndNodes(&wn.children, &self.block_table, self.header.IFH_NumDocuments, false)
+                } else { wn.children.clone() };
+                let mut children: Vec<Box<dyn IndexReader>> = childNodes.drain(..)
+                    .map(|child| self.build_index_reader(Some(child))).collect();
+                if self.weak_and_build_mode != WeakAndBuildMode::OrChildren { children.retain(|reader| !reader.IsEnd()); }
+                if children.is_empty() && self.weak_and_build_mode == WeakAndBuildMode::FlatPruned {
+                    children = FlattenWeakAndNodes(&wn.children, &self.block_table, self.header.IFH_NumDocuments, true).into_iter()
+                        .map(|child| self.build_index_reader(Some(child))).filter(|reader| !reader.IsEnd()).collect();
+                }
+                if children.is_empty() { return self.open_advanced_reader("", 1); }
+                let min_should_match = if self.weak_and_build_mode == WeakAndBuildMode::FlatPruned {
+                    if children.len() <= 2 { 1 } else if children.len() <= 5 { 2 } else { 3 }
+                } else {
+                    wn.min_should_match.min(children.len() as u32)
+                };
+                if children.len() == 1 { return children.remove(0); }
+                Box::new(WeakAndIndexReader::new(children, min_should_match))
             }
             Some(EvalNode::Not(nn)) => {
                 let base = self.build_index_reader(Some(*nn.base));
                 let exclude = self.build_index_reader(Some(*nn.exclude));
                 Box::new(NotIndexReader::new(base, exclude))
             }
+            Some(EvalNode::Boost(bn)) => {
+                let base = self.build_index_reader(Some(*bn.base));
+                if base.IsEnd() { return base; }
+                let boost = self.build_index_reader(Some(*bn.boost));
+                if boost.IsEnd() { return base; }
+                Box::new(BoostIndexReader::new(base, boost, bn.boost_weight))
+            }
         }
+    }
+
+    fn open_advanced_reader(&self, stream_key: &str, word_span: u32) -> Box<dyn IndexReader> {
+        let stream = stream_key.chars().last().unwrap_or('B');
+        let numDocuments = if self.header.IFH_NumDocuments > 0 {
+            self.header.IFH_NumDocuments
+        } else {
+            self.store.read().unwrap().TotalDocs()
+        };
+        let averageStreamLength = match stream {
+            'T' => self.average_stream_lengths[0], 'B' => self.average_stream_lengths[1],
+            'U' => self.average_stream_lengths[2], 'A' => self.average_stream_lengths[3],
+            'M' => self.average_stream_lengths[4], _ => self.header.IFH_AvgDocLength.max(1.0),
+        };
+        Box::new(AdvancedIndexReader::Open(
+            stream_key,
+            Arc::clone(&self.block_table),
+            numDocuments,
+            averageStreamLength,
+            IndexContext::ReaderSpanWeight(&self.query_parameters, stream, word_span),
+            word_span,
+        ))
+    }
+}
+
+impl SearchExecutionContext for SearchRuntime {
+    fn GetDocDataEntry(&self, docId: u64) -> Option<&DocDataEntry> {
+        let docId = ReaderDocumentIDValue(docId);
+        let firstDocId = IndexContext::DocDataFirstDocId(&self.docdata, &self.header);
+        if docId >= firstDocId {
+            let offset = usize::try_from(docId - firstDocId).ok()?.checked_mul(DOC_REC_SIZE)?;
+            if offset + DOC_REC_SIZE <= self.docdata.len()
+                && u32::from_le_bytes(self.docdata[offset..offset + 4].try_into().ok()?) as u64 == docId
+            {
+                return Some(unsafe { &*(self.docdata.as_ptr().add(offset) as *const DocDataEntry) });
+            }
+        }
+        self.delta.as_ref()?.GetDocDataEntry(docId)
     }
 }
 
 pub struct SearchTask {
-    receiver: mpsc::Receiver<Vec<SearchResult>>,
+    receiver: Option<mpsc::Receiver<Vec<SearchResult>>>,
+}
+
+#[derive(Default)]
+struct StreamLengthStats {
+    docdata: usize,
+    doc_count: u64,
+    averages: [f32; 5],
 }
 
 #[allow(non_snake_case)]
 impl SearchTask {
-    pub fn Wait(self) -> Vec<SearchResult> {
-        self.receiver.recv().unwrap_or_default()
+    pub fn Wait(mut self) -> Vec<SearchResult> {
+        self.receiver.take().and_then(|receiver| receiver.recv().ok()).unwrap_or_default()
     }
+
+    pub fn Valid(&self) -> bool { self.receiver.is_some() }
 }
+
+impl Default for SearchTask { fn default() -> Self { Self { receiver: None } } }
 
 /// Central factory — owns PostingStore, BlockTable and all search components.
 /// Mirrors MoonShot's IndexContext.h.
@@ -156,26 +266,34 @@ pub struct IndexContext {
     m_BlockTable: Arc<IndexBlockTable>,
     m_Tokenizer:   SmartTokenizer,
     m_Compiler:    IndexSearchCompiler,
-    m_VectorIndex: HnswIndex,
+    m_VectorIndex: Arc<RwLock<FreshDiskAnnVectorIndex>>,
     m_VectorBuilt: bool,
     m_IndexPath:  Option<String>,
     m_Built:       bool,
     m_LoadedFromDisk: bool,
     m_LoadDelta: bool,
+    m_LeafTermCacheBytes: u64,
+    m_QueryParameters: QueryCompileModeParameters,
+    m_WeakAndBuildMode: WeakAndBuildMode,
     m_IndexFileHeader: IndexFileHeader,
-    m_DocData: Vec<u8>,
+    m_DocData: Arc<[u8]>,
     m_PathPrefixSidecar: Vec<u8>,
     m_PathPrefixes: Vec<String>,
     m_DeltaContext: Option<Box<IndexContext>>,
     m_WriteBlockTable: IndexBlockTable,
-    m_WriteVectorIndex: HnswIndex,
+    m_WriteVectorIndex: FreshDiskAnnVectorIndex,
     m_WriteIndexFileHeader: IndexFileHeader,
-    m_WriteDocData: Vec<u8>,
+    m_WriteDocData: Arc<[u8]>,
     m_WritePathPrefixSidecar: Vec<u8>,
     m_WritePathPrefixes: Vec<String>,
+    m_WriteBuilt: bool,
     m_SearchQueue: Arc<(Mutex<SearchQueueState>, Condvar)>,
     m_SearchWorkers: Vec<JoinHandle<()>>,
-    m_SearchRuntime: Option<Arc<SearchRuntime>>,
+    m_StreamLengthStats: Mutex<StreamLengthStats>,
+}
+
+impl SearchExecutionContext for IndexContext {
+    fn GetDocDataEntry(&self, docId: u64) -> Option<&DocDataEntry> { IndexContext::GetDocDataEntry(self, docId) }
 }
 
 #[allow(non_snake_case)]
@@ -193,26 +311,30 @@ impl IndexContext {
             m_BlockTable: Arc::new(IndexBlockTable::new(512)),
             m_Tokenizer:   SmartTokenizer::new(),
             m_Compiler:    IndexSearchCompiler::new(SmartTokenizer::new()),
-            m_VectorIndex: HnswIndex::new(DOC_VECTOR_DIM, 32, 200, VectorMetric::Cosine),
+            m_VectorIndex: Arc::new(RwLock::new(FreshDiskAnnVectorIndex::new(32, 200))),
             m_VectorBuilt: false,
             m_IndexPath:  index_path.clone(),
             m_Built:       false,
             m_LoadedFromDisk: false,
             m_LoadDelta: load_delta,
-            m_IndexFileHeader: IndexFileHeader::default(),
-            m_DocData: Vec::new(),
+            m_LeafTermCacheBytes: LEAF_TERM_CACHE_BYTES,
+            m_QueryParameters: kWeakAndBigramParameters,
+            m_WeakAndBuildMode: WeakAndBuildMode::FlatPruned,
+            m_IndexFileHeader: IndexFileHeader::zeroed(),
+            m_DocData: Arc::from([]),
             m_PathPrefixSidecar: vec![0u8; PATH_PREFIX_SIDECAR_BYTES],
             m_PathPrefixes: Vec::new(),
             m_DeltaContext: None,
             m_WriteBlockTable: IndexBlockTable::new(512),
-            m_WriteVectorIndex: HnswIndex::new(DOC_VECTOR_DIM, 32, 200, VectorMetric::Cosine),
-            m_WriteIndexFileHeader: IndexFileHeader::default(),
-            m_WriteDocData: Vec::new(),
+            m_WriteVectorIndex: FreshDiskAnnVectorIndex::new(32, 200),
+            m_WriteIndexFileHeader: IndexFileHeader::zeroed(),
+            m_WriteDocData: Arc::from([]),
             m_WritePathPrefixSidecar: vec![0u8; PATH_PREFIX_SIDECAR_BYTES],
             m_WritePathPrefixes: Vec::new(),
+            m_WriteBuilt: false,
             m_SearchQueue: Arc::new((Mutex::new(SearchQueueState { queue: VecDeque::new(), stop: false }), Condvar::new())),
             m_SearchWorkers: Vec::new(),
-            m_SearchRuntime: None,
+            m_StreamLengthStats: Mutex::new(StreamLengthStats::default()),
         };
         if let Some(ref path) = index_path {
             let _ = ctx.LoadIndex(path);
@@ -262,27 +384,66 @@ impl IndexContext {
             embeddingTokens.extend(anchorTokens);
             embeddingTokens.extend(bodyTokens);
             embeddingTokens.extend(metaTokens);
-            writer.SetDocVector(docId, build_hashed_embedding(&embeddingTokens));
+            writer.SetDocVector(docId, self.m_VectorIndex.read().unwrap().GetModel().Embed(&embeddingTokens));
         }
 
         if !doc.path.is_empty() {
-            writer.SetDocPath(docId, doc.path.clone());
+            self.m_Store.write().unwrap().SetDocPath(docId, doc.path.clone());
         }
 
-        self.m_Built = false;
-        self.m_VectorBuilt = false;
+        self.m_WriteBuilt = false;
+        if !self.m_LoadedFromDisk {
+            self.m_Built = false;
+            self.m_VectorBuilt = false;
+        }
         docId
     }
 
     pub fn GetTokenizer(&self) -> &SmartTokenizer { &self.m_Tokenizer }
     pub fn GetCompiler(&self)  -> &IndexSearchCompiler { &self.m_Compiler }
+    pub fn GetExecutor(&self) -> IndexSearchExecutor<'_> { IndexSearchExecutor::new(self) }
     pub fn GetStore(&self) -> Arc<RwLock<PostingStore>> { Arc::clone(&self.m_Store) }
     pub fn DocumentCount(&self) -> u64 { self.m_IndexFileHeader.IFH_NumDocuments }
     pub fn AvgDocLen(&self) -> f32 { self.m_IndexFileHeader.IFH_AvgDocLength }
+    pub fn RawDocData(&self) -> &[u8] { &self.m_DocData }
+    pub fn GetIndexFileHeader(&self) -> &IndexFileHeader { &self.m_IndexFileHeader }
+
+    pub fn GetDocDataEntry(&self, doc_id: u64) -> Option<&DocDataEntry> {
+        let docId = ReaderDocumentIDValue(doc_id);
+        let firstDocId = Self::DocDataFirstDocId(&self.m_DocData, &self.m_IndexFileHeader);
+        if docId >= firstDocId {
+            let offset = usize::try_from(docId - firstDocId).ok()?.checked_mul(DOC_REC_SIZE)?;
+            if offset + DOC_REC_SIZE <= self.m_DocData.len()
+                && u32::from_le_bytes(self.m_DocData[offset..offset + 4].try_into().ok()?) as u64 == docId
+            {
+                return Some(unsafe { &*(self.m_DocData.as_ptr().add(offset) as *const DocDataEntry) });
+            }
+        }
+        self.m_DeltaContext.as_ref()?.GetDocDataEntry(docId)
+    }
+
+    pub fn GetStreamDocFreq(&self, stream_key: &str) -> u32 {
+        let mut total = self.m_BlockTable.FindTermData(stream_key)
+            .map(|location| location.doc_freq as u64)
+            .unwrap_or(0);
+        if let Some(delta) = self.m_DeltaContext.as_ref() {
+            total += delta.GetStreamDocFreq(stream_key) as u64;
+        }
+        total.min(u32::MAX as u64) as u32
+    }
+
+    pub fn SetTermMphfEnabled(&self, enabled: bool) {
+        self.m_BlockTable.SetTermMphfEnabled(enabled);
+        if let Some(delta) = self.m_DeltaContext.as_ref() {
+            delta.SetTermMphfEnabled(enabled);
+        }
+    }
+
+    pub fn GetBlockAccessStats(&self) -> BlockAccessStats {
+        self.m_BlockTable.GetBlockAccessStats()
+    }
     pub fn GetDocPath(&self, doc_id: u64) -> String {
         let docId = ReaderDocumentIDValue(doc_id);
-        let path = self.m_Store.read().unwrap().GetDocPath(docId).to_string();
-        if !path.is_empty() { return path; }
         let first_doc_id = Self::DocDataFirstDocId(&self.m_DocData, &self.m_IndexFileHeader);
         if docId >= first_doc_id {
             let slot = (docId - first_doc_id) as usize;
@@ -303,6 +464,20 @@ impl IndexContext {
         self.m_DeltaContext.as_ref().map(|delta| delta.DocumentCount() > 0).unwrap_or(false)
     }
 
+    pub fn SetDirectBlockAccessEnabled(&self, enabled: bool) {
+        self.m_BlockTable.SetDirectBlockAccessEnabled(enabled);
+        if let Some(delta) = self.m_DeltaContext.as_ref() {
+            delta.SetDirectBlockAccessEnabled(enabled);
+        }
+    }
+
+    pub fn SetLeafTermCacheBytes(&mut self, bytes: u64) {
+        self.m_LeafTermCacheBytes = if bytes > 0 { bytes } else { LEAF_TERM_CACHE_BYTES };
+        if let Some(delta) = self.m_DeltaContext.as_mut() {
+            delta.SetLeafTermCacheBytes(bytes);
+        }
+    }
+
     pub fn GetDeltaContext(&mut self) -> Option<&mut IndexContext> {
         if self.HasDelta() { self.m_DeltaContext.as_deref_mut() } else { None }
     }
@@ -320,12 +495,19 @@ impl IndexContext {
 
         let store = self.m_Store.read().unwrap();
 
+        if store.AllDocStats().is_empty() {
+            self.m_LoadedFromDisk = false;
+            self.m_VectorBuilt = true;
+            self.m_Built = true;
+            return;
+        }
+
         let table = Arc::get_mut(&mut self.m_BlockTable)
             .expect("BlockTable must have no other refs during build");
 
         let (header, newTable, vectorIndex, docData, pathPrefixSidecar, pathPrefixes) = Self::BuildIndexData(&store, true);
         *table = newTable;
-        self.m_VectorIndex = vectorIndex;
+        self.m_VectorIndex = Arc::new(RwLock::new(vectorIndex));
         self.m_VectorBuilt = true;
         self.m_IndexFileHeader = header;
         self.m_DocData = docData;
@@ -337,25 +519,32 @@ impl IndexContext {
     // ── Search ───────────────────────────────────────────────────────────────
 
     pub fn Compile(&self, query: &str, stream_set: &str) -> EvalTree {
-        self.m_Compiler.Compile(query, stream_set)
+        self.CompileWithMode(query, stream_set, QueryCompileMode::Default)
     }
 
-    pub fn GetReaderForQuery(&self, query: &str, stream_set: &str)
+    pub fn CompileWithMode(&self, query: &str, stream_set: &str, mode: QueryCompileMode) -> EvalTree {
+        self.m_Compiler.CompileWithEmbeddingModel(query, stream_set, Some(self.m_VectorIndex.read().unwrap().GetModel()), mode)
+    }
+
+    pub fn GetReaderForQuery(&mut self, query: &str, stream_set: &str)
         -> Box<dyn IndexReader>
     {
         let tree = self.Compile(query, stream_set);
         self.GetReader(tree)
     }
 
-    pub fn GetReader(&self, tree: EvalTree) -> Box<dyn IndexReader> {
+    pub fn GetReader(&mut self, tree: EvalTree) -> Box<dyn IndexReader> {
+        if tree.IsEmpty() { return self.OpenAdvancedReader("", 1); }
         let baseReader = self.BuildLocalReader(tree.clone());
-        if let Some(delta) = self.m_DeltaContext.as_ref() {
+        if self.HasDelta() {
+            let delta = self.m_DeltaContext.as_mut().unwrap();
             return Box::new(OrIndexReader::new(vec![baseReader, delta.BuildLocalReader(tree)]));
         }
         baseReader
     }
 
-    fn BuildLocalReader(&self, tree: EvalTree) -> Box<dyn IndexReader> {
+    pub fn BuildLocalReader(&mut self, tree: EvalTree) -> Box<dyn IndexReader> {
+        if tree.IsEmpty() { return self.OpenAdvancedReader("", 1); }
         if tree.HasTextQuery() && tree.HasVectorQuery() {
             return self.BuildIndexReader(tree.root);
         }
@@ -365,52 +554,145 @@ impl IndexContext {
         self.BuildIndexReader(tree.root)
     }
 
-    pub fn GetStreamReader(&self, stream_key: &str) -> Box<dyn IndexReader> {
+    pub fn GetStreamReader(&mut self, stream_key: &str) -> Box<dyn IndexReader> {
         let baseReader = self.BuildLocalStreamReader(stream_key);
-        if let Some(delta) = self.m_DeltaContext.as_ref() {
+        if self.HasDelta() {
+            let delta = self.m_DeltaContext.as_ref().unwrap();
             return Box::new(OrIndexReader::new(vec![baseReader, delta.BuildLocalStreamReader(stream_key)]));
         }
         baseReader
     }
 
-    fn BuildLocalStreamReader(&self, stream_key: &str) -> Box<dyn IndexReader> {
-        let docFreq = self.m_Store.read().unwrap().DocFreq(stream_key);
-        Box::new(AdvancedIndexReader::open(
-            stream_key, Arc::clone(&self.m_BlockTable), docFreq))
+    pub fn BuildLocalStreamReader(&self, stream_key: &str) -> Box<dyn IndexReader> {
+        self.OpenAdvancedReader(stream_key, 1)
+    }
+
+    pub fn SetQueryParameters(&mut self, parameters: QueryCompileModeParameters) {
+        self.StopSearchWorkers();
+        self.m_QueryParameters = parameters;
+        if let Some(delta) = self.m_DeltaContext.as_mut() {
+            delta.SetQueryParameters(parameters);
+        }
+    }
+
+    pub fn SetWeakAndBuildMode(&mut self, mode: WeakAndBuildMode) {
+        self.StopSearchWorkers();
+        self.m_WeakAndBuildMode = mode;
+        if let Some(delta) = self.m_DeltaContext.as_mut() { delta.SetWeakAndBuildMode(mode); }
+    }
+
+    pub fn GetSpanWeight(&self, wordSpan: u32) -> f32 {
+        if wordSpan >= 2 { self.m_QueryParameters.QMP_BigramWeight }
+        else { self.m_QueryParameters.QMP_UnigramWeight }
+    }
+
+    pub fn GetQueryParameters(&self) -> &QueryCompileModeParameters {
+        &self.m_QueryParameters
+    }
+
+    pub fn GetAverageStreamLength(&self, stream: char) -> f32 {
+        let mut stats = self.m_StreamLengthStats.lock().unwrap();
+        let docdata = self.m_DocData.as_ptr() as usize;
+        if stats.docdata != docdata || stats.doc_count != self.m_IndexFileHeader.IFH_NumDocuments {
+            stats.docdata = docdata;
+            stats.doc_count = self.m_IndexFileHeader.IFH_NumDocuments;
+            stats.averages = [1.0, self.m_IndexFileHeader.IFH_AvgDocLength.max(1.0),
+                self.m_IndexFileHeader.IFH_AvgDocLength.max(1.0), self.m_IndexFileHeader.IFH_AvgDocLength.max(1.0),
+                self.m_IndexFileHeader.IFH_AvgDocLength.max(1.0)];
+            let mut totals = [0.0f64; 5];
+            let mut counts = [0u64; 5];
+            let firstDocId = Self::DocDataFirstDocId(&self.m_DocData, &self.m_IndexFileHeader);
+            for slot in 0..self.m_IndexFileHeader.IFH_NumDocuments as usize {
+                let offset = slot * DOC_REC_SIZE;
+                if offset + DOC_REC_SIZE > self.m_DocData.len() { break; }
+                let entry = unsafe { &*(self.m_DocData.as_ptr().add(offset) as *const DocDataEntry) };
+                if entry.DDE_DocID as u64 != firstDocId + slot as u64 { continue; }
+                let lengths = [entry.DDE_TitleLength, entry.DDE_BodyLength, entry.DDE_UrlLength, entry.DDE_AnchorLength, entry.DDE_MetaLength];
+                for index in 0..lengths.len() {
+                    if lengths[index] > 0 { totals[index] += lengths[index] as f64; counts[index] += 1; }
+                }
+            }
+            for index in 0..stats.averages.len() {
+                if counts[index] > 0 { stats.averages[index] = (totals[index] / counts[index] as f64) as f32; }
+            }
+        }
+        match stream { 'T' => stats.averages[0], 'B' => stats.averages[1], 'U' => stats.averages[2],
+            'A' => stats.averages[3], 'M' => stats.averages[4], _ => self.m_IndexFileHeader.IFH_AvgDocLength.max(1.0) }
+    }
+
+    pub fn GetStreamLength(entry: &DocDataEntry, stream: char) -> u32 {
+        let length = match stream { 'T' => entry.DDE_TitleLength, 'B' => entry.DDE_BodyLength,
+            'U' => entry.DDE_UrlLength, 'A' => entry.DDE_AnchorLength, 'M' => entry.DDE_MetaLength, _ => 0 };
+        if length > 0 { length } else { entry.DDE_BodyLength.max(1) }
+    }
+
+    fn ReaderSpanWeight(parameters: &QueryCompileModeParameters, stream: char, wordSpan: u32) -> f32 {
+        let spanWeight = if wordSpan >= 2 { parameters.QMP_BigramWeight } else { parameters.QMP_UnigramWeight };
+        let streamWeight = match stream {
+            'A' => parameters.QMP_AnchorWeight,
+            'U' => parameters.QMP_UrlWeight,
+            'T' => parameters.QMP_TitleWeight,
+            'B' => parameters.QMP_BodyWeight,
+            _ => 1.0,
+        };
+        spanWeight * streamWeight
+    }
+
+    fn OpenAdvancedReader(&self, streamKey: &str, wordSpan: u32) -> Box<dyn IndexReader> {
+        let stream = streamKey.chars().last().unwrap_or('B');
+        let numDocuments = if self.m_IndexFileHeader.IFH_NumDocuments > 0 {
+            self.m_IndexFileHeader.IFH_NumDocuments
+        } else {
+            self.m_Store.read().unwrap().TotalDocs()
+        };
+        Box::new(AdvancedIndexReader::Open(
+            streamKey,
+            Arc::clone(&self.m_BlockTable),
+            numDocuments,
+            self.GetAverageStreamLength(stream),
+            Self::ReaderSpanWeight(&self.m_QueryParameters, stream, wordSpan),
+            wordSpan,
+        ))
     }
 
     pub fn CompileToVector(&self, query: &str) -> Vec<f32> {
-        self.m_Compiler.CompileToVector(query)
+        self.m_Compiler.CompileToVectorWithModel(query, self.m_VectorIndex.read().unwrap().GetModel())
     }
 
-    pub fn VectorSearch(&mut self, query: &[f32], top_k: usize, ef_search: usize) -> Vec<VectorSearchResult> {
+    pub fn VectorSearch(&mut self, query: &[f32], top_k: usize, metric: VectorMetric, ef_search: usize) -> Vec<VectorSearchResult> {
         self.BuildVectorRuntime();
-        self.m_VectorIndex.Search(query, top_k, ef_search)
+        self.m_VectorIndex.read().unwrap().Search(query, top_k, metric, ef_search)
     }
 
-    pub fn VectorCount(&self) -> usize { self.m_VectorIndex.Size() }
-    pub fn VectorDimension(&self) -> usize { self.m_VectorIndex.Dimension() }
+    pub fn VectorCount(&self) -> usize { self.m_VectorIndex.read().unwrap().Size() }
+    pub fn VectorDimension(&self) -> usize { self.m_VectorIndex.read().unwrap().Dimension() }
 
-    pub fn Enqueue(&mut self, query: &str, vector: Vec<f32>, streams: &str, top_k: usize) -> SearchTask {
-        self.EnsureSearchWorkersStarted(4);
+    pub fn Enqueue(&mut self, query: &str, vector: Vec<f32>, streams: &str, top_k: i32) -> SearchTask {
+        self.EnqueueWithMode(query, vector, streams, top_k, QueryCompileMode::WeakAndBigramBoostForDoc, 1000)
+    }
+
+    pub fn EnqueueWithMode(&mut self, query: &str, vector: Vec<f32>, streams: &str, top_k: i32, mode: QueryCompileMode, vector_ef_search: usize) -> SearchTask {
+        self.EnsureSearchWorkersStarted(16);
         let (sender, receiver) = mpsc::channel();
         let state = SearchTaskState {
             query: query.to_string(),
             vector,
             streams: if streams.is_empty() { "AUTB".to_string() } else { streams.to_string() },
             top_k,
+            mode,
+            vector_ef_search,
             reply: sender,
         };
         let (lock, cv) = &*self.m_SearchQueue;
         lock.lock().unwrap().queue.push_back(state);
         cv.notify_one();
-        SearchTask { receiver }
+        SearchTask { receiver: Some(receiver) }
     }
 
     fn EnsureSearchWorkersStarted(&mut self, worker_count: usize) {
         if !self.m_SearchWorkers.is_empty() { return; }
-        self.m_SearchRuntime = Some(SearchRuntime::from_context(self));
-        let runtime = Arc::clone(self.m_SearchRuntime.as_ref().unwrap());
+        self.BuildVectorRuntime();
+        let runtime = SearchRuntime::from_context(self);
         let (lock, _) = &*self.m_SearchQueue;
         lock.lock().unwrap().stop = false;
         for _ in 0..worker_count.max(1) {
@@ -423,6 +705,9 @@ impl IndexContext {
     }
 
     fn StopSearchWorkers(&mut self) {
+        // Intentional Rust mutation barrier: runtime-owning fields are never
+        // replaced while workers can still observe them. C++ races are not an
+        // API compatibility requirement.
         if self.m_SearchWorkers.is_empty() { return; }
         let (lock, cv) = &*self.m_SearchQueue;
         lock.lock().unwrap().stop = true;
@@ -430,7 +715,6 @@ impl IndexContext {
         for worker in self.m_SearchWorkers.drain(..) {
             let _ = worker.join();
         }
-        self.m_SearchRuntime = None;
     }
 
     fn SearchWorkerLoop(runtime: Arc<SearchRuntime>, queue: Arc<(Mutex<SearchQueueState>, Condvar)>) {
@@ -457,11 +741,12 @@ impl IndexContext {
         let mut tree = if task.query.is_empty() && !task.vector.is_empty() {
             EvalTree::new(None)
         } else {
-            compiler.Compile(&task.query, &task.streams)
+            compiler.CompileWithMode(&task.query, &task.streams, task.mode)
         };
         if !task.vector.is_empty() {
             tree.vector_query = task.vector.clone();
         }
+        tree.vector_ef_search = task.vector_ef_search;
         if tree.IsEmpty() { return Vec::new(); }
 
         let vector_query = if tree.HasTextQuery() && tree.HasVectorQuery() {
@@ -470,44 +755,59 @@ impl IndexContext {
             None
         };
         let mut reader = runtime.get_reader(tree);
-        let store = runtime.store.read().unwrap();
-        let executor = IndexSearchExecutor::new(&store);
-        executor.ExecuteWithVector(
-            reader.as_mut(),
-            task.top_k,
-            runtime.docdata.as_slice(),
-            Self::DocDataFirstDocId(runtime.docdata.as_slice(), &runtime.header),
-                vector_query.as_deref())
+        let executor = IndexSearchExecutor::new(runtime);
+        executor.ExecuteWithVector(reader.as_mut(), task.top_k, vector_query.as_deref())
     }
 
     // ── Persistence ─────────────────────────────────────────────────────────
+
+    pub fn SaveIndexCurrent(&mut self) -> Result<()> {
+        let path = self.m_IndexPath.clone().ok_or(RustBladeError::InvalidFormat)?;
+        self.SaveIndex(&path)
+    }
 
     pub fn SaveIndex(&mut self, path: &str) -> Result<()> {
         self.StopSearchWorkers();
         let savingDeltaIndex = self.m_IndexPath.as_ref()
             .map(|index_path| path == Self::DeltaIndexPath(index_path))
             .unwrap_or(false);
+        let overwritingLoadedIndex = !savingDeltaIndex && self.m_LoadedFromDisk
+            && self.m_IndexPath.as_deref() == Some(path);
         if !savingDeltaIndex {
             self.m_IndexPath = Some(path.to_string());
         }
-        let (header, blockTable, vectorIndex, docData, pathPrefixSidecar, pathPrefixes) = {
+        if !self.m_WriteBuilt {
             let store = self.m_Store.read().unwrap();
-            Self::BuildIndexData(&store, false)
-        };
+            if !store.AllDocStats().is_empty() {
+                let (header, blockTable, vectorIndex, docData, pathPrefixSidecar, pathPrefixes) = Self::BuildIndexData(&store, false);
+                self.m_WriteIndexFileHeader = header;
+                self.m_WriteBlockTable = blockTable;
+                self.m_WriteVectorIndex = vectorIndex;
+                self.m_WriteDocData = docData;
+                self.m_WritePathPrefixSidecar = pathPrefixSidecar;
+                self.m_WritePathPrefixes = pathPrefixes;
+            }
+            self.m_WriteBuilt = true;
+        }
 
-        self.m_WriteIndexFileHeader = header;
-        self.m_WriteBlockTable = blockTable;
-        self.m_WriteVectorIndex = vectorIndex;
-        self.m_WriteDocData = docData;
-        self.m_WritePathPrefixSidecar = pathPrefixSidecar;
-        self.m_WritePathPrefixes = pathPrefixes;
+        if overwritingLoadedIndex {
+            self.m_BlockTable = Arc::new(IndexBlockTable::new(512));
+            self.m_VectorIndex.write().unwrap().Clear();
+            self.m_IndexFileHeader = IndexFileHeader::zeroed();
+            self.m_DocData = Arc::from([]);
+            self.m_PathPrefixSidecar.fill(0);
+            self.m_PathPrefixes.clear();
+            self.m_Built = false;
+            self.m_LoadedFromDisk = false;
+            self.m_VectorBuilt = false;
+        }
 
         IndexSerializer::Save(&self.m_WriteIndexFileHeader, &self.m_WriteBlockTable, &self.m_WriteDocData, &self.m_WritePathPrefixSidecar, path)?;
         if savingDeltaIndex {
             let mut delta = IndexContext::with_path_and_load_delta(None, false);
             delta.m_IndexPath = Some(path.to_string());
             delta.m_BlockTable = Arc::new(std::mem::replace(&mut self.m_WriteBlockTable, IndexBlockTable::new(512)));
-            delta.m_VectorIndex = std::mem::replace(&mut self.m_WriteVectorIndex, HnswIndex::new(DOC_VECTOR_DIM, 32, 200, VectorMetric::Cosine));
+            delta.m_VectorIndex = Arc::new(RwLock::new(std::mem::replace(&mut self.m_WriteVectorIndex, FreshDiskAnnVectorIndex::new(32, 200))));
             delta.m_IndexFileHeader = self.m_WriteIndexFileHeader;
             delta.m_DocData = std::mem::take(&mut self.m_WriteDocData);
             delta.m_PathPrefixSidecar = std::mem::take(&mut self.m_WritePathPrefixSidecar);
@@ -516,7 +816,9 @@ impl IndexContext {
             delta.m_LoadedFromDisk = true;
             delta.m_VectorBuilt = false;
 
-            self.m_WriteIndexFileHeader = IndexFileHeader::default();
+            self.m_WriteIndexFileHeader = IndexFileHeader::zeroed();
+            self.m_WritePathPrefixSidecar = vec![0u8; PATH_PREFIX_SIDECAR_BYTES];
+            self.m_WriteBuilt = false;
             self.m_DeltaContext = Some(Box::new(delta));
         }
         Ok(())
@@ -524,13 +826,8 @@ impl IndexContext {
 
     #[allow(non_snake_case)]
     pub fn Merge(&mut self, output_path: &str) -> Result<()> {
-        let Some(basePath) = self.m_IndexPath.clone() else { return Err(RustBladeError::IndexNotBuilt); };
         if !self.m_Built || self.m_DocData.is_empty() { return Err(RustBladeError::IndexNotBuilt); }
-
-        let deltaPath = Self::DeltaIndexPath(&basePath);
-        if !IndexSerializer::is_valid_index(&deltaPath) { return Err(RustBladeError::InvalidFormat); }
-
-        let delta = IndexContext::with_path_and_load_delta(Some(deltaPath), false);
+        let Some(delta) = self.m_DeltaContext.as_ref() else { return Err(RustBladeError::IndexNotBuilt); };
         if !delta.m_Built || delta.m_DocData.is_empty() { return Err(RustBladeError::IndexNotBuilt); }
 
         let tempPath = format!("{output_path}.tmp");
@@ -548,14 +845,30 @@ impl IndexContext {
         let mergedDocs = baseDocCount + deltaDocCount;
 
         let mut mergedDocData = Vec::with_capacity(mergedDocs * DOC_REC_SIZE);
-        let baseDocBytes = baseDocCount * DOC_REC_SIZE;
-        if baseDocBytes > self.m_DocData.len() { return Err(RustBladeError::InvalidFormat); }
-        mergedDocData.extend_from_slice(&self.m_DocData[..baseDocBytes]);
+        let mut mergedPrefixToId = StableHashMap::default();
+        let mut mergedPathPrefixes = Vec::new();
+        let mut mergedStringBytes = 0usize;
+        Self::AppendMergedDocData(
+            &mut mergedDocData,
+            &self.m_DocData,
+            &self.m_IndexFileHeader,
+            &self.m_PathPrefixes,
+            &mut mergedPrefixToId,
+            &mut mergedPathPrefixes,
+            &mut mergedStringBytes,
+        )?;
         if deltaDocCount > 0 {
-            let deltaDocBytes = deltaDocCount * DOC_REC_SIZE;
-            if deltaDocBytes > delta.m_DocData.len() { return Err(RustBladeError::InvalidFormat); }
-            mergedDocData.extend_from_slice(&delta.m_DocData[..deltaDocBytes]);
+            Self::AppendMergedDocData(
+                &mut mergedDocData,
+                &delta.m_DocData,
+                &delta.m_IndexFileHeader,
+                &delta.m_PathPrefixes,
+                &mut mergedPrefixToId,
+                &mut mergedPathPrefixes,
+                &mut mergedStringBytes,
+            )?;
         }
+        let mergedPathPrefixSidecar = IndexSerializer::EncodePathPrefixSidecar(&mergedPathPrefixes);
         fs::write(&docDataTempPath, &mergedDocData)?;
 
         let mut headEntryCount = 0u64;
@@ -635,9 +948,10 @@ impl IndexContext {
         let leafOffset = headOffset + headEntryCount as usize * 32;
         let docDataOffset = leafOffset + headEntryCount as usize * PAGE_SIZE;
         let indexOffset = docDataOffset + mergedDocData.len();
-        let totalDocLength = (self.m_IndexFileHeader.IFH_AvgDocLength as f64 * baseDocCount as f64)
-            + (delta.m_IndexFileHeader.IFH_AvgDocLength as f64 * deltaDocCount as f64);
-        let avgDocLength = if mergedDocs == 0 { 1.0 } else { (totalDocLength / mergedDocs as f64) as f32 };
+        let baseTotalDocLength = (self.m_IndexFileHeader.IFH_AvgDocLength as f64 * baseDocCount as f64) as u64;
+        let deltaTotalDocLength = (delta.m_IndexFileHeader.IFH_AvgDocLength as f64 * deltaDocCount as f64) as u64;
+        let totalDocLength = baseTotalDocLength.wrapping_add(deltaTotalDocLength);
+        let avgDocLength = if mergedDocs == 0 { 1.0 } else { totalDocLength as f32 / mergedDocs as f32 };
 
         let mut mergedLeafBlocks = Vec::with_capacity(headEntryCount as usize);
         if headEntryCount > 0 {
@@ -671,6 +985,7 @@ impl IndexContext {
             IFH_TermMphfDisplacementCount: mphfDisplacements.len() as u64,
             IFH_TermMphfEntryOffset: mphfEntryOffset as u64,
             IFH_TermMphfEntryPageCount: mphfEntryPages.len() as u64,
+            ..IndexFileHeader::default()
         };
 
         let _ = fs::remove_file(&tempPath);
@@ -678,7 +993,7 @@ impl IndexContext {
         {
             let mut output = File::create(&tempPath)?;
             output.write_all(&header.to_bytes())?;
-            output.write_all(&IndexSerializer::EncodePathPrefixSidecar(&[]))?;
+            output.write_all(&mergedPathPrefixSidecar)?;
             Self::AppendFile(&mut output, &headTempPath)?;
             Self::AppendFile(&mut output, &leafTempPath)?;
             Self::AppendFile(&mut output, &docDataTempPath)?;
@@ -696,13 +1011,35 @@ impl IndexContext {
         }
 
         Self::CleanupTempFiles(&[&headTempPath, &leafTempPath, &indexTempPath, &docDataTempPath]);
+        self.ResetLoadedRuntimeState();
         let _ = fs::remove_file(output_path);
         fs::rename(&tempPath, output_path)?;
 
-        self.LoadIndex(output_path)
+        Ok(())
     }
 
-    fn BuildIndexData(store: &PostingStore, buildVectorIndex: bool) -> (IndexFileHeader, IndexBlockTable, HnswIndex, Vec<u8>, Vec<u8>, Vec<String>) {
+    fn ResetLoadedRuntimeState(&mut self) {
+        self.StopSearchWorkers();
+        self.m_DeltaContext = None;
+        self.m_DocData = Arc::from([]);
+        if let Some(table) = Arc::get_mut(&mut self.m_BlockTable) {
+            table.SetBlockMemory(None, None);
+        } else {
+            // An outstanding Rust reader safely retains the old pages. C++
+            // would leave that reader dangling, which is not parity to copy.
+            self.m_BlockTable = Arc::new(IndexBlockTable::new(512));
+        }
+        self.m_VectorIndex.write().unwrap().Clear();
+        self.m_IndexFileHeader = IndexFileHeader::zeroed();
+        self.m_PathPrefixSidecar = vec![0u8; PATH_PREFIX_SIDECAR_BYTES];
+        self.m_PathPrefixes.clear();
+        self.m_Built = false;
+        self.m_LoadedFromDisk = false;
+        self.m_VectorBuilt = false;
+        *self.m_StreamLengthStats.lock().unwrap() = StreamLengthStats::default();
+    }
+
+    fn BuildIndexData(store: &PostingStore, buildVectorIndex: bool) -> (IndexFileHeader, IndexBlockTable, FreshDiskAnnVectorIndex, Arc<[u8]>, Vec<u8>, Vec<String>) {
         let blocks = IndexSerializer::BuildBlocks(store);
         let (docData, pathPrefixSidecar, pathPrefixes) = Self::EncodeDocData(store);
         let firstDocId = Self::StoreFirstDocId(store);
@@ -734,20 +1071,22 @@ impl IndexContext {
             IFH_TermMphfDisplacementCount: blocks.BBR_TermMphfDisplacements.len() as u64,
             IFH_TermMphfEntryOffset: mphfEntryOffset as u64,
             IFH_TermMphfEntryPageCount: blocks.BBR_TermMphfEntryPages.len() as u64,
+            ..IndexFileHeader::default()
         };
 
         let mut blockTable = IndexBlockTable::new(blocks.BBR_IndexBlocks.len().max(512) + 64);
         let mphfHeader = blocks.BBR_TermMphfHeader;
         let mphfDisplacements = blocks.BBR_TermMphfDisplacements;
         let mphfEntryPages = blocks.BBR_TermMphfEntryPages;
-        blockTable.SetIndexBlocks(blocks.BBR_IndexBlocks);
-        blockTable.SetHeadLeafTermTable(blocks.BBR_HeadTermEntries, blocks.BBR_LeafTermBlocks);
+        blockTable.SetBlockMemory(Some(blocks.BBR_IndexBlocks), Some(blocks.BBR_LeafTermBlocks));
+        blockTable.SetHeadTermEntries(blocks.BBR_HeadTermEntries);
         if header.IFH_TermMphfHeaderCount > 0 {
             blockTable.SetTermMphf(mphfHeader, mphfDisplacements, mphfEntryPages);
         }
 
-        let mut vectorIndex = HnswIndex::new(DOC_VECTOR_DIM, 32, 200, VectorMetric::Cosine);
-        vectorIndex.SetDocDataWithFirstDocId(docData.clone(), firstDocId);
+        let docData: Arc<[u8]> = docData.into();
+        let mut vectorIndex = FreshDiskAnnVectorIndex::new(32, 200);
+        vectorIndex.SetDocData(Arc::clone(&docData), firstDocId);
         if buildVectorIndex {
             for docId in store.AllDocStats().keys().copied() {
                 if store.HasDocVector(docId) { vectorIndex.Add(docId); }
@@ -759,18 +1098,31 @@ impl IndexContext {
 
     fn BuildVectorRuntime(&mut self) {
         if self.m_VectorBuilt { return; }
-        let mut vectorIndex = HnswIndex::new(DOC_VECTOR_DIM, 32, 200, VectorMetric::Cosine);
         let firstDocId = Self::DocDataFirstDocId(&self.m_DocData, &self.m_IndexFileHeader);
-        vectorIndex.SetDocDataWithFirstDocId(self.m_DocData.clone(), firstDocId);
+        let mut vectorIndex = self.m_VectorIndex.write().unwrap();
+        vectorIndex.Clear();
+        vectorIndex.SetDocData(Arc::clone(&self.m_DocData), firstDocId);
+        let mut vectorDocCount = 0usize;
         for slot in 0..self.m_IndexFileHeader.IFH_NumDocuments {
             let offset = slot as usize * DOC_REC_SIZE;
             if offset + DOC_REC_SIZE > self.m_DocData.len() { break; }
             let docId = firstDocId + slot;
-            if u32::from_le_bytes(self.m_DocData[offset..offset + 4].try_into().unwrap()) as u64 == docId {
-                vectorIndex.Add(docId);
-            }
+            let valid = u32::from_le_bytes(self.m_DocData[offset..offset + 4].try_into().unwrap()) as u64 == docId
+                && u16::from_le_bytes(self.m_DocData[offset + 54..offset + 56].try_into().unwrap()) as usize == DOC_VECTOR_DIM
+                && u16::from_le_bytes(self.m_DocData[offset + 56..offset + 58].try_into().unwrap()) != 0;
+            if valid { vectorDocCount += 1; }
         }
-        self.m_VectorIndex = vectorIndex;
+        if vectorDocCount < u32::MAX as usize { vectorIndex.Reserve(vectorDocCount); }
+        for slot in 0..self.m_IndexFileHeader.IFH_NumDocuments {
+            let offset = slot as usize * DOC_REC_SIZE;
+            if offset + DOC_REC_SIZE > self.m_DocData.len() { break; }
+            let docId = firstDocId + slot;
+            let valid = u32::from_le_bytes(self.m_DocData[offset..offset + 4].try_into().unwrap()) as u64 == docId
+                && u16::from_le_bytes(self.m_DocData[offset + 54..offset + 56].try_into().unwrap()) as usize == DOC_VECTOR_DIM
+                && u16::from_le_bytes(self.m_DocData[offset + 56..offset + 58].try_into().unwrap()) != 0;
+            if valid { vectorIndex.Add(docId); }
+        }
+        drop(vectorIndex);
         self.m_VectorBuilt = true;
     }
 
@@ -778,7 +1130,7 @@ impl IndexContext {
         let firstDocId = Self::StoreFirstDocId(store);
         let documentCount = Self::StoreDocDataRecordCount(store);
         let mut out = vec![0u8; documentCount as usize * DOC_REC_SIZE];
-        let mut prefix_to_id = HashMap::new();
+        let mut prefix_to_id = StableHashMap::default();
         let mut prefixes = Vec::new();
         let mut string_bytes = 0usize;
         for slot in 0..documentCount as usize {
@@ -787,7 +1139,8 @@ impl IndexContext {
         }
         for (docId, stats) in store.AllDocStats() {
             let offset = (*docId - firstDocId) as usize * DOC_REC_SIZE;
-            let docId32 = (*docId).min(u32::MAX as u64) as u32;
+            debug_assert!(*docId <= u32::MAX as u64);
+            let docId32 = *docId as u32;
             out[offset..offset + 4].copy_from_slice(&docId32.to_le_bytes());
             out[offset + 4..offset + 6].copy_from_slice(&DocDataEncodeScore(stats.importance).to_le_bytes());
             let doc_length = stats.doc_len.max(1) as f32;
@@ -848,7 +1201,7 @@ impl IndexContext {
         32 + prefix_count * 8 + string_bytes <= PATH_PREFIX_SIDECAR_BYTES
     }
 
-    fn intern_path_prefix(prefix: &str, prefix_to_id: &mut HashMap<String, u16>, prefixes: &mut Vec<String>, string_bytes: &mut usize) -> u16 {
+    fn intern_path_prefix(prefix: &str, prefix_to_id: &mut StableHashMap<String, u16>, prefixes: &mut Vec<String>, string_bytes: &mut usize) -> u16 {
         if let Some(id) = prefix_to_id.get(prefix) { return *id; }
         if prefixes.len() >= DOC_PATH_PREFIX_INVALID as usize { return DOC_PATH_PREFIX_INVALID; }
         let next_string_bytes = *string_bytes + prefix.len();
@@ -860,7 +1213,7 @@ impl IndexContext {
         id
     }
 
-    fn encode_doc_path(record: &mut [u8], full_path: &str, prefix_to_id: &mut HashMap<String, u16>, prefixes: &mut Vec<String>, string_bytes: &mut usize) {
+    fn encode_doc_path(record: &mut [u8], full_path: &str, prefix_to_id: &mut StableHashMap<String, u16>, prefixes: &mut Vec<String>, string_bytes: &mut usize) {
         record[18..20].copy_from_slice(&0u16.to_le_bytes());
         record[DOC_PATH_OFFSET..DOC_PATH_OFFSET + DOC_PATH_MAX].fill(0);
         if full_path.is_empty() { return; }
@@ -871,6 +1224,37 @@ impl IndexContext {
         record[18..20].copy_from_slice(&path_len.to_le_bytes());
         record[DOC_PATH_OFFSET..DOC_PATH_OFFSET + 2].copy_from_slice(&prefix_id.to_le_bytes());
         record[DOC_PATH_OFFSET + 2..DOC_PATH_OFFSET + 2 + filename_len].copy_from_slice(&filename.as_bytes()[..filename_len]);
+    }
+
+    fn AppendMergedDocData(
+        output: &mut Vec<u8>,
+        source: &[u8],
+        header: &IndexFileHeader,
+        source_prefixes: &[String],
+        prefix_to_id: &mut StableHashMap<String, u16>,
+        prefixes: &mut Vec<String>,
+        string_bytes: &mut usize,
+    ) -> Result<()> {
+        let record_count = usize::try_from(header.IFH_NumDocuments).map_err(|_| RustBladeError::InvalidFormat)?;
+        let source_bytes = record_count.checked_mul(DOC_REC_SIZE).ok_or(RustBladeError::InvalidFormat)?;
+        if source.len() < source_bytes { return Err(RustBladeError::InvalidFormat); }
+        let first_doc_id = Self::DocDataFirstDocId(source, header);
+        for slot in 0..record_count {
+            let begin = slot * DOC_REC_SIZE;
+            let mut record = source[begin..begin + DOC_REC_SIZE].to_vec();
+            let stored_doc_id = u32::from_le_bytes(record[0..4].try_into().unwrap()) as u64;
+            if stored_doc_id == first_doc_id + slot as u64 {
+                let path_len = u16::from_le_bytes(record[18..20].try_into().unwrap()) as usize;
+                if path_len > DOC_PATH_MAX { return Err(RustBladeError::InvalidFormat); }
+                let full_path = Self::DecodeDocPath(
+                    &record[DOC_PATH_OFFSET..DOC_PATH_OFFSET + path_len],
+                    source_prefixes,
+                );
+                Self::encode_doc_path(&mut record, &full_path, prefix_to_id, prefixes, string_bytes);
+            }
+            output.extend_from_slice(&record);
+        }
+        Ok(())
     }
 
     fn DecodeDocPath(payload: &[u8], prefixes: &[String]) -> String {
@@ -896,32 +1280,40 @@ impl IndexContext {
 
     pub fn LoadIndex(&mut self, path: &str) -> Result<()> {
         self.StopSearchWorkers();
+        self.m_DeltaContext = None;
         self.m_IndexPath = Some(path.to_string());
         let mut store = PostingStore::new();
         let (header, head_term_entries, docdata) = IndexSerializer::load_file_tables(&mut store, path)?;
+        store = PostingStore::new();
         let (pathPrefixSidecar, pathPrefixes) = IndexSerializer::LoadPathPrefixSidecar(path)?;
         let (mphfHeader, mphfDisplacements, mphfEntryPages) = IndexSerializer::LoadTermMphf(path, &header)?;
         let mut table = IndexBlockTable::new(header.IFH_IndexBlockCount as usize);
-        table.InitFileBacked(
-            path,
+        table.Init(
+            BlockKind::Index,
+            Some(path),
             header.IFH_IndexBlockOffset,
             header.IFH_IndexBlockCount as u32,
-            header.IFH_IndexBlockCount.min(25_600) as u32,
+            header.IFH_IndexBlockCount.min(INDEX_BLOCK_CACHE_BYTES / std::mem::size_of::<IndexBlock>() as u64) as u32,
+        )?;
+        table.Init(
+            BlockKind::LeafTerm,
+            Some(path),
             header.IFH_LeafTermBlockOffset,
             header.IFH_LeafTermBlockCount as u32,
-            header.IFH_LeafTermBlockCount.min(25_600) as u32,
+            header.IFH_LeafTermBlockCount.min(self.m_LeafTermCacheBytes / std::mem::size_of::<LeafTermBlock>() as u64) as u32,
         )?;
-        table.SetHeadEntries(head_term_entries);
+        table.SetHeadTermEntries(head_term_entries);
         if header.IFH_TermMphfHeaderCount > 0 {
             table.SetTermMphf(mphfHeader, mphfDisplacements, mphfEntryPages);
         }
 
-        let mut vector_index = HnswIndex::new(DOC_VECTOR_DIM, 32, 200, VectorMetric::Cosine);
-        vector_index.SetDocDataWithFirstDocId(docdata.clone(), Self::DocDataFirstDocId(&docdata, &header));
+        let docdata: Arc<[u8]> = docdata.into();
+        let mut vector_index = FreshDiskAnnVectorIndex::new(32, 200);
+        vector_index.SetDocData(Arc::clone(&docdata), Self::DocDataFirstDocId(&docdata, &header));
 
         self.m_Store       = Arc::new(RwLock::new(store));
         self.m_BlockTable = Arc::new(table);
-        self.m_VectorIndex = vector_index;
+        self.m_VectorIndex = Arc::new(RwLock::new(vector_index));
         self.m_VectorBuilt = false;
         self.m_IndexFileHeader = header;
         self.m_DocData = docdata;
@@ -933,24 +1325,33 @@ impl IndexContext {
         Ok(())
     }
 
+    pub fn ReloadIndex(&mut self) -> Result<()> {
+        let path = self.m_IndexPath.clone().ok_or(RustBladeError::InvalidFormat)?;
+        self.LoadIndex(&path)
+    }
+
     /// Load from raw bytes (WASM path — no file system access needed).
     pub fn LoadFromBytes(&mut self, data: &[u8]) -> Result<()> {
+        self.StopSearchWorkers();
+        self.m_DeltaContext = None;
         let header = IndexFileHeader::parse(data)?;
         let mut store = PostingStore::new();
         let (head_term_entries, leaf_term_blocks, blocks, docdata, pathPrefixSidecar, pathPrefixes, mphfHeader, mphfDisplacements, mphfEntryPages) = IndexSerializer::decode(&mut store, data)?;
+        store = PostingStore::new();
         let mut table = IndexBlockTable::new(blocks.len().max(512) + 64);
-        table.SetIndexBlocks(blocks);
-        table.SetHeadLeafTermTable(head_term_entries, leaf_term_blocks);
+        table.SetBlockMemory(Some(blocks), Some(leaf_term_blocks));
+        table.SetHeadTermEntries(head_term_entries);
         if !mphfDisplacements.is_empty() && !mphfEntryPages.is_empty() {
             table.SetTermMphf(mphfHeader, mphfDisplacements, mphfEntryPages);
         }
 
-        let mut vector_index = HnswIndex::new(DOC_VECTOR_DIM, 32, 200, VectorMetric::Cosine);
-        vector_index.SetDocDataWithFirstDocId(docdata.clone(), Self::DocDataFirstDocId(&docdata, &IndexFileHeader { IFH_NumDocuments: (docdata.len() / DOC_REC_SIZE) as u64, ..IndexFileHeader::default() }));
+        let docdata: Arc<[u8]> = docdata.into();
+        let mut vector_index = FreshDiskAnnVectorIndex::new(32, 200);
+        vector_index.SetDocData(Arc::clone(&docdata), Self::DocDataFirstDocId(&docdata, &IndexFileHeader { IFH_NumDocuments: (docdata.len() / DOC_REC_SIZE) as u64, ..IndexFileHeader::default() }));
 
         self.m_Store       = Arc::new(RwLock::new(store));
         self.m_BlockTable = Arc::new(table);
-        self.m_VectorIndex = vector_index;
+        self.m_VectorIndex = Arc::new(RwLock::new(vector_index));
         self.m_VectorBuilt = false;
         self.m_IndexFileHeader = header;
         self.m_DocData = docdata;
@@ -963,6 +1364,8 @@ impl IndexContext {
 
     /// Load only the data needed for vector search (WASM viewer path).
     pub fn LoadVectorFromBytes(&mut self, data: &[u8]) -> Result<()> {
+        self.StopSearchWorkers();
+        self.m_DeltaContext = None;
         let header = IndexFileHeader::parse(data)?;
         let sidecar_begin = INDEX_FILE_HEADER_SIZE;
         let sidecar_end = sidecar_begin + PATH_PREFIX_SIDECAR_BYTES;
@@ -976,12 +1379,13 @@ impl IndexContext {
         if docdata_end > data.len() { return Err(RustBladeError::InvalidFormat); }
         let docdata = data[docdata_begin..docdata_end].to_vec();
 
-        let mut vector_index = HnswIndex::new(DOC_VECTOR_DIM, 32, 200, VectorMetric::Cosine);
-        vector_index.SetDocDataWithFirstDocId(docdata.clone(), Self::DocDataFirstDocId(&docdata, &header));
+        let docdata: Arc<[u8]> = docdata.into();
+        let mut vector_index = FreshDiskAnnVectorIndex::new(32, 200);
+        vector_index.SetDocData(Arc::clone(&docdata), Self::DocDataFirstDocId(&docdata, &header));
 
         self.m_Store = Arc::new(RwLock::new(PostingStore::new()));
         self.m_BlockTable = Arc::new(IndexBlockTable::new(512));
-        self.m_VectorIndex = vector_index;
+        self.m_VectorIndex = Arc::new(RwLock::new(vector_index));
         self.m_VectorBuilt = false;
         self.m_IndexFileHeader = header;
         self.m_DocData = docdata;
@@ -993,6 +1397,8 @@ impl IndexContext {
     }
 
     pub fn LoadVectorTables(&mut self, docdata: &[u8], pathPrefixSidecar: &[u8]) -> Result<()> {
+        self.StopSearchWorkers();
+        self.m_DeltaContext = None;
         if docdata.len() % DOC_REC_SIZE != 0 || pathPrefixSidecar.len() != PATH_PREFIX_SIDECAR_BYTES {
             return Err(RustBladeError::InvalidFormat);
         }
@@ -1000,13 +1406,13 @@ impl IndexContext {
         let mut header = IndexFileHeader::default();
         header.IFH_NumDocuments = (docdata.len() / DOC_REC_SIZE) as u64;
 
-        let docdata = docdata.to_vec();
-        let mut vector_index = HnswIndex::new(DOC_VECTOR_DIM, 32, 200, VectorMetric::Cosine);
-        vector_index.SetDocDataWithFirstDocId(docdata.clone(), Self::DocDataFirstDocId(&docdata, &header));
+        let docdata: Arc<[u8]> = Arc::from(docdata);
+        let mut vector_index = FreshDiskAnnVectorIndex::new(32, 200);
+        vector_index.SetDocData(Arc::clone(&docdata), Self::DocDataFirstDocId(&docdata, &header));
 
         self.m_Store = Arc::new(RwLock::new(PostingStore::new()));
         self.m_BlockTable = Arc::new(IndexBlockTable::new(512));
-        self.m_VectorIndex = vector_index;
+        self.m_VectorIndex = Arc::new(RwLock::new(vector_index));
         self.m_VectorBuilt = false;
         self.m_IndexFileHeader = header;
         self.m_DocData = docdata;
@@ -1035,7 +1441,7 @@ impl IndexContext {
         let deltaPath = Self::DeltaIndexPath(&indexPath);
         if deltaPath == indexPath || !IndexSerializer::is_valid_index(&deltaPath) { return; }
 
-        let delta = IndexContext::with_path_and_load_delta(Some(deltaPath), false);
+        let mut delta = IndexContext::with_path_and_load_delta(Some(deltaPath), false);
         if delta.m_LoadedFromDisk && delta.DocumentCount() > 0 {
             self.m_DeltaContext = Some(Box::new(delta));
         }
@@ -1092,18 +1498,17 @@ impl IndexContext {
 
     fn BuildIndexReader(&self, node: Option<EvalNode>) -> Box<dyn IndexReader> {
         match node {
-            None => Box::new(AdvancedIndexReader::open("", Arc::clone(&self.m_BlockTable), 0)),
+            None => self.OpenAdvancedReader("", 1),
 
             Some(EvalNode::Term(tn)) => {
-                let docFreq = self.m_Store.read().unwrap().DocFreq(&tn.stream_key);
-                Box::new(AdvancedIndexReader::open(&tn.stream_key, Arc::clone(&self.m_BlockTable), docFreq))
+                self.OpenAdvancedReader(&tn.stream_key, tn.word_span)
             }
 
             Some(EvalNode::And(an)) => {
                 let children: Vec<Box<dyn IndexReader>> = an.children.into_iter()
                     .map(|c| self.BuildIndexReader(Some(c))).collect();
                 if children.iter().any(|c| c.IsEnd()) {
-                    return Box::new(AdvancedIndexReader::open("", Arc::clone(&self.m_BlockTable), 0));
+                    return self.OpenAdvancedReader("", 1);
                 }
                 let mut v = children;
                 if v.len() == 1 { return v.remove(0); }
@@ -1115,11 +1520,32 @@ impl IndexContext {
                     .map(|c| self.BuildIndexReader(Some(c)))
                     .filter(|r| !r.IsEnd()).collect();
                 if children.is_empty() {
-                    return Box::new(AdvancedIndexReader::open("", Arc::clone(&self.m_BlockTable), 0));
+                    return self.OpenAdvancedReader("", 1);
                 }
                 let mut v = children;
                 if v.len() == 1 { return v.remove(0); }
                 Box::new(OrIndexReader::new(v))
+            }
+
+            Some(EvalNode::WeakAnd(wn)) => {
+                let mut childNodes = if self.m_WeakAndBuildMode == WeakAndBuildMode::FlatPruned {
+                    FlattenWeakAndNodes(&wn.children, &self.m_BlockTable, self.DocumentCount(), false)
+                } else { wn.children.clone() };
+                let mut children: Vec<Box<dyn IndexReader>> = childNodes.drain(..)
+                    .map(|child| self.BuildIndexReader(Some(child))).collect();
+                if self.m_WeakAndBuildMode != WeakAndBuildMode::OrChildren { children.retain(|reader| !reader.IsEnd()); }
+                if children.is_empty() && self.m_WeakAndBuildMode == WeakAndBuildMode::FlatPruned {
+                    children = FlattenWeakAndNodes(&wn.children, &self.m_BlockTable, self.DocumentCount(), true).into_iter()
+                        .map(|child| self.BuildIndexReader(Some(child))).filter(|reader| !reader.IsEnd()).collect();
+                }
+                if children.is_empty() { return self.OpenAdvancedReader("", 1); }
+                let min_should_match = if self.m_WeakAndBuildMode == WeakAndBuildMode::FlatPruned {
+                    if children.len() <= 2 { 1 } else if children.len() <= 5 { 2 } else { 3 }
+                } else {
+                    wn.min_should_match.min(children.len() as u32)
+                };
+                if children.len() == 1 { return children.remove(0); }
+                Box::new(WeakAndIndexReader::new(children, min_should_match))
             }
 
             Some(EvalNode::Not(nn)) => {
@@ -1127,11 +1553,20 @@ impl IndexContext {
                 let exclude = self.BuildIndexReader(Some(*nn.exclude));
                 Box::new(NotIndexReader::new(base, exclude))
             }
+
+            Some(EvalNode::Boost(bn)) => {
+                let base = self.BuildIndexReader(Some(*bn.base));
+                if base.IsEnd() { return base; }
+                let boost = self.BuildIndexReader(Some(*bn.boost));
+                if boost.IsEnd() { return base; }
+                Box::new(BoostIndexReader::new(base, boost, bn.boost_weight))
+            }
         }
     }
 
-    fn BuildVectorIndexReader(&self, query: &[f32], efSearch: usize) -> Box<dyn IndexReader> {
-        let results = self.m_VectorIndex.Search(query, 0, efSearch);
+    fn BuildVectorIndexReader(&mut self, query: &[f32], efSearch: usize) -> Box<dyn IndexReader> {
+        self.BuildVectorRuntime();
+        let results = self.m_VectorIndex.read().unwrap().Search(query, efSearch.max(1), VectorMetric::Cosine, efSearch);
         Box::new(VectorIndexReader::new(results))
     }
 }
@@ -1149,7 +1584,7 @@ struct LeafTermBlockView<'a> {
     m_IndexBlockCount: u32,
     m_LeafBlockID: u32,
     m_EntryIndex: usize,
-    m_CurrentLeaf: Option<PinnedBlock<LeafTermBlock>>,
+    m_CurrentLeaf: Option<BlockHandle<LeafTermBlock>>,
     m_CurrentEntry: Option<LeafTermEntry>,
     m_LeafBlocks: Vec<LeafTermBlock>,
     m_IndexBlocks: Vec<IndexBlock>,
@@ -1179,7 +1614,7 @@ fn WriteLeafEntry(block: &mut LeafTermBlock, entryIndex: usize, offset: usize, e
     data[10..12].copy_from_slice(&entry.LTE_IndexLength.to_le_bytes());
     data[12..14].copy_from_slice(&entry.LTE_ContinuationBlockCount.to_le_bytes());
     data[14] = entry.LTE_Flags;
-    data[15] = entry.LTE_Term.len() as u8;
+    data[15] = entry.LTE_TermLength;
     data[16..16 + entry.LTE_Term.len()].copy_from_slice(entry.LTE_Term.as_bytes());
 }
 
@@ -1356,6 +1791,7 @@ impl<'a> LeafTermBlockView<'a> {
             LTE_IndexLength: self.m_PostingIndexLength as u16,
             LTE_ContinuationBlockCount: self.m_PostingContinuationBlockCount as u16,
             LTE_Flags: source.LTE_Flags,
+            LTE_TermLength: source.LTE_TermLength,
         };
 
         WriteLeafEntry(&mut self.m_LeafBlocks[self.m_LeafBlockID as usize], self.m_LeafEntryCount, self.m_LeafWriteOffset, &entry);
@@ -1415,7 +1851,30 @@ impl<'a> LeafTermBlockView<'a> {
     fn PostingBytes(&self) -> Option<Vec<u8>> {
         let blockTable = self.m_BlockTable?;
         let entry = self.Current()?;
-        blockTable.PostingBytes(entry)
+        let first = blockTable.GetBlock::<IndexBlock>(BlockKind::Index, entry.LTE_IndexBlockID, true)?;
+        let firstSlot = first.Slot();
+        let begin = entry.LTE_IndexOffset as usize;
+        let end = begin.checked_add(entry.LTE_IndexLength as usize)?;
+        if end > PAGE_SIZE {
+            blockTable.ReleaseBlock(BlockKind::Index, firstSlot, true);
+            return None;
+        }
+        let mut bytes = first.IB_Data[begin..end].to_vec();
+        blockTable.ReleaseBlock(BlockKind::Index, firstSlot, true);
+
+        for offset in 0..entry.LTE_ContinuationBlockCount as u32 {
+            let block = blockTable.GetBlock::<IndexBlock>(BlockKind::Index, entry.LTE_IndexBlockID + 1 + offset, true)?;
+            let slot = block.Slot();
+            let result = (|| {
+                let header = IndexBlockContinuationHeader::from_bytes(&block.IB_Data)?;
+                let dataEnd = INDEX_BLOCK_CONTINUATION_HEADER_SIZE.checked_add(header.IBCH_DataLength as usize)?;
+                if dataEnd > PAGE_SIZE { return None; }
+                Some(block.IB_Data[INDEX_BLOCK_CONTINUATION_HEADER_SIZE..dataEnd].to_vec())
+            })();
+            blockTable.ReleaseBlock(BlockKind::Index, slot, true);
+            bytes.extend_from_slice(&result?);
+        }
+        Some(bytes)
     }
 
     fn AddIndexBytes(&mut self, sourceBytes: &[u8]) -> bool {
@@ -1473,7 +1932,7 @@ impl<'a> LeafTermBlockView<'a> {
 
         while self.m_LeafBlockID < self.m_LeafTermBlockCount {
             if self.m_CurrentLeaf.is_none() {
-                self.m_CurrentLeaf = self.m_BlockTable.unwrap().GetLeafBlockBySeq(self.m_LeafBlockID);
+                self.m_CurrentLeaf = self.m_BlockTable.unwrap().GetBlock(BlockKind::LeafTerm, self.m_LeafBlockID, true);
                 if self.m_CurrentLeaf.is_none() { return; }
             }
 
@@ -1483,9 +1942,19 @@ impl<'a> LeafTermBlockView<'a> {
                 return;
             }
 
-            self.m_CurrentLeaf = None;
+            if let Some(block) = self.m_CurrentLeaf.take() {
+                self.m_BlockTable.unwrap().ReleaseBlock(BlockKind::LeafTerm, block.Slot(), true);
+            }
             self.m_LeafBlockID += 1;
             self.m_EntryIndex = 0;
+        }
+    }
+}
+
+impl Drop for LeafTermBlockView<'_> {
+    fn drop(&mut self) {
+        if let (Some(blockTable), Some(block)) = (self.m_BlockTable, self.m_CurrentLeaf.take()) {
+            blockTable.ReleaseBlock(BlockKind::LeafTerm, block.Slot(), true);
         }
     }
 }

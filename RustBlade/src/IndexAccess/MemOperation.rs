@@ -18,6 +18,18 @@ unsafe impl<T: Copy + Sync> Sync for PinnedMemory<T> {}
 
 impl<T: Copy + Default> PinnedMemory<T> {
     pub fn new_zeroed(len: usize) -> Self {
+        if len == 0 {
+            return Self {
+                ptr: NonNull::dangling(),
+                len: 0,
+                #[cfg(not(target_arch = "wasm32"))]
+                bytes: 0,
+                #[cfg(target_arch = "wasm32")]
+                buffer: Vec::new().into_boxed_slice(),
+                _marker: PhantomData,
+            };
+        }
+
         #[cfg(target_arch = "wasm32")]
         {
             let mut buffer = vec![T::default(); len].into_boxed_slice();
@@ -27,7 +39,7 @@ impl<T: Copy + Default> PinnedMemory<T> {
 
         #[cfg(not(target_arch = "wasm32"))]
         unsafe {
-            let bytes = len * std::mem::size_of::<T>();
+            let bytes = len.checked_mul(std::mem::size_of::<T>()).expect("pinned allocation size overflow");
             let raw = PinnedMemAlloc(bytes as u64);
             let ptr = NonNull::new(raw as *mut T).expect("pinned allocation failed");
             std::ptr::write_bytes(ptr.as_ptr(), 0, len);
@@ -67,7 +79,9 @@ impl<T: Copy> IndexMut<usize> for PinnedMemory<T> {
 impl<T: Copy> Drop for PinnedMemory<T> {
     fn drop(&mut self) {
         #[cfg(not(target_arch = "wasm32"))]
-        unsafe { PinnedMemFree(self.ptr.as_ptr() as *mut u8, self.bytes as u64); }
+        if self.bytes > 0 {
+            unsafe { PinnedMemFree(self.ptr.as_ptr() as *mut u8, self.bytes as u64); }
+        }
     }
 }
 
@@ -93,6 +107,20 @@ unsafe fn PinnedMemFree(ptr: *mut u8, bytes: u64) {
 #[cfg(unix)]
 #[allow(non_snake_case)]
 unsafe fn PinnedMemAlloc(bytes: u64) -> *mut u8 {
+    let mut limit = std::mem::zeroed::<libc::rlimit>();
+    if libc::getrlimit(libc::RLIMIT_MEMLOCK, &mut limit) == 0
+        && limit.rlim_cur != libc::RLIM_INFINITY
+        && limit.rlim_cur < bytes as libc::rlim_t
+    {
+        let requested = bytes as libc::rlim_t;
+        let new_limit = if limit.rlim_max == libc::RLIM_INFINITY || limit.rlim_max > requested {
+            requested
+        } else {
+            limit.rlim_max
+        };
+        limit.rlim_cur = new_limit;
+        let _ = libc::setrlimit(libc::RLIMIT_MEMLOCK, &limit);
+    }
     let ptr = libc::mmap(
         std::ptr::null_mut(),
         bytes as usize,

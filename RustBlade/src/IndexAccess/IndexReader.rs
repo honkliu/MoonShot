@@ -1,5 +1,4 @@
-use crate::bm25::Bm25Scorer;
-use crate::posting_store::PostingStore;
+use crate::block_table::DocDataEntry;
 
 pub const NO_MORE_DOCS: u64 = u64::MAX;
 pub const READER_DOCID_SOURCE_SHIFT: u64 = 59;
@@ -41,7 +40,7 @@ pub fn ReaderSourceMaskForStream(stream: char) -> u8 {
 * IndexReader — the single interface for traversing posting lists.
 *
 * Leaf:      AdvancedIndexReader — reads one (term+stream) posting list
-*            from IndexBlockTable via VarByteDecoder.
+*            from IndexBlockTable via UnifiedDecoder.
 * Composite: AndIndexReader / OrIndexReader / NotIndexReader — combine leaves.
 *
 * TF and BM25 score live ONLY on leaf readers.
@@ -55,9 +54,9 @@ pub trait IndexReader {
     fn GoUntil(&mut self, target: u64, limit: u64);
     fn IsEnd(&self)            -> bool;
     fn GetDocumentID(&self)   -> u64;
-    fn GetTermFreq(&self)     -> u32   { 1 }
-    fn GetScore(&self, _scorer: &Bm25Scorer, _store: &PostingStore, _doc_id: u64) -> f32 { 0.0 }
-    fn GetSourceMask(&self) -> u8 { 0 }
+    fn GetTermFreq(&self)     -> u32   { 1u32 }
+    fn GetScore(&mut self, _entry: &DocDataEntry) -> f32 { 0.0 }
+    fn GetSourceMask(&mut self) -> u8 { 0 }
     fn SetDebug(&mut self, _label: &str, _depth: usize) {}
-    fn Close(&mut self) {}
+    fn Close(&mut self);
 }

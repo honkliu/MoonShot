@@ -8,8 +8,7 @@
 */
 use rustblade::{IndexContext, IndexWriter, SmartTokenizer};
 use rustblade::tokenizer::Tokenizer;
-use rustblade::compiler::IndexSearchCompiler;
-use rustblade::executor::IndexSearchExecutor;
+use rustblade::index_search_compiler::IndexSearchCompiler;
 
 static INDEX_FILE: &str = "moonshot_demo.idx";
 
@@ -98,9 +97,7 @@ fn search_index() {
     let run = |ctx: &mut IndexContext, q: &str| {
         let tree    = compiler.Compile(q, "AUTB");
         let mut reader = ctx.GetReader(tree);
-        let store = ctx.GetStore();
-        let store = store.read().unwrap();
-        let exec = IndexSearchExecutor::new(&store);
+        let exec = ctx.GetExecutor();
         let hits = exec.Execute(reader.as_mut(), 10);
         println!("\n[{}]", q);
         for h in &hits {
@@ -121,9 +118,7 @@ fn search_index() {
         let mut reader  = ctx.GetReader(tree);
         reader.SetDebug("race car toy", 0);
 
-        let store = ctx.GetStore();
-        let store = store.read().unwrap();
-        let exec = IndexSearchExecutor::new(&store);
+        let exec = ctx.GetExecutor();
         let hits = exec.Execute(reader.as_mut(), 10);
 
         println!("\n  results:");

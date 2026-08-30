@@ -265,7 +265,7 @@ tr:hover td { background:#2a2d2e; cursor:pointer; }
 <script async src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/auto-render.min.js" onerror="void 0"></script>
 <script async src="https://cdn.jsdelivr.net/npm/mermaid@10.9.1/dist/mermaid.min.js" onerror="void 0"></script>
 <script type="module">
-const BUILD_STAMP = 'v20-20260709-path20';
+const BUILD_STAMP = 'v20-20260828-rust-cache';
 const LARGE_INDEX_LIMIT = 128 * 1024 * 1024;
 const INDEX_HEADER_BYTES = 136;
 const FULL_PARSE_TERM_LIMIT = 250000;
@@ -290,8 +290,44 @@ await init(wasmBytes);
 window._wasm = { parse_index_summary, parse_index, search_index };
 window.MOONSHOT_VIEWER_BUILD = BUILD_STAMP;
 
-let G = { bytes: null, parsed: null, sc: null, localFile: null, vectorDocDataBytes: null, vectorPathPrefixBytes: null, indexUrl: '', indexSize: 0 };
+let G = { bytes: null, parsed: null, sc: null, localFile: null, browserIndexReady: false, vectorDocDataBytes: null, vectorPathPrefixBytes: null, indexUrl: '', indexSize: 0 };
 const TEXT_DECODER = new TextDecoder('utf-8');
+const SEARCH_WORKER = new Worker(`./search_worker.js?${BUILD_STAMP}`, { type: 'module' });
+let SEARCH_WORKER_REQUEST_ID = 0;
+const SEARCH_WORKER_REQUESTS = new Map();
+
+SEARCH_WORKER.onmessage = event => {
+  const request = SEARCH_WORKER_REQUESTS.get(event.data?.id);
+  if (!request) return;
+  SEARCH_WORKER_REQUESTS.delete(event.data.id);
+  if (event.data.ok) request.resolve(event.data);
+  else request.reject(new Error(event.data.error || 'Search worker failed'));
+};
+
+SEARCH_WORKER.onerror = event => {
+  const error = new Error(event.message || 'Search worker failed');
+  for (const request of SEARCH_WORKER_REQUESTS.values()) request.reject(error);
+  SEARCH_WORKER_REQUESTS.clear();
+};
+
+function requestSearchWorker(message) {
+  return new Promise((resolve, reject) => {
+    const id = ++SEARCH_WORKER_REQUEST_ID;
+    SEARCH_WORKER_REQUESTS.set(id, { resolve, reject });
+    SEARCH_WORKER.postMessage({ ...message, id });
+  });
+}
+
+async function openSelectedIndex(file) {
+  G.browserIndexReady = false;
+  await requestSearchWorker({ type: 'open', file, cacheMiB: 64 });
+  G.browserIndexReady = true;
+}
+
+async function searchSelectedIndex(query, streams = 'AUTB') {
+  const response = await requestSearchWorker({ type: 'search', query, streams });
+  return parseWasmJson(response.json, 'search_loaded_index');
+}
 
 // ── Drag-to-resize + click-to-collapse for hex pane divider ──────────────────
 (function() {
@@ -401,6 +437,7 @@ function parseWasmJson(raw, context) {
 // ── loading ───────────────────────────────────────────────────────────────────
 async function loadFile(file) {
   G.localFile = null;
+  G.browserIndexReady = false;
   G.vectorDocDataBytes = null;
   G.vectorPathPrefixBytes = null;
   G.indexUrl = '';
@@ -410,6 +447,13 @@ async function loadFile(file) {
     headerBytes = new Uint8Array(await file.slice(0, INDEX_HEADER_BYTES).arrayBuffer());
   } catch (e) {
     setStatus('Cannot read ' + file.name + ': ' + e);
+    return;
+  }
+  try {
+    setStatus('Opening ' + file.name + ' with Rust cache…');
+    await openSelectedIndex(file);
+  } catch (e) {
+    setStatus('Cannot open ' + file.name + ' for Rust search: ' + e);
     return;
   }
   if (shouldUseSummaryMode(headerBytes, file.size)) {
@@ -425,6 +469,7 @@ async function loadFile(file) {
 
 async function loadRemoteIndex(url, size) {
   G.localFile = null;
+  G.browserIndexReady = false;
   G.vectorDocDataBytes = null;
   G.vectorPathPrefixBytes = null;
   G.indexUrl = url;
@@ -1850,12 +1895,24 @@ window.runDocumentSearch = async function() {
     await runVectorDocumentSearch(q, out);
     return;
   }
-  if (G.summaryOnly) {
-    if (!q) {
-      out.innerHTML = '<p class="srch-hint">Enter a query and press Enter.</p>';
-      switchTabByName('srch-panel');
-      return;
+  if (!q) {
+    out.innerHTML = '<p class="srch-hint">Enter a query and press Enter.</p>';
+    switchTabByName('srch-panel');
+    return;
+  }
+  if (G.browserIndexReady) {
+    out.innerHTML = `<div class="search-summary">Rust cached search for "${esc(q)}"…</div>`;
+    switchTabByName('srch-panel');
+    try {
+      const res = await searchSelectedIndex(q);
+      if (res && !Array.isArray(res) && res.error) throw new Error(res.error);
+      renderSearchResults(q, res, false);
+    } catch (e) {
+      out.innerHTML = `<p class="srch-hint">Search failed: ${esc(e)}</p>`;
     }
+    return;
+  }
+  if (G.summaryOnly) {
     out.innerHTML = `<div class="search-summary">Paged search for "${esc(q)}"…</div>`;
     switchTabByName('srch-panel');
     try {
@@ -1866,11 +1923,6 @@ window.runDocumentSearch = async function() {
     }
     return;
   }
-  if (!q) {
-    out.innerHTML = '<p class="srch-hint">Enter a query and press Enter.</p>';
-    return;
-  }
-
   let res;
   try {
     res = JSON.parse(window._wasm.search_index(G.bytes, q, 'AUTB'));
@@ -1908,7 +1960,11 @@ async function runVectorDocumentSearch(q, out) {
     if (!Array.isArray(embed.vector)) throw new Error('embedding response missing vector');
     const vector = adaptVectorForIndex(embed.vector);
     out.innerHTML = `<div class="search-summary">Collecting AUTB candidates for "${esc(q)}"…</div>`;
-    const candidates = G.summaryOnly ? await runPagedSearch(q) : parseWasmJson(window._wasm.search_index(G.bytes, q, 'AUTB'), 'search_index');
+    const candidates = G.browserIndexReady
+      ? await searchSelectedIndex(q)
+      : G.summaryOnly
+        ? await runPagedSearch(q)
+        : parseWasmJson(window._wasm.search_index(G.bytes, q, 'AUTB'), 'search_index');
     if (candidates && !Array.isArray(candidates) && candidates.error) throw new Error(candidates.error);
     const res = await rerankCandidatesWithVector(out, q, candidates, vector);
     renderSearchResults(q, res, G.summaryOnly);

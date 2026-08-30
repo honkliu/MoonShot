@@ -3,7 +3,7 @@ use std::collections::HashMap;
 
 use wasm_bindgen::prelude::*;
 
-// Rust/WASM inspection surface for the C++ v19 index format. There is no native
+// Rust/WASM inspection surface for the C++ v20 index format. There is no native
 // C++ peer file; the binary structures below mirror BlockTable.h/IndexSerializer.h.
 
 use crate::block_table::{
@@ -21,9 +21,9 @@ use crate::block_table::{
     DOC_PATH_PREFIX_INVALID,
 };
 use crate::index_context::IndexContext;
-use crate::executor::IndexSearchExecutor;
+use crate::embeddings::VectorMetric;
 use crate::posting_store::PostingStore;
-use crate::serializer::IndexSerializer;
+use crate::index_serializer::IndexSerializer;
 
 #[derive(Clone, PartialEq, Eq)]
 struct VectorCacheKey {
@@ -43,6 +43,8 @@ struct CachedVectorContext {
 
 thread_local! {
     static VECTOR_CONTEXT_CACHE: RefCell<Option<CachedVectorContext>> = RefCell::new(None);
+    #[cfg(target_arch = "wasm32")]
+    static INDEX_CONTEXT: RefCell<Option<IndexContext>> = RefCell::new(None);
 }
 
 #[wasm_bindgen]
@@ -309,12 +311,10 @@ pub fn search_index(data: &[u8], query: &str, streams: &str) -> String {
     if let Err(error) = context.LoadFromBytes(data) {
         return format!(r#"{{"error":"Failed to load index: {error:?}"}}"#);
     }
-    let tree = context.Compile(query, streams);
+    let tree = context.Compile(query, if streams.is_empty() { "AUTB" } else { streams });
     let mut reader = context.GetReader(tree);
     let results = {
-        let store = context.GetStore();
-        let store = store.read().unwrap();
-        let executor = IndexSearchExecutor::new(&store);
+        let executor = context.GetExecutor();
         executor.Execute(reader.as_mut(), 0)
     };
     let mut out = String::from("[");
@@ -332,12 +332,55 @@ pub fn search_index(data: &[u8], query: &str, streams: &str) -> String {
     out
 }
 
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn open_index() -> Result<(), JsValue> {
+    let mut context = IndexContext::with_path_and_load_delta(None, false);
+    context.LoadIndex("browser-file")
+        .map_err(|error| JsValue::from_str(&format!("Failed to load index: {error:?}")))?;
+    INDEX_CONTEXT.with(|cached| *cached.borrow_mut() = Some(context));
+    Ok(())
+}
+
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn search_loaded_index(query: &str, streams: &str) -> String {
+    INDEX_CONTEXT.with(|cached| {
+        let mut cached = cached.borrow_mut();
+        let Some(context) = cached.as_mut() else {
+            return r#"{"error":"Index is not loaded"}"#.to_string();
+        };
+        let tree = context.Compile(query, if streams.is_empty() { "AUTB" } else { streams });
+        let mut reader = context.GetReader(tree);
+        let results = {
+            let executor = context.GetExecutor();
+            executor.Execute(reader.as_mut(), 0)
+        };
+        let mut out = String::from("[");
+        for (index, result) in results.iter().enumerate() {
+            if index > 0 { out.push(','); }
+            let path = context.GetDocPath(result.doc_id);
+            out.push_str(&format!(
+                r#"{{"doc_id":"{}","score":{:.4},"path":{}}}"#,
+                result.doc_id,
+                result.score,
+                serde_json::to_string(&path).unwrap_or_default()
+            ));
+        }
+        out.push(']');
+        out
+    })
+}
+
 #[wasm_bindgen]
 pub fn vector_search_index(data: &[u8], query_vector_json: &str, top_k: usize, ef_search: usize) -> String {
     let query_vector: Vec<f32> = match serde_json::from_str(query_vector_json) {
         Ok(vector) => vector,
         Err(error) => return format!(r#"{{"error":"Invalid query vector: {error}"}}"#),
     };
+    if query_vector.len() != crate::block_table::DOC_VECTOR_DIM {
+        return format!(r#"{{"error":"Invalid query vector dimension: expected {}, got {}"}}"#, crate::block_table::DOC_VECTOR_DIM, query_vector.len());
+    }
     let key = match vector_cache_key(data) {
         Ok(key) => key,
         Err(error) => return format!(r#"{{"error":"Failed to read index header: {error}"}}"#),
@@ -351,7 +394,7 @@ pub fn vector_search_index(data: &[u8], query_vector_json: &str, top_k: usize, e
             *cache = Some(CachedVectorContext { key: key.clone(), context });
         }
         let cached = cache.as_mut().ok_or_else(|| "vector cache unavailable".to_string())?;
-        Ok(cached.context.VectorSearch(&query_vector, top_k.max(1), ef_search.max(top_k.max(1)))
+        Ok(cached.context.VectorSearch(&query_vector, top_k, VectorMetric::Cosine, ef_search.max(if top_k == 0 { 1 } else { top_k }))
             .into_iter()
             .map(|result| {
                 let path = cached.context.GetDocPath(result.doc_id);
@@ -382,6 +425,9 @@ pub fn vector_search_tables(docdata: &[u8], path_prefix_sidecar: &[u8], query_ve
         Ok(vector) => vector,
         Err(error) => return format!(r#"{{"error":"Invalid query vector: {error}"}}"#),
     };
+    if query_vector.len() != crate::block_table::DOC_VECTOR_DIM {
+        return format!(r#"{{"error":"Invalid query vector dimension: expected {}, got {}"}}"#, crate::block_table::DOC_VECTOR_DIM, query_vector.len());
+    }
     let key = VectorCacheKey {
         file_size: docdata.len() + path_prefix_sidecar.len(),
         version: 0,
@@ -389,7 +435,7 @@ pub fn vector_search_tables(docdata: &[u8], path_prefix_sidecar: &[u8], query_ve
         num_terms: 0,
         docdata_off: 0,
         index_block_count: 0,
-        checksum: sampled_checksum(docdata) ^ sampled_checksum(path_prefix_sidecar).rotate_left(1),
+        checksum: content_checksum(docdata) ^ content_checksum(path_prefix_sidecar).rotate_left(1),
     };
     let results = match VECTOR_CONTEXT_CACHE.with(|cache| -> Result<Vec<(u64, f32, String)>, String> {
         let mut cache = cache.borrow_mut();
@@ -400,7 +446,7 @@ pub fn vector_search_tables(docdata: &[u8], path_prefix_sidecar: &[u8], query_ve
             *cache = Some(CachedVectorContext { key: key.clone(), context });
         }
         let cached = cache.as_mut().ok_or_else(|| "vector cache unavailable".to_string())?;
-        Ok(cached.context.VectorSearch(&query_vector, top_k.max(1), ef_search.max(top_k.max(1)))
+        Ok(cached.context.VectorSearch(&query_vector, top_k, VectorMetric::Cosine, ef_search.max(if top_k == 0 { 1 } else { top_k }))
             .into_iter()
             .map(|result| {
                 let path = cached.context.GetDocPath(result.doc_id);
@@ -425,6 +471,50 @@ pub fn vector_search_tables(docdata: &[u8], path_prefix_sidecar: &[u8], query_ve
     out
 }
 
+#[wasm_bindgen]
+pub fn combined_search_index(
+    data: &[u8],
+    query: &str,
+    query_vector_json: &str,
+    streams: &str,
+    top_k: i32,
+    ef_search: usize,
+) -> String {
+    let query_vector: Vec<f32> = match serde_json::from_str(query_vector_json) {
+        Ok(vector) => vector,
+        Err(error) => return format!(r#"{{"error":"Invalid query vector: {error}"}}"#),
+    };
+    if query_vector.len() != crate::block_table::DOC_VECTOR_DIM {
+        return format!(r#"{{"error":"Invalid query vector dimension: expected {}, got {}"}}"#, crate::block_table::DOC_VECTOR_DIM, query_vector.len());
+    }
+    if top_k < 0 {
+        return r#"{"error":"top_k must be zero or positive"}"#.to_string();
+    }
+    let mut context = IndexContext::new();
+    if let Err(error) = context.LoadFromBytes(data) {
+        return format!(r#"{{"error":"Failed to load index: {error:?}"}}"#);
+    }
+    let mut tree = context.Compile(query, if streams.is_empty() { "AUTB" } else { streams });
+    tree.vector_query = query_vector;
+    tree.vector_ef_search = ef_search.max(1);
+    let vector_query = tree.vector_query.clone();
+    let mut reader = context.GetReader(tree);
+    let results = context.GetExecutor().ExecuteWithVector(reader.as_mut(), top_k, Some(&vector_query));
+    let mut out = String::from("[");
+    for (index, result) in results.iter().enumerate() {
+        if index > 0 { out.push(','); }
+        let path = context.GetDocPath(result.doc_id);
+        out.push_str(&format!(
+            r#"{{"doc_id":"{}","score":{:.4},"path":{}}}"#,
+            result.doc_id,
+            result.score,
+            serde_json::to_string(&path).unwrap_or_default()
+        ));
+    }
+    out.push(']');
+    out
+}
+
 fn vector_cache_key(data: &[u8]) -> Result<VectorCacheKey, String> {
     let header = parse_header(data)?;
     Ok(VectorCacheKey {
@@ -434,25 +524,17 @@ fn vector_cache_key(data: &[u8]) -> Result<VectorCacheKey, String> {
         num_terms: header.num_terms,
         docdata_off: header.docdata_off,
         index_block_count: header.index_block_count,
-        checksum: 0,
+        checksum: content_checksum(data),
     })
 }
 
-fn sampled_checksum(data: &[u8]) -> u64 {
+    fn content_checksum(data: &[u8]) -> u64 {
     const FNV_OFFSET: u64 = 0xcbf29ce484222325;
     const FNV_PRIME: u64 = 0x100000001b3;
     let mut hash = FNV_OFFSET ^ data.len() as u64;
-    let head = data.len().min(4096);
-    for byte in &data[..head] {
+    for byte in data {
         hash ^= *byte as u64;
         hash = hash.wrapping_mul(FNV_PRIME);
-    }
-    if data.len() > head {
-        let tail_start = data.len().saturating_sub(4096);
-        for byte in &data[tail_start..] {
-            hash ^= *byte as u64;
-            hash = hash.wrapping_mul(FNV_PRIME);
-        }
     }
     hash
 }

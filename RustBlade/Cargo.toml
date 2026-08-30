@@ -2,7 +2,7 @@
 name = "rustblade"
 version = "0.2.0"
 edition = "2021"
-description = "MoonShot search engine — Rust implementation, v2 block-based index format"
+description = "MoonShot search engine — Rust implementation, v20 block-based index format"
 
 [lib]
 name = "rustblade"
@@ -20,6 +20,7 @@ wasm-bindgen         = { version = "0.2", optional = true }
 js-sys               = { version = "0.3", optional = true }
 serde-wasm-bindgen   = { version = "0.6", optional = true }
 icu_segmenter = "2.2.0"
+unicode-normalization = "0.1"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 mimalloc             = { version = "0.1", default-features = false }

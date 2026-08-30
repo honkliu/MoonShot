@@ -11,6 +11,8 @@ use rustblade::IndexContext;
 struct Options {
     port: u16,
     index_path: String,
+    gbe_host: String,
+    gbe_port: u16,
 }
 
 fn home_dir() -> PathBuf {
@@ -26,7 +28,7 @@ fn default_index_path() -> String {
 }
 
 fn parse_args() -> Result<Options, String> {
-    let mut options = Options { port: 9000, index_path: default_index_path() };
+    let mut options = Options { port: 9000, index_path: default_index_path(), gbe_host: "127.0.0.1".to_string(), gbe_port: 8765 };
     let args: Vec<String> = std::env::args().collect();
     let mut index = 1usize;
     while index < args.len() {
@@ -39,8 +41,17 @@ fn parse_args() -> Result<Options, String> {
                 options.index_path = expand_user_path(&args[index + 1]);
                 index += 2;
             }
+            "--gbe-host" | "--bge-host" if index + 1 < args.len() => {
+                options.gbe_host = args[index + 1].clone();
+                index += 2;
+            }
+            "--gbe-port" | "--bge-port" if index + 1 < args.len() => {
+                options.gbe_port = args[index + 1].parse::<u16>().ok().filter(|value| *value > 0)
+                    .ok_or_else(|| format!("invalid {} value", args[index]))?;
+                index += 2;
+            }
             "--help" | "-h" => {
-                println!("usage: shennong_rs [--port 9000] [--index ~/moon.idx]");
+                println!("usage: shennong [--port 9000] [--index ~/moon.idx] [--gbe-host 127.0.0.1] [--gbe-port 8765]");
                 std::process::exit(0);
             }
             other => return Err(format!("unknown or incomplete argument: {other}")),
@@ -115,18 +126,38 @@ fn query_int(query: &HashMap<String, String>, key: &str, default_value: usize, m
         .clamp(min_value, max_value)
 }
 
+fn parse_vector_param(value: &str) -> Vec<f32> {
+    value.split(',').filter_map(|part| part.parse::<f32>().ok()).collect()
+}
+
+fn embed_text_with_gbe_service(text: &str, host: &str, port: u16) -> Option<Vec<f32>> {
+    if text.is_empty() { return None; }
+    let mut stream = TcpStream::connect((host, port)).ok()?;
+    let payload = &text.as_bytes()[..text.len().min(65_536)];
+    stream.write_all(&(payload.len() as u32).to_le_bytes()).ok()?;
+    stream.write_all(payload).ok()?;
+    let mut dim = [0u8; 4];
+    stream.read_exact(&mut dim).ok()?;
+    if u32::from_le_bytes(dim) as usize != rustblade::block_table::DOC_VECTOR_DIM { return None; }
+    let mut encoded = vec![0; rustblade::block_table::DOC_VECTOR_DIM];
+    stream.read_exact(&mut encoded).ok()?;
+    Some(encoded.into_iter().map(|value| value as i8 as f32 / 128.0).collect())
+}
+
 struct SearchService {
     index_path: String,
+    gbe_host: String,
+    gbe_port: u16,
     context: Mutex<IndexContext>,
 }
 
 impl SearchService {
-    fn new(index_path: String) -> Result<Self, String> {
+    fn new(index_path: String, gbe_host: String, gbe_port: u16) -> Result<Self, String> {
         let mut context = IndexContext::new();
         context.LoadIndex(&index_path).map_err(|error| format!("{error:?}"))?;
         let docs = context.DocumentCount();
         if docs == 0 { return Err(format!("index loaded with zero docs or failed to load: {index_path}")); }
-        Ok(Self { index_path, context: Mutex::new(context) })
+        Ok(Self { index_path, gbe_host, gbe_port, context: Mutex::new(context) })
     }
 
     fn health_json(&self) -> String {
@@ -134,8 +165,8 @@ impl SearchService {
         let documents = context.DocumentCount();
         let avg_doc_len = context.AvgDocLen();
         format!(
-            "{{\"status\":\"ok\",\"index\":\"{}\",\"documents\":{},\"avg_doc_len\":{}}}",
-            json_escape(&self.index_path), documents, avg_doc_len)
+            "{{\"status\":\"ok\",\"index\":\"{}\",\"gbe_host\":\"{}\",\"gbe_port\":{},\"documents\":{},\"avg_doc_len\":{},\"vector_count\":{},\"vector_dim\":{}}}",
+            json_escape(&self.index_path), json_escape(&self.gbe_host), self.gbe_port, documents, avg_doc_len, context.VectorCount(), context.VectorDimension())
     }
 
     fn search_json(&self, params: &HashMap<String, String>) -> (u16, String) {
@@ -144,11 +175,15 @@ impl SearchService {
         let streams = params.get("streams").filter(|value| !value.is_empty()).cloned().unwrap_or_else(|| "AUTB".to_string());
         let offset = query_int(params, "offset", 0, 0, 1_000_000_000);
         let limit = query_int(params, "limit", 20, 1, 1000);
+        let ef_search = query_int(params, "efSearch", 200, 1, 1_000_000);
         let started = Instant::now();
 
+        let vector = embed_text_with_gbe_service(&query, &self.gbe_host, self.gbe_port);
+        let vector_ready = vector.is_some();
         let task = {
             let mut context = self.context.lock().unwrap();
-            context.Enqueue(&query, Vec::new(), &streams, 0)
+            context.EnqueueWithMode(&query, vector.unwrap_or_default(), &streams, 0,
+                rustblade::QueryCompileMode::WeakAndBigramBoostForDoc, ef_search)
         };
         let results = task.Wait();
         let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
@@ -157,8 +192,8 @@ impl SearchService {
         let end = (begin + limit).min(total);
 
         let mut body = format!(
-            "{{\"query\":\"{}\",\"streams\":\"{}\",\"total\":{},\"offset\":{},\"limit\":{},\"elapsed_ms\":{},\"results\":[",
-            json_escape(&query), json_escape(&streams), total, begin, limit, elapsed_ms);
+            "{{\"query\":\"{}\",\"streams\":\"{}\",\"total\":{},\"offset\":{},\"limit\":{},\"elapsed_ms\":{},\"vector_ready\":{},\"results\":[",
+            json_escape(&query), json_escape(&streams), total, begin, limit, elapsed_ms, vector_ready);
         for (rank, result) in results[begin..end].iter().enumerate() {
             if rank > 0 { body.push(','); }
             let path = self.context.lock().unwrap().GetDocPath(result.doc_id);
@@ -173,26 +208,37 @@ impl SearchService {
     #[allow(non_snake_case)]
     fn vector_search_json(&self, params: &HashMap<String, String>) -> (u16, String) {
         let query = params.get("q").cloned().unwrap_or_default();
-        if query.is_empty() { return (400, "{\"error\":\"missing q parameter\"}".to_string()); }
         let offset = query_int(params, "offset", 0, 0, 1_000_000_000);
         let limit = query_int(params, "limit", 20, 1, 1000);
-        let efSearch = query_int(params, "ef", 200, 1, 10_000);
+        let efSearch = query_int(params, "efSearch", 200, 1, 1_000_000);
         let started = Instant::now();
 
-        let mut context = self.context.lock().unwrap();
-        let vectorQuery = context.CompileToVector(&query);
-        let results = context.VectorSearch(&vectorQuery, 0, efSearch);
+        let task = {
+            let mut context = self.context.lock().unwrap();
+            let vectorQuery = if let Some(value) = params.get("vector").filter(|value| !value.is_empty()) {
+                parse_vector_param(value)
+            } else {
+                if query.is_empty() { return (400, "{\"error\":\"missing q or vector parameter\"}".to_string()); }
+                context.CompileToVector(&query)
+            };
+            if vectorQuery.len() != rustblade::block_table::DOC_VECTOR_DIM {
+                return (400, "{\"error\":\"empty query vector\"}".to_string());
+            }
+            context.EnqueueWithMode("", vectorQuery, "AUTB", 0,
+                rustblade::QueryCompileMode::WeakAndBigramBoostForDoc, efSearch)
+        };
+        let results = task.Wait();
         let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
         let total = results.len();
         let begin = offset.min(total);
         let end = (begin + limit).min(total);
 
         let mut body = format!(
-            "{{\"query\":\"{}\",\"total\":{},\"offset\":{},\"limit\":{},\"elapsed_ms\":{},\"results\":[",
-            json_escape(&query), total, begin, limit, elapsed_ms);
+            "{{\"query\":\"{}\",\"vector_dim\":{},\"vector_count\":{},\"efSearch\":{},\"total\":{},\"offset\":{},\"limit\":{},\"elapsed_ms\":{},\"results\":[",
+            json_escape(&query), rustblade::block_table::DOC_VECTOR_DIM, self.context.lock().unwrap().VectorCount(), efSearch, total, begin, limit, elapsed_ms);
         for (rank, result) in results[begin..end].iter().enumerate() {
             if rank > 0 { body.push(','); }
-            let path = context.GetDocPath(result.doc_id);
+            let path = self.context.lock().unwrap().GetDocPath(result.doc_id);
             body.push_str(&format!(
                 "{{\"rank\":{},\"doc_id\":{},\"score\":{},\"path\":\"{}\"}}",
                 begin + rank + 1, result.doc_id, result.score, json_escape(&path)));
@@ -204,7 +250,7 @@ impl SearchService {
 
 fn http_response(status: u16, status_text: &str, body: &str) -> String {
     format!(
-        "HTTP/1.1 {} {}\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, OPTIONS\r\nConnection: Close\r\n\r\n{}",
+        "HTTP/1.1 {} {}\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type\r\nConnection: close\r\n\r\n{}",
         status, status_text, body.as_bytes().len(), body)
 }
 
@@ -226,7 +272,7 @@ fn handle_request(service: &SearchService, request: &str) -> String {
             let (status, body) = service.vector_search_json(&params);
             http_response(status, if status == 200 { "OK" } else { "Bad Request" }, &body)
         },
-        "/" | "/help" => http_response(200, "OK", "{\"service\":\"shennong_rs\",\"endpoints\":[\"/health\",\"/search?q=usage&offset=0&limit=20&streams=AUTB\",\"/vector-search?q=usage&offset=0&limit=20\"]}"),
+        "/" | "/help" => http_response(200, "OK", "{\"service\":\"shennong\",\"endpoints\":[\"/health\",\"/search?q=usage&offset=0&limit=20&streams=AUTB\",\"/vector-search?q=usage&offset=0&limit=20\"]}"),
         _ => http_response(404, "Not Found", "{\"error\":\"not found\"}"),
     }
 }
@@ -253,10 +299,10 @@ fn main() {
         eprintln!("index not found: {}", options.index_path);
         std::process::exit(2);
     }
-    println!("ShenNong Rust HTTP service starting");
+    println!("ShenNong HTTP service starting");
     println!("Index: {}", options.index_path);
     println!("Listen: 0.0.0.0:{}", options.port);
-    let service = match SearchService::new(options.index_path.clone()) {
+    let service = match SearchService::new(options.index_path.clone(), options.gbe_host, options.gbe_port) {
         Ok(service) => service,
         Err(error) => { eprintln!("shennong_rs: {error}"); std::process::exit(1); }
     };

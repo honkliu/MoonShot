@@ -1,7 +1,6 @@
-use rustblade::executor::IndexSearchExecutor;
 use rustblade::index_writer::IndexWriter;
 use rustblade::tokenizer::Tokenizer;
-use rustblade::vector_index::build_hashed_embedding;
+use rustblade::embeddings::build_hashed_embedding;
 use rustblade::{IndexContext, SmartTokenizer};
 
 fn add_doc(ctx: &mut IndexContext, doc_id: u64, title: &str, body: &str) {
@@ -19,11 +18,9 @@ fn add_doc(ctx: &mut IndexContext, doc_id: u64, title: &str, body: &str) {
     writer.SetDocPath(doc_id, format!("doc{doc_id}.txt"));
 }
 
-fn sync_results(ctx: &IndexContext, query: &str) -> Vec<u64> {
+fn sync_results(ctx: &mut IndexContext, query: &str) -> Vec<u64> {
     let mut reader = ctx.GetReaderForQuery(query, "AUTB");
-    let store = ctx.GetStore();
-    let store = store.read().unwrap();
-    let executor = IndexSearchExecutor::new(&store);
+    let executor = ctx.GetExecutor();
     executor.Execute(reader.as_mut(), 10).into_iter().map(|result| result.doc_id).collect()
 }
 
@@ -35,7 +32,7 @@ fn enqueue_matches_sync_search() {
     add_doc(&mut ctx, 2, "Lazy Dog", "the lazy dog sleeps while the fox runs");
     ctx.Build();
 
-    let expected = sync_results(&ctx, "fox lazy");
+    let expected = sync_results(&mut ctx, "fox lazy");
     let actual: Vec<u64> = ctx.Enqueue("fox lazy", Vec::new(), "AUTB", 10)
         .Wait()
         .into_iter()

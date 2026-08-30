@@ -1,10 +1,9 @@
-use rustblade::executor::IndexSearchExecutor;
 use rustblade::index_writer::IndexWriter;
 use rustblade::block_table::INDEX_FILE_HEADER_SIZE;
 use rustblade::posting_store::PostingStore;
-use rustblade::serializer::{IndexFileHeader, IndexSerializer};
+use rustblade::index_serializer::{IndexFileHeader, IndexSerializer};
 use rustblade::tokenizer::Tokenizer;
-use rustblade::vector_index::build_hashed_embedding;
+use rustblade::embeddings::build_hashed_embedding;
 use rustblade::{Document, IndexContext, SmartTokenizer};
 use std::fs::File;
 use std::io::Read;
@@ -48,9 +47,7 @@ fn add_doc_via_context(ctx: &mut IndexContext, doc_id: u64, title: &str, body: &
 
 fn search_doc_ids(ctx: &mut IndexContext, query: &str) -> Vec<u64> {
     let mut reader = ctx.GetReaderForQuery(query, "AUTB");
-    let store = ctx.GetStore();
-    let store = store.read().unwrap();
-    let executor = IndexSearchExecutor::new(&store);
+    let executor = ctx.GetExecutor();
     executor.Execute(reader.as_mut(), 0).into_iter().map(|result| result.doc_id).collect()
 }
 
@@ -62,7 +59,7 @@ fn read_header(path: &std::path::Path) -> IndexFileHeader {
 }
 
 #[test]
-fn build_blocks_does_not_emit_term_mphf_for_v19_indexes() {
+fn build_blocks_does_not_emit_term_mphf_without_an_enabled_mphf() {
     let mut store = PostingStore::new();
     let mut terms = vec!["t28".to_string(), "t66".to_string()];
     let mut suffix = 0;
@@ -99,6 +96,8 @@ fn merge_base_and_delta_indexes() {
 
     let mut merge = IndexContext::with_path(Some(base_path_text.clone()));
     merge.Merge(&base_path_text).unwrap();
+    assert_eq!(merge.DocumentCount(), 0);
+    assert!(!merge.HasDelta());
 
     let mut merged = IndexContext::with_path(Some(base_path_text));
     assert_eq!(merged.DocumentCount(), 2);
@@ -180,9 +179,7 @@ fn title_score_uses_title_length_instead_of_body_length() {
     let token = ctx.GetTokenizer().Tokenize("needle").into_iter().next().unwrap();
     let stream_key = format!("{token}T");
     let mut reader = ctx.GetStreamReader(&stream_key);
-    let store = ctx.GetStore();
-    let store = store.read().unwrap();
-    let executor = IndexSearchExecutor::new(&store);
+    let executor = ctx.GetExecutor();
     let results = executor.Execute(reader.as_mut(), 0);
     let short_score = results.iter().find(|result| result.doc_id == 0).unwrap().score;
     let long_score = results.iter().find(|result| result.doc_id == 1).unwrap().score;

@@ -1,6 +1,9 @@
-use std::collections::HashMap;
+use std::collections::{hash_map::DefaultHasher, HashMap};
+use std::hash::BuildHasherDefault;
 
 use crate::block_table::DOC_VECTOR_DIM;
+
+pub type StableHashMap<K, V> = HashMap<K, V, BuildHasherDefault<DefaultHasher>>;
 
 #[derive(Clone, Debug)]
 pub struct IndexEntry {
@@ -61,9 +64,9 @@ pub struct DocStats {
 #[allow(non_snake_case)]
 #[derive(Debug, Default)]
 pub struct PostingStore {
-    m_Postings:    HashMap<String, PostingList>,
-    m_DocStats:   HashMap<u64, DocStats>,
-    m_DocVectors: HashMap<u64, [i8; DOC_VECTOR_DIM]>,
+    m_Postings:    StableHashMap<String, PostingList>,
+    m_DocStats:   StableHashMap<u64, DocStats>,
+    m_DocVectors: StableHashMap<u64, [i8; DOC_VECTOR_DIM]>,
     m_TotalTerms: u64,
     m_PostingEntries: u64,
 }
@@ -157,6 +160,7 @@ impl PostingStore {
 
     #[allow(non_snake_case)]
     pub fn SetDocVectorBytes(&mut self, doc_id: u64, vector: &[u8]) -> bool {
+        if vector.len() < DOC_VECTOR_DIM { return false; }
         self.m_DocStats.entry(doc_id).or_default();
         let mut bytes = [0i8; DOC_VECTOR_DIM];
         for i in 0..DOC_VECTOR_DIM {
@@ -203,6 +207,19 @@ impl PostingStore {
             _ => 0,
         };
         if stream_len > 0 { stream_len } else { doc_len }
+    }
+
+    #[allow(non_snake_case)]
+    pub fn GetRawStreamLen(&self, doc_id: u64, stream: char) -> u32 {
+        let Some(stats) = self.m_DocStats.get(&doc_id) else { return 0; };
+        match stream {
+            'T' => stats.title_len,
+            'B' => stats.body_len,
+            'U' => stats.url_len,
+            'A' => stats.anchor_len,
+            'M' => stats.meta_len,
+            _ => 0,
+        }
     }
 
     #[allow(non_snake_case)]
@@ -255,17 +272,17 @@ impl PostingStore {
     }
 
     #[allow(non_snake_case)]
-    pub fn AllPostings(&self) -> &HashMap<String, PostingList> {
+    pub fn AllPostings(&self) -> &StableHashMap<String, PostingList> {
         &self.m_Postings
     }
 
     #[allow(non_snake_case)]
-    pub fn AllPostingsMut(&mut self) -> &mut HashMap<String, PostingList> {
+    pub fn AllPostingsMut(&mut self) -> &mut StableHashMap<String, PostingList> {
         &mut self.m_Postings
     }
 
     #[allow(non_snake_case)]
-    pub fn AllDocStats(&self) -> &HashMap<u64, DocStats> {
+    pub fn AllDocStats(&self) -> &StableHashMap<u64, DocStats> {
         &self.m_DocStats
     }
 }
