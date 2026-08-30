@@ -4,59 +4,125 @@
 #  endif
 #  include <winsock2.h>
 #  include <ws2tcpip.h>
+#else
+#  include <arpa/inet.h>
+#  include <cerrno>
+#  include <fcntl.h>
+#  include <netinet/in.h>
+#  include <sys/socket.h>
+#  include <unistd.h>
 #endif
 
-#include "IndexContext.h"
+#include "moonshot.h"
+
+#include <httplib.h>
+#include <nlohmann/json.hpp>
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
-#include <climits>
-#include <cctype>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
-#include <cstring>
 #include <filesystem>
 #include <iostream>
-#include <memory>
-#include <mutex>
-#include <sstream>
+#include <limits>
+#include <optional>
+#include <stdexcept>
 #include <string>
-#include <thread>
-#include <unordered_map>
+#include <string_view>
+#include <utility>
 #include <vector>
+
+namespace {
+
+using json = nlohmann::json;
 
 #ifdef _WIN32
 using socket_t = SOCKET;
 static constexpr socket_t INVALID_SOCKET_FD = INVALID_SOCKET;
 #else
-#  include <arpa/inet.h>
-#  include <netdb.h>
-#  include <netinet/in.h>
-#  include <sys/socket.h>
-#  include <unistd.h>
 using socket_t = int;
 static constexpr socket_t INVALID_SOCKET_FD = -1;
 #endif
 
-namespace {
+static constexpr size_t MAX_REQUEST_BYTES = 2 * 1024 * 1024;
+static constexpr size_t MAX_RESULT_WINDOW = 1000;
+static constexpr size_t MAX_PAGE_SIZE = 100;
+static constexpr size_t MAX_EF_SEARCH = 1000000;
+static constexpr size_t BGE_MAX_TEXT_BYTES = 65536;
+static constexpr long BGE_TIMEOUT_MS = 2000;
 
 struct Options {
-    uint16_t port = 9000;
-    std::string index_path;
-    std::string gbe_host = "127.0.0.1";
-    uint16_t gbe_port = 8765;
+    uint16_t Port = 9000;
+    std::string IndexPath;
+    std::string BgeHost = "127.0.0.1";
+    uint16_t BgePort = 8765;
 };
 
-static constexpr size_t GBE_MAX_TEXT_BYTES = 65536;
-
-struct ParsedRequest {
-    std::string method;
-    std::string path;
-    std::unordered_map<std::string, std::string> query;
+enum class SearchMode {
+    Text,
+    Vector,
+    Hybrid,
 };
 
-static std::string home_dir()
+struct SearchRequest {
+    SearchMode Mode = SearchMode::Text;
+    std::string Query;
+    std::vector<float> Vector;
+    std::string Streams = "AUTB";
+    size_t Offset = 0;
+    size_t Limit = 20;
+    size_t EfSearch = 0;
+};
+
+struct SearchHit {
+    size_t Rank = 0;
+    uint64_t DocumentId = 0;
+    float Score = 0.0f;
+    std::string Path;
+};
+
+struct SearchResponse {
+    SearchMode Mode = SearchMode::Text;
+    double TookMs = 0.0;
+    size_t Offset = 0;
+    size_t Limit = 0;
+    bool HasMore = false;
+    std::vector<SearchHit> Results;
+};
+
+class ApiError : public std::runtime_error {
+public:
+    ApiError(int status, std::string code, std::string message)
+        : std::runtime_error(std::move(message))
+        , Status(status)
+        , Code(std::move(code))
+    {}
+
+    int Status;
+    std::string Code;
+};
+
+#ifdef _WIN32
+class SocketRuntime {
+public:
+    SocketRuntime()
+    {
+        WSADATA data{};
+        if (WSAStartup(MAKEWORD(2, 2), &data) != 0)
+            throw std::runtime_error("WSAStartup failed");
+    }
+
+    ~SocketRuntime()
+    {
+        WSACleanup();
+    }
+};
+#endif
+
+static std::string HomeDirectory()
 {
 #ifdef _WIN32
     const char* home = std::getenv("USERPROFILE");
@@ -67,51 +133,47 @@ static std::string home_dir()
 #endif
 }
 
-static std::string default_index_path()
+static std::string DefaultIndexPath()
 {
-    return (std::filesystem::path(home_dir()) / "moon.idx").string();
+    return (std::filesystem::path(HomeDirectory()) / "moon.idx").string();
 }
 
-static std::string expand_user_path(const std::string& path)
+static std::string ExpandUserPath(const std::string& path)
 {
-    if (path == "~") return home_dir();
-    if (path.rfind("~/", 0) == 0 || path.rfind("~\\", 0) == 0) {
-        return (std::filesystem::path(home_dir()) / path.substr(2)).string();
-    }
+    if (path == "~")
+        return HomeDirectory();
+    if (path.starts_with("~/") || path.starts_with("~\\"))
+        return (std::filesystem::path(HomeDirectory()) / path.substr(2)).string();
     return path;
 }
 
-static bool parse_port(const std::string& value, uint16_t& port)
+static uint16_t ParsePort(const std::string& value, std::string_view option)
 {
-    if (value.empty()) return false;
     char* end = nullptr;
-    long parsed = std::strtol(value.c_str(), &end, 10);
-    if (!end || *end != '\0' || parsed < 1 || parsed > 65535) return false;
-    port = static_cast<uint16_t>(parsed);
-    return true;
+    const long parsed = std::strtol(value.c_str(), &end, 10);
+    if (value.empty() || !end || *end != '\0' || parsed < 1 || parsed > 65535)
+        throw std::runtime_error("invalid " + std::string(option) + " value");
+    return static_cast<uint16_t>(parsed);
 }
 
-static Options parse_args(int argc, char** argv)
+static Options ParseArguments(int argc, char** argv)
 {
     Options options;
-    options.index_path = default_index_path();
+    options.IndexPath = DefaultIndexPath();
 
     for (int i = 1; i < argc; ++i) {
-        std::string arg = argv[i];
+        const std::string arg = argv[i];
         if (arg == "--port" && i + 1 < argc) {
-            if (!parse_port(argv[++i], options.port)) {
-                throw std::runtime_error("invalid --port value");
-            }
+            options.Port = ParsePort(argv[++i], arg);
         } else if (arg == "--index" && i + 1 < argc) {
-            options.index_path = expand_user_path(argv[++i]);
-        } else if ((arg == "--gbe-host" || arg == "--bge-host") && i + 1 < argc) {
-            options.gbe_host = argv[++i];
-        } else if ((arg == "--gbe-port" || arg == "--bge-port") && i + 1 < argc) {
-            if (!parse_port(argv[++i], options.gbe_port)) {
-                throw std::runtime_error("invalid " + arg + " value");
-            }
+            options.IndexPath = ExpandUserPath(argv[++i]);
+        } else if ((arg == "--bge-host" || arg == "--gbe-host") && i + 1 < argc) {
+            options.BgeHost = argv[++i];
+        } else if ((arg == "--bge-port" || arg == "--gbe-port") && i + 1 < argc) {
+            options.BgePort = ParsePort(argv[++i], arg);
         } else if (arg == "--help" || arg == "-h") {
-            std::cout << "usage: shennong [--port 9000] [--index ~/moon.idx] [--gbe-host 127.0.0.1] [--gbe-port 8765]\n";
+            std::cout << "usage: shennong [--port 9000] [--index ~/moon.idx] "
+                         "[--bge-host 127.0.0.1] [--bge-port 8765]\n";
             std::exit(0);
         } else {
             throw std::runtime_error("unknown or incomplete argument: " + arg);
@@ -121,500 +183,566 @@ static Options parse_args(int argc, char** argv)
     return options;
 }
 
-static std::string url_decode(const std::string& input)
+using EmbeddingDeadline = std::chrono::steady_clock::time_point;
+
+static void CloseSocket(socket_t socket)
 {
-    std::string out;
-    out.reserve(input.size());
-    for (size_t i = 0; i < input.size(); ++i) {
-        if (input[i] == '+') {
-            out.push_back(' ');
-        } else if (input[i] == '%' && i + 2 < input.size()) {
-            const auto hex = input.substr(i + 1, 2);
-            char* end = nullptr;
-            long value = std::strtol(hex.c_str(), &end, 16);
-            if (end && *end == '\0') {
-                out.push_back(static_cast<char>(value));
-                i += 2;
-            } else {
-                out.push_back(input[i]);
-            }
-        } else {
-            out.push_back(input[i]);
+#ifdef _WIN32
+    closesocket(socket);
+#else
+    close(socket);
+#endif
+}
+
+static bool WouldBlock()
+{
+#ifdef _WIN32
+    const int error = WSAGetLastError();
+    return error == WSAEWOULDBLOCK || error == WSAEINPROGRESS;
+#else
+    return errno == EAGAIN || errno == EWOULDBLOCK || errno == EINPROGRESS;
+#endif
+}
+
+static bool WaitForSocket(socket_t socket, bool writable, EmbeddingDeadline deadline)
+{
+    const auto remaining = std::chrono::duration_cast<std::chrono::microseconds>(
+        deadline - std::chrono::steady_clock::now());
+    if (remaining <= std::chrono::microseconds::zero())
+        return false;
+
+    fd_set descriptors;
+    FD_ZERO(&descriptors);
+    FD_SET(socket, &descriptors);
+    timeval timeout{
+        static_cast<long>(remaining.count() / 1000000),
+        static_cast<long>(remaining.count() % 1000000),
+    };
+    return select(static_cast<int>(socket + 1),
+                  writable ? nullptr : &descriptors,
+                  writable ? &descriptors : nullptr,
+                  nullptr,
+                  &timeout) > 0;
+}
+
+static bool SendAll(socket_t socket,
+                    const void* data,
+                    size_t length,
+                    EmbeddingDeadline deadline)
+{
+    const char* current = static_cast<const char*>(data);
+    while (length > 0) {
+        if (!WaitForSocket(socket, true, deadline))
+            return false;
+#ifdef _WIN32
+        const int sent = send(socket, current,
+                              static_cast<int>(std::min<size_t>(length, 64 * 1024)), 0);
+#else
+    const ssize_t sent = send(socket, current, length, MSG_NOSIGNAL);
+#endif
+    if (sent < 0 && WouldBlock())
+        continue;
+        if (sent <= 0)
+            return false;
+        current += sent;
+        length -= static_cast<size_t>(sent);
+    }
+    return true;
+}
+
+static bool ConnectWithTimeout(socket_t socket,
+                               const sockaddr* address,
+                               socklen_t addressLength,
+                               EmbeddingDeadline deadline)
+{
+#ifdef _WIN32
+    u_long nonBlocking = 1;
+    if (ioctlsocket(socket, FIONBIO, &nonBlocking) != 0)
+        return false;
+#else
+    const int flags = fcntl(socket, F_GETFL, 0);
+    if (flags < 0 || fcntl(socket, F_SETFL, flags | O_NONBLOCK) != 0)
+        return false;
+#endif
+
+    const int result = connect(socket, address, addressLength);
+    if (result != 0) {
+#ifdef _WIN32
+        const int error = WSAGetLastError();
+        if (error != WSAEWOULDBLOCK && error != WSAEINPROGRESS)
+            return false;
+#else
+        if (errno != EINPROGRESS)
+            return false;
+#endif
+
+        if (!WaitForSocket(socket, true, deadline))
+            return false;
+
+        int socketError = 0;
+        socklen_t errorLength = sizeof(socketError);
+        if (getsockopt(socket, SOL_SOCKET, SO_ERROR,
+                       reinterpret_cast<char*>(&socketError), &errorLength) != 0
+            || socketError != 0) {
+            return false;
         }
     }
-    return out;
+
+    return true;
 }
 
-static std::unordered_map<std::string, std::string> parse_query(const std::string& query)
+static bool ReceiveAll(socket_t socket,
+                       void* data,
+                       size_t length,
+                       EmbeddingDeadline deadline)
 {
-    std::unordered_map<std::string, std::string> values;
-    size_t start = 0;
-    while (start <= query.size()) {
-        size_t amp = query.find('&', start);
-        std::string part = query.substr(start, amp == std::string::npos ? std::string::npos : amp - start);
-        if (!part.empty()) {
-            size_t eq = part.find('=');
-            std::string key = url_decode(part.substr(0, eq));
-            std::string value = eq == std::string::npos ? "" : url_decode(part.substr(eq + 1));
-            values[std::move(key)] = std::move(value);
-        }
-        if (amp == std::string::npos) break;
-        start = amp + 1;
+    char* current = static_cast<char*>(data);
+    while (length > 0) {
+        if (!WaitForSocket(socket, false, deadline))
+            return false;
+#ifdef _WIN32
+        const int received = recv(socket, current,
+                                  static_cast<int>(std::min<size_t>(length, 64 * 1024)), 0);
+#else
+        const ssize_t received = recv(socket, current, length, 0);
+#endif
+    if (received < 0 && WouldBlock())
+        continue;
+        if (received <= 0)
+            return false;
+        current += received;
+        length -= static_cast<size_t>(received);
     }
-    return values;
+    return true;
 }
 
-static ParsedRequest parse_http_request(const std::string& request)
-{
-    std::istringstream in(request);
-    std::string target;
-    std::string version;
-    ParsedRequest parsed;
-    in >> parsed.method >> target >> version;
-
-    size_t question = target.find('?');
-    parsed.path = question == std::string::npos ? target : target.substr(0, question);
-    if (question != std::string::npos) parsed.query = parse_query(target.substr(question + 1));
-    return parsed;
-}
-
-static std::string json_escape(const std::string& input)
-{
-    std::string out;
-    out.reserve(input.size() + 8);
-    for (unsigned char ch : input) {
-        switch (ch) {
-        case '\\': out += "\\\\"; break;
-        case '"': out += "\\\""; break;
-        case '\b': out += "\\b"; break;
-        case '\f': out += "\\f"; break;
-        case '\n': out += "\\n"; break;
-        case '\r': out += "\\r"; break;
-        case '\t': out += "\\t"; break;
-        default:
-            if (ch < 0x20) {
-                static const char* digits = "0123456789abcdef";
-                out += "\\u00";
-                out.push_back(digits[(ch >> 4) & 0x0f]);
-                out.push_back(digits[ch & 0x0f]);
-            } else {
-                out.push_back(static_cast<char>(ch));
-            }
-        }
+class BgeEmbeddingClient {
+public:
+    BgeEmbeddingClient(std::string host, uint16_t port)
+        : m_Host(std::move(host))
+        , m_Port(port)
+    {
+        m_Address.sin_family = AF_INET;
+        m_Address.sin_port = htons(m_Port);
+        if (inet_pton(AF_INET, m_Host.c_str(), &m_Address.sin_addr) != 1)
+            throw std::runtime_error("--bge-host must be a numeric IPv4 address");
     }
-    return out;
+
+    std::optional<std::vector<float>> Embed(std::string_view text) const
+    {
+        if (text.empty() || text.size() > BGE_MAX_TEXT_BYTES)
+            return std::nullopt;
+
+        const EmbeddingDeadline deadline = std::chrono::steady_clock::now()
+            + std::chrono::milliseconds(BGE_TIMEOUT_MS);
+        const socket_t socket = ::socket(AF_INET, SOCK_STREAM, 0);
+        if (socket == INVALID_SOCKET_FD)
+            return std::nullopt;
+        if (!ConnectWithTimeout(socket,
+                                reinterpret_cast<const sockaddr*>(&m_Address),
+                                sizeof(m_Address),
+                                deadline)) {
+            CloseSocket(socket);
+            return std::nullopt;
+        }
+
+        const size_t payloadSize = text.size();
+        const uint32_t length = static_cast<uint32_t>(payloadSize);
+        uint32_t dimension = 0;
+        std::array<int8_t, DOC_VECTOR_DIM> encoded{};
+        const bool success = SendAll(socket, &length, sizeof(length), deadline)
+            && SendAll(socket, text.data(), payloadSize, deadline)
+            && ReceiveAll(socket, &dimension, sizeof(dimension), deadline)
+            && dimension == DOC_VECTOR_DIM
+            && ReceiveAll(socket, encoded.data(), encoded.size(), deadline);
+        CloseSocket(socket);
+
+        if (!success)
+            return std::nullopt;
+
+        std::vector<float> vector(DOC_VECTOR_DIM);
+        for (size_t i = 0; i < vector.size(); ++i)
+            vector[i] = static_cast<float>(encoded[i]) / 128.0f;
+        return vector;
+    }
+
+    const std::string& Host() const { return m_Host; }
+    uint16_t Port() const { return m_Port; }
+
+private:
+    std::string m_Host;
+    uint16_t m_Port;
+    sockaddr_in m_Address{};
+};
+
+static std::string_view SearchModeName(SearchMode mode)
+{
+    switch (mode) {
+    case SearchMode::Text: return "text";
+    case SearchMode::Vector: return "vector";
+    case SearchMode::Hybrid: return "hybrid";
+    }
+    return "unknown";
 }
 
-static int query_int(const std::unordered_map<std::string, std::string>& query,
-                     const std::string& key,
-                     int default_value,
-                     int min_value,
-                     int max_value)
+static SearchMode ParseSearchMode(const json& body)
 {
-    auto it = query.find(key);
-    if (it == query.end()) return default_value;
-    char* end = nullptr;
-    long value = std::strtol(it->second.c_str(), &end, 10);
-    if (!end || *end != '\0') return default_value;
-    value = std::max<long>(min_value, std::min<long>(max_value, value));
-    return static_cast<int>(value);
+    if (!body.contains("mode") || !body["mode"].is_string())
+        throw ApiError(422, "invalid_mode", "mode must be text, vector, or hybrid");
+
+    const std::string mode = body["mode"].get<std::string>();
+    if (mode == "text")
+        return SearchMode::Text;
+    if (mode == "vector")
+        return SearchMode::Vector;
+    if (mode == "hybrid")
+        return SearchMode::Hybrid;
+    throw ApiError(422, "invalid_mode", "mode must be text, vector, or hybrid");
 }
 
-static std::vector<float> parse_vector_param(const std::string& value)
+static size_t ReadSize(const json& body,
+                       std::string_view name,
+                       size_t defaultValue,
+                       size_t minimum,
+                       size_t maximum)
 {
+    if (!body.contains(name))
+        return defaultValue;
+
+    const json& value = body.at(name);
+    uint64_t parsed = 0;
+    if (value.is_number_unsigned()) {
+        parsed = value.get<uint64_t>();
+    } else if (value.is_number_integer()) {
+        const int64_t signedValue = value.get<int64_t>();
+        if (signedValue < 0)
+            throw ApiError(422, "invalid_pagination", std::string(name) + " is out of range");
+        parsed = static_cast<uint64_t>(signedValue);
+    } else {
+        throw ApiError(422, "invalid_pagination", std::string(name) + " must be an integer");
+    }
+
+    if (parsed < minimum || parsed > maximum)
+        throw ApiError(422, "invalid_pagination", std::string(name) + " is out of range");
+    return static_cast<size_t>(parsed);
+}
+
+static std::string ParseFields(const json& body)
+{
+    if (!body.contains("fields"))
+        return "AUTB";
+    if (!body["fields"].is_array() || body["fields"].empty())
+        throw ApiError(422, "invalid_fields", "fields must be a non-empty array");
+
+    std::string streams;
+    for (const json& fieldValue : body["fields"]) {
+        if (!fieldValue.is_string())
+            throw ApiError(422, "invalid_fields", "every field must be a string");
+
+        const std::string field = fieldValue.get<std::string>();
+        char stream = '\0';
+        if (field == "anchor") stream = 'A';
+        else if (field == "url") stream = 'U';
+        else if (field == "title") stream = 'T';
+        else if (field == "body") stream = 'B';
+        else if (field == "meta") stream = 'M';
+        else throw ApiError(422, "invalid_fields", "unknown search field: " + field);
+
+        if (streams.find(stream) == std::string::npos)
+            streams.push_back(stream);
+    }
+    return streams;
+}
+
+static std::vector<float> ParseVector(const json& body)
+{
+    if (!body.contains("vector"))
+        return {};
+    if (!body["vector"].is_array() || body["vector"].empty())
+        throw ApiError(422, "invalid_vector", "vector must be a non-empty array");
+
     std::vector<float> vector;
-    size_t start = 0;
-    while (start <= value.size()) {
-        size_t comma = value.find(',', start);
-        std::string part = value.substr(start, comma == std::string::npos ? std::string::npos : comma - start);
-        if (!part.empty()) {
-            char* end = nullptr;
-            float parsed = std::strtof(part.c_str(), &end);
-            if (end && *end == '\0') vector.push_back(parsed);
+    vector.reserve(body["vector"].size());
+    for (const json& component : body["vector"]) {
+        if (!component.is_number())
+            throw ApiError(422, "invalid_vector", "every vector component must be numeric");
+        const double value = component.get<double>();
+        if (!std::isfinite(value)
+            || std::abs(value) > static_cast<double>(std::numeric_limits<float>::max())) {
+            throw ApiError(422, "invalid_vector", "every vector component must be finite");
         }
-        if (comma == std::string::npos) break;
-        start = comma + 1;
+        vector.push_back(static_cast<float>(value));
     }
     return vector;
 }
 
-static void close_socket(socket_t fd)
+static SearchRequest ParseSearchRequest(const json& body)
 {
-#ifdef _WIN32
-    closesocket(fd);
-#else
-    close(fd);
-#endif
-}
+    if (!body.is_object())
+        throw ApiError(400, "invalid_request", "request body must be a JSON object");
 
-static bool send_all(socket_t fd, const std::string& data)
-{
-    const char* ptr = data.data();
-    size_t remaining = data.size();
-    while (remaining > 0) {
-#ifdef _WIN32
-        int sent = send(fd, ptr, static_cast<int>(std::min<size_t>(remaining, 64 * 1024)), 0);
-#else
-        ssize_t sent = send(fd, ptr, remaining, 0);
-#endif
-        if (sent <= 0) return false;
-        ptr += sent;
-        remaining -= static_cast<size_t>(sent);
+    static constexpr std::array<std::string_view, 7> allowedFields{
+        "mode", "query", "vector", "fields", "offset", "limit", "ef_search"
+    };
+    for (const auto& [name, _] : body.items()) {
+        if (std::find(allowedFields.begin(), allowedFields.end(), name) == allowedFields.end())
+            throw ApiError(400, "unknown_property", "unknown request property: " + name);
     }
-    return true;
-}
 
-static bool send_all_bytes(socket_t fd, const char* data, size_t bytes)
-{
-    const char* ptr = data;
-    size_t remaining = bytes;
-    while (remaining > 0) {
-#ifdef _WIN32
-        int sent = send(fd, ptr, static_cast<int>(std::min<size_t>(remaining, 64 * 1024)), 0);
-#else
-        ssize_t sent = send(fd, ptr, remaining, 0);
-#endif
-        if (sent <= 0) return false;
-        ptr += sent;
-        remaining -= static_cast<size_t>(sent);
+    SearchRequest request;
+    request.Mode = ParseSearchMode(body);
+    if (body.contains("query")) {
+        if (!body["query"].is_string())
+            throw ApiError(422, "invalid_query", "query must be a string");
+        request.Query = body["query"].get<std::string>();
     }
-    return true;
-}
+    request.Vector = ParseVector(body);
+    request.Offset = ReadSize(body, "offset", 0, 0, MAX_RESULT_WINDOW - 1);
+    request.Limit = ReadSize(body, "limit", 20, 1, MAX_PAGE_SIZE);
+    if (request.Offset + request.Limit > MAX_RESULT_WINDOW)
+        throw ApiError(422, "invalid_pagination", "offset plus limit must not exceed 1000");
 
-static bool recv_all_bytes(socket_t fd, char* data, size_t bytes)
-{
-    char* ptr = data;
-    size_t remaining = bytes;
-    while (remaining > 0) {
-#ifdef _WIN32
-        int got = recv(fd, ptr, static_cast<int>(std::min<size_t>(remaining, 64 * 1024)), 0);
-#else
-        ssize_t got = recv(fd, ptr, remaining, 0);
-#endif
-        if (got <= 0) return false;
-        ptr += got;
-        remaining -= static_cast<size_t>(got);
+    const bool hasQuery = !request.Query.empty();
+    const bool hasVector = !request.Vector.empty();
+    const bool hasFields = body.contains("fields");
+    const bool hasEfSearch = body.contains("ef_search");
+
+    switch (request.Mode) {
+    case SearchMode::Text:
+        if (!hasQuery || hasVector)
+            throw ApiError(422, "invalid_text_request", "text mode requires query and rejects vector");
+        if (hasEfSearch)
+            throw ApiError(422, "invalid_text_request", "ef_search is only valid in vector mode");
+        request.Streams = ParseFields(body);
+        break;
+
+    case SearchMode::Vector:
+        if (hasQuery == hasVector)
+            throw ApiError(422, "invalid_vector_request", "vector mode requires exactly one of query or vector");
+        if (hasFields)
+            throw ApiError(422, "invalid_vector_request", "fields are not valid in vector mode");
+        request.EfSearch = ReadSize(body, "ef_search",
+                                    std::max<size_t>(200, request.Offset + request.Limit + 1),
+                                    1, MAX_EF_SEARCH);
+        if (request.EfSearch < request.Offset + request.Limit + 1)
+            throw ApiError(422, "invalid_ef_search", "ef_search must cover the requested result window");
+        break;
+
+    case SearchMode::Hybrid:
+        if (!hasQuery)
+            throw ApiError(422, "invalid_hybrid_request", "hybrid mode requires query");
+        if (hasEfSearch)
+            throw ApiError(422, "invalid_hybrid_request", "ef_search does not affect current hybrid retrieval");
+        request.Streams = ParseFields(body);
+        break;
     }
-    return true;
-}
 
-static bool embed_text_with_gbe_service(const std::string& text,
-                                        const std::string& host,
-                                        uint16_t port,
-                                        std::vector<float>& vector)
-{
-    if (text.empty()) return false;
-
-    addrinfo hints{};
-    hints.ai_family = AF_INET;
-    hints.ai_socktype = SOCK_STREAM;
-    addrinfo* resolved = nullptr;
-    const std::string portText = std::to_string(port);
-    if (getaddrinfo(host.c_str(), portText.c_str(), &hints, &resolved) != 0 || !resolved)
-        return false;
-
-    socket_t fd = INVALID_SOCKET_FD;
-    for (addrinfo* cur = resolved; cur; cur = cur->ai_next) {
-        socket_t candidate = socket(cur->ai_family, cur->ai_socktype, cur->ai_protocol);
-        if (candidate == INVALID_SOCKET_FD) continue;
-        if (connect(candidate, cur->ai_addr, static_cast<int>(cur->ai_addrlen)) == 0) {
-            fd = candidate;
-            break;
-        }
-        close_socket(candidate);
-    }
-    freeaddrinfo(resolved);
-    if (fd == INVALID_SOCKET_FD) return false;
-
-    std::string payload = text;
-    if (payload.size() > GBE_MAX_TEXT_BYTES)
-        payload.resize(GBE_MAX_TEXT_BYTES);
-
-    const uint32_t length = static_cast<uint32_t>(payload.size());
-    uint32_t dim = 0;
-    std::array<int8_t, DOC_VECTOR_DIM> response{};
-    const bool ok = send_all_bytes(fd, reinterpret_cast<const char*>(&length), sizeof(length))
-        && send_all_bytes(fd, payload.data(), payload.size())
-        && recv_all_bytes(fd, reinterpret_cast<char*>(&dim), sizeof(dim))
-        && dim == DOC_VECTOR_DIM
-        && recv_all_bytes(fd, reinterpret_cast<char*>(response.data()), response.size());
-    close_socket(fd);
-    if (!ok) return false;
-
-    vector.assign(DOC_VECTOR_DIM, 0.0f);
-    for (size_t i = 0; i < DOC_VECTOR_DIM; ++i)
-        vector[i] = static_cast<float>(response[i]) / 128.0f;
-    return true;
-}
-
-static std::string http_response(int status, const std::string& status_text,
-                                 const std::string& body,
-                                 const std::string& content_type = "application/json; charset=utf-8")
-{
-    std::ostringstream out;
-    out << "HTTP/1.1 " << status << ' ' << status_text << "\r\n"
-        << "Content-Type: " << content_type << "\r\n"
-        << "Content-Length: " << body.size() << "\r\n"
-        << "Access-Control-Allow-Origin: *\r\n"
-        << "Access-Control-Allow-Methods: GET, OPTIONS\r\n"
-        << "Access-Control-Allow-Headers: Content-Type\r\n"
-        << "Connection: close\r\n\r\n"
-        << body;
-    return out.str();
+    return request;
 }
 
 class SearchService {
 public:
-    explicit SearchService(std::string index_path, std::string gbe_host, uint16_t gbe_port)
-        : m_IndexPath(std::move(index_path))
-        , m_GbeHost(std::move(gbe_host))
-        , m_GbePort(gbe_port)
+    SearchService(std::string indexPath, std::string bgeHost, uint16_t bgePort)
+        : m_IndexPath(std::move(indexPath))
+        , m_Embedding(std::move(bgeHost), bgePort)
         , m_Context("", m_IndexPath.c_str())
     {
-        if (m_Context.DocumentCount() == 0) {
-            throw std::runtime_error("index loaded with zero docs or failed to load: " + m_IndexPath);
-        }
+        if (m_Context.DocumentCount() == 0)
+            throw std::runtime_error("index loaded with zero documents: " + m_IndexPath);
     }
 
-    std::string health_json()
+    SearchResponse Search(SearchRequest request)
     {
-        std::ostringstream out;
-        const IndexFileHeader& header = m_Context.GetIndexFileHeader();
-        out << "{\"status\":\"ok\",\"index\":\"" << json_escape(m_IndexPath) << "\""
-            << ",\"gbe_host\":\"" << json_escape(m_GbeHost) << "\""
-            << ",\"gbe_port\":" << m_GbePort
-            << ",\"documents\":" << header.IFH_NumDocuments
-            << ",\"avg_doc_len\":" << header.IFH_AvgDocLength
-            << ",\"vector_count\":" << m_Context.VectorCount()
-            << ",\"vector_dim\":" << m_Context.VectorDimension()
-            << "}";
-        return out.str();
-    }
-
-    std::string search_json(const std::unordered_map<std::string, std::string>& params)
-    {
-        auto qit = params.find("q");
-        const std::string query = qit == params.end() ? "" : qit->second;
-        if (query.empty()) {
-            return "{\"error\":\"missing q parameter\"}";
-        }
-
-        const auto streamsIt = params.find("streams");
-        const std::string streams = streamsIt != params.end() && !streamsIt->second.empty()
-            ? streamsIt->second
-            : "AUTB";
-        const int offset = query_int(params, "offset", 0, 0, 1000000000);
-        const int limit = query_int(params, "limit", 20, 1, 1000);
-        const int efSearch = query_int(params, "efSearch", 200, 1, 1000000);
-
         const auto started = std::chrono::steady_clock::now();
 
-        std::vector<float> vector;
-        const bool vectorReady = embed_text_with_gbe_service(query, m_GbeHost, m_GbePort, vector);
+        if ((request.Mode == SearchMode::Vector || request.Mode == SearchMode::Hybrid)
+            && request.Vector.empty()) {
+            if (request.Query.size() > BGE_MAX_TEXT_BYTES)
+                throw ApiError(422, "query_too_long", "query is too large for embedding");
+            auto vector = m_Embedding.Embed(request.Query);
+            if (!vector)
+                throw ApiError(503, "embedding_unavailable", "query embedding is unavailable");
+            request.Vector = std::move(*vector);
+        }
+
+        if (!request.Vector.empty()) {
+            const size_t dimension = m_Context.VectorDimension();
+            if (dimension > 0 && request.Vector.size() != dimension) {
+                throw ApiError(422, "invalid_vector_dimension",
+                               "expected " + std::to_string(dimension)
+                               + " dimensions but received "
+                               + std::to_string(request.Vector.size()));
+            }
+            double squaredNorm = 0.0;
+            for (float component : request.Vector)
+                squaredNorm += static_cast<double>(component) * component;
+            if (!(squaredNorm > 0.0) || !std::isfinite(squaredNorm))
+                throw ApiError(422, "invalid_vector", "vector must have a finite non-zero magnitude");
+            if (dimension == 0 || m_Context.VectorCount() == 0)
+                throw ApiError(503, "vector_search_unavailable", "the loaded index has no vector index");
+        }
+
+        const size_t resultWindow = request.Offset + request.Limit + 1;
+        const std::string query = request.Mode == SearchMode::Vector ? "" : request.Query;
         auto task = m_Context.Enqueue(query.c_str(),
-                          vectorReady ? std::move(vector) : std::vector<float>{},
-                          streams.c_str(),
-                          0,
-                          QueryCompileMode::WeakAndBigramBoostForDoc,
-                          static_cast<size_t>(efSearch));
-        std::vector<SearchResult> results = task.Wait();
+                                      std::move(request.Vector),
+                                      request.Streams.c_str(),
+                                      static_cast<int>(resultWindow),
+                                      QueryCompileMode::WeakAndBigramBoostForDoc,
+                                      request.EfSearch);
+        const std::vector<SearchResult> results = task.Wait();
 
-        const auto finished = std::chrono::steady_clock::now();
-        const double elapsed_ms = std::chrono::duration<double, std::milli>(finished - started).count();
-        const int total = static_cast<int>(std::min<size_t>(results.size(), static_cast<size_t>(INT32_MAX)));
-        const int begin = std::min(offset, total);
-        const int end = std::min(begin + limit, total);
+        SearchResponse response;
+        response.Mode = request.Mode;
+        response.Offset = request.Offset;
+        response.Limit = request.Limit;
+        response.HasMore = results.size() > request.Offset + request.Limit;
 
-        std::ostringstream out;
-        out << "{\"query\":\"" << json_escape(query) << "\""
-            << ",\"streams\":\"" << json_escape(streams) << "\""
-            << ",\"total\":" << total
-            << ",\"offset\":" << begin
-            << ",\"limit\":" << limit
-            << ",\"elapsed_ms\":" << elapsed_ms
-            << ",\"vector_ready\":" << (vectorReady ? "true" : "false")
-            << ",\"results\":[";
-
-        for (int i = begin; i < end; ++i) {
-            if (i > begin) out << ',';
-            const auto& result = results[static_cast<size_t>(i)];
-            const std::string path = m_Context.GetDocPath(result.doc_id);
-            out << "{\"rank\":" << (i + 1)
-                << ",\"doc_id\":" << result.doc_id
-                << ",\"score\":" << result.score
-                << ",\"path\":\"" << json_escape(path) << "\"}";
+        const size_t end = std::min(results.size(), request.Offset + request.Limit);
+        response.Results.reserve(end > request.Offset ? end - request.Offset : 0);
+        for (size_t i = request.Offset; i < end; ++i) {
+            const SearchResult& result = results[i];
+            const uint64_t documentId = ReaderDocumentIDValue(result.doc_id);
+            response.Results.push_back({
+                i + 1,
+                documentId,
+                result.score,
+                m_Context.GetDocPath(documentId),
+            });
         }
 
-        out << "]}";
-        return out.str();
+        response.TookMs = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - started).count();
+        return response;
     }
 
-    std::string vector_search_json(const std::unordered_map<std::string, std::string>& params)
+    json ReadyStatus() const
     {
-        const int offset = query_int(params, "offset", 0, 0, 1000000000);
-        const int limit = query_int(params, "limit", 20, 1, 1000);
-        const int efSearch = query_int(params, "efSearch", 200, 1, 1000000);
-        std::string queryText;
-        std::unique_ptr<EvalTree> tree;
-
-        auto vit = params.find("vector");
-        if (vit != params.end() && !vit->second.empty()) {
-            tree = std::make_unique<EvalTree>();
-            tree->vector_query = parse_vector_param(vit->second);
-        } else {
-            auto qit = params.find("q");
-            queryText = qit == params.end() ? "" : qit->second;
-            if (queryText.empty()) return "{\"error\":\"missing q or vector parameter\"}";
-            tree.reset(m_Context.Compile(queryText.c_str(), "V"));
-        }
-
-        if (!tree || !tree->HasVectorQuery()) return "{\"error\":\"empty query vector\"}";
-        tree->vector_ef_search = static_cast<size_t>(efSearch);
-
-        const auto started = std::chrono::steady_clock::now();
-        const size_t vectorDim = tree->vector_query.size();
-        auto task = m_Context.Enqueue("",
-                          std::move(tree->vector_query),
-                          "AUTB",
-                          0,
-                          QueryCompileMode::WeakAndBigramBoostForDoc,
-                          static_cast<size_t>(efSearch));
-        std::vector<SearchResult> results = task.Wait();
-        const auto finished = std::chrono::steady_clock::now();
-        const double elapsed_ms = std::chrono::duration<double, std::milli>(finished - started).count();
-        const int total = static_cast<int>(std::min<size_t>(results.size(), static_cast<size_t>(INT32_MAX)));
-        const int begin = std::min(offset, total);
-        const int end = std::min(begin + limit, total);
-
-        std::ostringstream out;
-        out << "{\"query\":\"" << json_escape(queryText) << "\""
-            << ",\"vector_dim\":" << vectorDim
-            << ",\"vector_count\":" << m_Context.VectorCount()
-            << ",\"efSearch\":" << efSearch
-            << ",\"total\":" << total
-            << ",\"offset\":" << begin
-            << ",\"limit\":" << limit
-            << ",\"elapsed_ms\":" << elapsed_ms
-            << ",\"results\":[";
-        for (int i = begin; i < end; ++i) {
-            if (i > begin) out << ',';
-            const auto& result = results[static_cast<size_t>(i)];
-            const std::string path = m_Context.GetDocPath(result.doc_id);
-            out << "{\"rank\":" << (i + 1)
-                << ",\"doc_id\":" << result.doc_id
-                << ",\"score\":" << result.score
-                << ",\"path\":\"" << json_escape(path) << "\"}";
-        }
-        out << "]}";
-        return out.str();
+        const IndexFileHeader& header = m_Context.GetIndexFileHeader();
+        return {
+            {"status", "ready"},
+            {"index", m_IndexPath},
+            {"documents", header.IFH_NumDocuments},
+            {"avg_doc_len", header.IFH_AvgDocLength},
+            {"vector_count", m_Context.VectorCount()},
+            {"vector_dim", m_Context.VectorDimension()},
+            {"embedding", {
+                {"configured", true},
+                {"host", m_Embedding.Host()},
+                {"port", m_Embedding.Port()},
+            }},
+        };
     }
 
 private:
     std::string m_IndexPath;
-    std::string m_GbeHost;
-    uint16_t m_GbePort = 8765;
+    BgeEmbeddingClient m_Embedding;
     IndexContext m_Context;
 };
 
-static std::string handle_request(SearchService& service, const ParsedRequest& request)
+static std::string MakeRequestId()
 {
-    if (request.method == "OPTIONS") {
-        return http_response(204, "No Content", "");
-    }
-    if (request.method != "GET") {
-        return http_response(405, "Method Not Allowed", "{\"error\":\"method not allowed\"}");
-    }
-    if (request.path == "/health") {
-        return http_response(200, "OK", service.health_json());
-    }
-    if (request.path == "/search") {
-        const auto body = service.search_json(request.query);
-        const int status = body.rfind("{\"error\"", 0) == 0 ? 400 : 200;
-        return http_response(status, status == 200 ? "OK" : "Bad Request", body);
-    }
-    if (request.path == "/vector-search") {
-        const auto body = service.vector_search_json(request.query);
-        const int status = body.rfind("{\"error\"", 0) == 0 ? 400 : 200;
-        return http_response(status, status == 200 ? "OK" : "Bad Request", body);
-    }
-    if (request.path == "/" || request.path == "/help") {
-        return http_response(200, "OK", "{\"service\":\"shennong\",\"endpoints\":[\"/health\",\"/search?q=usage&offset=0&limit=20&streams=AUTB\",\"/vector-search?q=usage&offset=0&limit=20\"]}");
-    }
-    return http_response(404, "Not Found", "{\"error\":\"not found\"}");
+    static std::atomic<uint64_t> sequence{0};
+    const auto now = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    return std::to_string(now) + "-" + std::to_string(sequence.fetch_add(1));
 }
 
-static socket_t create_listen_socket(uint16_t port)
+static json SearchResponseJson(const SearchResponse& response, const std::string& requestId)
 {
-#ifdef _WIN32
-    WSADATA data{};
-    if (WSAStartup(MAKEWORD(2, 2), &data) != 0) {
-        throw std::runtime_error("WSAStartup failed");
-    }
-#endif
-
-    socket_t fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd == INVALID_SOCKET_FD) throw std::runtime_error("socket() failed");
-
-    int yes = 1;
-    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&yes), sizeof(yes));
-
-    sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_ANY);
-    addr.sin_port = htons(port);
-
-    if (bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
-        close_socket(fd);
-        throw std::runtime_error("bind() failed");
-    }
-    if (listen(fd, 128) != 0) {
-        close_socket(fd);
-        throw std::runtime_error("listen() failed");
+    json results = json::array();
+    for (const SearchHit& hit : response.Results) {
+        json result{
+            {"rank", hit.Rank},
+            {"document_id", std::to_string(hit.DocumentId)},
+            {"score", std::isfinite(hit.Score) ? json(hit.Score) : json(nullptr)},
+            {"path", hit.Path.empty() ? json(nullptr) : json(hit.Path)},
+        };
+        results.push_back(std::move(result));
     }
 
-    return fd;
+    return {
+        {"request_id", requestId},
+        {"mode", SearchModeName(response.Mode)},
+        {"took_ms", response.TookMs},
+        {"offset", response.Offset},
+        {"limit", response.Limit},
+        {"returned", response.Results.size()},
+        {"has_more", response.HasMore},
+        {"next_offset", response.HasMore
+            ? json(response.Offset + response.Results.size())
+            : json(nullptr)},
+        {"results", std::move(results)},
+    };
 }
 
-static void serve_one_client(socket_t client, SearchService& service)
+static void SetJsonResponse(httplib::Response& response, int status, const json& body)
 {
-    std::string request;
-    char buffer[4096];
-    while (request.find("\r\n\r\n") == std::string::npos && request.size() < 64 * 1024) {
-#ifdef _WIN32
-        int n = recv(client, buffer, sizeof(buffer), 0);
-#else
-        ssize_t n = recv(client, buffer, sizeof(buffer), 0);
-#endif
-        if (n <= 0) break;
-        request.append(buffer, buffer + n);
-    }
-
-    try {
-        auto response = handle_request(service, parse_http_request(request));
-        send_all(client, response);
-    } catch (const std::exception& ex) {
-        send_all(client, http_response(500, "Internal Server Error", std::string("{\"error\":\"") + json_escape(ex.what()) + "\"}"));
-    }
-
-    close_socket(client);
+    response.status = status;
+    response.set_content(body.dump(), "application/json; charset=utf-8");
 }
 
-static void serve_forever(SearchService& service, uint16_t port)
+static void SetErrorResponse(httplib::Response& response,
+                             int status,
+                             const std::string& requestId,
+                             std::string_view code,
+                             std::string_view message)
 {
-    socket_t server = create_listen_socket(port);
-    std::cout << "Ready: http://localhost:" << port << "/search?q=usage&offset=0&limit=20\n";
+    SetJsonResponse(response, status, {
+        {"request_id", requestId},
+        {"error", {
+            {"code", code},
+            {"message", message},
+        }},
+    });
+}
 
-    while (true) {
-        sockaddr_in client_addr{};
-#ifdef _WIN32
-        int len = sizeof(client_addr);
-#else
-        socklen_t len = sizeof(client_addr);
-#endif
-        socket_t client = accept(server, reinterpret_cast<sockaddr*>(&client_addr), &len);
-        if (client == INVALID_SOCKET_FD) continue;
-        std::thread([client, &service] { serve_one_client(client, service); }).detach();
-    }
+static void ConfigureServer(httplib::Server& server, SearchService& service)
+{
+    server.set_payload_max_length(MAX_REQUEST_BYTES);
+    server.set_post_routing_handler([](const httplib::Request&, httplib::Response& response) {
+        response.set_header("Access-Control-Allow-Origin", "*");
+        response.set_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+        response.set_header("Access-Control-Allow-Headers", "Content-Type");
+    });
+
+    server.Options(R"(/.*)", [](const httplib::Request&, httplib::Response& response) {
+        response.status = 204;
+    });
+
+    server.Get("/v1/health/live", [](const httplib::Request&, httplib::Response& response) {
+        SetJsonResponse(response, 200, {{"status", "alive"}});
+    });
+
+    server.Get("/v1/health/ready", [&service](const httplib::Request&, httplib::Response& response) {
+        SetJsonResponse(response, 200, service.ReadyStatus());
+    });
+
+    server.Post("/v1/search", [&service](const httplib::Request& request,
+                                         httplib::Response& response) {
+        const std::string requestId = MakeRequestId();
+        try {
+            const json body = json::parse(request.body);
+            SearchRequest searchRequest = ParseSearchRequest(body);
+            SetJsonResponse(response, 200,
+                            SearchResponseJson(service.Search(std::move(searchRequest)), requestId));
+        } catch (const json::parse_error&) {
+            SetErrorResponse(response, 400, requestId, "invalid_json", "request body is not valid JSON");
+        } catch (const ApiError& error) {
+            SetErrorResponse(response, error.Status, requestId, error.Code, error.what());
+        } catch (const std::exception& error) {
+            std::cerr << "request " << requestId << " failed: " << error.what() << '\n';
+            SetErrorResponse(response, 500, requestId, "internal_error", "search failed");
+        }
+    });
+
+    server.set_error_handler([](const httplib::Request&, httplib::Response& response) {
+        if (response.status == 404) {
+            SetErrorResponse(response, 404, MakeRequestId(), "not_found", "endpoint not found");
+        } else if (response.status == 405) {
+            SetErrorResponse(response, 405, MakeRequestId(), "method_not_allowed", "method not allowed");
+        }
+    });
 }
 
 } // namespace
@@ -622,21 +750,28 @@ static void serve_forever(SearchService& service, uint16_t port)
 int main(int argc, char** argv)
 {
     try {
-        Options options = parse_args(argc, argv);
-        if (!std::filesystem::is_regular_file(options.index_path)) {
-            std::cerr << "index not found: " << options.index_path << "\n";
+#ifdef _WIN32
+        SocketRuntime socketRuntime;
+#endif
+        const Options options = ParseArguments(argc, argv);
+        if (!std::filesystem::is_regular_file(options.IndexPath)) {
+            std::cerr << "index not found: " << options.IndexPath << '\n';
             return 2;
         }
 
         std::cout << "ShenNong HTTP service starting\n"
-                  << "Index: " << options.index_path << "\n"
-                  << "Listen: 0.0.0.0:" << options.port << "\n";
+                  << "Index: " << options.IndexPath << '\n'
+                  << "Listen: 0.0.0.0:" << options.Port << '\n';
 
-        SearchService service(options.index_path, options.gbe_host, options.gbe_port);
-        std::cout << "Index loaded: " << service.health_json() << "\n";
-        serve_forever(service, options.port);
-    } catch (const std::exception& ex) {
-        std::cerr << "shennong: " << ex.what() << "\n";
+        SearchService service(options.IndexPath, options.BgeHost, options.BgePort);
+        httplib::Server server;
+        ConfigureServer(server, service);
+
+        std::cout << "Ready: http://localhost:" << options.Port << "/v1/health/ready\n";
+        if (!server.listen("0.0.0.0", options.Port))
+            throw std::runtime_error("failed to bind HTTP server");
+    } catch (const std::exception& error) {
+        std::cerr << "shennong: " << error.what() << '\n';
         return 1;
     }
     return 0;
