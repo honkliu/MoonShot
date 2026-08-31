@@ -4,7 +4,7 @@
  * Usage:
  *   moon -idx <index> -file <filepath>       Index one file into <index>
  *   moon -idx <index> -dir <directory> -r    Index files recursively into <index>
- *   moon -idx <index> -i                     Search <index> with inverted index
+ *   moon -idx <index> -i [-wiki-data <root>] Search <index> with inverted index
  *   moon -idx <index> -v                     Search <index> with vector index
  *   moon -idx <index> -i -v                  Search <index> with both
  *   moon -file <filepath>                    Index one file
@@ -421,6 +421,7 @@ static bool ParseDecimalUint64(std::string_view text, uint64_t& value)
 
 static bool ReadWikiPreview(const std::string& locator,
                             const std::string& wikiDataPath,
+                            bool includeText,
                             WikiPreview& preview)
 {
     if (wikiDataPath.empty() || !locator.starts_with(WIKI_LOCATOR_PREFIX))
@@ -490,7 +491,8 @@ static bool ReadWikiPreview(const std::string& locator,
         return false;
     preview.Title = title->get<std::string>();
     preview.Url = url->get<std::string>();
-    preview.Text = text->get<std::string>();
+    if (includeText)
+        preview.Text = text->get<std::string>();
     return true;
 }
 
@@ -944,7 +946,7 @@ static std::vector<std::string> Search(IndexContext& ctx, const std::string& que
     for (const auto& hit : results) {
         std::string path = hit.context->GetDocPath(hit.result.doc_id);
         WikiPreview preview;
-        if (ReadWikiPreview(path, options.wikiDataPath, preview)) {
+        if (ReadWikiPreview(path, options.wikiDataPath, false, preview)) {
             std::string label = preview.Title;
             if (!preview.ExternalId.empty())
                 label += " [page " + preview.ExternalId + "]";
@@ -1048,7 +1050,7 @@ static void PageFile(const std::string& path, const SearchOptions& options)
             return;
         }
         WikiPreview preview;
-        if (!ReadWikiPreview(path, options.wikiDataPath, preview)) {
+        if (!ReadWikiPreview(path, options.wikiDataPath, true, preview)) {
             std::cout << "unable to read wiki document: " << path << "\n";
             return;
         }
@@ -1264,6 +1266,14 @@ static bool HandleInteractiveCommand(IndexContext& ctx,
 
 static int RunInteractiveSearch(const std::string& idxPath, const SearchOptions& options)
 {
+    if (!options.wikiDataPath.empty()) {
+        std::error_code error;
+        if (!std::filesystem::is_directory(FsPathFromUtf8(options.wikiDataPath), error) || error) {
+            std::cerr << "Wiki data root is not a directory: " << options.wikiDataPath << "\n";
+            return 1;
+        }
+    }
+
     auto loadStart = std::chrono::steady_clock::now();
     IndexContext ctx("", idxPath.c_str());
     const auto loadMs = std::chrono::duration_cast<std::chrono::milliseconds>(
