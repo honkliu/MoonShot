@@ -8,13 +8,19 @@ if(MSVC)
 endif()
 
 # ── moon_wasm (Rust → WASM viewer) ───────────────────────────────────────────
-find_program(WASM_PACK wasm-pack
-    HINTS "$ENV{HOME}/.cargo/bin" "$ENV{USERPROFILE}/.cargo/bin"
-    DOC "wasm-pack tool")
+option(MOONSHOT_BUILD_WASM "Build the Rust/WASM index viewer" ON)
 
-if(NOT WASM_PACK)
-    message(FATAL_ERROR "wasm-pack not found. Install it with: cargo install wasm-pack")
-else()
+if(MOONSHOT_BUILD_WASM)
+    find_program(WASM_PACK wasm-pack
+        HINTS "$ENV{HOME}/.cargo/bin" "$ENV{USERPROFILE}/.cargo/bin"
+        DOC "wasm-pack tool")
+
+    if(NOT WASM_PACK)
+        message(FATAL_ERROR
+            "wasm-pack not found. Install it with: cargo install wasm-pack, "
+            "or configure with -DMOONSHOT_BUILD_WASM=OFF")
+    endif()
+
     message(STATUS "wasm-pack found: ${WASM_PACK}")
 
     get_filename_component(CARGO_BIN_DIR "${CARGO}" DIRECTORY)
@@ -58,4 +64,6 @@ else()
     if(TARGET rustblade)
         add_dependencies(moon_wasm rustblade)
     endif()
+else()
+    message(STATUS "MoonShot WASM viewer disabled")
 endif()
