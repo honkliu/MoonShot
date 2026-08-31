@@ -4,6 +4,13 @@
 
 ## Build and Run
 
+On Debian/Ubuntu, install the Shennong HTTP/JSON development packages before configuring CMake:
+
+```bash
+sudo apt-get update
+sudo apt-get install libcpp-httplib-dev nlohmann-json3-dev
+```
+
 ```powershell
 cmake --build build --config Release
 .\build\x64\Release\shennong.exe --port 9000 --index "$env:USERPROFILE\moon.idx"

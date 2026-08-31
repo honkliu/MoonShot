@@ -198,7 +198,7 @@ static void ShowDocument(httplib::Client& client, const Result& result)
     const std::string content = body.at("content").get<std::string>();
     const std::string contentType = body.value("content_type", "text/plain");
     if (contentType.starts_with("text/markdown") && !RenderMarkdown(content)) {
-        std::cout << "[Install Glow for rendered Markdown: winget install charmbracelet.glow]\n";
+        std::cout << "[Rendered Markdown unavailable; showing paged source]\n";
         PageText(content);
     } else if (!contentType.starts_with("text/markdown")) {
         PageText(content);
