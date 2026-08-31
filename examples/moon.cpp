@@ -40,6 +40,7 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <map>
 #include <mutex>
 #include <set>
@@ -392,7 +393,106 @@ struct SearchOptions {
     std::string bgePython;
     std::string bgeScript;
     std::string bgeModel = "BAAI/bge-small-en-v1.5";
+    std::string wikiDataPath;
 };
+
+struct WikiPreview {
+    std::string ExternalId;
+    std::string Title;
+    std::string Url;
+    std::string Text;
+};
+
+static bool ParseDecimalUint64(std::string_view text, uint64_t& value)
+{
+    if (text.empty())
+        return false;
+    value = 0;
+    for (const char ch : text) {
+        if (ch < '0' || ch > '9')
+            return false;
+        const uint64_t digit = static_cast<uint64_t>(ch - '0');
+        if (value > (std::numeric_limits<uint64_t>::max() - digit) / 10)
+            return false;
+        value = value * 10 + digit;
+    }
+    return true;
+}
+
+static bool ReadWikiPreview(const std::string& locator,
+                            const std::string& wikiDataPath,
+                            WikiPreview& preview)
+{
+    if (wikiDataPath.empty() || !locator.starts_with(WIKI_LOCATOR_PREFIX))
+        return false;
+
+    const size_t marker = locator.rfind('#');
+    const size_t separator = marker == std::string::npos
+        ? std::string::npos
+        : locator.find(':', marker + 1);
+    if (marker <= WIKI_LOCATOR_PREFIX.size() || separator == std::string::npos)
+        return false;
+
+    const std::string relativeText = locator.substr(
+        WIKI_LOCATOR_PREFIX.size(), marker - WIKI_LOCATOR_PREFIX.size());
+    const std::filesystem::path relativePath = FsPathFromUtf8(relativeText);
+    if (relativePath.is_absolute() || relativePath.has_root_path())
+        return false;
+    for (const auto& component : relativePath) {
+        if (component == "." || component == "..")
+            return false;
+    }
+
+    uint64_t offset = 0;
+    uint64_t length = 0;
+    if (!ParseDecimalUint64(std::string_view(locator).substr(
+            marker + 1, separator - marker - 1), offset)
+        || !ParseDecimalUint64(std::string_view(locator).substr(separator + 1), length)
+        || length == 0
+        || length > static_cast<uint64_t>(std::numeric_limits<size_t>::max())) {
+        return false;
+    }
+
+    std::ifstream input(FsPathFromUtf8(wikiDataPath) / relativePath, std::ios::binary);
+    if (!input)
+        return false;
+    input.seekg(0, std::ios::end);
+    const std::streampos fileSize = input.tellg();
+    if (fileSize < 0 || offset > static_cast<uint64_t>(fileSize)
+        || length > static_cast<uint64_t>(fileSize) - offset) {
+        return false;
+    }
+    input.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
+    std::string record(static_cast<size_t>(length), '\0');
+    if (!input.read(record.data(), static_cast<std::streamsize>(record.size())))
+        return false;
+
+    const json value = json::parse(record, nullptr, false);
+    if (value.is_discarded() || !value.is_object())
+        return false;
+    const auto title = value.find("title");
+    const auto url = value.find("url");
+    const auto text = value.find("text");
+    const auto id = value.find("id");
+    if (title == value.end() || !title->is_string()
+        || url == value.end() || !url->is_string()
+        || text == value.end() || !text->is_string()
+        || id == value.end()) {
+        return false;
+    }
+    if (id->is_string())
+        preview.ExternalId = id->get<std::string>();
+    else if (id->is_number_unsigned())
+        preview.ExternalId = std::to_string(id->get<uint64_t>());
+    else if (id->is_number_integer())
+        preview.ExternalId = std::to_string(id->get<int64_t>());
+    else
+        return false;
+    preview.Title = title->get<std::string>();
+    preview.Url = url->get<std::string>();
+    preview.Text = text->get<std::string>();
+    return true;
+}
 
 static constexpr size_t BGE_MAX_TEXT_BYTES = 65536;
 static constexpr const char* BGE_DOCUMENT_MARKER = "__MOONSHOT_BGE_DOCUMENT__\n";
@@ -838,9 +938,22 @@ static std::vector<std::string> Search(IndexContext& ctx, const std::string& que
     }
 
     std::vector<std::string> resultPaths;
+    std::vector<std::string> resultLabels;
     resultPaths.reserve(results.size());
-    for (const auto& hit : results)
-        resultPaths.push_back(hit.context->GetDocPath(hit.result.doc_id));
+    resultLabels.reserve(results.size());
+    for (const auto& hit : results) {
+        std::string path = hit.context->GetDocPath(hit.result.doc_id);
+        WikiPreview preview;
+        if (ReadWikiPreview(path, options.wikiDataPath, preview)) {
+            std::string label = preview.Title;
+            if (!preview.ExternalId.empty())
+                label += " [page " + preview.ExternalId + "]";
+            resultLabels.push_back(std::move(label));
+        } else {
+            resultLabels.push_back(path);
+        }
+        resultPaths.push_back(std::move(path));
+    }
 
     constexpr size_t PAGE_SIZE_RESULTS = 20;
     std::cout << results.size() << " result(s)\n";
@@ -858,7 +971,7 @@ static std::vector<std::string> Search(IndexContext& ctx, const std::string& que
                 << std::setw(5) << std::setfill('0') << std::max(0.0f, hit.result.score);
             std::cout << (i + 1) << " " << score.str() << " "
                     << SourceMaskText(ReaderDocumentIDSourceMask(hit.result.doc_id)) << " "
-                    << (resultPaths[i].empty() ? "[unknown]" : resultPaths[i]) << "\n";
+                    << (resultLabels[i].empty() ? "[unknown]" : resultLabels[i]) << "\n";
         }
 
         if (end < results.size()) {
@@ -927,8 +1040,24 @@ static bool ParseResultReference(const std::string& line, size_t& resultNumber)
     return static_cast<unsigned long long>(resultNumber) == parsed;
 }
 
-static void PageFile(const std::string& path)
+static void PageFile(const std::string& path, const SearchOptions& options)
 {
+    if (path.starts_with(WIKI_LOCATOR_PREFIX)) {
+        if (options.wikiDataPath.empty()) {
+            std::cout << "wiki data root is not configured; restart with -wiki-data <root>\n";
+            return;
+        }
+        WikiPreview preview;
+        if (!ReadWikiPreview(path, options.wikiDataPath, preview)) {
+            std::cout << "unable to read wiki document: " << path << "\n";
+            return;
+        }
+        std::cout << preview.Title << "\n"
+                  << "Page " << preview.ExternalId << "\n"
+                  << preview.Url << "\n\n"
+                  << preview.Text << "\n";
+        return;
+    }
 #ifdef _WIN32
     std::ifstream input(Utf8ToWide(path));
 #else
@@ -1183,7 +1312,7 @@ static int RunInteractiveSearch(const std::string& idxPath, const SearchOptions&
             } else if (lastResultPaths[resultNumber - 1].empty()) {
                 std::cout << "result " << resultNumber << " has no file path\n";
             } else {
-                PageFile(lastResultPaths[resultNumber - 1]);
+                PageFile(lastResultPaths[resultNumber - 1], options);
             }
             continue;
         }
@@ -1380,6 +1509,12 @@ static bool ParseSearchOptions(const std::vector<std::string>& args,
                 return false;
             }
             options.bgePort = static_cast<uint16_t>(value);
+        } else if (arg == "-wiki-data") {
+            if (i + 1 >= args.size()) {
+                error = "Usage: moon -i -wiki-data <wikiextractor-root>";
+                return false;
+            }
+            options.wikiDataPath = args[++i];
         } else if (arg == "-k") {
             if (i + 1 >= args.size()) {
                 error = "Usage: moon -v -bge -k N";
@@ -1409,7 +1544,7 @@ static bool ParseSearchOptions(const std::vector<std::string>& args,
     }
 
     if (!options.inverted && !options.vector) {
-        error = "Usage: moon [-idx <index>] -i [-v] | moon [-idx <index>] -v [-bge]";
+        error = "Usage: moon [-idx <index>] -i [-v] [-wiki-data <root>] | moon [-idx <index>] -v [-bge]";
         return false;
     }
 
@@ -1852,6 +1987,7 @@ static void PrintHelp(const std::string& idxPath)
           << "  -i                        Interactive inverted-index search\n"
           << "  -v                        Interactive vector search\n"
           << "  -i -v                     Interactive hybrid search\n"
+          << "  -wiki-data <root>         Resolve WikiExtractor titles and @N content\n"
           << "  -sample-merge             Run the base/delta/merge example\n"
           << "  -wiki-build               Build an index from WikiExtractor JSONL shards\n"
           << "  -beir-build               Build an index from a BEIR corpus\n"
@@ -1916,6 +2052,7 @@ static void PrintHelp(const std::string& idxPath)
           << "EXAMPLES\n"
           << "  moon -idx notes.idx -dir docs -ext md,txt -r\n"
           << "  moon -idx notes.idx -i\n"
+          << "  moon -idx wiki.idx -i -wiki-data data/output\n"
           << "  moon -idx notes.idx -i -v\n"
           << "  moon -idx beir.idx -beir-build -data data/scifact\n"
           << "  moon -idx beir.idx -beir-eval -data data/scifact -k 10,100,1000\n";
@@ -2597,6 +2734,26 @@ static bool ReadWikiString(const json& value, const char* name, std::string& out
     return true;
 }
 
+static bool ReadWikiIdentifier(const json& value, const char* name, std::string& out)
+{
+    const auto it = value.find(name);
+    if (it == value.end())
+        return false;
+    if (it->is_string()) {
+        out = it->get<std::string>();
+        return true;
+    }
+    if (it->is_number_unsigned()) {
+        out = std::to_string(it->get<uint64_t>());
+        return true;
+    }
+    if (it->is_number_integer()) {
+        out = std::to_string(it->get<int64_t>());
+        return true;
+    }
+    return false;
+}
+
 static bool SaveWikiBatch(const std::string& idxPath,
                           const std::string& batchPath,
                           const std::string& deltaPath,
@@ -2719,8 +2876,8 @@ static int RunWikiBuild(const std::string& idxPath, const WikiBuildOptions& opti
             std::string revisionId;
             WikiDocument document;
             if (value.is_discarded() || !value.is_object()
-                || !ReadWikiString(value, "id", externalId)
-                || !ReadWikiString(value, "revid", revisionId)
+                || !ReadWikiIdentifier(value, "id", externalId)
+                || !ReadWikiIdentifier(value, "revid", revisionId)
                 || !ReadWikiString(value, "url", document.Url)
                 || !ReadWikiString(value, "title", document.Title)
                 || !ReadWikiString(value, "text", document.Text)) {
