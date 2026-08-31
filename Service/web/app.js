@@ -3,6 +3,7 @@ const form=$('#search-form'),queryInput=$('#query'),modeInput=$('#mode'),status=
 let query='',mode='text',offset=0,nextOffset=null,loading=false;
 
 const titleFromPath=path=>{if(!path)return'Untitled document';const clean=path.replace(/[\\/]+$/,'');return clean.slice(Math.max(clean.lastIndexOf('/'),clean.lastIndexOf('\\'))+1)||path};
+const parentFromPath=path=>{if(!path)return'';const clean=path.replace(/[\\/]+$/,'');const separator=Math.max(clean.lastIndexOf('/'),clean.lastIndexOf('\\'));return separator<0?clean:clean.slice(0,separator)};
 const message=(text,error=false)=>{status.textContent=text;status.className=error?'error':''};
 
 // Add another MIME type here to support a new document renderer.
@@ -40,10 +41,10 @@ async function search(){
     if(!response.ok)throw new Error(body.error?.message||`HTTP ${response.status}`);
     results.replaceChildren();
     for(const hit of body.results){
-      const button=document.createElement('button'),name=document.createElement('span'),path=document.createElement('span'),score=document.createElement('span');
-      button.className='result';button.type='button';name.className='result-title';path.className='result-path';score.className='result-score';
-      name.textContent=titleFromPath(hit.path);path.textContent=hit.path||`Document ${hit.document_id}`;score.textContent=`Score ${hit.score==null?'—':Number(hit.score).toFixed(2)}`;
-      button.append(name,path,score);button.addEventListener('click',()=>showDocument(hit));results.append(button);
+      const button=document.createElement('button'),name=document.createElement('span'),meta=document.createElement('span'),path=document.createElement('span'),score=document.createElement('span');
+      button.className='result';button.type='button';name.className='result-title';meta.className='result-meta';path.className='result-path';score.className='result-score';
+      name.textContent=titleFromPath(hit.path);path.textContent=parentFromPath(hit.path)||`Document ${hit.document_id}`;path.title=hit.path||'';score.textContent=`Score ${hit.score==null?'—':Number(hit.score).toFixed(2)}`;
+      meta.append(path,score);button.append(name,meta);button.addEventListener('click',()=>showDocument(hit));results.append(button);
     }
     nextOffset=body.next_offset;previous.disabled=offset===0;next.disabled=!body.has_more;pageNumber.textContent=`Page ${Math.floor(offset/20)+1}`;pagination.hidden=!body.returned&&offset===0;
     message(`${body.returned} result${body.returned===1?'':'s'} · ${Number(body.took_ms).toFixed(2)} ms`);
@@ -52,6 +53,7 @@ async function search(){
 }
 
 async function showDocument(hit){
+  const searchStatus=status.textContent;
   message('Loading document…');
   try{
     const response=await fetch(`/v1/documents/${encodeURIComponent(hit.document_id)}`),body=await response.json();
@@ -62,16 +64,17 @@ async function showDocument(hit){
     }else{
       documentFrame.hidden=true;documentFrame.removeAttribute('src');documentContent.hidden=false;renderDocument(body);openLink.href=`/v1/documents/${encodeURIComponent(hit.document_id)}?raw=1`;
     }
-    openLink.hidden=false;message('');
+    openLink.hidden=false;message(searchStatus);
   }catch(error){message(error.message,true)}
 }
 
-form.addEventListener('submit',event=>{event.preventDefault();if(loading)return;query=queryInput.value.trim();mode=modeInput.value;if(query){offset=0;search()}});
+form.addEventListener('submit',event=>{event.preventDefault();if(loading)return;query=queryInput.value.trim();mode=modeInput.value;if(query){workspace.classList.add('searched');offset=0;search()}});
+queryInput.addEventListener('keydown',event=>{if(event.key==='Enter'&&!event.isComposing){event.preventDefault();form.requestSubmit()}});
 previous.addEventListener('click',()=>{offset=Math.max(0,offset-20);search()});
 next.addEventListener('click',()=>{if(nextOffset!==null){offset=nextOffset;search()}});
 $('#close-preview').addEventListener('click',()=>{preview.hidden=true;workspace.classList.remove('with-preview');documentFrame.removeAttribute('src')});
 
-const resizePreview=width=>workspace.style.setProperty('--preview-width',`${Math.max(320,Math.min(width,workspace.clientWidth*.8))}px`);
+const resizePreview=width=>{const maximum=Math.max(320,workspace.clientWidth-360-resizer.offsetWidth);const resolved=Math.max(320,Math.min(width,maximum));workspace.style.setProperty('--preview-width',`${resolved}px`);resizer.setAttribute('aria-valuenow',Math.round(resolved/workspace.clientWidth*100))};
 let resizePointer=null;
 resizer.addEventListener('pointerdown',event=>{resizePointer=event.pointerId;document.body.classList.add('resizing');event.preventDefault()});
 window.addEventListener('pointermove',event=>{if(event.pointerId===resizePointer)resizePreview(workspace.getBoundingClientRect().right-event.clientX)});
