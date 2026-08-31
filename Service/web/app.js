@@ -41,10 +41,13 @@ async function search(){
     if(!response.ok)throw new Error(body.error?.message||`HTTP ${response.status}`);
     results.replaceChildren();
     for(const hit of body.results){
-      const button=document.createElement('button'),name=document.createElement('span'),meta=document.createElement('span'),path=document.createElement('span'),score=document.createElement('span');
-      button.className='result';button.type='button';name.className='result-title';meta.className='result-meta';path.className='result-path';score.className='result-score';
-      name.textContent=titleFromPath(hit.path);path.textContent=parentFromPath(hit.path)||`Document ${hit.document_id}`;path.title=hit.path||'';score.textContent=`Score ${hit.score==null?'—':Number(hit.score).toFixed(2)}`;
-      meta.append(path,score);button.append(name,meta);button.addEventListener('click',()=>showDocument(hit));results.append(button);
+      const item=document.createElement('article'),name=document.createElement('button'),meta=document.createElement('span'),path=document.createElement('span'),score=document.createElement('span');
+      item.className='result';name.className='result-title result-preview';name.type='button';meta.className='result-meta';path.className='result-path';score.className='result-score';
+      name.textContent=hit.title||titleFromPath(hit.path);path.textContent=parentFromPath(hit.path)||`Document ${hit.document_id}`;path.title=hit.path||'';score.textContent=`Score ${hit.score==null?'—':Number(hit.score).toFixed(2)}`;
+      name.addEventListener('click',()=>showDocument(hit));
+      if(hit.kind==='wiki'&&hit.external_id){const pageId=document.createElement('button');pageId.className='wiki-page-id result-preview';pageId.type='button';pageId.textContent=`Page ${hit.external_id}`;pageId.addEventListener('click',()=>showDocument(hit));meta.append(pageId)}else meta.append(path);
+      if(hit.kind==='wiki'&&hit.url){const wikipedia=document.createElement('a');wikipedia.className='wiki-url';wikipedia.href=hit.url;wikipedia.target='_blank';wikipedia.rel='noopener';wikipedia.textContent='Wikipedia';meta.append(wikipedia)}
+      meta.append(score);item.append(name,meta);results.append(item);
     }
     nextOffset=body.next_offset;previous.disabled=offset===0;next.disabled=!body.has_more;pageNumber.textContent=`Page ${Math.floor(offset/20)+1}`;pagination.hidden=!body.returned&&offset===0;
     message(`${body.returned} result${body.returned===1?'':'s'} · ${Number(body.took_ms).toFixed(2)} ms`);
@@ -58,11 +61,12 @@ async function showDocument(hit){
   try{
     const response=await fetch(`/v1/documents/${encodeURIComponent(hit.document_id)}`),body=await response.json();
     if(!response.ok)throw new Error(body.error?.message||`HTTP ${response.status}`);
-    preview.hidden=false;workspace.classList.add('with-preview');previewTitle.textContent=titleFromPath(hit.path);
+    preview.hidden=false;workspace.classList.add('with-preview');previewTitle.textContent=body.title||hit.title||titleFromPath(hit.path);
     if(body.kind==='url'){
-      documentContent.hidden=true;documentFrame.hidden=false;documentFrame.src=body.url;openLink.href=body.url;
+      documentContent.hidden=true;documentFrame.hidden=false;documentFrame.src=body.url;openLink.href=body.url;openLink.textContent='Open';
     }else{
-      documentFrame.hidden=true;documentFrame.removeAttribute('src');documentContent.hidden=false;renderDocument(body);openLink.href=`/v1/documents/${encodeURIComponent(hit.document_id)}?raw=1`;
+      documentFrame.hidden=true;documentFrame.removeAttribute('src');documentContent.hidden=false;renderDocument(body);
+      if(body.kind==='wiki'){openLink.href=body.url;openLink.textContent='Wikipedia'}else{openLink.href=`/v1/documents/${encodeURIComponent(hit.document_id)}?raw=1`;openLink.textContent='Open'}
     }
     openLink.hidden=false;message(searchStatus);
   }catch(error){message(error.message,true)}

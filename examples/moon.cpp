@@ -11,6 +11,7 @@
  *   moon -dir <directory> -ext md,txt        Index matching files in one directory
  *   moon -dir <directory> -ext md -r         Index matching files recursively
  *   moon -sample-merge -dir <root> -out <index-path> [-ext cpp,h,rs]
+ *   moon -idx <index> -wiki-build -data <root> [-limit N] [-b 10000]
  *
  * Index stored at:
  *   Linux   : ~/moon.idx  (+ ~/moon.idx.meta)
@@ -24,6 +25,8 @@
 #endif
 
 #include "moonshot.h"
+
+#include <nlohmann/json.hpp>
 
 #include <algorithm>
 #include <array>
@@ -157,7 +160,9 @@ static std::string BatchIndexPath(const std::string& path)
 // ─── Paths and file collection ───────────────────────────────────────────────
 
 using PathMap = std::map<std::string, uint64_t>;  // filepath → sequential id
+using json = nlohmann::json;
 static constexpr uintmax_t MAX_INDEX_FILE_BYTES = 8ull * 1024ull * 1024ull;
+static constexpr std::string_view WIKI_LOCATOR_PREFIX = "wiki:";
 
 struct FileItem {
     std::string path;
@@ -1213,6 +1218,12 @@ struct BeirBuildOptions {
     bool buildVectors = false;
 };
 
+struct WikiBuildOptions {
+    std::string dataPath;
+    uint64_t limit = 0;
+    uint64_t batchSize = 10000;
+};
+
 struct BeirPatchVectorOptions {
     std::string sourceIndexPath;
     std::string docVectorsPath;
@@ -1596,6 +1607,45 @@ static bool ParseBeirBuildOptions(const std::vector<std::string>& args,
     return true;
 }
 
+static bool ParseWikiBuildOptions(const std::vector<std::string>& args,
+                                  WikiBuildOptions& options,
+                                  std::string& error)
+{
+    for (size_t i = 1; i < args.size(); ++i) {
+        const std::string& arg = args[i];
+        if (arg == "-data") {
+            if (i + 1 >= args.size()) {
+                error = "Usage: moon [-idx <index>] -wiki-build -data <root> [-limit N] [-b 10000]";
+                return false;
+            }
+            options.dataPath = args[++i];
+        } else if (arg == "-limit") {
+            if (i + 1 >= args.size() || !ParseUInt64(args[++i], options.limit)) {
+                error = "-limit must be a non-negative integer";
+                return false;
+            }
+        } else if (arg == "-b") {
+            if (i + 1 >= args.size() || !ParseBatchSize(args[++i], options.batchSize)) {
+                error = "-b must be a positive integer";
+                return false;
+            }
+            if (options.batchSize < 10000) {
+                error = "-b must be at least 10000 for indexing performance";
+                return false;
+            }
+        } else {
+            error = "Unknown wiki build option: " + arg;
+            return false;
+        }
+    }
+
+    if (options.dataPath.empty()) {
+        error = "Usage: moon [-idx <index>] -wiki-build -data <root> [-limit N] [-b 10000]";
+        return false;
+    }
+    return true;
+}
+
 static bool ParseBeirPatchVectorOptions(const std::vector<std::string>& args,
                                         BeirPatchVectorOptions& options,
                                         std::string& error)
@@ -1803,6 +1853,7 @@ static void PrintHelp(const std::string& idxPath)
           << "  -v                        Interactive vector search\n"
           << "  -i -v                     Interactive hybrid search\n"
           << "  -sample-merge             Run the base/delta/merge example\n"
+          << "  -wiki-build               Build an index from WikiExtractor JSONL shards\n"
           << "  -beir-build               Build an index from a BEIR corpus\n"
           << "  -beir-patch-vectors       Copy a BEIR index and replace its vectors\n"
           << "  -beir-eval                Evaluate BEIR Recall@k\n\n"
@@ -1827,6 +1878,10 @@ static void PrintHelp(const std::string& idxPath)
           << "  -bge-model <name>         Embedding model\n\n"
           << "SAMPLE MERGE\n"
           << "  moon -sample-merge -dir <root> -out <index> [-ext cpp,h,rs]\n\n"
+          << "WIKIEXTRACTOR BUILD\n"
+          << "  moon [-idx <index>] -wiki-build -data <root> [options]\n"
+          << "    -limit <count>          Limit documents; 0 means all (default: 0)\n"
+          << "    -b <count>              Delta batch size (default/minimum: 10000)\n\n"
           << "BEIR BUILD\n"
           << "  moon [-idx <index>] -beir-build -data <dir> [options]\n"
           << "    -doc-vectors <file>     Read external document vectors\n"
@@ -2497,6 +2552,230 @@ static uint64_t BeirEvalLeafCacheBytes(const std::string& idxPath, const BeirEva
         + header.IFH_TermMphfDisplacementCount * sizeof(int32_t)
         + header.IFH_TermMphfEntryPageCount * sizeof(IndexBlock);
     return LEAF_TERM_CACHE_BYTES + mphfBytes;
+}
+
+struct WikiDocument {
+    uint64_t DocId = 0;
+    std::string Locator;
+    std::string Url;
+    std::string Title;
+    std::string Text;
+};
+
+static std::vector<std::filesystem::path> CollectWikiShards(const std::filesystem::path& root)
+{
+    std::vector<std::filesystem::path> shards;
+    std::error_code error;
+    std::filesystem::recursive_directory_iterator it(
+        root, std::filesystem::directory_options::skip_permission_denied, error);
+    const std::filesystem::recursive_directory_iterator end;
+    for (; it != end; it.increment(error)) {
+        if (error) {
+            error.clear();
+            continue;
+        }
+        if (!it->is_regular_file(error) || error) {
+            error.clear();
+            continue;
+        }
+        const std::string filename = PathToUtf8(it->path().filename());
+        if (filename.starts_with("wiki_"))
+            shards.push_back(it->path());
+    }
+    std::sort(shards.begin(), shards.end(), [](const auto& left, const auto& right) {
+        return PathToUtf8(left.lexically_normal()) < PathToUtf8(right.lexically_normal());
+    });
+    return shards;
+}
+
+static bool ReadWikiString(const json& value, const char* name, std::string& out)
+{
+    const auto it = value.find(name);
+    if (it == value.end() || !it->is_string())
+        return false;
+    out = it->get<std::string>();
+    return true;
+}
+
+static bool SaveWikiBatch(const std::string& idxPath,
+                          const std::string& batchPath,
+                          const std::string& deltaPath,
+                          const std::vector<WikiDocument>& documents)
+{
+    IndexContext batch("", "", false);
+    for (const auto& item : documents) {
+        Document doc;
+        doc.doc_id = item.DocId;
+        doc.path = item.Locator;
+        doc.url = item.Url;
+        doc.title = item.Title;
+        doc.body = item.Text;
+        batch.AddDocument(doc);
+    }
+    if (!batch.SaveIndex(batchPath.c_str()))
+        return false;
+
+    std::error_code error;
+    if (!IndexSerializer::IsValidIndex(idxPath.c_str())) {
+        std::filesystem::rename(FsPathFromUtf8(batchPath), FsPathFromUtf8(idxPath), error);
+        return !error;
+    }
+
+    std::filesystem::remove(FsPathFromUtf8(deltaPath), error);
+    error.clear();
+    std::filesystem::rename(FsPathFromUtf8(batchPath), FsPathFromUtf8(deltaPath), error);
+    if (error)
+        return false;
+
+    IndexContext mergeContext("", idxPath.c_str());
+    if (!mergeContext.Merge(idxPath.c_str()))
+        return false;
+    std::filesystem::remove(FsPathFromUtf8(deltaPath), error);
+    return true;
+}
+
+static int RunWikiBuild(const std::string& idxPath, const WikiBuildOptions& options)
+{
+    const std::filesystem::path root = std::filesystem::absolute(FsPathFromUtf8(options.dataPath));
+    std::error_code error;
+    if (!std::filesystem::is_directory(root, error) || error) {
+        std::cerr << "Wiki data root is not a directory: " << options.dataPath << "\n";
+        return 1;
+    }
+
+    const auto shards = CollectWikiShards(root);
+    if (shards.empty()) {
+        std::cerr << "No WikiExtractor shards named wiki_* found under " << options.dataPath << "\n";
+        return 1;
+    }
+
+    const std::string batchPath = BatchIndexPath(idxPath);
+    const std::string deltaPath = DeltaIndexPath(idxPath);
+    std::filesystem::remove(FsPathFromUtf8(idxPath), error);
+    error.clear();
+    std::filesystem::remove(FsPathFromUtf8(batchPath), error);
+    error.clear();
+    std::filesystem::remove(FsPathFromUtf8(deltaPath), error);
+
+    std::vector<WikiDocument> batch;
+    batch.reserve(static_cast<size_t>(options.batchSize));
+    uint64_t indexed = 0;
+    uint64_t skipped = 0;
+    uint64_t savedBatches = 0;
+    const auto started = std::chrono::steady_clock::now();
+
+    auto flush = [&]() -> bool {
+        if (batch.empty())
+            return true;
+        std::cout << "  writing wiki batch " << (savedBatches + 1)
+                  << " docs=" << batch.size() << "\n";
+        if (!SaveWikiBatch(idxPath, batchPath, deltaPath, batch))
+            return false;
+        batch.clear();
+        ++savedBatches;
+        return true;
+    };
+
+    for (const auto& shard : shards) {
+        if (options.limit > 0 && indexed >= options.limit)
+            break;
+
+        const std::filesystem::path relativePath = std::filesystem::relative(shard, root, error);
+        if (error || relativePath.empty() || relativePath.is_absolute()) {
+            std::cerr << "Skipping shard with invalid relative path: " << PathToUtf8(shard) << "\n";
+            error.clear();
+            ++skipped;
+            continue;
+        }
+        std::string relative = PathToUtf8(relativePath);
+        std::replace(relative.begin(), relative.end(), '\\', '/');
+        std::ifstream input(shard, std::ios::binary);
+        const uintmax_t fileSize = std::filesystem::file_size(shard, error);
+        if (!input || error) {
+            std::cerr << "Skipping unreadable shard: " << PathToUtf8(shard) << "\n";
+            error.clear();
+            ++skipped;
+            continue;
+        }
+
+        std::cout << "  reading " << relative << "\n";
+        std::string line;
+        while (true) {
+            const std::streampos startPosition = input.tellg();
+            if (startPosition < 0 || !std::getline(input, line))
+                break;
+            const uint64_t offset = static_cast<uint64_t>(startPosition);
+            const std::streampos nextPosition = input.tellg();
+            const uint64_t endOffset = nextPosition < 0
+                ? static_cast<uint64_t>(fileSize)
+                : static_cast<uint64_t>(nextPosition);
+            if (endOffset < offset) {
+                ++skipped;
+                continue;
+            }
+
+            const json value = json::parse(line, nullptr, false);
+            std::string externalId;
+            std::string revisionId;
+            WikiDocument document;
+            if (value.is_discarded() || !value.is_object()
+                || !ReadWikiString(value, "id", externalId)
+                || !ReadWikiString(value, "revid", revisionId)
+                || !ReadWikiString(value, "url", document.Url)
+                || !ReadWikiString(value, "title", document.Title)
+                || !ReadWikiString(value, "text", document.Text)) {
+                ++skipped;
+                continue;
+            }
+
+            document.DocId = indexed;
+            document.Locator = std::string(WIKI_LOCATOR_PREFIX) + relative
+                + "#" + std::to_string(offset) + ":" + std::to_string(endOffset - offset);
+            const size_t slash = document.Locator.find_last_of('/');
+            const size_t tailBytes = slash == std::string::npos
+                ? document.Locator.size()
+                : document.Locator.size() - slash - 1;
+            if (tailBytes > DOC_PATH_FILENAME_MAX) {
+                std::cerr << "Wiki locator exceeds persisted path tail capacity: "
+                          << document.Locator << "\n";
+                return 1;
+            }
+
+            batch.push_back(std::move(document));
+            ++indexed;
+            if (batch.size() >= options.batchSize && !flush()) {
+                std::cerr << "Failed to save wiki index batch to " << idxPath << "\n";
+                return 1;
+            }
+            if (options.limit > 0 && indexed >= options.limit)
+                break;
+        }
+    }
+
+    if (indexed == 0) {
+        std::cerr << "WikiExtractor shards contained no valid documents\n";
+        return 1;
+    }
+    if (!flush()) {
+        std::cerr << "Failed to save wiki index batch to " << idxPath << "\n";
+        return 1;
+    }
+
+    IndexContext verification("", idxPath.c_str(), false);
+    if (verification.DocumentCount() != indexed) {
+        std::cerr << "Wiki index verification failed: expected " << indexed
+                  << " documents, loaded " << verification.DocumentCount() << "\n";
+        return 1;
+    }
+    const auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - started).count();
+    std::cout << "Wiki build complete docs=" << indexed
+              << " shards=" << shards.size()
+              << " batches=" << savedBatches;
+    if (skipped)
+        std::cout << " skipped=" << skipped;
+    std::cout << " elapsed_ms=" << elapsedMs << " index=" << idxPath << "\n";
+    return 0;
 }
 
 static int RunBeirBuild(const std::string& idxPath, const BeirBuildOptions& options)
@@ -3520,6 +3799,15 @@ int main(int argc, char* argv[])
             return 1;
         }
         return RunSampleMerge(options);
+
+    // ── WikiExtractor JSONL build ───────────────────────────────────────────
+    } else if (cmd == "-wiki-build") {
+        WikiBuildOptions options;
+        if (!ParseWikiBuildOptions(args, options, error)) {
+            std::cerr << error << "\n";
+            return 1;
+        }
+        return RunWikiBuild(idxPath, options);
 
     // ── BEIR recall evaluation ──────────────────────────────────────────────
     } else if (cmd == "-beir-build") {

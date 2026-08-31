@@ -56,12 +56,14 @@ static constexpr size_t MAX_EF_SEARCH = 1000000;
 static constexpr size_t BGE_MAX_TEXT_BYTES = 65536;
 static constexpr size_t MAX_DOCUMENT_BYTES = 1024 * 1024;
 static constexpr long BGE_TIMEOUT_MS = 2000;
+static constexpr std::string_view WIKI_LOCATOR_PREFIX = "wiki:";
 
 struct Options {
     std::string ListenAddress = "127.0.0.1";
     uint16_t Port = 9000;
     std::string IndexPath;
     std::string WebPath;
+    std::string WikiDataPath;
     std::string BgeHost = "127.0.0.1";
     uint16_t BgePort = 8765;
 };
@@ -87,6 +89,10 @@ struct SearchHit {
     uint64_t DocumentId = 0;
     float Score = 0.0f;
     std::string Path;
+    std::string Kind;
+    std::string ExternalId;
+    std::string Title;
+    std::string Url;
 };
 
 struct SearchResponse {
@@ -177,6 +183,8 @@ static Options ParseArguments(int argc, char** argv)
             options.IndexPath = ExpandUserPath(argv[++i]);
         } else if (arg == "--ui" && i + 1 < argc) {
             options.WebPath = ExpandUserPath(argv[++i]);
+        } else if (arg == "--wiki-data" && i + 1 < argc) {
+            options.WikiDataPath = ExpandUserPath(argv[++i]);
         } else if ((arg == "--bge-host" || arg == "--gbe-host") && i + 1 < argc) {
             options.BgeHost = argv[++i];
         } else if ((arg == "--bge-port" || arg == "--gbe-port") && i + 1 < argc) {
@@ -184,6 +192,7 @@ static Options ParseArguments(int argc, char** argv)
         } else if (arg == "--help" || arg == "-h") {
             std::cout << "usage: shennong [--listen 127.0.0.1] [--port 9000] [--index ~/moon.idx] "
                          "[--ui <web-directory>] "
+                         "[--wiki-data <wikiextractor-root>] "
                          "[--bge-host 127.0.0.1] [--bge-port 8765]\n";
             std::exit(0);
         } else {
@@ -549,15 +558,130 @@ static SearchRequest ParseSearchRequest(const json& body, size_t documentCount)
     return request;
 }
 
+struct WikiLocator {
+    std::filesystem::path RelativePath;
+    uint64_t Offset = 0;
+    uint64_t Length = 0;
+};
+
+struct WikiRecord {
+    std::string ExternalId;
+    std::string RevisionId;
+    std::string Title;
+    std::string Url;
+    std::string Content;
+};
+
+static bool ParseUint64(std::string_view text, uint64_t& value)
+{
+    if (text.empty())
+        return false;
+    uint64_t parsed = 0;
+    for (const char ch : text) {
+        if (ch < '0' || ch > '9')
+            return false;
+        const uint64_t digit = static_cast<uint64_t>(ch - '0');
+        if (parsed > (std::numeric_limits<uint64_t>::max() - digit) / 10)
+            return false;
+        parsed = parsed * 10 + digit;
+    }
+    value = parsed;
+    return true;
+}
+
+static std::optional<WikiLocator> ParseWikiLocator(const std::string& locator)
+{
+    if (!locator.starts_with(WIKI_LOCATOR_PREFIX))
+        return std::nullopt;
+
+    const size_t marker = locator.rfind('#');
+    const size_t separator = locator.rfind(':');
+    if (marker == std::string::npos || separator == std::string::npos
+        || marker <= WIKI_LOCATOR_PREFIX.size() || separator <= marker + 1) {
+        throw ApiError(404, "document_not_found", "wiki document locator is invalid");
+    }
+
+    const std::string relativeText = locator.substr(
+        WIKI_LOCATOR_PREFIX.size(), marker - WIKI_LOCATOR_PREFIX.size());
+    if (relativeText.empty() || relativeText.find('\\') != std::string::npos
+        || relativeText.find(':') != std::string::npos) {
+        throw ApiError(404, "document_not_found", "wiki document locator is invalid");
+    }
+
+    WikiLocator parsed;
+    parsed.RelativePath = std::filesystem::path(relativeText);
+    if (parsed.RelativePath.is_absolute() || parsed.RelativePath.has_root_path())
+        throw ApiError(404, "document_not_found", "wiki document locator is invalid");
+    for (const auto& component : parsed.RelativePath) {
+        if (component == "." || component == "..")
+            throw ApiError(404, "document_not_found", "wiki document locator is invalid");
+    }
+    if (!ParseUint64(std::string_view(locator).substr(marker + 1, separator - marker - 1), parsed.Offset)
+        || !ParseUint64(std::string_view(locator).substr(separator + 1), parsed.Length)
+        || parsed.Length == 0) {
+        throw ApiError(404, "document_not_found", "wiki document locator is invalid");
+    }
+    return parsed;
+}
+
+static bool IsWithin(const std::filesystem::path& root, const std::filesystem::path& candidate)
+{
+    auto rootIt = root.begin();
+    auto candidateIt = candidate.begin();
+    for (; rootIt != root.end(); ++rootIt, ++candidateIt) {
+        if (candidateIt == candidate.end() || *rootIt != *candidateIt)
+            return false;
+    }
+    return true;
+}
+
+static bool ReadJsonIdentifier(const json& value, const char* name, std::string& out)
+{
+    const auto it = value.find(name);
+    if (it == value.end())
+        return false;
+    if (it->is_string()) {
+        out = it->get<std::string>();
+        return true;
+    }
+    if (it->is_number_unsigned()) {
+        out = std::to_string(it->get<uint64_t>());
+        return true;
+    }
+    if (it->is_number_integer()) {
+        out = std::to_string(it->get<int64_t>());
+        return true;
+    }
+    return false;
+}
+
+static bool ReadJsonString(const json& value, const char* name, std::string& out)
+{
+    const auto it = value.find(name);
+    if (it == value.end() || !it->is_string())
+        return false;
+    out = it->get<std::string>();
+    return true;
+}
+
 class SearchService {
 public:
-    SearchService(std::string indexPath, std::string bgeHost, uint16_t bgePort)
+    SearchService(std::string indexPath,
+                  std::string wikiDataPath,
+                  std::string bgeHost,
+                  uint16_t bgePort)
         : m_IndexPath(std::move(indexPath))
         , m_Embedding(std::move(bgeHost), bgePort)
         , m_Context("", m_IndexPath.c_str())
     {
         if (m_Context.DocumentCount() == 0)
             throw std::runtime_error("index loaded with zero documents: " + m_IndexPath);
+        if (!wikiDataPath.empty()) {
+            std::error_code error;
+            m_WikiDataRoot = std::filesystem::canonical(wikiDataPath, error);
+            if (error || !std::filesystem::is_directory(*m_WikiDataRoot))
+                throw std::runtime_error("wiki data root is not a directory: " + wikiDataPath);
+        }
     }
 
     SearchResponse Search(SearchRequest request)
@@ -613,12 +737,24 @@ public:
         for (size_t i = request.Offset; i < end; ++i) {
             const SearchResult& result = results[i];
             const uint64_t documentId = ReaderDocumentIDValue(result.doc_id);
-            response.Results.push_back({
+            SearchHit hit{
                 i + 1,
                 documentId,
                 result.score,
                 m_Context.GetDocPath(documentId),
-            });
+            };
+            if (hit.Path.starts_with(WIKI_LOCATOR_PREFIX)) {
+                try {
+                    const WikiRecord record = ReadWikiRecord(hit.Path);
+                    hit.Kind = "wiki";
+                    hit.ExternalId = record.ExternalId;
+                    hit.Title = record.Title;
+                    hit.Url = record.Url;
+                } catch (const ApiError&) {
+                    hit.Kind = "wiki";
+                }
+            }
+            response.Results.push_back(std::move(hit));
         }
 
         response.TookMs = std::chrono::duration<double, std::milli>(
@@ -636,6 +772,7 @@ public:
             {"avg_doc_len", header.IFH_AvgDocLength},
             {"vector_count", m_Context.VectorCount()},
             {"vector_dim", m_Context.VectorDimension()},
+            {"wiki_data_configured", m_WikiDataRoot.has_value()},
             {"embedding", {
                 {"configured", true},
                 {"host", m_Embedding.Host()},
@@ -654,6 +791,18 @@ public:
         const std::string path = m_Context.GetDocPath(documentId);
         if (path.empty())
             throw ApiError(404, "document_not_found", "document was not found");
+        if (path.starts_with(WIKI_LOCATOR_PREFIX)) {
+            WikiRecord record = ReadWikiRecord(path);
+            return {
+                {"document_id", std::to_string(documentId)},
+                {"kind", "wiki"},
+                {"external_id", std::move(record.ExternalId)},
+                {"revision_id", std::move(record.RevisionId)},
+                {"title", std::move(record.Title)},
+                {"url", std::move(record.Url)},
+                {"content", std::move(record.Content)},
+            };
+        }
         if (path.starts_with("http://") || path.starts_with("https://")) {
             return {
                 {"document_id", std::to_string(documentId)},
@@ -700,7 +849,53 @@ public:
     }
 
 private:
+    WikiRecord ReadWikiRecord(const std::string& locator) const
+    {
+        if (!m_WikiDataRoot)
+            throw ApiError(503, "wiki_data_unconfigured", "wiki data root is not configured");
+        const auto parsed = ParseWikiLocator(locator);
+        if (!parsed)
+            throw ApiError(404, "document_not_found", "wiki document locator is invalid");
+
+        std::error_code error;
+        const std::filesystem::path filePath = std::filesystem::canonical(
+            *m_WikiDataRoot / parsed->RelativePath, error);
+        if (error || !IsWithin(*m_WikiDataRoot, filePath)
+            || !std::filesystem::is_regular_file(filePath, error) || error) {
+            throw ApiError(404, "document_not_found", "wiki document shard is unavailable");
+        }
+
+        const uintmax_t fileSize = std::filesystem::file_size(filePath, error);
+        if (error || parsed->Offset > fileSize || parsed->Length > fileSize - parsed->Offset
+            || parsed->Length > static_cast<uint64_t>(std::numeric_limits<size_t>::max())
+            || parsed->Length > static_cast<uint64_t>(std::numeric_limits<std::streamsize>::max())) {
+            throw ApiError(404, "document_not_found", "wiki document locator is out of bounds");
+        }
+
+        std::ifstream input(filePath, std::ios::binary);
+        if (!input)
+            throw ApiError(403, "document_unreadable", "wiki document shard cannot be read");
+        input.seekg(static_cast<std::streamoff>(parsed->Offset));
+        std::string bytes(static_cast<size_t>(parsed->Length), '\0');
+        input.read(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+        if (input.gcount() != static_cast<std::streamsize>(bytes.size()))
+            throw ApiError(404, "document_not_found", "wiki document record is incomplete");
+
+        const json value = json::parse(bytes, nullptr, false);
+        WikiRecord record;
+        if (value.is_discarded() || !value.is_object()
+            || !ReadJsonIdentifier(value, "id", record.ExternalId)
+            || !ReadJsonIdentifier(value, "revid", record.RevisionId)
+            || !ReadJsonString(value, "title", record.Title)
+            || !ReadJsonString(value, "url", record.Url)
+            || !ReadJsonString(value, "text", record.Content)) {
+            throw ApiError(415, "invalid_wiki_document", "wiki document record is invalid");
+        }
+        return record;
+    }
+
     std::string m_IndexPath;
+    std::optional<std::filesystem::path> m_WikiDataRoot;
     BgeEmbeddingClient m_Embedding;
     IndexContext m_Context;
 };
@@ -722,6 +917,10 @@ static json SearchResponseJson(const SearchResponse& response, const std::string
             {"document_id", std::to_string(hit.DocumentId)},
             {"score", std::isfinite(hit.Score) ? json(hit.Score) : json(nullptr)},
             {"path", hit.Path.empty() ? json(nullptr) : json(hit.Path)},
+            {"kind", hit.Kind.empty() ? json(nullptr) : json(hit.Kind)},
+            {"external_id", hit.ExternalId.empty() ? json(nullptr) : json(hit.ExternalId)},
+            {"title", hit.Title.empty() ? json(nullptr) : json(hit.Title)},
+            {"url", hit.Url.empty() ? json(nullptr) : json(hit.Url)},
         };
         results.push_back(std::move(result));
     }
@@ -859,7 +1058,10 @@ int main(int argc, char** argv)
                   << "Index: " << options.IndexPath << '\n'
                   << "Listen: " << options.ListenAddress << ':' << options.Port << '\n';
 
-        SearchService service(options.IndexPath, options.BgeHost, options.BgePort);
+        SearchService service(options.IndexPath,
+                      options.WikiDataPath,
+                      options.BgeHost,
+                      options.BgePort);
         httplib::Server server;
         ConfigureServer(server, service, options.WebPath);
 

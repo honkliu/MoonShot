@@ -16,6 +16,12 @@ cmake --build build --config Release
 .\build\x64\Release\shennong.exe --port 9000 --index "$env:USERPROFILE\moon.idx"
 ```
 
+For an index built with `moon -wiki-build`, pass the same WikiExtractor root used at build time:
+
+```powershell
+.\build\x64\Release\shennong.exe --index "$env:USERPROFILE\wiki.idx" --wiki-data "D:\wikipedia\output"
+```
+
 With a Visual Studio multi-configuration build, omitting `--config Release` builds Debug by default. Omitting `--target` builds the complete default target set, including examples, tests, Rust tools, Shennong clients, WASM assets, and web assets.
 
 Supported options:
@@ -26,6 +32,7 @@ Supported options:
 | `--port` | `9000` | HTTP listen port. |
 | `--index` | `~/moon.idx` | MoonShot index loaded at startup. |
 | `--ui` | `web` beside the executable | Static search-interface directory. |
+| `--wiki-data` | unset | Root containing the `wiki_*` WikiExtractor JSONL shards referenced by the index. |
 | `--bge-host` | `127.0.0.1` | Query embedding service numeric IPv4 address. `--gbe-host` remains an accepted spelling. |
 | `--bge-port` | `8765` | Query embedding service port. `--gbe-port` remains an accepted spelling. |
 
@@ -166,7 +173,7 @@ Field names map to MoonShot stream letters only at the service boundary: anchor=
 
 ## Documents
 
-`GET /v1/documents/{document_id}` returns the indexed file contents or an HTTP/HTTPS URL descriptor. `?raw=1` returns file content directly. Shennong accepts only IDs resolved through the loaded index, reads regular text files only, and limits previews to 1 MiB.
+`GET /v1/documents/{document_id}` returns indexed file contents, an HTTP/HTTPS URL descriptor, or a WikiExtractor record. Wiki records have `kind=wiki` and include `external_id`, `revision_id`, `title`, `url`, and `content`; Shennong resolves their compact locator beneath `--wiki-data`, rejects traversal and out-of-root symlinks, validates file bounds, and reads the exact indexed JSONL bytes. `?raw=1` returns local-file content directly. Shennong accepts only IDs resolved through the loaded index, reads regular text files only, and limits local-file previews to 1 MiB.
 
 ## SDK Search Mapping
 

@@ -5,6 +5,9 @@ foreach(example quickstart fulltext_search demo moon)
     target_link_libraries(${example} PRIVATE MoonShot::MoonShot)
 endforeach()
 
+find_package(nlohmann_json CONFIG REQUIRED)
+target_link_libraries(moon PRIVATE nlohmann_json::nlohmann_json)
+
 if(WIN32)
     target_link_libraries(moon PRIVATE ws2_32)
 endif()
