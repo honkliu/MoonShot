@@ -24,7 +24,14 @@
     </header>
     <div id="status" role="status"></div>
     <section id="workspace">
-      <div id="results"></div>
+      <div id="result-pane">
+        <div id="results"></div>
+        <nav id="pagination" aria-label="Search result pages" hidden>
+          <button id="previous" type="button">Previous</button>
+          <span id="page-number"></span>
+          <button id="next" type="button">Next</button>
+        </nav>
+      </div>
       <div id="preview-resizer" role="separator" aria-label="Resize document preview" aria-orientation="vertical" tabindex="0"></div>
       <aside id="preview" hidden>
         <div class="preview-bar">
@@ -36,11 +43,6 @@
         <iframe id="document-frame" title="Document preview" sandbox referrerpolicy="no-referrer" hidden></iframe>
       </aside>
     </section>
-    <nav id="pagination" aria-label="Search result pages" hidden>
-      <button id="previous" type="button">Previous</button>
-      <span id="page-number"></span>
-      <button id="next" type="button">Next</button>
-    </nav>
   </main>
   <script src="https://cdn.jsdelivr.net/npm/marked@16.2.1/lib/marked.umd.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/dompurify@3.2.6/dist/purify.min.js"></script>

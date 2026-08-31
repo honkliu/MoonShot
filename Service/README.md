@@ -44,6 +44,8 @@ cmake --build build --target shennong_cli --config Debug
 
 Enter a query to search, `@N` to display result N from the latest page, `/n` for the next page, `/h` for help, or `/q` to quit. The client contains no MoonShot search logic; all queries and document reads go through Shennong.
 
+For formatted Markdown in the terminal, install the established [Glow](https://github.com/charmbracelet/glow) renderer with `winget install charmbracelet.glow`. `@N` renders Markdown through Glow and pages it with the native terminal pager (`more.com` on Windows); if Glow or a pager is unavailable, the client falls back to its existing paged plain-text display.
+
 ## Search
 
 All searches use:

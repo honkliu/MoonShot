@@ -3,6 +3,8 @@
 
 #include <algorithm>
 #include <cctype>
+#include <csignal>
+#include <cstdio>
 #include <cstdlib>
 #include <iomanip>
 #include <iostream>
@@ -103,6 +105,40 @@ static void PageText(const std::string& text)
     }
 }
 
+static bool RenderMarkdown(const std::string& markdown)
+{
+#ifdef _WIN32
+    if (std::system("where glow >nul 2>nul") != 0)
+        return false;
+    FILE* renderer = _popen("set \"PAGER=more.com\" && glow -p -", "w");
+#else
+    if (std::system("command -v glow >/dev/null 2>&1") != 0)
+        return false;
+    const char* command = nullptr;
+    if (std::system("command -v less >/dev/null 2>&1") == 0)
+        command = "PAGER=less glow -p -";
+    else if (std::system("command -v more >/dev/null 2>&1") == 0)
+        command = "PAGER=more glow -p -";
+    else
+        return false;
+    FILE* renderer = popen(command, "w");
+#endif
+    if (!renderer)
+        return false;
+
+#ifndef _WIN32
+    const auto previousSigpipe = std::signal(SIGPIPE, SIG_IGN);
+#endif
+    const size_t written = std::fwrite(markdown.data(), 1, markdown.size(), renderer);
+#ifdef _WIN32
+    const int status = _pclose(renderer);
+#else
+    const int status = pclose(renderer);
+    std::signal(SIGPIPE, previousSigpipe);
+#endif
+    return written == markdown.size() && status == 0;
+}
+
 static bool Search(httplib::Client& client,
                    const Options& options,
                    const std::string& query,
@@ -159,7 +195,14 @@ static void ShowDocument(httplib::Client& client, const Result& result)
         std::cout << body.at("url").get<std::string>() << '\n';
         return;
     }
-    PageText(body.at("content").get<std::string>());
+    const std::string content = body.at("content").get<std::string>();
+    const std::string contentType = body.value("content_type", "text/plain");
+    if (contentType.starts_with("text/markdown") && !RenderMarkdown(content)) {
+        std::cout << "[Install Glow for rendered Markdown: winget install charmbracelet.glow]\n";
+        PageText(content);
+    } else if (!contentType.starts_with("text/markdown")) {
+        PageText(content);
+    }
     if (body.value("truncated", false))
         std::cout << "[preview truncated]\n";
 }

@@ -1,6 +1,20 @@
-.with-preview #results {
+#result-pane {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-width: 0;
+}
+
+#results {
+  flex: 1;
+}
+
+.with-preview #result-pane {
   flex: 1;
   min-width: 260px;
+}
+
+.with-preview #results {
   width: auto;
   border-right: 0;
 }
@@ -62,7 +76,7 @@
   align-items: center;
   justify-content: center;
   gap: 16px;
-  margin: 0 auto 40px;
+  margin: 0 auto 24px;
 }
 
 #pagination[hidden] {
