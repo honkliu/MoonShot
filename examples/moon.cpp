@@ -2767,20 +2767,26 @@ static bool ReadWikiIdentifier(const json& value, const char* name, std::string&
 static bool SaveWikiBatch(const std::string& idxPath,
                           const std::string& batchPath,
                           const std::string& deltaPath,
-                          const std::vector<WikiDocument>& documents)
+                          std::vector<WikiDocument>& documents)
 {
-    IndexContext batch("", "", false);
-    for (const auto& item : documents) {
-        Document doc;
-        doc.doc_id = item.DocId;
-        doc.path = item.Locator;
-        doc.url = item.Url;
-        doc.title = item.Title;
-        doc.body = item.Text;
-        batch.AddDocument(doc);
+    {
+        IndexContext batch("", "", false);
+        for (const auto& item : documents) {
+            Document doc;
+            doc.doc_id = item.DocId;
+            doc.path = item.Locator;
+            doc.url = item.Url;
+            doc.title = item.Title;
+            doc.body = item.Text;
+            batch.AddDocument(doc);
+        }
+        if (!batch.SaveIndex(batchPath.c_str()))
+            return false;
     }
-    if (!batch.SaveIndex(batchPath.c_str()))
-        return false;
+
+    // The on-disk batch is now authoritative. Release article text before
+    // loading both the growing base and the staged delta for the merge.
+    documents.clear();
 
     std::error_code error;
     if (!IndexSerializer::IsValidIndex(idxPath.c_str())) {
