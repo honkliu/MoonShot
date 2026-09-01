@@ -2239,7 +2239,7 @@ struct LeafTermBlockView<'a> {
     m_HasIndexWrite: bool,
 }
 
-const POSTING_SCRATCH_PAGE_COUNT: usize = 100;
+const POSTING_SCRATCH_PAGE_COUNT: usize = 1000;
 const POSTING_SCRATCH_BYTES: usize = POSTING_SCRATCH_PAGE_COUNT * PAGE_SIZE;
 
 #[allow(non_snake_case)]

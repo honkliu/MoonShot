@@ -1877,7 +1877,7 @@ private:
         bool operator==(const LeafTermBlockView& other) const { return CurrentTerm() == other.CurrentTerm(); }
 
     private:
-        static constexpr size_t POSTING_SCRATCH_PAGE_COUNT = 100;
+        static constexpr size_t POSTING_SCRATCH_PAGE_COUNT = 1000;
         static constexpr size_t POSTING_SCRATCH_BYTES = POSTING_SCRATCH_PAGE_COUNT * PAGE_SIZE;
 
         IndexBlockTable* m_BlockTable = nullptr;
