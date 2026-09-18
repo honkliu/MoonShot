@@ -1171,6 +1171,36 @@ void TestTokenizerSnowballStemming()
     std::cout << "  Snowball stems suggested/suggests/suggesting to suggest\n";
 }
 
+void TestTokenizerHanCharacterSegmentation()
+{
+    SmartTokenizer tokenizer;
+    const auto tokens = tokenizer.Tokenize("中国科学院 射雕英雄传");
+    const std::vector<std::string> expected = {
+        "中", "国", "科", "学", "院", "射", "雕", "英", "雄", "传"
+    };
+    assert(tokens == expected);
+
+    IndexContext engine;
+    auto writer = engine.GetWriter();
+    writer->Write(tokens, 0, "Body");
+    engine.Build();
+
+    auto* store = engine.GetStore();
+    const std::string scienceBigram = std::string("科") + BIGRAM_SEP + "学B";
+    assert(store->GetPostingList("科B") != nullptr);
+    assert(store->GetPostingList("学B") != nullptr);
+    assert(store->GetPostingList(scienceBigram) != nullptr);
+    assert(store->GetPostingList("科学B") == nullptr);
+
+    IndexSearchCompiler compiler;
+    auto tree = std::unique_ptr<EvalTree>(compiler.Compile("科学", "B"));
+    auto executor = engine.GetExecutor();
+    const auto results = executor->Execute(engine.GetReader(tree.get()), 5);
+    AssertContains(results, 0, "Han character bigram query matches text inside dictionary word");
+
+    std::cout << "  Han text emits character unigrams and adjacent character bigrams\n";
+}
+
 } // namespace IndexAccessTests
 
 std::map<std::string, std::function<void()>> testRegistry = {
@@ -1195,4 +1225,5 @@ std::map<std::string, std::function<void()>> testRegistry = {
     {"TestHeadTermMaxKeyBoundary", IndexAccessTests::TestHeadTermMaxKeyBoundary},
     {"TestTermMphfSameBaseCollision", IndexAccessTests::TestTermMphfSameBaseCollision},
     {"TestTokenizerSnowballStemming", IndexAccessTests::TestTokenizerSnowballStemming},
+    {"TestTokenizerHanCharacterSegmentation", IndexAccessTests::TestTokenizerHanCharacterSegmentation},
 };

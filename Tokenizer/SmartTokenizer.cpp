@@ -75,6 +75,45 @@ static string StemEnglishToken(const string& token)
     return string(reinterpret_cast<const char*>(result), static_cast<size_t>(sb_stemmer_length(stemmer.get())));
 }
 
+static bool IsHanToken(const UnicodeString& token)
+{
+    bool sawIdeograph = false;
+    for (int32_t i = 0; i < token.length();) {
+        UChar32 ch = token.char32At(i);
+        i += U16_LENGTH(ch);
+
+        if (u_hasBinaryProperty(ch, UCHAR_IDEOGRAPHIC)) {
+            sawIdeograph = true;
+            continue;
+        }
+        if (sawIdeograph && (u_hasBinaryProperty(ch, UCHAR_GRAPHEME_EXTEND) ||
+                             u_hasBinaryProperty(ch, UCHAR_VARIATION_SELECTOR))) {
+            continue;
+        }
+        return false;
+    }
+    return sawIdeograph;
+}
+
+static void AppendHanCharacters(const UnicodeString& word, vector<string>& tokens)
+{
+    for (int32_t start = 0; start < word.length();) {
+        int32_t end = start + U16_LENGTH(word.char32At(start));
+        while (end < word.length()) {
+            UChar32 ch = word.char32At(end);
+            if (u_hasBinaryProperty(ch, UCHAR_IDEOGRAPHIC))
+                break;
+            end += U16_LENGTH(ch);
+        }
+
+        string utf8;
+        word.tempSubStringBetween(start, end).toUTF8String(utf8);
+        if (IsIndexableToken(utf8))
+            tokens.push_back(move(utf8));
+        start = end;
+    }
+}
+
 SmartTokenizer::SmartTokenizer(const Locale& locale)
     : m_Locale(locale)
 {
@@ -118,12 +157,16 @@ vector<string> SmartTokenizer::Tokenize(const char* text)
             UnicodeString word = normalized.tempSubStringBetween(start, end);
             word.toLower(m_Locale);
 
-            string utf8;
-            word.toUTF8String(utf8);
-            utf8 = StemEnglishToken(utf8);
+            if (IsHanToken(word)) {
+                AppendHanCharacters(word, tokens);
+            } else {
+                string utf8;
+                word.toUTF8String(utf8);
+                utf8 = StemEnglishToken(utf8);
 
-            if (IsIndexableToken(utf8))
-                tokens.push_back(move(utf8));
+                if (IsIndexableToken(utf8))
+                    tokens.push_back(move(utf8));
+            }
         }
         start = end;
         end   = breaker->next();

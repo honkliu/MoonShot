@@ -49,6 +49,50 @@ impl SmartTokenizer {
     }
 }
 
+fn is_han_ideograph(ch: char) -> bool {
+    matches!(ch as u32,
+        0x3006..=0x3007 |
+        0x3400..=0x4DBF |
+        0x4E00..=0x9FFF |
+        0xF900..=0xFAFF |
+        0x20000..=0x2A6DF |
+        0x2A700..=0x2B73F |
+        0x2B740..=0x2B81F |
+        0x2B820..=0x2CEAF |
+        0x2CEB0..=0x2EE5F |
+        0x2F800..=0x2FA1F |
+        0x30000..=0x3347F)
+}
+
+fn is_variation_selector(ch: char) -> bool {
+    matches!(ch as u32, 0xFE00..=0xFE0F | 0xE0100..=0xE01EF)
+}
+
+fn is_han_token(token: &str) -> bool {
+    let mut saw_ideograph = false;
+    for ch in token.chars() {
+        if is_han_ideograph(ch) {
+            saw_ideograph = true;
+        } else if !saw_ideograph || !is_variation_selector(ch) {
+            return false;
+        }
+    }
+    saw_ideograph
+}
+
+fn append_han_characters(word: &str, tokens: &mut Vec<String>) {
+    let mut current = String::new();
+    for ch in word.chars() {
+        if is_han_ideograph(ch) && !current.is_empty() {
+            tokens.push(std::mem::take(&mut current));
+        }
+        current.push(ch);
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+}
+
 impl Default for SmartTokenizer {
     fn default() -> Self {
         Self::new()
@@ -76,9 +120,13 @@ impl Tokenizer for SmartTokenizer {
                 word_type.is_word_like() || segment.chars().any(char::is_alphanumeric);
             if end > start && is_word_like {
                 let word = lowercase_for_locale(segment, &self.m_Locale);
-                let word = StemEnglishToken(&word);
-                if Self::IsIndexableToken(&word) {
-                    tokens.push(word);
+                if is_han_token(&word) {
+                    append_han_characters(&word, &mut tokens);
+                } else {
+                    let word = StemEnglishToken(&word);
+                    if Self::IsIndexableToken(&word) {
+                        tokens.push(word);
+                    }
                 }
             }
             start = end;
@@ -488,9 +536,12 @@ mod tests {
     use super::{SmartTokenizer, Tokenizer};
 
     #[test]
-    fn keeps_cjk_word_segments() {
+    fn segments_han_into_characters() {
         let tokenizer = SmartTokenizer::new();
-        assert_eq!(tokenizer.Tokenize("学习"), vec!["学习"]);
+        assert_eq!(
+            tokenizer.Tokenize("中国科学院 射雕英雄传"),
+            vec!["中", "国", "科", "学", "院", "射", "雕", "英", "雄", "传"]
+        );
     }
 
     #[test]
