@@ -112,4 +112,14 @@ fn enqueue_handles_many_tasks() {
             assert!(docs.contains(&1));
         }
     }
+
+}
+
+#[test]
+fn han_substring_query_uses_character_bigram() {
+    let mut ctx = IndexContext::new();
+    add_doc(&mut ctx, 0, "研究机构", "中国科学院");
+    ctx.Build();
+
+    assert_eq!(sync_results(&mut ctx, "科学"), vec![0]);
 }
