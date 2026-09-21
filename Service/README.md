@@ -47,7 +47,7 @@ curl.exe -sS http://localhost:9000/v1/health/ready
 
 ## Browser Search
 
-Open `http://localhost:9000/`; Shennong redirects to `http://localhost:9000/ui/`. The integrated interface supports text, vector, and hybrid queries, 20-result previous/next pages through all matching results, a horizontally resizable split document preview, sanitized Markdown rendering, and best-effort URL framing. Markdown parsing uses pinned Marked, DOMPurify, KaTeX, and Mermaid browser scripts. KaTeX renders `$...$`, `$$...$$`, `\\(...\\)`, and `\\[...\\]`; fenced `mermaid` blocks render as diagrams. If a rendering script is unavailable, its content safely falls back to text or a code block.
+Open `http://localhost:9000/`; Shennong redirects to `http://localhost:9000/ui/`. The integrated interface supports text, vector, and hybrid queries, 20-result previous/next pages through all matching results, a horizontally resizable split document preview on desktop, sanitized Markdown rendering, and best-effort URL framing. On mobile, the results and document are mutually collapsible full-screen panels; edge controls switch between them, while closing the document returns to results permanently. Markdown parsing uses pinned Marked, DOMPurify, KaTeX, and Mermaid browser scripts. KaTeX renders `$...$`, `$$...$$`, `\\(...\\)`, and `\\[...\\]`; fenced `mermaid` blocks render as diagrams. If a rendering script is unavailable, its content safely falls back to text or a code block.
 
 ## Command-Line Search
 
