@@ -49,10 +49,12 @@ target_link_libraries(shennong_cli PRIVATE
     ${SHENNONG_JSON_TARGET}
 )
 
-add_custom_target(shennong_web
+add_custom_target(shennong_web ALL
     COMMAND ${CMAKE_COMMAND} -E copy_directory
             "${CMAKE_CURRENT_SOURCE_DIR}/web"
             "${MOONSHOT_CONFIG_OUTPUT_DIR}/web"
+    COMMENT "Syncing Shennong web assets"
+    VERBATIM
 )
 add_dependencies(shennong shennong_web)
 

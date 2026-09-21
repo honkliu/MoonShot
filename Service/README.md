@@ -24,6 +24,18 @@ For an index built with `moon -wiki-build`, pass the same WikiExtractor root use
 
 With a Visual Studio multi-configuration build, omitting `--config Release` builds Debug by default. Omitting `--target` builds the complete default target set, including examples, tests, Rust tools, Shennong clients, WASM assets, and web assets.
 
+The `shennong_web` target runs as part of every default build and synchronizes `Service/web` to the `web` directory beside the executable. Rebuilding `shennong` is enough to copy UI changes:
+
+```powershell
+cmake --build build --target shennong --config Release
+```
+
+During UI development, `--ui` can serve the source directory directly so no copy step is needed:
+
+```powershell
+.\build\x64\Release\shennong.exe --ui .\Service\web --index "$env:USERPROFILE\moon.idx"
+```
+
 Supported options:
 
 | Option | Default | Meaning |
