@@ -2,43 +2,116 @@
 
 ## Build
 
-Keep all generated files under `build/`. Do not build from source folders.
+Use an out-of-source build with CMake 3.19 or newer. `Build` is a disposable
+directory you create, not a required directory name. CMake places its generated
+files, native/Rust outputs, and WASM viewer beneath the selected build directory.
+The output architecture comes from the compiler target, not the host CPU.
 
-Windows:
+### Windows
 
 ```powershell
-cd Q:\gitroot\MoonShot
-cmake -S . -B build
-cmake --build build --config Debug -- /m
-cmake --build build --config Release -- /m
+mkdir Build
+cd Build
+cmake ..
+cmake --build . --config Debug --parallel
+cmake --build . --config Release --parallel
 ```
 
-Linux/macOS:
+`cmake ..` uses the generator's default platform. With Visual Studio, select a
+platform explicitly on the **first configure** if needed:
+
+```powershell
+cmake .. -G "Visual Studio 17 2022" -A ARM64
+# Or, in a different/fresh build directory:
+cmake .. -G "Visual Studio 17 2022" -A x64
+```
+
+One CMake build tree has one target architecture. Do not change `-A` in an
+existing configured tree. To keep both builds, create separate trees inside
+`Build` (for example, from the repository root, use
+`cmake -S . -B Build/windows-arm64 -A ARM64` and
+`cmake -S . -B Build/windows-x64 -A x64`). Do not copy caches or generated files
+between them.
+
+Set `VCPKG_ROOT` to enable the vcpkg toolchain automatically. The vcpkg target
+triplet must match the C++ architecture (`arm64-windows`, `x64-windows`, or
+`x86-windows` for MSVC); mismatches are rejected. Visual Studio also supports
+`-A Win32` for x86, provided the corresponding C++ tools and dependencies exist.
+
+CMake passes an explicit matching target to Cargo, including for cross-builds.
+Install the Rust standard library for the chosen MSVC target before building:
+
+| CMake platform | Output architecture | Rust target |
+| --- | --- | --- |
+| `ARM64` | `arm64` | `aarch64-pc-windows-msvc` |
+| `x64` | `x64` | `x86_64-pc-windows-msvc` |
+| `Win32` | `x86` | `i686-pc-windows-msvc` |
+
+For example: `rustup target add x86_64-pc-windows-msvc`. Cross-builds also
+require the corresponding Visual Studio C++ build tools/SDK. Debug uses Cargo's
+`dev` profile; Release, RelWithDebInfo, and MinSizeRel use Cargo's `release`
+profile, with separate output/cache directories for each CMake configuration.
+
+On Windows ARM64 hosts, the WASM viewer requires LLVM Clang. Its optional
+`wasm-opt` pass is skipped because the optimizer has no ARM64 binary. If Clang
+is unavailable, configure with `-DMOONSHOT_BUILD_WASM=OFF` to omit the viewer.
+The viewer targets `wasm32-unknown-unknown` regardless of the native target.
+
+### Linux/macOS
 
 ```bash
-cd ~/gitroot/MoonShot
-cmake -S . -B build
-cmake --build build
+mkdir Build
+cd Build
+cmake .. -DCMAKE_BUILD_TYPE=Release
+cmake --build . --parallel
+# With the Unix Makefiles generator, "make" also works here.
 ```
 
-Output layout:
+Native builds use the Rust host triple and verify that its architecture matches
+C++. For cross-compilation, supply a CMake toolchain and
+`-DMOONSHOT_RUST_TARGET=<matching-rust-triple>`, along with the required Rust
+target and linker configuration. macOS builds must select one architecture per
+build tree; universal binaries are not supported by the Rust executable build.
+
+### Output layout
+
+For a build configured directly in `Build`, only the selected architecture is
+created:
 
 ```text
-build/x64/Debug/      C++ executables/libs, Rust binaries, moon_wasm viewer
-build/x64/Release/    C++ executables/libs, Rust binaries, moon_wasm viewer
+Build/
+  CMakeCache.txt, CMakeFiles/, generated projects/Makefiles, ...
+  <architecture>/          arm64, x64, x86, or arm
+    Debug/
+    Release/
+      ...                 C++ executables/libraries and copied Rust executables
+      rust/               Cargo target/profile-specific intermediates
+      moon_wasm/          viewer assets and WASM package
+  sdk/                    default destination for cmake --install .
 ```
 
-Examples:
+The same layout applies relative to any other chosen build directory.
+Architecture names are lowercase in CMake paths; on Windows, Visual Studio may
+create the same case-insensitive directory as `ARM64`.
+
+Examples from the repository root for an x64 Debug build (replace `x64` with
+`arm64` for ARM64):
 
 ```powershell
-.\build\x64\Debug\moon.exe -i
-.\build\x64\Debug\shennong.exe --port 9000 --index "$env:USERPROFILE\moon.idx"
-.\build\x64\Debug\moon_rs.exe -i
-.\build\x64\Debug\shennong_rs.exe --port 9000 --index "$env:USERPROFILE\moon.idx"
-cd .\build\x64\Debug\moon_wasm; python3 serve.py
+.\Build\x64\Debug\moon.exe -i
+.\Build\x64\Debug\shennong.exe --port 9000 --index "$env:USERPROFILE\moon.idx"
+.\Build\x64\Debug\moon_rs.exe -i
+.\Build\x64\Debug\shennong_rs.exe --port 9000 --index "$env:USERPROFILE\moon.idx"
+cd .\Build\x64\Debug\moon_wasm; python3 serve.py
 ```
 
-Rust cargo invoked directly from the repo root defaults to `build/x64/Debug/rust` via `.cargo/config.toml`. CMake/MSBuild passes the config-specific Rust target directory automatically.
+Standalone Cargo commands default to `Build/cargo` via `.cargo/config.toml`,
+without incorrectly assuming x64 or Debug. CMake overrides that default with
+the selected build tree's architecture/configuration-specific Rust directory.
+`Build/`, `build/`, and root-level `Build-*`/`build-*` trees are ignored by Git.
+
+Architecture-selection regression checks can be run with
+`cmake -P Test/CMake/Architecture.cmake` from the repository root.
 
 C:\gitroot\MoonShot\ThirdParty>git submodule add https://github.com/microsoft/mimalloc.git
 
