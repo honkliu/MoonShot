@@ -26,11 +26,33 @@ if(MOONSHOT_BUILD_WASM)
     get_filename_component(CARGO_BIN_DIR "${CARGO}" DIRECTORY)
 
     if(WIN32)
+        set(WASM_PACK_PATH_PREFIX "${CARGO_BIN_DIR}")
+        if(CMAKE_HOST_SYSTEM_PROCESSOR MATCHES "^(ARM64|arm64|aarch64)$")
+            find_program(CLANG_EXECUTABLE
+                NAMES clang
+                HINTS "$ENV{LLVM_HOME}/bin" "C:/Program Files/LLVM/bin"
+                DOC "Clang compiler used by ring on Windows ARM64 hosts")
+
+            if(NOT CLANG_EXECUTABLE)
+                message(FATAL_ERROR
+                    "Clang not found for the Windows ARM64 WASM host build. "
+                    "Install LLVM or configure with -DMOONSHOT_BUILD_WASM=OFF.")
+            endif()
+
+            get_filename_component(CLANG_BIN_DIR "${CLANG_EXECUTABLE}" DIRECTORY)
+            set(WASM_PACK_PATH_PREFIX "${CLANG_BIN_DIR};${CARGO_BIN_DIR}")
+        endif()
+
+        set(WASM_PACK_OPT_ARGUMENTS)
+        if(CMAKE_HOST_SYSTEM_PROCESSOR MATCHES "^(ARM64|arm64|aarch64)$")
+            list(APPEND WASM_PACK_OPT_ARGUMENTS --no-opt)
+        endif()
+
         # Generate a wrapper that prepends cargo bin to the LIVE PATH at build time.
         # cmake -E env would bake in the configure-time PATH, missing MSVC link.exe.
         file(GENERATE
             OUTPUT "${CMAKE_BINARY_DIR}/run_wasm_pack.$<CONFIG>.bat"
-            CONTENT "@echo off\r\nset PATH=${CARGO_BIN_DIR};%PATH%\r\n\"${WASM_PACK}\" %*\r\n"
+            CONTENT "@echo off\r\nset \"PATH=${WASM_PACK_PATH_PREFIX};%PATH%\"\r\n\"${WASM_PACK}\" %*\r\n"
         )
         set(WASM_PACK_COMMAND "${CMAKE_BINARY_DIR}/run_wasm_pack.$<CONFIG>.bat")
     else()
@@ -44,6 +66,7 @@ if(MOONSHOT_BUILD_WASM)
                 build
                 --target web
                 --release
+                ${WASM_PACK_OPT_ARGUMENTS}
             --out-dir "${MOONSHOT_CONFIG_OUTPUT_DIR}/moon_wasm/pkg"
                 .
                 --

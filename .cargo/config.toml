@@ -1,4 +1,4 @@
 [build]
-# Direct cargo commands default to the Debug layout.
-# CMake/MSBuild pass a config-specific target-dir: build/x64/<Config>/rust.
-target-dir = "build/x64/Debug/rust"
+# Standalone Cargo builds use Cargo's own target/profile subdirectories.
+# CMake overrides this with <binary-dir>/<architecture>/<configuration>/rust.
+target-dir = "Build/cargo"

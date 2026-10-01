@@ -1,4 +1,8 @@
-cmake_minimum_required(VERSION 3.10)
+cmake_minimum_required(VERSION 3.19)
+
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_BINARY_DIR)
+    message(FATAL_ERROR "Use an out-of-source build: mkdir Build, cd Build, cmake ..")
+endif()
 
 if(DEFINED ENV{VCPKG_ROOT} AND NOT DEFINED CMAKE_TOOLCHAIN_FILE)
     set(CMAKE_TOOLCHAIN_FILE "$ENV{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake" CACHE STRING "")
@@ -9,13 +13,34 @@ project(MoonShot VERSION 0.1.0)
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-set(MOONSHOT_OUTPUT_ROOT "${CMAKE_BINARY_DIR}/x64")
+include(cmake/MoonShotArchitecture.cmake)
+moonshot_detect_target_arch(MOONSHOT_TARGET_ARCH)
+if(DEFINED MOONSHOT_CONFIGURED_ARCH AND
+   NOT MOONSHOT_CONFIGURED_ARCH STREQUAL MOONSHOT_TARGET_ARCH)
+    message(FATAL_ERROR
+        "This build directory was configured for ${MOONSHOT_CONFIGURED_ARCH}, "
+        "not ${MOONSHOT_TARGET_ARCH}. Use a fresh build directory when changing architecture.")
+endif()
+set(MOONSHOT_CONFIGURED_ARCH "${MOONSHOT_TARGET_ARCH}" CACHE INTERNAL
+    "Architecture assigned to this build tree")
+if(VCPKG_TARGET_TRIPLET)
+    string(REGEX REPLACE "-.*$" "" vcpkg_arch "${VCPKG_TARGET_TRIPLET}")
+    moonshot_normalize_arch("${vcpkg_arch}" vcpkg_arch)
+    if(NOT vcpkg_arch STREQUAL MOONSHOT_TARGET_ARCH)
+        message(FATAL_ERROR
+            "vcpkg target '${VCPKG_TARGET_TRIPLET}' does not match the "
+            "C++ target '${MOONSHOT_TARGET_ARCH}'. Configure a fresh build directory "
+            "with a matching platform and VCPKG_TARGET_TRIPLET.")
+    endif()
+endif()
+set(MOONSHOT_OUTPUT_ROOT "${CMAKE_BINARY_DIR}/${MOONSHOT_TARGET_ARCH}")
+message(STATUS "MoonShot target: ${MOONSHOT_TARGET_ARCH}; outputs: ${MOONSHOT_OUTPUT_ROOT}")
 if(CMAKE_CONFIGURATION_TYPES)
     set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${MOONSHOT_OUTPUT_ROOT}")
     set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${MOONSHOT_OUTPUT_ROOT}")
     set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY "${MOONSHOT_OUTPUT_ROOT}")
     set(MOONSHOT_CONFIG_OUTPUT_DIR "${MOONSHOT_OUTPUT_ROOT}/$<CONFIG>")
-    foreach(config Debug Release RelWithDebInfo MinSizeRel)
+    foreach(config IN LISTS CMAKE_CONFIGURATION_TYPES)
         string(TOUPPER "${config}" config_upper)
         set(CMAKE_RUNTIME_OUTPUT_DIRECTORY_${config_upper} "${MOONSHOT_OUTPUT_ROOT}/${config}")
         set(CMAKE_LIBRARY_OUTPUT_DIRECTORY_${config_upper} "${MOONSHOT_OUTPUT_ROOT}/${config}")
